@@ -3,11 +3,15 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import redis.asyncio as aioredis
+import sentry_sdk
 import structlog
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+from sentry_sdk.integrations.redis import RedisIntegration
 from sqlalchemy import text
 
 from app.core.config import settings
@@ -17,6 +21,47 @@ from app.middleware.tenant import TenantMiddleware
 from app.schemas.mcp import HealthResponse, StreamMessage, WebSocketMessage
 
 logger = structlog.get_logger(__name__)
+
+
+def _setup_opentelemetry() -> None:
+    if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        resource = Resource.create({"service.name": "mcp-server", "service.version": settings.APP_VERSION})
+        provider = TracerProvider(resource=resource)
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_ENDPOINT)))
+        trace.set_tracer_provider(provider)
+        FastAPIInstrumentor.instrument()
+        logger.info("opentelemetry_initialized", endpoint=settings.OTEL_ENDPOINT)
+    except ImportError:
+        logger.warning("opentelemetry_packages_missing")
+
+
+_setup_opentelemetry()
+
+# ---------------------------------------------------------------------------
+# Sentry
+# ---------------------------------------------------------------------------
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=getattr(settings, "ENVIRONMENT", "production"),
+        release=f"mcp-server@{settings.APP_VERSION}",
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            SqlalchemyIntegration(),
+            RedisIntegration(),
+        ],
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
 
 # Module-level Redis client (shared)
 redis_client: aioredis.Redis | None = None

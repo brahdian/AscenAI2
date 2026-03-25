@@ -14,3 +14,10 @@ qdrant-client==1.11.3
 sentence-transformers==3.2.1
 cryptography==43.0.3
 python-multipart==0.0.12
+twilio==9.3.7
+sentry-sdk[fastapi]==2.19.2
+opentelemetry-sdk==1.28.4
+opentelemetry-exporter-otlp==1.28.4
+opentelemetry-instrumentation-fastapi==0.49b4
+opentelemetry-instrumentation-sqlalchemy==0.49b4
+opentelemetry-instrumentation-redis==0.49b4

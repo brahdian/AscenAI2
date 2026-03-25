@@ -2,12 +2,16 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+from sentry_sdk.integrations.redis import RedisIntegration
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
@@ -16,6 +20,25 @@ from app.middleware.auth import AuthMiddleware
 from app.api.v1 import auth, tenants, api_keys, webhooks, proxy
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Sentry (initialized at module load so it captures startup errors too)
+# ---------------------------------------------------------------------------
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=settings.ENVIRONMENT,
+        release=f"api-gateway@{settings.APP_VERSION}",
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            SqlalchemyIntegration(),
+            RedisIntegration(),
+        ],
+        traces_sample_rate=0.1,
+        profiles_sample_rate=0.05,
+        send_default_pii=False,
+    )
+    logger.info("sentry_initialized", service="api-gateway")
 
 # ---------------------------------------------------------------------------
 # Rate limiter (sliding window using Redis)
@@ -119,6 +142,31 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
+
+
+def _setup_opentelemetry() -> None:
+    """Wire OpenTelemetry tracing if enabled."""
+    if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        resource = Resource.create({"service.name": "api-gateway", "service.version": settings.APP_VERSION})
+        provider = TracerProvider(resource=resource)
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_ENDPOINT)))
+        trace.set_tracer_provider(provider)
+        FastAPIInstrumentor.instrument()
+        logger.info("opentelemetry_initialized", endpoint=settings.OTEL_ENDPOINT)
+    except ImportError:
+        logger.warning("opentelemetry_packages_missing")
+
+
+_setup_opentelemetry()
 
 
 @asynccontextmanager

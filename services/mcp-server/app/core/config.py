@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     # Observability
     PROMETHEUS_ENABLED: bool = True
     SENTRY_DSN: Optional[str] = None
+    ENVIRONMENT: str = "production"
+    OTEL_ENABLED: bool = False
+    OTEL_ENDPOINT: str = ""
 
 
 settings = Settings()

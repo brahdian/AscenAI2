@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # CORS
     ALLOWED_ORIGINS: list[str] = ["*"]
 
+    # Observability
+    SENTRY_DSN: str = ""
+    ENVIRONMENT: str = "production"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

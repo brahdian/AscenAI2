@@ -8,12 +8,16 @@ class Settings(BaseSettings):
     MCP_SERVER_URL: str = "http://mcp-server:8001"
     MCP_WS_URL: str = "ws://mcp-server:8001"
 
-    # LLM config - Gemini Flash Lite or OpenAI compatible
-    LLM_PROVIDER: str = "gemini"  # "gemini" | "openai"
+    # LLM config
+    LLM_PROVIDER: str = "gemini"  # "gemini" | "openai" | "vertex"
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.0-flash-lite"
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
+
+    # Vertex AI (set LLM_PROVIDER=vertex to use Gemini via Google Cloud)
+    VERTEX_PROJECT_ID: str = ""
+    VERTEX_LOCATION: str = "us-central1"
 
     # Embedding model
     EMBEDDING_MODEL: str = "text-embedding-3-small"
@@ -37,6 +41,12 @@ class Settings(BaseSettings):
 
     # CORS
     ALLOWED_ORIGINS: list[str] = ["*"]
+
+    # Observability
+    SENTRY_DSN: str = ""
+    ENVIRONMENT: str = "production"
+    OTEL_ENDPOINT: str = ""
+    OTEL_ENABLED: bool = False
 
     class Config:
         env_file = ".env"

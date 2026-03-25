@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:3000"
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:3001"]
 
+    # Observability
+    SENTRY_DSN: str = ""
+    OTEL_ENDPOINT: str = ""      # e.g. "http://otel-collector:4317"
+    OTEL_ENABLED: bool = False
+    ENVIRONMENT: str = "production"
+
 
 @lru_cache()
 def get_settings() -> Settings:

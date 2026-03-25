@@ -135,6 +135,8 @@ export const feedbackApi = {
     rating: 'positive' | 'negative'
     labels?: string[]
     comment?: string
+    ideal_response?: string
+    correction_reason?: string
     feedback_source?: string
   }) => api.post('/proxy/feedback', data).then((r) => r.data),
 
@@ -163,4 +165,29 @@ export const feedbackApi = {
 export const analyticsApi = {
   overview: (params?: { days?: number; agent_id?: string }) =>
     api.get('/proxy/analytics/overview', { params }).then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
+// Playbook (via proxy)
+// ---------------------------------------------------------------------------
+
+export const playbookApi = {
+  get: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/playbook`).then((r) => r.data),
+
+  upsert: (agentId: string, data: {
+    greeting_message?: string
+    instructions?: string
+    tone?: string
+    dos?: string[]
+    donts?: string[]
+    scenarios?: { trigger: string; response: string }[]
+    out_of_scope_response?: string
+    fallback_response?: string
+    custom_escalation_message?: string
+    is_active?: boolean
+  }) => api.put(`/proxy/agents/${agentId}/playbook`, data).then((r) => r.data),
+
+  delete: (agentId: string) =>
+    api.delete(`/proxy/agents/${agentId}/playbook`),
 }

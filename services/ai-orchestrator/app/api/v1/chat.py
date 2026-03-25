@@ -99,6 +99,7 @@ async def chat(
         mcp_client=mcp_client,
         memory_manager=memory_manager,
         db=db,
+        redis_client=redis_client,
     )
 
     response = await orchestrator.process_message(
@@ -139,6 +140,7 @@ async def chat_stream(
         mcp_client=mcp_client,
         memory_manager=memory_manager,
         db=db,
+        redis_client=redis_client,
     )
 
     async def event_generator():

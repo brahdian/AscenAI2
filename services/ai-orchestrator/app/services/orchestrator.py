@@ -8,8 +8,10 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
+import json
+
 from app.core.config import settings
-from app.models.agent import Agent, Session as AgentSession, Message, AgentAnalytics
+from app.models.agent import Agent, AgentPlaybook, Session as AgentSession, Message, AgentAnalytics
 from app.schemas.chat import ChatResponse, StreamChatEvent
 from app.services.llm_client import LLMClient, LLMResponse, ToolCall
 from app.services.mcp_client import MCPClient
@@ -45,12 +47,80 @@ class Orchestrator:
         mcp_client: MCPClient,
         memory_manager: MemoryManager,
         db: AsyncSession,
+        redis_client=None,
     ):
         self.llm = llm_client
         self.mcp = mcp_client
         self.memory = memory_manager
         self.db = db
+        self.redis = redis_client
         self.intent_detector = IntentDetector()
+
+    # ------------------------------------------------------------------
+    # Helpers: playbook + corrections
+    # ------------------------------------------------------------------
+
+    async def _load_playbook(self, agent_id) -> Optional[AgentPlaybook]:
+        """Load the active playbook for this agent, if any."""
+        from sqlalchemy import select as sa_select
+        result = await self.db.execute(
+            sa_select(AgentPlaybook).where(
+                AgentPlaybook.agent_id == agent_id,
+                AgentPlaybook.is_active.is_(True),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _load_corrections(self, agent_id: str) -> list[dict]:
+        """Fetch operator corrections stored in Redis for this agent."""
+        if self.redis is None:
+            return []
+        try:
+            key = f"corrections:{agent_id}"
+            raw_items = await self.redis.lrange(key, 0, 19)
+            corrections = []
+            for raw in raw_items:
+                try:
+                    corrections.append(json.loads(raw))
+                except Exception:
+                    pass
+            return corrections
+        except Exception:
+            return []
+
+    async def _maybe_send_greeting(
+        self, agent: Agent, session: AgentSession, playbook: Optional[AgentPlaybook]
+    ) -> Optional[str]:
+        """
+        If this is a brand-new session (no messages yet) and the playbook
+        has a greeting, persist it and return the greeting text.
+        """
+        if not playbook or not playbook.greeting_message:
+            return None
+
+        from sqlalchemy import select as sa_select, func as sa_func
+        count_result = await self.db.execute(
+            sa_select(sa_func.count()).select_from(Message).where(
+                Message.session_id == session.id
+            )
+        )
+        msg_count = count_result.scalar() or 0
+        if msg_count > 0:
+            return None  # Not a new session
+
+        greeting = playbook.greeting_message
+        self.db.add(Message(
+            session_id=session.id,
+            tenant_id=session.tenant_id,
+            role="assistant",
+            content=greeting,
+            tokens_used=0,
+            latency_ms=0,
+        ))
+        await self.memory.add_to_short_term_memory(
+            session.id, {"role": "assistant", "content": greeting}
+        )
+        return greeting
 
     async def process_message(
         self,
@@ -88,6 +158,11 @@ class Orchestrator:
                 agent, session, user_message, start_time
             )
 
+        # --- Load playbook + corrections ---
+        playbook = await self._load_playbook(agent.id)
+        corrections = await self._load_corrections(str(agent.id))
+        await self._maybe_send_greeting(agent, session, playbook)
+
         # --- Step 1: Load short-term memory ---
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
@@ -113,6 +188,8 @@ class Orchestrator:
             agent=agent,
             context_items=context_items,
             business_info={"customer_profile": customer_profile, "intent": intent},
+            playbook=playbook,
+            corrections=corrections,
         )
 
         # --- Step 4: Get tool schemas ---
@@ -278,6 +355,10 @@ class Orchestrator:
             return
 
         # Load memory and context
+        playbook = await self._load_playbook(agent.id)
+        corrections = await self._load_corrections(str(agent.id))
+        await self._maybe_send_greeting(agent, session, playbook)
+
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
         kb_ids = agent.knowledge_base_ids or []
@@ -300,6 +381,8 @@ class Orchestrator:
             agent=agent,
             context_items=context_items,
             business_info={"customer_profile": customer_profile, "intent": intent},
+            playbook=playbook,
+            corrections=corrections,
         )
 
         tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)

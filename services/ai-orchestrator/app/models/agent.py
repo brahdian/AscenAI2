@@ -52,6 +52,9 @@ class Agent(Base):
     analytics: Mapped[list["AgentAnalytics"]] = relationship(
         "AgentAnalytics", back_populates="agent"
     )
+    playbook: Mapped[Optional["AgentPlaybook"]] = relationship(
+        "AgentPlaybook", back_populates="agent", uselist=False, cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -246,6 +249,11 @@ class MessageFeedback(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
+    # Operator's corrected / ideal response — used to generate few-shot examples
+    ideal_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Short explanation of why the original response was wrong
+    correction_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
@@ -256,6 +264,82 @@ class MessageFeedback(Base):
             "rating": self.rating,
             "labels": self.labels or [],
             "comment": self.comment,
+            "ideal_response": self.ideal_response,
+            "correction_reason": self.correction_reason,
             "feedback_source": self.feedback_source,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AgentPlaybook(Base):
+    """
+    Operator-authored configuration that shapes how an agent behaves in chat.
+    Injected into the system prompt on every turn.
+    """
+    __tablename__ = "agent_playbooks"
+    __table_args__ = (
+        Index("ix_playbooks_agent_id", "agent_id"),
+        Index("ix_playbooks_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agents.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    # Greeting: sent as the first assistant message in a new session
+    greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Detailed operator instructions injected into the system prompt
+    instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Tone style: "professional" | "friendly" | "casual" | "empathetic"
+    tone: Mapped[str] = mapped_column(String(50), nullable=False, default="professional")
+
+    # Things to always do / never do  (JSONB list[str])
+    dos: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    donts: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+
+    # Scenario playbook: list of {trigger: str, response: str}
+    scenarios: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+
+    # Canned fallback responses
+    out_of_scope_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fallback_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    custom_escalation_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    agent: Mapped["Agent"] = relationship("Agent", back_populates="playbook")
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "agent_id": str(self.agent_id),
+            "tenant_id": str(self.tenant_id),
+            "greeting_message": self.greeting_message,
+            "instructions": self.instructions,
+            "tone": self.tone,
+            "dos": self.dos or [],
+            "donts": self.donts or [],
+            "scenarios": self.scenarios or [],
+            "out_of_scope_response": self.out_of_scope_response,
+            "fallback_response": self.fallback_response,
+            "custom_escalation_message": self.custom_escalation_message,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

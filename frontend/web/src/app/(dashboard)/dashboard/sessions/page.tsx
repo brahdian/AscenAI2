@@ -47,6 +47,8 @@ function FeedbackModal({
   )
   const [labels, setLabels] = useState<string[]>(message.feedback?.labels ?? [])
   const [comment, setComment] = useState(message.feedback?.comment ?? '')
+  const [idealResponse, setIdealResponse] = useState(message.feedback?.ideal_response ?? '')
+  const [correctionReason, setCorrectionReason] = useState(message.feedback?.correction_reason ?? '')
   const qc = useQueryClient()
 
   const submit = useMutation({
@@ -58,6 +60,8 @@ function FeedbackModal({
         rating: rating!,
         labels,
         comment: comment || undefined,
+        ideal_response: idealResponse || undefined,
+        correction_reason: correctionReason || undefined,
         feedback_source: 'operator',
       }),
     onSuccess: () => {
@@ -139,12 +143,40 @@ function FeedbackModal({
           </div>
         )}
 
+        {/* Ideal response — shown for negative or when operator wants to correct */}
+        <div className="mb-4">
+          <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">
+            What should it have said? <span className="normal-case text-gray-400">(trains the bot)</span>
+          </label>
+          <textarea
+            value={idealResponse}
+            onChange={(e) => setIdealResponse(e.target.value)}
+            placeholder="Write the ideal response here — it will be used as a training example for future conversations…"
+            rows={4}
+            className="w-full text-sm rounded-xl border border-violet-200 dark:border-violet-800 bg-violet-50/40 dark:bg-violet-900/10 px-3 py-2 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-violet-400 resize-none"
+          />
+        </div>
+
+        {/* Correction reason */}
+        <div className="mb-4">
+          <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">
+            Why was it wrong? <span className="normal-case text-gray-400">(optional)</span>
+          </label>
+          <input
+            type="text"
+            value={correctionReason}
+            onChange={(e) => setCorrectionReason(e.target.value)}
+            placeholder="e.g. wrong price, missed context, tone too formal…"
+            className="w-full text-sm rounded-xl border border-gray-200 dark:border-gray-700 bg-transparent px-3 py-2 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-violet-400"
+          />
+        </div>
+
         {/* Comment */}
         <textarea
           value={comment}
           onChange={(e) => setComment(e.target.value)}
-          placeholder="Optional comment (what was wrong, what could be better...)"
-          rows={3}
+          placeholder="Any other notes…"
+          rows={2}
           className="w-full text-sm rounded-xl border border-gray-200 dark:border-gray-700 bg-transparent px-3 py-2 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-violet-400 mb-4 resize-none"
         />
 
@@ -208,14 +240,18 @@ function MessageBubble({
             {isAssistant && (
               <div className="flex items-center gap-1 ml-1">
                 {message.feedback ? (
-                  <span className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${
-                    message.feedback.rating === 'positive'
-                      ? 'bg-green-100 text-green-600 dark:bg-green-900/30'
-                      : 'bg-red-100 text-red-600 dark:bg-red-900/30'
-                  }`}>
+                  <button
+                    onClick={() => setShowFeedback(true)}
+                    title={message.feedback.ideal_response ? 'Has correction — click to edit' : 'Click to edit feedback'}
+                    className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-opacity hover:opacity-80 ${
+                      message.feedback.rating === 'positive'
+                        ? 'bg-green-100 text-green-600 dark:bg-green-900/30'
+                        : 'bg-red-100 text-red-600 dark:bg-red-900/30'
+                    }`}>
                     {message.feedback.rating === 'positive' ? <ThumbsUp size={11} /> : <ThumbsDown size={11} />}
                     {message.feedback.labels?.join(', ') || message.feedback.rating}
-                  </span>
+                    {message.feedback.ideal_response && <span className="ml-1 text-violet-500">✎</span>}
+                  </button>
                 ) : (
                   <button
                     onClick={() => setShowFeedback(true)}

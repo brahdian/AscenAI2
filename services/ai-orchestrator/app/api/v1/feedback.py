@@ -29,6 +29,10 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
+CORRECTIONS_KEY = "corrections:{agent_id}"
+CORRECTIONS_MAX = 20  # keep the most recent N per agent
+
+
 def _fb_to_response(fb: MessageFeedback) -> FeedbackResponse:
     return FeedbackResponse(
         id=str(fb.id),
@@ -39,9 +43,38 @@ def _fb_to_response(fb: MessageFeedback) -> FeedbackResponse:
         rating=fb.rating,
         labels=fb.labels or [],
         comment=fb.comment,
+        ideal_response=fb.ideal_response,
+        correction_reason=fb.correction_reason,
         feedback_source=fb.feedback_source,
         created_at=fb.created_at.isoformat() if fb.created_at else "",
     )
+
+
+async def _store_correction_in_redis(
+    request: Request,
+    agent_id: str,
+    user_message_content: str,
+    ideal_response: str,
+) -> None:
+    """
+    Push an operator correction into Redis so the orchestrator can inject it
+    as a few-shot example on future turns for this agent.
+    """
+    import json, time
+    redis = getattr(request.app.state, "redis", None)
+    if redis is None:
+        return
+    key = CORRECTIONS_KEY.format(agent_id=agent_id)
+    entry = json.dumps({
+        "user_message": user_message_content[:300],
+        "ideal_response": ideal_response[:800],
+        "ts": time.time(),
+    })
+    pipe = redis.pipeline()
+    pipe.lpush(key, entry)
+    pipe.ltrim(key, 0, CORRECTIONS_MAX - 1)
+    pipe.expire(key, 60 * 60 * 24 * 30)  # 30-day TTL
+    await pipe.execute()
 
 
 @router.post("", response_model=FeedbackResponse, status_code=201)
@@ -75,12 +108,26 @@ async def submit_feedback(
         rating=body.rating,
         labels=body.labels or [],
         comment=body.comment,
+        ideal_response=body.ideal_response,
+        correction_reason=body.correction_reason,
         feedback_source=body.feedback_source or "user",
     )
     db.add(fb)
     await db.commit()
     await db.refresh(fb)
-    logger.info("feedback_submitted", tenant_id=tenant_id, rating=body.rating)
+    logger.info("feedback_submitted", tenant_id=tenant_id, rating=body.rating,
+                has_correction=bool(body.ideal_response))
+
+    # If an ideal response was provided, push a correction into Redis so
+    # the orchestrator injects it as a few-shot example on future turns.
+    if body.ideal_response and msg:
+        await _store_correction_in_redis(
+            request=request,
+            agent_id=body.agent_id,
+            user_message_content=msg.content,
+            ideal_response=body.ideal_response,
+        )
+
     return _fb_to_response(fb)
 
 

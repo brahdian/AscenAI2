@@ -138,6 +138,8 @@ class FeedbackCreate(BaseModel):
     rating: str = Field(..., description="positive or negative")
     labels: list[str] = Field(default_factory=list, description="Descriptive labels")
     comment: Optional[str] = Field(None, max_length=2000, description="Optional free-text comment")
+    ideal_response: Optional[str] = Field(None, max_length=5000, description="What the response should have been")
+    correction_reason: Optional[str] = Field(None, max_length=2000, description="Why the original response was wrong")
     feedback_source: str = Field(default="user", description="user or operator")
 
 
@@ -150,8 +152,50 @@ class FeedbackResponse(BaseModel):
     rating: str
     labels: list[str]
     comment: Optional[str]
+    ideal_response: Optional[str]
+    correction_reason: Optional[str]
     feedback_source: str
     created_at: str
+
+
+# ---------------------------------------------------------------------------
+# Playbook
+# ---------------------------------------------------------------------------
+
+class ScenarioItem(BaseModel):
+    trigger: str = Field(..., description="Trigger phrase or question")
+    response: str = Field(..., description="Canned response to use")
+
+
+class PlaybookUpsert(BaseModel):
+    greeting_message: Optional[str] = Field(None, max_length=2000)
+    instructions: Optional[str] = Field(None, max_length=10000)
+    tone: str = Field(default="professional", description="professional | friendly | casual | empathetic")
+    dos: list[str] = Field(default_factory=list)
+    donts: list[str] = Field(default_factory=list)
+    scenarios: list[ScenarioItem] = Field(default_factory=list)
+    out_of_scope_response: Optional[str] = Field(None, max_length=2000)
+    fallback_response: Optional[str] = Field(None, max_length=2000)
+    custom_escalation_message: Optional[str] = Field(None, max_length=2000)
+    is_active: bool = True
+
+
+class PlaybookResponse(BaseModel):
+    id: str
+    agent_id: str
+    tenant_id: str
+    greeting_message: Optional[str]
+    instructions: Optional[str]
+    tone: str
+    dos: list[str]
+    donts: list[str]
+    scenarios: list[dict]
+    out_of_scope_response: Optional[str]
+    fallback_response: Optional[str]
+    custom_escalation_message: Optional[str]
+    is_active: bool
+    created_at: str
+    updated_at: str
 
 
 class FeedbackSummary(BaseModel):

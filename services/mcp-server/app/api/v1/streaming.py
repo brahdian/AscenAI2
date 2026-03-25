@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.core.config import settings
 from app.schemas.mcp import StreamMessage, WebSocketMessage
 
 logger = structlog.get_logger(__name__)
@@ -35,12 +37,32 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _verify_ws_token(token: str, path_tenant_id: str) -> bool:
+    """Verify JWT access token and confirm tenant claim matches URL path."""
+    try:
+        from jose import jwt as jose_jwt
+        payload = jose_jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        if payload.get("type") != "access":
+            return False
+        jwt_tenant = payload.get("tenant_id")
+        return bool(jwt_tenant and jwt_tenant == path_tenant_id)
+    except Exception:
+        return False
+
+
 @router.websocket("/ws/{tenant_id}")
 async def websocket_endpoint(websocket: WebSocket, tenant_id: str):
     """
     WebSocket endpoint for real-time MCP streaming.
     Clients send WebSocketMessage JSON; server responds with StreamMessage JSON.
     """
+    token = websocket.query_params.get("token", "")
+    if not token or not _verify_ws_token(token, tenant_id):
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
     client_id = f"{tenant_id}:{uuid.uuid4()}"
     await manager.connect(client_id, websocket)
 
@@ -93,10 +115,11 @@ async def websocket_endpoint(websocket: WebSocket, tenant_id: str):
                         }
                     )
                 except Exception as exc:
+                    logger.error("tool_call_error", tenant_id=tenant_id, error=str(exc))
                     await websocket.send_json(
                         {
                             "type": "error",
-                            "payload": {"message": str(exc)},
+                            "payload": {"message": "Tool execution failed"},
                             "trace_id": msg.trace_id,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }

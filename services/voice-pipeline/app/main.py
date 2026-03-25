@@ -123,6 +123,21 @@ async def health():
     return {"status": "ok", "service": settings.APP_NAME, "version": settings.APP_VERSION}
 
 
+def _verify_ws_token(token: str, path_tenant_id: str) -> bool:
+    """Verify JWT and confirm tenant_id claim matches the URL path."""
+    try:
+        from jose import jwt as jose_jwt, JWTError
+        payload = jose_jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        )
+        if payload.get("type") != "access":
+            return False
+        jwt_tenant = payload.get("tenant_id")
+        return bool(jwt_tenant and jwt_tenant == path_tenant_id)
+    except Exception:
+        return False
+
+
 @app.websocket("/ws/voice/{tenant_id}/{session_id}")
 async def voice_websocket(
     websocket: WebSocket,
@@ -140,6 +155,11 @@ async def voice_websocket(
       - Binary frames: TTS audio (MP3 or PCM)
       - JSON text frames: transcript & status events
     """
+    token = websocket.query_params.get("token", "")
+    if not token or not _verify_ws_token(token, tenant_id):
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
     client_id = f"{tenant_id}:{session_id}"
     await manager.connect(client_id, websocket)
 
@@ -185,7 +205,7 @@ async def voice_websocket(
     except Exception as exc:
         logger.error("voice_ws_error", client_id=client_id, error=str(exc))
         try:
-            await websocket.send_json({"type": "error", "message": str(exc)})
+            await websocket.send_json({"type": "error", "message": "An internal error occurred"})
         except Exception:
             pass
     finally:

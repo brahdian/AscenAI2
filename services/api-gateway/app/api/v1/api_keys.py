@@ -14,6 +14,13 @@ from app.services.auth_service import auth_service
 
 router = APIRouter(prefix="/api-keys")
 
+# Scopes available to any authenticated user
+_USER_SCOPES = frozenset({"chat", "sessions", "feedback"})
+# Scopes that require owner or admin role
+_PRIVILEGED_SCOPES = frozenset({"admin", "agents:write", "api-keys:write", "tenants:write"})
+# All valid scopes
+_ALL_VALID_SCOPES = _USER_SCOPES | _PRIVILEGED_SCOPES | frozenset({"agents:read", "analytics"})
+
 
 def _require_tenant(request: Request) -> str:
     tenant_id = getattr(request.state, "tenant_id", None)
@@ -33,6 +40,24 @@ async def create_api_key(
     user_id = getattr(request.state, "user_id", None)
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required.")
+
+    # Validate requested scopes
+    requested = set(body.scopes)
+    invalid = requested - _ALL_VALID_SCOPES
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid scope(s): {', '.join(sorted(invalid))}. "
+                   f"Valid scopes: {', '.join(sorted(_ALL_VALID_SCOPES))}",
+        )
+
+    # Only owner/admin users may request privileged scopes
+    user_role = getattr(request.state, "role", "member")
+    if requested & _PRIVILEGED_SCOPES and user_role not in {"owner", "admin"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only owner or admin users may request privileged scopes.",
+        )
 
     expires_at: datetime | None = None
     if body.expires_at:

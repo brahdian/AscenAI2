@@ -106,7 +106,10 @@ async def get_session(
     if include_messages:
         msg_result = await db.execute(
             select(Message)
-            .where(Message.session_id == session_id)
+            .where(
+                Message.session_id == session_id,
+                Message.tenant_id == uuid.UUID(tenant_id),
+            )
             .order_by(Message.created_at.asc())
         )
         messages = list(msg_result.scalars().all())
@@ -178,7 +181,10 @@ async def session_analytics(
         raise HTTPException(status_code=404, detail="Session not found.")
 
     msg_result = await db.execute(
-        select(Message).where(Message.session_id == session_id)
+        select(Message).where(
+            Message.session_id == session_id,
+            Message.tenant_id == uuid.UUID(tenant_id),
+        )
     )
     messages = list(msg_result.scalars().all())
 

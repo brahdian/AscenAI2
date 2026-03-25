@@ -1,5 +1,15 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
+
+_WEAK_KEYS = frozenset({
+    "change-this-secret-key-in-production-min-32-chars",
+    "change-this-secret-key-in-production",
+    "secret",
+    "password",
+    "dev",
+    "test",
+})
 
 
 class Settings(BaseSettings):
@@ -21,6 +31,18 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def validate_secret_key(cls, v: str) -> str:
+        if len(v) < 32:
+            raise ValueError("SECRET_KEY must be at least 32 characters long")
+        if v in _WEAK_KEYS:
+            raise ValueError(
+                "SECRET_KEY is a known weak default. "
+                "Generate a strong key: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        return v
+
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/mcp_db"
 
@@ -39,8 +61,8 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 100
     RATE_LIMIT_WINDOW_SECONDS: int = 60
 
-    # CORS
-    ALLOWED_ORIGINS: list[str] = ["*"]
+    # CORS — override in production with explicit origin list
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
     ALLOWED_METHODS: list[str] = ["*"]
     ALLOWED_HEADERS: list[str] = ["*"]
 

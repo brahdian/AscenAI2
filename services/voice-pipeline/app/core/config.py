@@ -1,5 +1,15 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pydantic import field_validator
+from pydantic_settings import BaseSettings
+
+_WEAK_KEYS = frozenset({
+    "change-this-secret-key-in-production-min-32-chars",
+    "change-this-secret-key-in-production",
+    "secret",
+    "password",
+    "dev",
+    "test",
+})
 
 
 class Settings(BaseSettings):
@@ -22,6 +32,18 @@ class Settings(BaseSettings):
     # JWT
     JWT_ALGORITHM: str = "HS256"
 
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def validate_secret_key(cls, v: str) -> str:
+        if len(v) < 32:
+            raise ValueError("SECRET_KEY must be at least 32 characters long")
+        if v in _WEAK_KEYS:
+            raise ValueError(
+                "SECRET_KEY is a known weak default. "
+                "Generate a strong key: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        return v
+
     # Audio settings
     SAMPLE_RATE: int = 16000
     CHUNK_SIZE_MS: int = 100
@@ -40,8 +62,8 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
-    # CORS
-    ALLOWED_ORIGINS: list[str] = ["*"]
+    # CORS — override in production with explicit origin list
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
 
     # Observability
     SENTRY_DSN: str = ""

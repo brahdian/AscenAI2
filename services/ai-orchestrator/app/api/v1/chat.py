@@ -51,7 +51,10 @@ async def _get_or_create_session(
 ) -> AgentSession:
     if session_id:
         result = await db.execute(
-            select(AgentSession).where(AgentSession.id == session_id)
+            select(AgentSession).where(
+                AgentSession.id == session_id,
+                AgentSession.tenant_id == uuid.UUID(tenant_id),
+            )
         )
         sess = result.scalar_one_or_none()
         if sess:
@@ -153,6 +156,7 @@ async def chat_stream(
             await db.commit()
         except Exception as exc:
             import json
-            yield f"data: {json.dumps({'type': 'error', 'data': str(exc), 'session_id': str(session.id)})}\n\n"
+            logger.error("stream_error", session_id=str(session.id), error=str(exc))
+            yield f"data: {json.dumps({'type': 'error', 'data': 'An internal error occurred', 'session_id': str(session.id)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

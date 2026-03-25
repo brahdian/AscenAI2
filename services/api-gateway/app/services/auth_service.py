@@ -112,7 +112,12 @@ class AuthService:
         user: User | None = result.scalar_one_or_none()
 
         from fastapi import HTTPException
-        if not user or not self.verify_password(request.password, user.hashed_password):
+        # Always run verify_password even when user is None to prevent timing-based
+        # user enumeration (constant-time response regardless of whether email exists).
+        _dummy_hash = "$2b$12$KIXyiB0FkCDybLVc8CxmgOWk6tPn2dIlhXjLuPn4c9BEjyVCh3p9."
+        candidate_hash = user.hashed_password if user else _dummy_hash
+        password_ok = self.verify_password(request.password, candidate_hash)
+        if not user or not password_ok:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
         if not user.is_active:
@@ -159,6 +164,63 @@ class AuthService:
             raise HTTPException(status_code=403, detail="Tenant account is inactive.")
 
         return self._build_token_response(user, tenant)
+
+    async def request_password_reset(
+        self, email: str, db: AsyncSession, redis=None
+    ) -> None:
+        """
+        Generate a one-time password-reset token, store it in Redis (1-hour TTL),
+        and send a reset email. Always succeeds silently to prevent email enumeration.
+        """
+        import hashlib
+        result = await db.execute(select(User).where(User.email == email))
+        user: User | None = result.scalar_one_or_none()
+        if not user or not user.is_active:
+            return  # Silent success — don't reveal whether the email exists
+
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        if redis:
+            # Store hash → user_id with 1-hour TTL; use hash so raw token isn't in Redis
+            await redis.setex(f"pwd_reset:{token_hash}", 3600, str(user.id))
+
+        reset_url = f"{settings.FRONTEND_URL}/reset-password?token={raw_token}"
+        asyncio.create_task(self._send_reset_email(email, user.full_name, reset_url))
+        logger.info("password_reset_requested", user_id=str(user.id))
+
+    async def reset_password(
+        self, raw_token: str, new_password: str, db: AsyncSession, redis=None
+    ) -> None:
+        """
+        Validate the reset token, update the user's password, and invalidate the token.
+        Raises HTTPException if token is invalid or expired.
+        """
+        import hashlib
+        from fastapi import HTTPException
+
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        user_id_str: str | None = None
+
+        if redis:
+            user_id_str = await redis.get(f"pwd_reset:{token_hash}")
+
+        if not user_id_str:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
+
+        result = await db.execute(select(User).where(User.id == uuid.UUID(user_id_str)))
+        user: User | None = result.scalar_one_or_none()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
+
+        user.hashed_password = self.hash_password(new_password)
+        await db.commit()
+
+        # Invalidate the token immediately (one-time use)
+        if redis:
+            await redis.delete(f"pwd_reset:{token_hash}")
+
+        logger.info("password_reset_completed", user_id=str(user.id))
 
     async def create_api_key(
         self,
@@ -305,6 +367,44 @@ class AuthService:
                 return slug
             slug = f"{base_slug}-{secrets.token_hex(3)}"
         return f"{base_slug}-{secrets.token_hex(6)}"
+
+    @staticmethod
+    async def _send_reset_email(email: str, full_name: str, reset_url: str) -> None:
+        """Send a password-reset email via SMTP (async, best-effort)."""
+        if not settings.SMTP_HOST:
+            logger.info("smtp_not_configured_skipping_reset_email", email=email)
+            return
+        try:
+            import aiosmtplib
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text import MIMEText
+
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = "Reset your AscenAI password"
+            msg["From"] = settings.FROM_EMAIL
+            msg["To"] = email
+
+            html_body = f"""
+            <html><body>
+            <p>Hi {full_name},</p>
+            <p>Click the link below to reset your password. This link expires in 1 hour.</p>
+            <p><a href="{reset_url}">Reset Password</a></p>
+            <p>If you did not request a password reset, ignore this email.</p>
+            </body></html>
+            """
+            msg.attach(MIMEText(html_body, "html"))
+
+            await aiosmtplib.send(
+                msg,
+                hostname=settings.SMTP_HOST,
+                port=settings.SMTP_PORT,
+                username=settings.SMTP_USER or None,
+                password=settings.SMTP_PASSWORD or None,
+                start_tls=True,
+            )
+            logger.info("reset_email_sent", email=email)
+        except Exception as exc:
+            logger.warning("reset_email_failed", email=email, error=str(exc))
 
     @staticmethod
     async def _send_welcome_email(email: str, full_name: str) -> None:

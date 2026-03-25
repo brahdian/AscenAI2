@@ -26,6 +26,10 @@ ESCALATION_KEYWORDS = [
     "speak to human", "talk to agent", "real person", "supervisor",
     "I can't help", "beyond my capabilities", "escalating",
 ]
+# Module-level constant — do NOT define inside the hot-path _check_input_guardrails
+_PROFANITY_LIST = frozenset([
+    "fuck", "shit", "bitch", "asshole", "cunt", "bastard",
+])
 
 
 class Orchestrator:
@@ -113,8 +117,7 @@ class Orchestrator:
 
         # Profanity filter
         if guardrails.profanity_filter:
-            _PROFANITY = ["fuck", "shit", "bitch", "asshole", "cunt", "bastard"]
-            for word in _PROFANITY:
+            for word in _PROFANITY_LIST:
                 if word in msg_lower:
                     return "profanity"
 

@@ -81,11 +81,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         window_key = f"{key}:{now // 60}"
 
         try:
-            pipe = redis.pipeline()
-            pipe.incr(window_key)
-            pipe.expire(window_key, 120)
-            results = await pipe.execute()
-            count = results[0]
+            # Atomic INCR + EXPIRE via Lua script to avoid a race where INCR
+            # succeeds but EXPIRE is never called (e.g. crash between the two),
+            # which would leave the counter key without a TTL and block forever.
+            _lua = """
+local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], 120) end
+return c
+"""
+            count = await redis.eval(_lua, 1, window_key)
         except Exception:
             # If Redis is down, allow the request through
             count = 0
@@ -176,6 +180,7 @@ async def lifespan(app: FastAPI):
 
     global redis_client
     redis_client = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    app.state.redis = redis_client  # expose for password reset and other routes
     logger.info("redis_connected", url=settings.REDIS_URL)
 
     yield

@@ -197,12 +197,45 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _verify_ws_token(token: str, path_tenant_id: str) -> Optional[str]:
+    """
+    Validate a JWT from a WebSocket handshake.
+    Returns the tenant_id claim if valid AND it matches path_tenant_id, else None.
+    """
+    from jose import JWTError, jwt as jose_jwt
+    try:
+        payload = jose_jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        )
+        if payload.get("type") != "access":
+            return None
+        jwt_tenant = payload.get("tenant_id")
+        if not jwt_tenant or jwt_tenant != path_tenant_id:
+            return None
+        return jwt_tenant
+    except JWTError:
+        return None
+
+
 @app.websocket("/ws/{tenant_id}/{session_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
     tenant_id: str,
     session_id: str,
 ):
+    # ── Authentication ────────────────────────────────────────────────────
+    # Accept token from query param (?token=...) or Authorization header
+    token = websocket.query_params.get("token") or ""
+    if not token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+
+    if not token or not _verify_ws_token(token, tenant_id):
+        await websocket.close(code=4401, reason="Unauthorized")
+        logger.warning("websocket_auth_rejected", tenant_id=tenant_id, session_id=session_id)
+        return
+
     session_key = f"{tenant_id}:{session_id}"
     await manager.connect(session_key, websocket)
 
@@ -227,13 +260,21 @@ async def websocket_endpoint(
                 await websocket.send_json({"type": "error", "data": "agent_id and message are required", "session_id": session_id})
                 continue
 
+            # Validate agent_id format before UUID conversion
+            try:
+                agent_uuid = uuid.UUID(agent_id)
+                tenant_uuid = uuid.UUID(tenant_id)
+            except ValueError:
+                await websocket.send_json({"type": "error", "data": "Invalid agent_id or tenant_id format", "session_id": session_id})
+                continue
+
             async with AsyncSessionLocal() as db:
-                # Load agent
+                # Load agent — must belong to this tenant
                 result = await db.execute(
                     select(Agent).where(
-                        Agent.id == uuid.UUID(agent_id),
-                        Agent.tenant_id == uuid.UUID(tenant_id),
-                        Agent.is_active == True,
+                        Agent.id == agent_uuid,
+                        Agent.tenant_id == tenant_uuid,
+                        Agent.is_active.is_(True),
                     )
                 )
                 agent = result.scalar_one_or_none()
@@ -241,15 +282,18 @@ async def websocket_endpoint(
                     await websocket.send_json({"type": "error", "data": "Agent not found", "session_id": session_id})
                     continue
 
-                # Load or create session
+                # Load or create session — enforce tenant ownership
                 sess_result = await db.execute(
-                    select(AgentSession).where(AgentSession.id == session_id)
+                    select(AgentSession).where(
+                        AgentSession.id == session_id,
+                        AgentSession.tenant_id == tenant_uuid,
+                    )
                 )
                 session_obj = sess_result.scalar_one_or_none()
                 if not session_obj:
                     session_obj = AgentSession(
                         id=session_id,
-                        tenant_id=uuid.UUID(tenant_id),
+                        tenant_id=tenant_uuid,
                         agent_id=agent.id,
                         customer_identifier=customer_identifier,
                         channel="web",
@@ -287,7 +331,8 @@ async def websocket_endpoint(
     except Exception as exc:
         logger.error("websocket_error", session_key=session_key, error=str(exc))
         try:
-            await websocket.send_json({"type": "error", "data": str(exc), "session_id": session_id})
+            # Never expose internal error details to the client
+            await websocket.send_json({"type": "error", "data": "An internal error occurred", "session_id": session_id})
         except Exception:
             pass
         manager.disconnect(session_key)

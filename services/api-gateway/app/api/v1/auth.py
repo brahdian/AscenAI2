@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -37,14 +37,19 @@ async def refresh(request: RefreshRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/forgot-password", status_code=202)
-async def forgot_password(request: ForgotPasswordRequest):
-    """Send a password reset email (always returns 202 to avoid enumeration)."""
-    # In production, trigger an email; for now just acknowledge
+async def forgot_password(http_request: Request, body: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Generate a password-reset token stored in Redis (1-hour TTL) and send an email.
+    Always returns 202 regardless of whether the email exists — prevents enumeration.
+    """
+    redis = getattr(http_request.app.state, "redis", None)
+    await auth_service.request_password_reset(body.email, db, redis)
     return {"detail": "If that email exists, a reset link has been sent."}
 
 
 @router.post("/reset-password", status_code=200)
-async def reset_password(request: ResetPasswordRequest):
-    """Reset password using a reset token."""
-    # Placeholder — integrate with token store in production
+async def reset_password(http_request: Request, body: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """Reset password using a valid reset token (one-time, 1-hour TTL)."""
+    redis = getattr(http_request.app.state, "redis", None)
+    await auth_service.reset_password(body.token, body.new_password, db, redis)
     return {"detail": "Password reset successfully."}

@@ -4,11 +4,12 @@ import uuid
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from sqlalchemy import select, and_
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_current_tenant
-from app.models.agent import Agent, Message, MessageFeedback
+from app.models.agent import Agent, Session, Message, MessageFeedback
 from app.schemas.chat import (
     LearningInsights, LearningGap, UnreviewedNegative,
     GuardrailTrigger, SuggestedTrainingPair,
@@ -50,40 +51,51 @@ async def get_learning_insights(
     agent_uuid = uuid.UUID(agent_id)
     await _get_agent(agent_id, tenant_id, db)
 
-    # 1. Knowledge gaps: assistant messages with is_fallback=True, joined to user message
+    # 1. Knowledge gaps: assistant messages with is_fallback=True for this agent.
+    # Use a self-join to fetch the preceding user message in the same query,
+    # avoiding an N+1 pattern.
+    UserMsg = aliased(Message)
     fallback_result = await db.execute(
-        select(Message).where(
+        select(Message, UserMsg)
+        .join(
+            UserMsg,
+            and_(
+                UserMsg.session_id == Message.session_id,
+                UserMsg.role == "user",
+                UserMsg.created_at < Message.created_at,
+            ),
+        )
+        .where(
             and_(
                 Message.tenant_id == uuid.UUID(tenant_id),
                 Message.is_fallback.is_(True),
                 Message.role == "assistant",
+                # Filter to sessions that belong to this specific agent
+                Message.session_id.in_(
+                    select(Session.id).where(
+                        and_(
+                            Session.agent_id == agent_uuid,
+                            Session.tenant_id == uuid.UUID(tenant_id),
+                        )
+                    )
+                ),
             )
-        ).order_by(Message.created_at.desc()).limit(limit)
+        )
+        .order_by(Message.created_at.desc())
+        .limit(limit)
     )
-    fallback_msgs = fallback_result.scalars().all()
+    rows = fallback_result.all()
 
     knowledge_gaps: list[LearningGap] = []
-    for asst_msg in fallback_msgs:
-        # Find the preceding user message in the same session
-        user_result = await db.execute(
-            select(Message).where(
-                and_(
-                    Message.session_id == asst_msg.session_id,
-                    Message.role == "user",
-                    Message.created_at < asst_msg.created_at,
-                )
-            ).order_by(Message.created_at.desc()).limit(1)
-        )
-        user_msg = user_result.scalar_one_or_none()
-        if user_msg:
-            knowledge_gaps.append(LearningGap(
-                message_id=str(asst_msg.id),
-                session_id=asst_msg.session_id,
-                agent_id=agent_id,
-                user_message=user_msg.content[:500],
-                agent_response=asst_msg.content[:500],
-                created_at=asst_msg.created_at.isoformat(),
-            ))
+    for asst_msg, user_msg in rows:
+        knowledge_gaps.append(LearningGap(
+            message_id=str(asst_msg.id),
+            session_id=asst_msg.session_id,
+            agent_id=agent_id,
+            user_message=user_msg.content[:500],
+            agent_response=asst_msg.content[:500],
+            created_at=asst_msg.created_at.isoformat(),
+        ))
 
     # 2. Unreviewed negatives: negative feedback without ideal_response
     neg_result = await db.execute(

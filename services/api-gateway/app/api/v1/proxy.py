@@ -16,6 +16,8 @@ _SERVICE_MAP = {
     "chat": settings.AI_ORCHESTRATOR_URL,
     "agents": settings.AI_ORCHESTRATOR_URL,
     "sessions": settings.AI_ORCHESTRATOR_URL,
+    "feedback": settings.AI_ORCHESTRATOR_URL,
+    "analytics": settings.AI_ORCHESTRATOR_URL,
     "tools": settings.MCP_SERVER_URL,
     "context": settings.MCP_SERVER_URL,
     "voice": settings.VOICE_PIPELINE_URL,

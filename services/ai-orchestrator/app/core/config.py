@@ -1,5 +1,14 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+_WEAK_KEYS = {
+    "change-this-secret-key-in-production",
+    "change-this-secret-key-in-production-min-32-chars",
+    "secret",
+    "supersecret",
+    "your-secret-key",
+}
 
 
 class Settings(BaseSettings):
@@ -23,6 +32,18 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
 
     SECRET_KEY: str = "change-this-secret-key-in-production"
+
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def validate_secret_key(cls, v: str) -> str:
+        if len(v) < 32:
+            raise ValueError("SECRET_KEY must be at least 32 characters long")
+        if v in _WEAK_KEYS:
+            raise ValueError(
+                "SECRET_KEY is a known weak default. "
+                "Set a strong random value (e.g. openssl rand -hex 32)."
+            )
+        return v
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 

@@ -26,6 +26,12 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
+def _get_provider(request: Request, db: AsyncSession) -> ContextProvider:
+    qdrant = getattr(request.app.state, "qdrant", None)
+    redis = getattr(request.app.state, "redis", None)
+    return ContextProvider(qdrant_client=qdrant, redis_client=redis, db=db)
+
+
 @router.post("/retrieve", response_model=MCPContextResult)
 async def retrieve_context(
     body: MCPContextRequest,
@@ -34,13 +40,12 @@ async def retrieve_context(
 ):
     """Retrieve relevant context for a query."""
     tenant_id = _tenant_id(request)
-    # Override tenant_id from auth
     body_dict = body.model_dump()
     body_dict["tenant_id"] = tenant_id
     body = MCPContextRequest(**body_dict)
 
-    provider = ContextProvider(db)
-    return await provider.retrieve(body)
+    provider = _get_provider(request, db)
+    return await provider.retrieve_context(body)
 
 
 @router.post("/knowledge-bases", response_model=KnowledgeBaseResponse, status_code=201)
@@ -51,7 +56,7 @@ async def create_knowledge_base(
 ):
     """Create a new knowledge base."""
     tenant_id = _tenant_id(request)
-    provider = ContextProvider(db)
+    provider = _get_provider(request, db)
     kb = await provider.create_knowledge_base(tenant_id, body)
     await db.commit()
     await db.refresh(kb)
@@ -65,7 +70,7 @@ async def list_knowledge_bases(
 ):
     """List knowledge bases for the tenant."""
     tenant_id = _tenant_id(request)
-    provider = ContextProvider(db)
+    provider = _get_provider(request, db)
     return await provider.list_knowledge_bases(tenant_id)
 
 
@@ -82,12 +87,11 @@ async def add_document(
 ):
     """Add a document to a knowledge base."""
     tenant_id = _tenant_id(request)
-    # Ensure the kb belongs to this tenant
     body_dict = body.model_dump()
     body_dict["kb_id"] = kb_id
     body = KnowledgeDocumentCreate(**body_dict)
 
-    provider = ContextProvider(db)
+    provider = _get_provider(request, db)
     doc = await provider.add_document(tenant_id, body)
     await db.commit()
     await db.refresh(doc)
@@ -103,7 +107,7 @@ async def delete_document(
 ):
     """Delete a document from a knowledge base."""
     tenant_id = _tenant_id(request)
-    provider = ContextProvider(db)
+    provider = _get_provider(request, db)
     deleted = await provider.delete_document(tenant_id, kb_id, doc_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Document not found.")

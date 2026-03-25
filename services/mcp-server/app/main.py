@@ -82,7 +82,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("database_init_failed", error=str(exc))
         raise
 
-    # 2. Connect to Redis
+    # 2. Connect to Qdrant
+    try:
+        from qdrant_client import QdrantClient
+        qdrant_client = QdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            timeout=10,
+        )
+        app.state.qdrant = qdrant_client
+        logger.info("qdrant_connected", host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+    except Exception as exc:
+        logger.warning("qdrant_connect_failed", error=str(exc))
+        app.state.qdrant = None
+
+    # 3. Connect to Redis
     try:
         redis_client = aioredis.from_url(
             settings.REDIS_URL,

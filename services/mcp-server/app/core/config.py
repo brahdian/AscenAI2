@@ -31,11 +31,13 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
     QDRANT_COLLECTION_NAME: str = "knowledge_base"
+    QDRANT_COLLECTION_PREFIX: str = "kb_"
     QDRANT_VECTOR_SIZE: int = 384  # all-MiniLM-L6-v2 size
 
     # Tool Execution
     MAX_TOOL_EXECUTION_TIMEOUT: int = 30
     RATE_LIMIT_PER_MINUTE: int = 100
+    RATE_LIMIT_WINDOW_SECONDS: int = 60
 
     # CORS
     ALLOWED_ORIGINS: list[str] = ["*"]

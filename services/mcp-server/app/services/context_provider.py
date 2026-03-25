@@ -10,7 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.context import KnowledgeBase, KnowledgeDocument
-from app.schemas.mcp import ContextItem, MCPContextRequest, MCPContextResult
+from app.schemas.mcp import (
+    ContextItem,
+    KnowledgeBaseCreate,
+    KnowledgeDocumentCreate,
+    MCPContextRequest,
+    MCPContextResult,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -445,6 +451,87 @@ class ContextProvider:
                 vector_id=vector_id,
                 error=str(exc),
             )
+
+    # ------------------------------------------------------------------
+    # Knowledge Base CRUD (PostgreSQL)
+    # ------------------------------------------------------------------
+
+    async def create_knowledge_base(
+        self, tenant_id: str, body: KnowledgeBaseCreate
+    ) -> KnowledgeBase:
+        """Create and persist a new KnowledgeBase row."""
+        kb = KnowledgeBase(
+            id=uuid.uuid4(),
+            tenant_id=uuid.UUID(tenant_id),
+            name=body.name,
+            description=body.description,
+            agent_id=uuid.UUID(body.agent_id) if body.agent_id else None,
+        )
+        self.db.add(kb)
+        await self.db.flush()
+        return kb
+
+    async def list_knowledge_bases(self, tenant_id: str) -> list[KnowledgeBase]:
+        """Return all knowledge bases owned by a tenant."""
+        result = await self.db.execute(
+            select(KnowledgeBase).where(
+                KnowledgeBase.tenant_id == uuid.UUID(tenant_id)
+            )
+        )
+        return list(result.scalars().all())
+
+    async def add_document(
+        self, tenant_id: str, body: KnowledgeDocumentCreate
+    ) -> KnowledgeDocument:
+        """Persist a document and index it in Qdrant."""
+        # Verify the knowledge base belongs to this tenant
+        kb_result = await self.db.execute(
+            select(KnowledgeBase).where(
+                KnowledgeBase.id == uuid.UUID(body.kb_id),
+                KnowledgeBase.tenant_id == uuid.UUID(tenant_id),
+            )
+        )
+        kb = kb_result.scalar_one_or_none()
+        if kb is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Knowledge base not found.")
+
+        doc = KnowledgeDocument(
+            id=uuid.uuid4(),
+            kb_id=uuid.UUID(body.kb_id),
+            tenant_id=uuid.UUID(tenant_id),
+            title=body.title,
+            content=body.content,
+            content_type=body.content_type,
+            doc_metadata=body.doc_metadata,
+        )
+        self.db.add(doc)
+        await self.db.flush()
+
+        # Index embedding in Qdrant
+        vector_id = await self.upsert_knowledge(tenant_id, body.kb_id, doc)
+        doc.vector_id = vector_id
+        return doc
+
+    async def delete_document(
+        self, tenant_id: str, kb_id: str, doc_id: str
+    ) -> bool:
+        """Delete a document from DB and Qdrant. Returns True if found."""
+        result = await self.db.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.id == uuid.UUID(doc_id),
+                KnowledgeDocument.kb_id == uuid.UUID(kb_id),
+                KnowledgeDocument.tenant_id == uuid.UUID(tenant_id),
+            )
+        )
+        doc = result.scalar_one_or_none()
+        if doc is None:
+            return False
+
+        if doc.vector_id:
+            await self.delete_knowledge(tenant_id, doc.vector_id)
+        await self.db.delete(doc)
+        return True
 
     async def _ensure_collection(
         self, collection_name: str, vector_size: int

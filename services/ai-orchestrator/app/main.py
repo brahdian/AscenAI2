@@ -66,6 +66,8 @@ from app.api.v1 import sessions as sessions_router
 from app.api.v1 import feedback as feedback_router
 from app.api.v1 import analytics as analytics_router
 from app.api.v1 import playbook as playbook_router
+from app.api.v1 import guardrails as guardrails_router
+from app.api.v1 import learning as learning_router
 
 logger = structlog.get_logger(__name__)
 
@@ -137,6 +139,8 @@ app.include_router(sessions_router.router, prefix="/api/v1/sessions", tags=["ses
 app.include_router(feedback_router.router, prefix="/api/v1/feedback", tags=["feedback"])
 app.include_router(analytics_router.router, prefix="/api/v1/analytics", tags=["analytics"])
 app.include_router(playbook_router.router, prefix="/api/v1/agents", tags=["playbook"])
+app.include_router(guardrails_router.router, prefix="/api/v1/agents", tags=["guardrails"])
+app.include_router(learning_router.router, prefix="/api/v1/agents", tags=["learning"])
 
 # Prometheus metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")

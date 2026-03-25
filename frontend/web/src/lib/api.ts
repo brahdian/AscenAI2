@@ -191,3 +191,51 @@ export const playbookApi = {
   delete: (agentId: string) =>
     api.delete(`/proxy/agents/${agentId}/playbook`),
 }
+
+// ---------------------------------------------------------------------------
+// Guardrails (via proxy)
+// ---------------------------------------------------------------------------
+
+export const guardrailsApi = {
+  get: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/guardrails`).then((r) => r.data),
+
+  upsert: (agentId: string, data: {
+    blocked_keywords?: string[]
+    blocked_topics?: string[]
+    allowed_topics?: string[]
+    profanity_filter?: boolean
+    pii_redaction?: boolean
+    max_response_length?: number
+    require_disclaimer?: string
+    blocked_message?: string
+    off_topic_message?: string
+    content_filter_level?: string
+    is_active?: boolean
+  }) => api.put(`/proxy/agents/${agentId}/guardrails`, data).then((r) => r.data),
+
+  delete: (agentId: string) =>
+    api.delete(`/proxy/agents/${agentId}/guardrails`),
+}
+
+// ---------------------------------------------------------------------------
+// Learning (via proxy)
+// ---------------------------------------------------------------------------
+
+export const learningApi = {
+  getInsights: (agentId: string, limit?: number) =>
+    api.get(`/proxy/agents/${agentId}/learning`, { params: limit ? { limit } : undefined }).then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
+// Embed / Widget public token (future: api-keys with widget scope)
+// ---------------------------------------------------------------------------
+
+export const embedApi = {
+  // Returns the snippet and SDK info for the current agent
+  getSnippet: (agentId: string, apiKey: string, apiUrl: string) => ({
+    scriptTag: `<script>\n  window.AscenAI = {\n    agentId: '${agentId}',\n    apiKey: '${apiKey}',\n    apiUrl: '${apiUrl}',\n  };\n</script>\n<script src="${apiUrl}/widget/widget.js" defer></script>`,
+    npmInstall: `npm install @ascenai/sdk`,
+    sdkUsage: `import { AscenAIClient } from '@ascenai/sdk';\n\nconst client = new AscenAIClient({\n  apiKey: '${apiKey}',\n  apiUrl: '${apiUrl}',\n  agentId: '${agentId}',\n});\n\nconst response = await client.chat('Hello!');\nconsole.log(response.message);`,
+  }),
+}

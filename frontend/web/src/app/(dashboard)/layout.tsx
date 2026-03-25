@@ -15,6 +15,9 @@ import {
   Zap,
   BarChart2,
   ThumbsUp,
+  Shield,
+  BrainCircuit,
+  Code2,
 } from 'lucide-react'
 
 const navItems = [
@@ -23,7 +26,9 @@ const navItems = [
   { href: '/dashboard/sessions', icon: MessageSquare, label: 'Chat History' },
   { href: '/dashboard/analytics', icon: BarChart2, label: 'Analytics' },
   { href: '/dashboard/feedback', icon: ThumbsUp, label: 'Feedback' },
+  { href: '/dashboard/learning', icon: BrainCircuit, label: 'Learning' },
   { href: '/dashboard/api-keys', icon: Key, label: 'API Keys' },
+  { href: '/dashboard/embed', icon: Code2, label: 'Embed & SDK' },
   { href: '/dashboard/settings', icon: Settings, label: 'Settings' },
 ]
 

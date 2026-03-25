@@ -11,7 +11,7 @@ from sqlalchemy import select, and_, func
 import json
 
 from app.core.config import settings
-from app.models.agent import Agent, AgentPlaybook, Session as AgentSession, Message, AgentAnalytics
+from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, Session as AgentSession, Message, AgentAnalytics
 from app.schemas.chat import ChatResponse, StreamChatEvent
 from app.services.llm_client import LLMClient, LLMResponse, ToolCall
 from app.services.mcp_client import MCPClient
@@ -88,6 +88,71 @@ class Orchestrator:
         except Exception:
             return []
 
+    async def _load_guardrails(self, agent_id):
+        """Load active guardrails for this agent."""
+        from app.models.agent import AgentGuardrails
+        from sqlalchemy import select as sa_select
+        result = await self.db.execute(
+            sa_select(AgentGuardrails).where(
+                AgentGuardrails.agent_id == agent_id,
+                AgentGuardrails.is_active.is_(True),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    def _check_input_guardrails(self, user_message: str, guardrails) -> Optional[str]:
+        """Return a block reason string if message should be blocked, else None."""
+        if not guardrails:
+            return None
+        msg_lower = user_message.lower()
+
+        # Hard keyword block
+        for kw in (guardrails.blocked_keywords or []):
+            if kw.lower() in msg_lower:
+                return f"blocked_keyword:{kw}"
+
+        # Profanity filter
+        if guardrails.profanity_filter:
+            _PROFANITY = ["fuck", "shit", "bitch", "asshole", "cunt", "bastard"]
+            for word in _PROFANITY:
+                if word in msg_lower:
+                    return "profanity"
+
+        return None
+
+    def _apply_output_guardrails(self, response: str, guardrails) -> str:
+        """Apply output-side guardrails: PII redaction, length cap, disclaimer."""
+        import re
+        if not guardrails:
+            return response
+
+        if guardrails.pii_redaction:
+            response = re.sub(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b', '[EMAIL]', response)
+            response = re.sub(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b', '[PHONE]', response)
+            response = re.sub(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b', '[CARD]', response)
+
+        if guardrails.max_response_length and len(response) > guardrails.max_response_length:
+            response = response[:guardrails.max_response_length].rstrip() + "…"
+
+        if guardrails.require_disclaimer:
+            response = response + "\n\n" + guardrails.require_disclaimer
+
+        return response
+
+    def _is_fallback_response(self, response: str, playbook) -> bool:
+        """Detect if the response is a fallback/uncertain reply."""
+        fallback_phrases = [
+            "i don't know", "i'm not sure", "i cannot help",
+            "i'm unable to", "beyond my", "i don't have information",
+        ]
+        r = response.lower()
+        if any(phrase in r for phrase in fallback_phrases):
+            return True
+        if playbook and playbook.fallback_response:
+            if playbook.fallback_response.strip().lower() in r:
+                return True
+        return False
+
     async def _maybe_send_greeting(
         self, agent: Agent, session: AgentSession, playbook: Optional[AgentPlaybook]
     ) -> Optional[str]:
@@ -163,6 +228,34 @@ class Orchestrator:
         corrections = await self._load_corrections(str(agent.id))
         await self._maybe_send_greeting(agent, session, playbook)
 
+        guardrails = await self._load_guardrails(agent.id)
+
+        # --- Input guardrail check ---
+        block_reason = self._check_input_guardrails(user_message, guardrails)
+        if block_reason:
+            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
+            # Persist the blocked user message for learning insights
+            blocked_user_msg = Message(
+                session_id=session_id,
+                tenant_id=session.tenant_id,
+                role="user",
+                content=user_message,
+                guardrail_triggered=block_reason,
+                tokens_used=0,
+                latency_ms=0,
+            )
+            self.db.add(blocked_user_msg)
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return ChatResponse(
+                session_id=session_id,
+                message=block_msg,
+                tool_calls_made=[],
+                suggested_actions=[],
+                escalate_to_human=False,
+                latency_ms=latency_ms,
+                tokens_used=0,
+            )
+
         # --- Step 1: Load short-term memory ---
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
@@ -190,6 +283,7 @@ class Orchestrator:
             business_info={"customer_profile": customer_profile, "intent": intent},
             playbook=playbook,
             corrections=corrections,
+            guardrails=guardrails,
         )
 
         # --- Step 4: Get tool schemas ---
@@ -274,6 +368,9 @@ class Orchestrator:
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
+        final_response = self._apply_output_guardrails(final_response, guardrails)
+        is_fallback = self._is_fallback_response(final_response, playbook)
+
         # --- Step 8: Persist to memory ---
         await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
         await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": final_response})
@@ -295,6 +392,7 @@ class Orchestrator:
             tool_calls=tool_calls_made if tool_calls_made else None,
             tokens_used=total_tokens,
             latency_ms=latency_ms,
+            is_fallback=is_fallback,
         )
         self.db.add(user_msg)
         self.db.add(assistant_msg)
@@ -359,6 +457,35 @@ class Orchestrator:
         corrections = await self._load_corrections(str(agent.id))
         await self._maybe_send_greeting(agent, session, playbook)
 
+        guardrails = await self._load_guardrails(agent.id)
+
+        # --- Input guardrail check ---
+        block_reason = self._check_input_guardrails(user_message, guardrails)
+        if block_reason:
+            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
+            blocked_user_msg = Message(
+                session_id=session_id,
+                tenant_id=session.tenant_id,
+                role="user",
+                content=user_message,
+                guardrail_triggered=block_reason,
+                tokens_used=0,
+                latency_ms=0,
+            )
+            self.db.add(blocked_user_msg)
+            yield StreamChatEvent(
+                type="text_delta",
+                data=block_msg,
+                session_id=session_id,
+            )
+            yield StreamChatEvent(
+                type="done",
+                data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
+                      "tool_calls_made": 0, "escalate_to_human": False},
+                session_id=session_id,
+            )
+            return
+
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
         kb_ids = agent.knowledge_base_ids or []
@@ -383,6 +510,7 @@ class Orchestrator:
             business_info={"customer_profile": customer_profile, "intent": intent},
             playbook=playbook,
             corrections=corrections,
+            guardrails=guardrails,
         )
 
         tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)
@@ -496,6 +624,9 @@ class Orchestrator:
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
+        full_response_text = self._apply_output_guardrails(full_response_text, guardrails)
+        is_fallback = self._is_fallback_response(full_response_text, playbook)
+
         # Persist to memory and DB
         await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
         await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": full_response_text})
@@ -516,6 +647,7 @@ class Orchestrator:
             tool_calls=tool_calls_made if tool_calls_made else None,
             tokens_used=total_tokens,
             latency_ms=latency_ms,
+            is_fallback=is_fallback,
         )
         self.db.add(user_msg)
         self.db.add(assistant_msg)

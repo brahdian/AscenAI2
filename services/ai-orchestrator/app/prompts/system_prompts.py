@@ -33,6 +33,7 @@ def build_system_prompt(
     business_info: dict = None,
     playbook: Optional["AgentPlaybook"] = None,
     corrections: list[dict] = None,
+    guardrails=None,
 ) -> str:
     """
     Assemble the full system prompt for an agent turn.
@@ -106,6 +107,35 @@ def build_system_prompt(
                 f"\n## Fallback\nIf you don't know the answer, say:\n"
                 f'"{playbook.fallback_response}"'
             )
+
+    # ------------------------------------------------------------------ #
+    # 2b. Guardrails — content policy injected into prompt
+    # ------------------------------------------------------------------ #
+    if guardrails and guardrails.is_active:
+        gr_parts: list[str] = []
+
+        if guardrails.allowed_topics:
+            topics_str = ", ".join(guardrails.allowed_topics)
+            off_msg = guardrails.off_topic_message or "I can only help with topics related to our service."
+            gr_parts.append(
+                f"You are ONLY permitted to discuss these topics: {topics_str}. "
+                f'For anything outside this list, respond with: "{off_msg}"'
+            )
+        elif guardrails.blocked_topics:
+            topics_str = ", ".join(guardrails.blocked_topics)
+            off_msg = guardrails.off_topic_message or "I cannot help with that topic."
+            gr_parts.append(
+                f"You must REFUSE to discuss the following topics: {topics_str}. "
+                f'If asked, say: "{off_msg}"'
+            )
+
+        if guardrails.require_disclaimer:
+            gr_parts.append(
+                f'Always end your response with this disclaimer: "{guardrails.require_disclaimer}"'
+            )
+
+        if gr_parts:
+            parts.append("\n## Content Policy\n" + "\n".join(gr_parts))
 
     # ------------------------------------------------------------------ #
     # 3. Retrieved context

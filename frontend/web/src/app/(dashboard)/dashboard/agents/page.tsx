@@ -5,7 +5,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { agentsApi } from '@/lib/api'
 import Link from 'next/link'
 import toast from 'react-hot-toast'
-import { Bot, Plus, Trash2, Edit2, Mic, MicOff, TestTube, BookOpen } from 'lucide-react'
+import { Bot, Plus, Trash2, Edit2, Mic, MicOff, TestTube, BookOpen, Shield } from 'lucide-react'
 
 export default function AgentsPage() {
   const qc = useQueryClient()
@@ -124,6 +124,13 @@ export default function AgentsPage() {
                     title="Edit Playbook"
                   >
                     <BookOpen size={16} />
+                  </Link>
+                  <Link
+                    href={`/dashboard/agents/${agent.id}/guardrails`}
+                    className="p-2 text-gray-400 hover:text-orange-500 transition-colors"
+                    title="Edit Guardrails"
+                  >
+                    <Shield size={16} />
                   </Link>
                   <Link
                     href={`/dashboard/agents/${agent.id}`}

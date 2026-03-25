@@ -55,6 +55,9 @@ class Agent(Base):
     playbook: Mapped[Optional["AgentPlaybook"]] = relationship(
         "AgentPlaybook", back_populates="agent", uselist=False, cascade="all, delete-orphan"
     )
+    guardrails: Mapped[Optional["AgentGuardrails"]] = relationship(
+        "AgentGuardrails", back_populates="agent", uselist=False, cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -147,6 +150,8 @@ class Message(Base):
     tool_results: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     tokens_used: Mapped[int] = mapped_column(Integer, default=0)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    is_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
+    guardrail_triggered: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -339,6 +344,84 @@ class AgentPlaybook(Base):
             "out_of_scope_response": self.out_of_scope_response,
             "fallback_response": self.fallback_response,
             "custom_escalation_message": self.custom_escalation_message,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AgentGuardrails(Base):
+    """
+    Per-agent content policy: keyword blocks, topic restrictions,
+    PII redaction, profanity filter, response length cap.
+    """
+    __tablename__ = "agent_guardrails"
+    __table_args__ = (
+        Index("ix_guardrails_agent_id", "agent_id"),
+        Index("ix_guardrails_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agents.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    # Input checks
+    blocked_keywords: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    blocked_topics: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    allowed_topics: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    profanity_filter: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Output checks
+    pii_redaction: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_response_length: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
+    require_disclaimer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Custom response messages
+    blocked_message: Mapped[str] = mapped_column(
+        Text, nullable=False, default="I'm sorry, I can't help with that."
+    )
+    off_topic_message: Mapped[str] = mapped_column(
+        Text, nullable=False, default="I'm only able to help with topics related to our service."
+    )
+
+    # Display level (for UI)
+    content_filter_level: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="medium"
+    )  # none | low | medium | strict
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    agent: Mapped["Agent"] = relationship("Agent", back_populates="guardrails")
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "agent_id": str(self.agent_id),
+            "tenant_id": str(self.tenant_id),
+            "blocked_keywords": self.blocked_keywords or [],
+            "blocked_topics": self.blocked_topics or [],
+            "allowed_topics": self.allowed_topics or [],
+            "profanity_filter": self.profanity_filter,
+            "pii_redaction": self.pii_redaction,
+            "max_response_length": self.max_response_length,
+            "require_disclaimer": self.require_disclaimer,
+            "blocked_message": self.blocked_message,
+            "off_topic_message": self.off_topic_message,
+            "content_filter_level": self.content_filter_level,
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

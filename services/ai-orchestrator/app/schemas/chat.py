@@ -247,3 +247,95 @@ class AnalyticsOverview(BaseModel):
     feedback_positive_pct: Optional[float]
     daily: list[DailyAnalytics]
     by_agent: list[AgentAnalyticsSummary]
+
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+
+class GuardrailsUpsert(BaseModel):
+    blocked_keywords: list[str] = Field(default_factory=list)
+    blocked_topics: list[str] = Field(default_factory=list)
+    allowed_topics: list[str] = Field(default_factory=list)
+    profanity_filter: bool = True
+    pii_redaction: bool = False
+    max_response_length: int = Field(default=0, ge=0)
+    require_disclaimer: Optional[str] = Field(None, max_length=1000)
+    blocked_message: str = Field(default="I'm sorry, I can't help with that.", max_length=500)
+    off_topic_message: str = Field(default="I'm only able to help with topics related to our service.", max_length=500)
+    content_filter_level: str = Field(default="medium", description="none|low|medium|strict")
+    is_active: bool = True
+
+
+class GuardrailsResponse(BaseModel):
+    id: str
+    agent_id: str
+    tenant_id: str
+    blocked_keywords: list[str]
+    blocked_topics: list[str]
+    allowed_topics: list[str]
+    profanity_filter: bool
+    pii_redaction: bool
+    max_response_length: int
+    require_disclaimer: Optional[str]
+    blocked_message: str
+    off_topic_message: str
+    content_filter_level: str
+    is_active: bool
+    created_at: str
+    updated_at: str
+
+
+# ---------------------------------------------------------------------------
+# Learning Insights
+# ---------------------------------------------------------------------------
+
+class LearningGap(BaseModel):
+    message_id: str
+    session_id: str
+    agent_id: str
+    user_message: str
+    agent_response: str
+    created_at: str
+
+
+class UnreviewedNegative(BaseModel):
+    feedback_id: str
+    message_id: str
+    session_id: str
+    agent_id: str
+    agent_response: str
+    labels: list[str]
+    comment: Optional[str]
+    created_at: str
+
+
+class GuardrailTrigger(BaseModel):
+    message_id: str
+    session_id: str
+    agent_id: str
+    user_message: str
+    trigger_reason: str
+    created_at: str
+
+
+class SuggestedTrainingPair(BaseModel):
+    feedback_id: str
+    message_id: str
+    session_id: str
+    agent_id: str
+    user_message: str
+    agent_response: str
+    labels: list[str]
+    created_at: str
+
+
+class LearningInsights(BaseModel):
+    agent_id: str
+    knowledge_gaps: list[LearningGap]
+    unreviewed_negatives: list[UnreviewedNegative]
+    guardrail_triggers: list[GuardrailTrigger]
+    suggested_training_pairs: list[SuggestedTrainingPair]
+    total_gaps: int
+    total_unreviewed: int
+    total_triggers: int

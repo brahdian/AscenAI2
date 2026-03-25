@@ -121,3 +121,85 @@ class SessionAnalyticsResponse(BaseModel):
 class AgentTestRequest(BaseModel):
     message: str = Field(..., description="Test message to send to the agent")
     customer_identifier: Optional[str] = "test-user"
+
+
+# ---------------------------------------------------------------------------
+# Feedback / Training Labels
+# ---------------------------------------------------------------------------
+
+POSITIVE_LABELS = ["helpful", "accurate", "fast", "clear", "complete"]
+NEGATIVE_LABELS = ["wrong", "off-topic", "inappropriate", "slow", "incomplete", "confusing"]
+
+
+class FeedbackCreate(BaseModel):
+    message_id: str = Field(..., description="UUID of the assistant message being rated")
+    session_id: str = Field(..., description="Session the message belongs to")
+    agent_id: str = Field(..., description="Agent UUID")
+    rating: str = Field(..., description="positive or negative")
+    labels: list[str] = Field(default_factory=list, description="Descriptive labels")
+    comment: Optional[str] = Field(None, max_length=2000, description="Optional free-text comment")
+    feedback_source: str = Field(default="user", description="user or operator")
+
+
+class FeedbackResponse(BaseModel):
+    id: str
+    message_id: str
+    session_id: str
+    tenant_id: str
+    agent_id: str
+    rating: str
+    labels: list[str]
+    comment: Optional[str]
+    feedback_source: str
+    created_at: str
+
+
+class FeedbackSummary(BaseModel):
+    total: int
+    positive: int
+    negative: int
+    positive_pct: float
+    top_positive_labels: list[dict]
+    top_negative_labels: list[dict]
+    by_agent: list[dict]
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+class DailyAnalytics(BaseModel):
+    date: str
+    total_sessions: int
+    total_messages: int
+    total_tokens: int
+    estimated_cost_usd: float
+    avg_latency_ms: float
+    tool_executions: int
+    escalations: int
+    successful_completions: int
+
+
+class AgentAnalyticsSummary(BaseModel):
+    agent_id: str
+    agent_name: str
+    total_sessions: int
+    total_messages: int
+    total_tokens: int
+    estimated_cost_usd: float
+    avg_latency_ms: float
+    positive_feedback_pct: Optional[float]
+
+
+class AnalyticsOverview(BaseModel):
+    period_days: int
+    total_sessions: int
+    total_messages: int
+    total_tokens: int
+    total_cost_usd: float
+    avg_latency_ms: float
+    total_tool_executions: int
+    total_escalations: int
+    feedback_positive_pct: Optional[float]
+    daily: list[DailyAnalytics]
+    by_agent: list[AgentAnalyticsSummary]

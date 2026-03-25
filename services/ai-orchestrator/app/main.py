@@ -63,6 +63,8 @@ from app.services.orchestrator import Orchestrator
 from app.api.v1 import chat as chat_router
 from app.api.v1 import agents as agents_router
 from app.api.v1 import sessions as sessions_router
+from app.api.v1 import feedback as feedback_router
+from app.api.v1 import analytics as analytics_router
 
 logger = structlog.get_logger(__name__)
 
@@ -131,6 +133,8 @@ app.add_middleware(
 app.include_router(chat_router.router, prefix="/api/v1", tags=["chat"])
 app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(sessions_router.router, prefix="/api/v1/sessions", tags=["sessions"])
+app.include_router(feedback_router.router, prefix="/api/v1/feedback", tags=["feedback"])
+app.include_router(analytics_router.router, prefix="/api/v1/analytics", tags=["analytics"])
 
 # Prometheus metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")

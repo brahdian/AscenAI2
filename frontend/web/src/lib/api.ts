@@ -122,3 +122,45 @@ export const apiKeysApi = {
     api.post('/api-keys', data).then((r) => r.data),
   revoke: (id: string) => api.delete(`/api-keys/${id}`),
 }
+
+// ---------------------------------------------------------------------------
+// Feedback (via proxy)
+// ---------------------------------------------------------------------------
+
+export const feedbackApi = {
+  submit: (data: {
+    message_id: string
+    session_id: string
+    agent_id: string
+    rating: 'positive' | 'negative'
+    labels?: string[]
+    comment?: string
+    feedback_source?: string
+  }) => api.post('/proxy/feedback', data).then((r) => r.data),
+
+  list: (params?: {
+    agent_id?: string
+    rating?: string
+    session_id?: string
+    limit?: number
+    offset?: number
+  }) => api.get('/proxy/feedback', { params }).then((r) => r.data),
+
+  summary: (params?: { agent_id?: string }) =>
+    api.get('/proxy/feedback/summary', { params }).then((r) => r.data),
+
+  exportUrl: (params?: { format?: string; agent_id?: string; rating?: string }) => {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : ''
+    const qs = new URLSearchParams({ ...(params as any) }).toString()
+    return `${API_URL}/api/v1/proxy/feedback/export${qs ? `?${qs}` : ''}`
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Analytics (via proxy)
+// ---------------------------------------------------------------------------
+
+export const analyticsApi = {
+  overview: (params?: { days?: number; agent_id?: string }) =>
+    api.get('/proxy/analytics/overview', { params }).then((r) => r.data),
+}

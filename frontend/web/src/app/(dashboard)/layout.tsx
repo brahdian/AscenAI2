@@ -13,12 +13,16 @@ import {
   Settings,
   LogOut,
   Zap,
+  BarChart2,
+  ThumbsUp,
 } from 'lucide-react'
 
 const navItems = [
   { href: '/dashboard', icon: LayoutDashboard, label: 'Overview' },
   { href: '/dashboard/agents', icon: Bot, label: 'Agents' },
-  { href: '/dashboard/sessions', icon: MessageSquare, label: 'Sessions' },
+  { href: '/dashboard/sessions', icon: MessageSquare, label: 'Chat History' },
+  { href: '/dashboard/analytics', icon: BarChart2, label: 'Analytics' },
+  { href: '/dashboard/feedback', icon: ThumbsUp, label: 'Feedback' },
   { href: '/dashboard/api-keys', icon: Key, label: 'API Keys' },
   { href: '/dashboard/settings', icon: Settings, label: 'Settings' },
 ]

@@ -206,3 +206,56 @@ class AgentAnalytics(Base):
             "escalations": self.escalations,
             "successful_completions": self.successful_completions,
         }
+
+
+class MessageFeedback(Base):
+    __tablename__ = "message_feedback"
+    __table_args__ = (
+        Index("ix_feedback_tenant_id", "tenant_id"),
+        Index("ix_feedback_message_id", "message_id"),
+        Index("ix_feedback_agent_id", "agent_id"),
+        Index("ix_feedback_rating", "tenant_id", "rating"),
+        Index("ix_feedback_created_at", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    # "positive" | "negative"
+    rating: Mapped[str] = mapped_column(String(20), nullable=False)
+    # e.g. ["helpful", "accurate"] or ["wrong", "off-topic", "inappropriate"]
+    labels: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # "user" (end-user) | "operator" (dashboard reviewer)
+    feedback_source: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "message_id": str(self.message_id),
+            "session_id": self.session_id,
+            "tenant_id": str(self.tenant_id),
+            "agent_id": str(self.agent_id),
+            "rating": self.rating,
+            "labels": self.labels or [],
+            "comment": self.comment,
+            "feedback_source": self.feedback_source,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

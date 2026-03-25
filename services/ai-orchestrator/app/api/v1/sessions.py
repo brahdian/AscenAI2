@@ -8,7 +8,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models.agent import Message, Session as AgentSession
+from app.models.agent import Message, MessageFeedback, Session as AgentSession
 from app.schemas.chat import SessionAnalyticsResponse, SessionResponse
 
 logger = structlog.get_logger(__name__)
@@ -22,7 +22,26 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-def _session_to_response(sess: AgentSession, messages: list | None = None) -> SessionResponse:
+def _session_to_response(
+    sess: AgentSession,
+    messages: list | None = None,
+    feedback_map: dict | None = None,
+) -> SessionResponse:
+    msg_list = None
+    if messages is not None:
+        msg_list = []
+        for m in messages:
+            fb = (feedback_map or {}).get(str(m.id))
+            msg_list.append({
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "tokens_used": m.tokens_used,
+                "latency_ms": m.latency_ms,
+                "tool_calls": m.tool_calls,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "feedback": fb,
+            })
     return SessionResponse(
         id=str(sess.id),
         tenant_id=str(sess.tenant_id),
@@ -34,10 +53,7 @@ def _session_to_response(sess: AgentSession, messages: list | None = None) -> Se
         started_at=sess.started_at.isoformat() if hasattr(sess, "started_at") and sess.started_at else None,
         ended_at=sess.ended_at.isoformat() if hasattr(sess, "ended_at") and sess.ended_at else None,
         updated_at=sess.updated_at.isoformat() if hasattr(sess, "updated_at") and sess.updated_at else None,
-        messages=[
-            {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
-            for m in (messages or [])
-        ] if messages is not None else None,
+        messages=msg_list,
     )
 
 
@@ -86,6 +102,7 @@ async def get_session(
         raise HTTPException(status_code=404, detail="Session not found.")
 
     messages = None
+    feedback_map = None
     if include_messages:
         msg_result = await db.execute(
             select(Message)
@@ -94,7 +111,25 @@ async def get_session(
         )
         messages = list(msg_result.scalars().all())
 
-    return _session_to_response(sess, messages)
+        # Load any existing feedback for these messages
+        if messages:
+            message_ids = [m.id for m in messages]
+            fb_result = await db.execute(
+                select(MessageFeedback).where(
+                    MessageFeedback.message_id.in_(message_ids)
+                )
+            )
+            feedback_map = {
+                str(fb.message_id): {
+                    "id": str(fb.id),
+                    "rating": fb.rating,
+                    "labels": fb.labels or [],
+                    "comment": fb.comment,
+                }
+                for fb in fb_result.scalars().all()
+            }
+
+    return _session_to_response(sess, messages, feedback_map)
 
 
 @router.post("/{session_id}/end", response_model=SessionResponse)

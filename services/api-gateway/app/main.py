@@ -17,7 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.config import settings
 from app.core.database import close_db, init_db
 from app.middleware.auth import AuthMiddleware
-from app.api.v1 import auth, tenants, api_keys, webhooks, proxy
+from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing
 
 logger = structlog.get_logger(__name__)
 
@@ -234,6 +234,8 @@ app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(tenants.router, prefix="/api/v1", tags=["tenants"])
 app.include_router(api_keys.router, prefix="/api/v1", tags=["api-keys"])
 app.include_router(webhooks.router, prefix="/api/v1", tags=["webhooks"])
+app.include_router(team.router, prefix="/api/v1", tags=["team"])
+app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
 
 

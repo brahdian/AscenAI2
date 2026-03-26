@@ -52,11 +52,14 @@ class Agent(Base):
     analytics: Mapped[list["AgentAnalytics"]] = relationship(
         "AgentAnalytics", back_populates="agent"
     )
-    playbook: Mapped[Optional["AgentPlaybook"]] = relationship(
-        "AgentPlaybook", back_populates="agent", uselist=False, cascade="all, delete-orphan"
+    playbooks: Mapped[list["AgentPlaybook"]] = relationship(
+        "AgentPlaybook", back_populates="agent", cascade="all, delete-orphan"
     )
     guardrails: Mapped[Optional["AgentGuardrails"]] = relationship(
         "AgentGuardrails", back_populates="agent", uselist=False, cascade="all, delete-orphan"
+    )
+    documents: Mapped[list["AgentDocument"]] = relationship(
+        "AgentDocument", back_populates="agent", cascade="all, delete-orphan"
     )
 
     def to_dict(self) -> dict:
@@ -294,9 +297,13 @@ class AgentPlaybook(Base):
         UUID(as_uuid=True),
         ForeignKey("agents.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="Default")
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    intent_triggers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Greeting: sent as the first assistant message in a new session
     greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -328,13 +335,17 @@ class AgentPlaybook(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    agent: Mapped["Agent"] = relationship("Agent", back_populates="playbook")
+    agent: Mapped["Agent"] = relationship("Agent", back_populates="playbooks")
 
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
             "agent_id": str(self.agent_id),
             "tenant_id": str(self.tenant_id),
+            "name": self.name,
+            "description": self.description,
+            "intent_triggers": self.intent_triggers or [],
+            "is_default": self.is_default,
             "greeting_message": self.greeting_message,
             "instructions": self.instructions,
             "tone": self.tone,
@@ -345,6 +356,44 @@ class AgentPlaybook(Base):
             "fallback_response": self.fallback_response,
             "custom_escalation_message": self.custom_escalation_message,
             "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AgentDocument(Base):
+    __tablename__ = "agent_documents"
+    __table_args__ = (
+        Index("ix_agent_docs_agent_id", "agent_id"),
+        Index("ix_agent_docs_tenant_id", "tenant_id"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(50), nullable=False)  # pdf, txt, docx, md
+    file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    storage_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    vector_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    status: Mapped[str] = mapped_column(String(20), default="processing")  # processing | ready | failed
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    agent: Mapped["Agent"] = relationship("Agent", back_populates="documents")
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "agent_id": str(self.agent_id),
+            "tenant_id": str(self.tenant_id),
+            "name": self.name,
+            "file_type": self.file_type,
+            "file_size_bytes": self.file_size_bytes,
+            "chunk_count": self.chunk_count,
+            "status": self.status,
+            "error_message": self.error_message,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

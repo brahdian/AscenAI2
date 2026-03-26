@@ -55,6 +55,7 @@ class APIKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     scopes: list[str] = Field(default_factory=lambda: ["chat"])
     expires_at: str | None = None  # ISO datetime string, optional
+    agent_id: str | None = None  # Optional: restrict key to specific agent
 
 
 class APIKeyResponse(BaseModel):
@@ -67,6 +68,7 @@ class APIKeyResponse(BaseModel):
     last_used_at: str | None
     expires_at: str | None
     created_at: str
+    agent_id: str | None = None
 
     model_config = {"from_attributes": True}
 

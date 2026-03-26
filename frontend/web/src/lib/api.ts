@@ -118,7 +118,7 @@ export const sessionsApi = {
 
 export const apiKeysApi = {
   list: () => api.get('/api-keys').then((r) => r.data),
-  create: (data: { name: string; scopes?: string[] }) =>
+  create: (data: { name: string; scopes?: string[]; agent_id?: string }) =>
     api.post('/api-keys', data).then((r) => r.data),
   revoke: (id: string) => api.delete(`/api-keys/${id}`),
 }
@@ -225,6 +225,65 @@ export const guardrailsApi = {
 export const learningApi = {
   getInsights: (agentId: string, limit?: number) =>
     api.get(`/proxy/agents/${agentId}/learning`, { params: limit ? { limit } : undefined }).then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
+// Multi-playbook API
+// ---------------------------------------------------------------------------
+
+export const playbooksApi = {
+  list: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/playbooks`).then((r) => r.data),
+  create: (agentId: string, data: Record<string, unknown>) =>
+    api.post(`/proxy/agents/${agentId}/playbooks`, data).then((r) => r.data),
+  get: (agentId: string, playbookId: string) =>
+    api.get(`/proxy/agents/${agentId}/playbooks/${playbookId}`).then((r) => r.data),
+  update: (agentId: string, playbookId: string, data: Record<string, unknown>) =>
+    api.put(`/proxy/agents/${agentId}/playbooks/${playbookId}`, data).then((r) => r.data),
+  delete: (agentId: string, playbookId: string) =>
+    api.delete(`/proxy/agents/${agentId}/playbooks/${playbookId}`),
+  setDefault: (agentId: string, playbookId: string) =>
+    api.post(`/proxy/agents/${agentId}/playbooks/${playbookId}/set-default`).then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
+// Documents / RAG API
+// ---------------------------------------------------------------------------
+
+export const documentsApi = {
+  list: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/documents`).then((r) => r.data),
+  upload: (agentId: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return api.post(`/proxy/agents/${agentId}/documents`, form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    }).then((r) => r.data)
+  },
+  delete: (agentId: string, docId: string) =>
+    api.delete(`/proxy/agents/${agentId}/documents/${docId}`),
+}
+
+// ---------------------------------------------------------------------------
+// Team management API
+// ---------------------------------------------------------------------------
+
+export const teamApi = {
+  list: () => api.get('/team').then((r) => r.data),
+  invite: (data: { email: string; full_name: string; role: string }) =>
+    api.post('/team/invite', data).then((r) => r.data),
+  updateRole: (userId: string, role: string) =>
+    api.patch(`/team/${userId}/role`, { role }).then((r) => r.data),
+  remove: (userId: string) => api.delete(`/team/${userId}`),
+}
+
+// ---------------------------------------------------------------------------
+// Billing API
+// ---------------------------------------------------------------------------
+
+export const billingApi = {
+  overview: () => api.get('/billing/overview').then((r) => r.data),
+  agents: () => api.get('/billing/agents').then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------

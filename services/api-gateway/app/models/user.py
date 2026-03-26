@@ -97,6 +97,9 @@ class APIKey(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )  # If set, this key only works for this specific agent
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     # The actual key is never stored; only its SHA-256 hash.

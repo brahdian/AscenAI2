@@ -168,6 +168,10 @@ class ScenarioItem(BaseModel):
 
 
 class PlaybookUpsert(BaseModel):
+    name: str = Field(default="Default", max_length=255)
+    description: Optional[str] = None
+    intent_triggers: list[str] = Field(default_factory=list)
+    is_default: bool = False
     greeting_message: Optional[str] = Field(None, max_length=2000)
     instructions: Optional[str] = Field(None, max_length=10000)
     tone: str = Field(default="professional", description="professional | friendly | casual | empathetic")
@@ -184,6 +188,10 @@ class PlaybookResponse(BaseModel):
     id: str
     agent_id: str
     tenant_id: str
+    name: str
+    description: Optional[str]
+    intent_triggers: list[str]
+    is_default: bool
     greeting_message: Optional[str]
     instructions: Optional[str]
     tone: str

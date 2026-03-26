@@ -20,13 +20,15 @@ class Settings(BaseSettings):
     # LLM config
     LLM_PROVIDER: str = "gemini"  # "gemini" | "openai" | "vertex"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.0-flash-lite"
-    OPENAI_API_KEY: str = ""
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
 
     # Vertex AI (set LLM_PROVIDER=vertex to use Gemini via Google Cloud)
     VERTEX_PROJECT_ID: str = ""
     VERTEX_LOCATION: str = "us-central1"
+
+    # OpenAI (fallback)
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     # Embedding model
     EMBEDDING_MODEL: str = "text-embedding-3-small"

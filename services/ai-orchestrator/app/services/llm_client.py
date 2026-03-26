@@ -49,9 +49,8 @@ class LLMClient:
 
     def _get_gemini_client(self):
         if self._gemini_client is None:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self._gemini_client = genai
+            from google import genai
+            self._gemini_client = genai.Client(api_key=self.api_key)
         return self._gemini_client
 
     def _get_openai_client(self):
@@ -91,25 +90,52 @@ class LLMClient:
         max_tokens: int,
         stream: bool,
     ) -> LLMResponse | AsyncGenerator:
-        import google.generativeai as genai
-        from google.generativeai.types import content_types
+        from google import genai
+        from google.genai import types
 
-        genai.configure(api_key=self.api_key)
+        client = self._get_gemini_client()
 
         # Extract system prompt from messages
         system_instruction = None
         chat_messages = []
         for msg in messages:
             if msg["role"] == "system":
-                system_instruction = msg["content"]
+                system_instruction = (system_instruction or "") + msg["content"]
             else:
                 chat_messages.append(msg)
 
-        # Build generation config
-        generation_config = genai.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
+        # Convert messages to google-genai Content format
+        contents = []
+        for msg in chat_messages:
+            role = msg["role"]
+            content = msg.get("content", "")
+
+            if role == "tool":
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_function_response(
+                                name=msg.get("name", "tool"),
+                                response={"result": content},
+                            )
+                        ],
+                    )
+                )
+            elif role == "user":
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=content)],
+                    )
+                )
+            elif role == "assistant":
+                contents.append(
+                    types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=content)],
+                    )
+                )
 
         # Build tool declarations for Gemini
         gemini_tools = None
@@ -118,102 +144,47 @@ class LLMClient:
             for tool in tools:
                 fn = tool.get("function", tool)
                 params = fn.get("parameters", {})
-                # Gemini expects properties without additionalProperties
-                clean_params = {
-                    "type": params.get("type", "object"),
-                    "properties": params.get("properties", {}),
-                }
-                if "required" in params:
-                    clean_params["required"] = params["required"]
                 function_declarations.append(
-                    genai.protos.FunctionDeclaration(
+                    types.FunctionDeclaration(
                         name=fn["name"],
                         description=fn.get("description", ""),
-                        parameters=genai.protos.Schema(
-                            type=genai.protos.Type.OBJECT,
-                            properties={
-                                k: _build_gemini_schema(v)
-                                for k, v in clean_params.get("properties", {}).items()
-                            },
-                            required=clean_params.get("required", []),
-                        ),
+                        parameters=_build_genai_schema(params),
                     )
                 )
-            gemini_tools = [genai.protos.Tool(function_declarations=function_declarations)]
+            gemini_tools = [types.Tool(function_declarations=function_declarations)]
 
-        model_kwargs = {
-            "model_name": self.model,
-            "generation_config": generation_config,
+        config_kwargs = {
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
         }
         if system_instruction:
-            model_kwargs["system_instruction"] = system_instruction
+            config_kwargs["system_instruction"] = system_instruction
         if gemini_tools:
-            model_kwargs["tools"] = gemini_tools
+            config_kwargs["tools"] = gemini_tools
 
-        model = genai.GenerativeModel(**model_kwargs)
-
-        # Convert messages to Gemini format
-        history = []
-        last_user_message = None
-
-        for i, msg in enumerate(chat_messages):
-            role = msg["role"]
-            content = msg["content"]
-
-            if role == "tool":
-                # Tool result message - append as function response
-                history.append(
-                    genai.protos.Content(
-                        role="function",
-                        parts=[
-                            genai.protos.Part(
-                                function_response=genai.protos.FunctionResponse(
-                                    name=msg.get("name", "tool"),
-                                    response={"result": content},
-                                )
-                            )
-                        ],
-                    )
-                )
-            elif role == "user":
-                if i == len(chat_messages) - 1:
-                    last_user_message = content
-                else:
-                    history.append(
-                        genai.protos.Content(
-                            role="user",
-                            parts=[genai.protos.Part(text=content)],
-                        )
-                    )
-            elif role == "assistant":
-                history.append(
-                    genai.protos.Content(
-                        role="model",
-                        parts=[genai.protos.Part(text=content)],
-                    )
-                )
-
-        if last_user_message is None and chat_messages:
-            last_user_message = chat_messages[-1].get("content", "")
+        generate_config = types.GenerateContentConfig(**config_kwargs)
 
         try:
-            chat = model.start_chat(history=history)
-
             if stream and not tools:
-                return self._gemini_stream_generator(chat, last_user_message or "")
+                return self._gemini_stream_generator(client, contents, generate_config)
 
             response = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: chat.send_message(last_user_message or "")
+                None,
+                lambda: client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=generate_config,
+                ),
             )
 
             # Parse response
             tool_calls = []
             text_content = None
 
-            for candidate in response.candidates:
-                for part in candidate.content.parts:
-                    if hasattr(part, "function_call") and part.function_call.name:
-                        args = dict(part.function_call.args)
+            for candidate in (response.candidates or []):
+                for part in (candidate.content.parts if candidate.content else []):
+                    if hasattr(part, "function_call") and part.function_call and part.function_call.name:
+                        args = dict(part.function_call.args or {})
                         tool_calls.append(
                             ToolCall(
                                 id=str(uuid.uuid4()),
@@ -244,13 +215,17 @@ class LLMClient:
             logger.error("gemini_completion_error", error=str(exc), model=self.model)
             raise
 
-    async def _gemini_stream_generator(self, chat, message: str) -> AsyncGenerator[str, None]:
-        import asyncio
+    async def _gemini_stream_generator(self, client, contents, config) -> AsyncGenerator[str, None]:
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, lambda: chat.send_message(message, stream=True)
+        response_iter = await loop.run_in_executor(
+            None,
+            lambda: client.models.generate_content_stream(
+                model=self.model,
+                contents=contents,
+                config=config,
+            ),
         )
-        for chunk in response:
+        for chunk in response_iter:
             if chunk.text:
                 yield chunk.text
 
@@ -488,34 +463,9 @@ class LLMClient:
             return [0.0] * 1536
 
 
-def _build_gemini_schema(prop: dict) -> "genai.protos.Schema":
-    import google.generativeai as genai
-
-    type_map = {
-        "string": genai.protos.Type.STRING,
-        "integer": genai.protos.Type.INTEGER,
-        "number": genai.protos.Type.NUMBER,
-        "boolean": genai.protos.Type.BOOLEAN,
-        "array": genai.protos.Type.ARRAY,
-        "object": genai.protos.Type.OBJECT,
-    }
-    prop_type = type_map.get(prop.get("type", "string"), genai.protos.Type.STRING)
-
-    schema_kwargs = {
-        "type": prop_type,
-        "description": prop.get("description", ""),
-    }
-
-    if prop_type == genai.protos.Type.OBJECT and "properties" in prop:
-        schema_kwargs["properties"] = {
-            k: _build_gemini_schema(v) for k, v in prop["properties"].items()
-        }
-        if "required" in prop:
-            schema_kwargs["required"] = prop["required"]
-    elif prop_type == genai.protos.Type.ARRAY and "items" in prop:
-        schema_kwargs["items"] = _build_gemini_schema(prop["items"])
-
-    return genai.protos.Schema(**schema_kwargs)
+def _build_genai_schema(params: dict) -> dict:
+    """Convert JSON Schema parameters dict to google-genai compatible schema dict."""
+    return params
 
 
 def _build_vertex_schema(prop: dict):

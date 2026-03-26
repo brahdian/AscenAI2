@@ -18,6 +18,8 @@ import {
   Shield,
   BrainCircuit,
   Code2,
+  Users,
+  CreditCard,
 } from 'lucide-react'
 
 const navItems = [
@@ -28,6 +30,8 @@ const navItems = [
   { href: '/dashboard/feedback', icon: ThumbsUp, label: 'Feedback' },
   { href: '/dashboard/learning', icon: BrainCircuit, label: 'Learning' },
   { href: '/dashboard/api-keys', icon: Key, label: 'API Keys' },
+  { href: '/dashboard/team', icon: Users, label: 'Team' },
+  { href: '/dashboard/billing', icon: CreditCard, label: 'Billing' },
   { href: '/dashboard/embed', icon: Code2, label: 'Embed & SDK' },
   { href: '/dashboard/settings', icon: Settings, label: 'Settings' },
 ]
@@ -62,7 +66,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         {/* Nav */}
         <nav className="flex-1 px-3 py-4 space-y-1">
           {navItems.map((item) => {
-            const active = pathname === item.href
+            const active = pathname === item.href || (item.href !== '/dashboard' && pathname.startsWith(item.href))
             return (
               <Link
                 key={item.href}

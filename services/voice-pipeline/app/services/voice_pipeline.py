@@ -17,6 +17,7 @@ and the new utterance is processed.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from dataclasses import dataclass, field
@@ -363,6 +364,91 @@ class VoicePipeline:
                     await websocket.send_bytes(audio_chunk)
         except Exception as exc:
             logger.error("tts_send_error", session_id=state.session_id, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # Gemini audio STT
+    # ------------------------------------------------------------------
+
+    async def _transcribe_gemini(self, audio_bytes: bytes) -> str:
+        """
+        Transcribe raw PCM-16 audio (16 kHz mono) using Gemini multimodal STT.
+        Roughly 44x cheaper than OpenAI Whisper (~$0.000135/min vs $0.006/min).
+        """
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.models.generate_content(
+                model=settings.GEMINI_STT_MODEL,
+                contents=[
+                    types.Part.from_bytes(
+                        data=audio_bytes,
+                        mime_type="audio/pcm;rate=16000",
+                    ),
+                    "Transcribe the following audio accurately. Return only the transcript, nothing else.",
+                ],
+            ),
+        )
+        return (response.text or "").strip()
+
+    # ------------------------------------------------------------------
+    # Google Cloud TTS
+    # ------------------------------------------------------------------
+
+    async def _tts_google_cloud(self, text: str) -> bytes:
+        """
+        Synthesize speech using Google Cloud TTS Neural2 voices.
+        Returns MP3 audio bytes.
+        Cost: ~$0.000016/char for Neural2/HD voices.
+        """
+        from google.cloud import texttospeech
+
+        client = texttospeech.TextToSpeechAsyncClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-US",
+            name=settings.GOOGLE_TTS_VOICE,
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.1,
+            pitch=0.0,
+            effects_profile_id=["small-bluetooth-speaker-class-device"],
+        )
+        response = await client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        return response.audio_content
+
+    async def _tts_google_cloud_telephony(self, text: str) -> bytes:
+        """
+        Synthesize speech using Google Cloud TTS optimised for telephony.
+        Returns 8 kHz μ-law PCM suitable for Twilio Media Streams.
+        """
+        from google.cloud import texttospeech
+
+        client = texttospeech.TextToSpeechAsyncClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-US",
+            name=settings.GOOGLE_TTS_VOICE,
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MULAW,
+            sample_rate_hertz=8000,
+            effects_profile_id=["telephony-class-application"],
+        )
+        response = await client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        return response.audio_content
 
     # ------------------------------------------------------------------
     # Orchestrator communication

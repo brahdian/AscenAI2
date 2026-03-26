@@ -14,17 +14,28 @@ _WEAK_KEYS = frozenset({
 
 class Settings(BaseSettings):
     # STT config
-    STT_PROVIDER: str = "openai"  # "openai" | "deepgram" | "google"
+    STT_PROVIDER: str = "gemini"  # "gemini" | "openai" | "deepgram"
     OPENAI_API_KEY: str = ""
     DEEPGRAM_API_KEY: str = ""
 
+    # Gemini STT / LLM
+    GEMINI_API_KEY: str = ""
+    GEMINI_STT_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
+
     # TTS config
-    TTS_PROVIDER: str = "openai"  # "openai" | "elevenlabs" | "google"
+    TTS_PROVIDER: str = "google"  # "google" | "openai" | "elevenlabs"
     ELEVENLABS_API_KEY: str = ""
+    GOOGLE_TTS_VOICE: str = "en-US-Neural2-D"
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""  # Path to GCP service account JSON
 
     # AI Orchestrator
     AI_ORCHESTRATOR_WS_URL: str = "ws://ai-orchestrator:8002"
     AI_ORCHESTRATOR_URL: str = "http://ai-orchestrator:8002"
+
+    # Twilio
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_FROM_NUMBER: str = ""
 
     REDIS_URL: str = "redis://localhost:6379/0"
     SECRET_KEY: str = "change-this-secret-key-in-production"

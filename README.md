@@ -17,6 +17,30 @@ AI agent platform for small businesses — build, deploy, and manage conversatio
 
 ---
 
+## Quickstart — OrbStack (recommended for macOS)
+
+[OrbStack](https://orbstack.dev) is a fast, lightweight Docker engine for macOS. It starts in under 2 seconds, uses less RAM than Docker Desktop, and is free for personal use.
+
+A single script handles everything — installing OrbStack, generating secrets, and starting all services:
+
+```bash
+bash setup-orbstack.sh
+```
+
+The script will:
+1. Install Homebrew (if missing)
+2. Install OrbStack via Homebrew (if missing)
+3. Start the Docker engine
+4. Copy `.env.example` → `.env` and auto-generate a strong `SECRET_KEY`
+5. Prompt for your LLM API key (Gemini/OpenAI) if not already set
+6. Run `docker compose up --build -d`
+7. Wait for all services to pass health checks
+8. Print URLs for the dashboard and all API docs
+
+Once complete, open **http://localhost:3000** and register your account.
+
+---
+
 ## Running on macOS
 
 ### Prerequisites

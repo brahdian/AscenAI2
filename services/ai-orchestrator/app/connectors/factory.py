@@ -24,20 +24,56 @@ _REGISTRY: dict[str, type] = {}
 
 
 def _register():
-    """Lazily import connectors to avoid hard failures at startup if a
-    dependency is missing for an unused provider."""
+    """Lazily import all connectors.
+    Lazy loading avoids import-time failures when a connector's optional
+    dependencies are not installed or when it will never be used.
+    """
     global _REGISTRY
     if _REGISTRY:
         return
+
+    # Original connectors
     from app.connectors.intercom import IntercomConnector
     from app.connectors.zendesk import ZendeskConnector
     from app.connectors.freshchat import FreshchatConnector
     from app.connectors.webhook import WebhookConnector
+
+    # Canadian SMB connectors
+    from app.connectors.hubspot import HubSpotConnector
+    from app.connectors.freshdesk import FreshdeskConnector
+    from app.connectors.livechat import LiveChatConnector
+    from app.connectors.zoho_desk import ZohoDeskConnector
+    from app.connectors.helpscout import HelpScoutConnector
+    from app.connectors.crisp import CrispConnector
+    from app.connectors.gorgias import GorgiasConnector
+    from app.connectors.reamaze import ReamazeConnector
+    from app.connectors.liveagent import LiveAgentConnector
+    from app.connectors.front import FrontConnector
+    from app.connectors.tidio import TidioConnector
+    from app.connectors.tawkto import TawkToConnector
+    from app.connectors.comm100 import Comm100Connector
+
     _REGISTRY = {
-        "intercom": IntercomConnector,
-        "zendesk": ZendeskConnector,
-        "freshchat": FreshchatConnector,
-        "webhook": WebhookConnector,
+        # ── Original ──────────────────────────────────────────────────────────
+        "intercom":   IntercomConnector,
+        "zendesk":    ZendeskConnector,
+        "freshchat":  FreshchatConnector,   # Freshchat (live chat product)
+        "webhook":    WebhookConnector,
+
+        # ── CRM / helpdesk (high Canadian SMB penetration) ───────────────────
+        "hubspot":    HubSpotConnector,     # HubSpot Tickets + Contacts CRM
+        "freshdesk":  FreshdeskConnector,   # Freshdesk tickets (≠ Freshchat)
+        "livechat":   LiveChatConnector,    # LiveChat Inc. tickets
+        "zoho_desk":  ZohoDeskConnector,    # Zoho Desk tickets
+        "helpscout":  HelpScoutConnector,   # Help Scout conversations
+        "crisp":      CrispConnector,       # Crisp conversations
+        "gorgias":    GorgiasConnector,     # Gorgias (popular Shopify stores)
+        "reamaze":    ReamazeConnector,     # Re:amaze (ecommerce SMBs)
+        "liveagent":  LiveAgentConnector,   # LiveAgent tickets
+        "front":      FrontConnector,       # Front collaborative inbox
+        "tidio":      TidioConnector,       # Tidio (webhook-based)
+        "tawkto":     TawkToConnector,      # tawk.to (webhook bridge; Canadian #1 free)
+        "comm100":    Comm100Connector,     # Comm100 (Vancouver, BC — Canadian)
     }
 
 

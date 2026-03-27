@@ -7,6 +7,7 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -238,6 +239,12 @@ app.include_router(team.router, prefix="/api/v1", tags=["team"])
 app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 app.include_router(compliance.router, prefix="/api/v1", tags=["compliance"])
 app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
+
+# ── Static assets — widget.js served at /widget/widget.js ─────────────────
+import os as _os
+_static_dir = _os.path.join(_os.path.dirname(__file__), "..", "static")
+if _os.path.isdir(_static_dir):
+    app.mount("/widget", StaticFiles(directory=_static_dir), name="widget")
 
 
 # ---------------------------------------------------------------------------

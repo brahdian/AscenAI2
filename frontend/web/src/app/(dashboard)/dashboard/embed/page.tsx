@@ -1,11 +1,11 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { agentsApi, apiKeysApi } from '@/lib/api'
-import { Code2, Copy, Check, Globe, Package, Terminal } from 'lucide-react'
+import { Code2, Copy, Check, Globe, Package, Terminal, MessageSquare, Eye, RefreshCw } from 'lucide-react'
 
 interface Agent { id: string; name: string }
-interface APIKey { id: string; name: string; key_prefix: string }
+interface APIKey { id: string; name: string; key_prefix: string; key?: string }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -16,6 +16,8 @@ export default function EmbedPage() {
   const [keyPrefix, setKeyPrefix] = useState('')
   const [activeTab, setActiveTab] = useState<'widget' | 'sdk' | 'api'>('widget')
   const [copied, setCopied] = useState<string | null>(null)
+  const [previewKey, setPreviewKey] = useState(0)
+  const iframeRef = useRef<HTMLIFrameElement>(null)
 
   useEffect(() => {
     agentsApi.list().then(setAgents).catch(() => {})
@@ -171,11 +173,73 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
               </pre>
               <CopyBtn text={widgetSnippet} id="widget" />
             </div>
-            <div className="mt-4 p-4 bg-violet-50 dark:bg-violet-900/20 rounded-lg border border-violet-100 dark:border-violet-800">
-              <p className="text-xs text-violet-700 dark:text-violet-300 font-medium mb-1">Widget Preview</p>
-              <p className="text-xs text-violet-600 dark:text-violet-400">
-                A chat bubble will appear in the bottom-right corner. Visitors can click it to start chatting with <strong>{selectedAgent?.name || 'your agent'}</strong>.
-              </p>
+
+            {/* Live preview */}
+            <div className="rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-2.5 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+                <div className="flex items-center gap-2 text-sm font-medium text-gray-700 dark:text-gray-300">
+                  <Eye size={14} className="text-violet-500" />
+                  Live Preview
+                </div>
+                <button
+                  onClick={() => setPreviewKey(k => k + 1)}
+                  className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors px-2 py-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"
+                >
+                  <RefreshCw size={12} />
+                  Reset
+                </button>
+              </div>
+              <div className="relative bg-[#f8f9ff] dark:bg-gray-900" style={{ height: '360px' }}>
+                {agentId && keyPrefix ? (
+                  <iframe
+                    key={previewKey}
+                    ref={iframeRef}
+                    title="Widget Preview"
+                    className="w-full h-full border-0"
+                    sandbox="allow-scripts allow-same-origin allow-forms"
+                    srcDoc={`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <style>
+    body { margin: 0; background: #f8f9ff; font-family: sans-serif; }
+    .page-mock {
+      padding: 40px;
+      color: #6b7280;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    h3 { color: #111827; font-size: 18px; margin-bottom: 8px; }
+    p { margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <div class="page-mock">
+    <h3>Your website</h3>
+    <p>This is how the chat widget will appear on your customers' site. Click the bubble in the bottom-right corner to try it.</p>
+    <p>The widget is fully isolated — it won't conflict with your existing styles.</p>
+  </div>
+  <script>
+    window.AscenAI = {
+      agentId: '${agentId}',
+      apiKey: '${keyPrefix}',
+      apiUrl: '${API_URL}',
+      title: '${selectedAgent?.name ?? 'Support'}',
+      greeting: 'Hi! How can I help you today?',
+      theme: { primaryColor: '#7c3aed' },
+    };
+  </script>
+  <script src="${API_URL}/widget/widget.js" defer></script>
+</body>
+</html>`}
+                  />
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full gap-3 text-gray-400">
+                    <MessageSquare size={36} className="opacity-30" />
+                    <p className="text-sm">Select an agent and API key above to preview the widget</p>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}

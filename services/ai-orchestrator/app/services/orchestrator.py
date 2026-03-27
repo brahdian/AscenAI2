@@ -18,6 +18,7 @@ from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
 from app.services.intent_detector import IntentDetector
 from app.prompts.system_prompts import build_system_prompt
+from app.connectors.factory import trigger_connector, EscalationPayload
 
 logger = structlog.get_logger(__name__)
 
@@ -1204,6 +1205,14 @@ class Orchestrator:
             action = "chat_handoff"
             session.status = "escalated"
 
+            # Fire connector (Intercom / Zendesk / Freshchat / webhook) if configured
+            await self._fire_connector(
+                escalation_config=escalation_config,
+                agent=agent,
+                session=session,
+                trigger_message=user_message,
+            )
+
         # ── Text / web — no chat queue: collect contact info for callback ─────
         else:
             metadata = dict(session.metadata or {})
@@ -1316,7 +1325,8 @@ class Orchestrator:
                 session.metadata = clean_meta
                 session.status = "escalated"
 
-                escalation_number = (agent.escalation_config or {}).get("escalation_number", "")
+                escalation_config_ref = agent.escalation_config or {}
+                escalation_number = escalation_config_ref.get("escalation_number", "")
                 message = (
                     f"Perfect — I've notified our team. An agent will call you "
                     f"at {phone} shortly, {name}."
@@ -1324,6 +1334,16 @@ class Orchestrator:
                 if escalation_number:
                     message += f"\n\nYou can also reach us directly at {escalation_number}."
                 action = "phone_callback_scheduled"
+
+                # Fire connector with collected contact info
+                await self._fire_connector(
+                    escalation_config=escalation_config_ref,
+                    agent=agent,
+                    session=session,
+                    trigger_message=user_message,
+                    contact_name=name,
+                    contact_phone=phone,
+                )
             else:
                 # Cancelled
                 clean_meta = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
@@ -1357,6 +1377,53 @@ class Orchestrator:
             latency_ms=latency_ms,
             tokens_used=0,
         )
+
+    # ------------------------------------------------------------------
+    # Connector fire-and-forget helper
+    # ------------------------------------------------------------------
+
+    async def _fire_connector(
+        self,
+        escalation_config: dict,
+        agent: Agent,
+        session: AgentSession,
+        trigger_message: str,
+        contact_name: str = "",
+        contact_phone: str = "",
+        contact_email: str = "",
+    ) -> None:
+        """
+        Asynchronously trigger the configured live-agent connector.
+        Loads conversation history from the current session and fires the
+        handoff in the background — escalation proceeds even if the connector
+        call fails.
+        """
+        # Fetch recent messages for the transcript (last 30 turns)
+        try:
+            result = await self.db.execute(
+                select(Message)
+                .where(Message.session_id == session.id)
+                .order_by(Message.created_at.asc())
+            )
+            msgs = result.scalars().all()
+            history = [{"role": m.role, "content": m.content} for m in msgs]
+        except Exception:
+            history = []
+
+        payload = EscalationPayload(
+            tenant_id=str(session.tenant_id),
+            session_id=str(session.id),
+            agent_name=agent.name or "AscenAI Bot",
+            contact_name=contact_name,
+            contact_phone=contact_phone,
+            contact_email=contact_email,
+            history=history,
+            trigger_message=trigger_message,
+            channel=session.channel or "web",
+        )
+
+        # Run in background so connector latency doesn't delay the response
+        asyncio.create_task(trigger_connector(escalation_config, payload))
 
     # ------------------------------------------------------------------
     # TC-E01: Emergency bypass

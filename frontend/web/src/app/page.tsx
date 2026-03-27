@@ -12,17 +12,17 @@ export default function HomePage() {
           <span className="text-xl font-bold text-white">AscenAI</span>
         </div>
         <div className="flex items-center gap-4">
-          <Link
-            href="/login"
-            className="text-gray-300 hover:text-white transition-colors text-sm"
-          >
+          <Link href="/pricing" className="text-gray-300 hover:text-white transition-colors text-sm">
+            Pricing
+          </Link>
+          <Link href="/login" className="text-gray-300 hover:text-white transition-colors text-sm">
             Sign in
           </Link>
           <Link
             href="/register"
             className="px-4 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white text-sm font-medium hover:opacity-90 transition-opacity"
           >
-            Get Started Free
+            Get Started
           </Link>
         </div>
       </nav>
@@ -31,7 +31,7 @@ export default function HomePage() {
       <section className="max-w-7xl mx-auto px-8 pt-24 pb-32 text-center">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-violet-500/10 border border-violet-500/20 text-violet-300 text-sm mb-8">
           <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-          Now in public beta
+          $100 per agent · no usage caps
         </div>
         <h1 className="text-5xl sm:text-7xl font-bold mb-6 leading-tight">
           AI Agents that{' '}
@@ -48,13 +48,13 @@ export default function HomePage() {
             href="/register"
             className="px-8 py-4 rounded-xl bg-gradient-to-r from-violet-600 to-blue-600 text-white font-semibold hover:opacity-90 transition-all hover:shadow-[0_0_30px_rgba(124,58,237,0.5)]"
           >
-            Start free trial — 14 days
+            Get started — $100/agent/month
           </Link>
           <Link
-            href="/login"
+            href="/pricing"
             className="px-8 py-4 rounded-xl border border-white/10 text-white font-semibold hover:bg-white/5 transition-colors"
           >
-            Sign in to dashboard
+            View pricing
           </Link>
         </div>
       </section>
@@ -66,17 +66,17 @@ export default function HomePage() {
             {
               icon: '🎙️',
               title: 'Voice-first AI',
-              desc: 'Real-time voice conversations with sub-200ms latency using our streaming pipeline.',
+              desc: 'Real-time voice conversations with sub-200ms latency. Powered by Gemini audio and Google Cloud TTS with Twilio phone integration.',
             },
             {
-              icon: '🔧',
-              title: 'MCP Tool Integration',
-              desc: 'Connect any external API — POS, booking systems, CRM — through our tool registry.',
+              icon: '📚',
+              title: 'Knowledge Base & Playbooks',
+              desc: 'Upload documents your agent references. Set multiple playbooks with intent triggers for automatic routing.',
             },
             {
               icon: '🏢',
               title: 'Multi-tenant SaaS',
-              desc: 'Enterprise-grade isolation: each business gets its own agents, usage limits, and billing.',
+              desc: 'Enterprise-grade isolation: each business gets its own agents, guardrails, team members, and billing.',
             },
           ].map((f) => (
             <div
@@ -93,7 +93,8 @@ export default function HomePage() {
 
       {/* Footer */}
       <footer className="border-t border-white/5 py-8 text-center text-gray-500 text-sm">
-        © {new Date().getFullYear()} AscenAI. Built with FastAPI, Next.js, and Gemini.
+        © {new Date().getFullYear()} AscenAI. Built with FastAPI, Next.js, and Gemini.{' '}
+        <Link href="/pricing" className="hover:text-gray-300 transition-colors">Pricing</Link>
       </footer>
     </main>
   )

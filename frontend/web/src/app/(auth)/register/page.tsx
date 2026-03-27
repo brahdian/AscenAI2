@@ -59,7 +59,7 @@ export default function RegisterPage() {
             </div>
             <span className="text-2xl font-bold text-white">AscenAI</span>
           </Link>
-          <p className="text-gray-400 mt-3">Start your free 14-day trial</p>
+          <p className="text-gray-400 mt-3">$100 per agent · no usage caps</p>
         </div>
 
         <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-8 backdrop-blur-sm">
@@ -104,7 +104,7 @@ export default function RegisterPage() {
               disabled={loading}
               className="w-full py-3 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed mt-2"
             >
-              {loading ? 'Creating account…' : 'Create account — Free'}
+              {loading ? 'Creating account…' : 'Create account'}
             </button>
           </form>
 

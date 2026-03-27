@@ -119,7 +119,7 @@ export default function AgentsPage() {
                     <TestTube size={16} />
                   </button>
                   <Link
-                    href={`/dashboard/agents/${agent.id}/playbook`}
+                    href={`/dashboard/agents/${agent.id}/playbooks`}
                     className="p-2 text-gray-400 hover:text-violet-600 transition-colors"
                     title="Edit Playbook"
                   >

@@ -3,77 +3,52 @@ import { Check, Zap, X } from 'lucide-react'
 
 const tiers = [
   {
-    name: 'Starter',
-    price: 49,
-    description: 'Chat-only agents for small teams.',
+    name: 'Professional',
+    price: 99,
+    description: 'Perfect for salons, restaurants, clinics and small businesses.',
     badge: null,
     color: 'border-white/10',
     highlight: false,
     limits: {
-      chat_messages: '2,000 / month',
-      voice_minutes: 'Not included',
-      playbooks: '2 per agent',
-      rag_documents: '10 documents',
-      team_seats: '1 seat',
-      api_access: true,
-      webhooks: false,
-      guardrails: true,
-      analytics: 'Basic',
-      support: 'Community',
-    },
-    overage: {
-      chat: '$0.02 / message',
-      voice: '—',
-    },
-    cta: 'Get started',
-  },
-  {
-    name: 'Professional',
-    price: 149,
-    description: 'Chat + voice agents for growing businesses.',
-    badge: 'Most popular',
-    color: 'border-violet-500/50',
-    highlight: true,
-    limits: {
-      chat_messages: '10,000 / month',
-      voice_minutes: '300 min / month',
-      playbooks: '10 per agent',
-      rag_documents: '100 documents',
-      team_seats: '5 seats',
+      chat_messages: '5,000 / month',
+      voice_minutes: '200 min / month',
+      playbooks: '5 per agent',
+      rag_documents: '25 documents',
+      team_seats: '3 seats',
       api_access: true,
       webhooks: true,
       guardrails: true,
-      analytics: 'Full + exports',
-      support: 'Email (48h)',
+      analytics: 'Standard',
+      support: 'Email',
     },
     overage: {
-      chat: '$0.02 / message',
-      voice: '$0.20 / min',
+      chat: '$0.015 / message',
+      voice: '$0.15 / min',
     },
     cta: 'Get started',
   },
   {
     name: 'Business',
-    price: 399,
-    description: 'High-volume deployments with priority support.',
-    badge: null,
-    color: 'border-white/10',
-    highlight: false,
+    price: 299,
+    description: 'For growing businesses with high call and chat volume.',
+    badge: 'Most popular',
+    color: 'border-violet-500/50',
+    highlight: true,
     limits: {
-      chat_messages: '50,000 / month',
-      voice_minutes: '2,000 min / month',
+      chat_messages: '25,000 / month',
+      voice_minutes: '1,000 min / month',
       playbooks: 'Unlimited',
-      rag_documents: '500 documents',
-      team_seats: '20 seats',
+      rag_documents: '200 documents',
+      team_seats: '10 seats',
       api_access: true,
       webhooks: true,
       guardrails: true,
-      analytics: 'Full + custom reports',
-      support: 'Priority (24h)',
+      analytics: 'Advanced + exports',
+      support: 'Priority email (24h)',
     },
     overage: {
-      chat: '$0.015 / message',
-      voice: '$0.18 / min',
+      chat: '$0.012 / message',
+      voice: '$0.12 / min',
     },
     cta: 'Get started',
   },
@@ -94,8 +69,8 @@ const featureRows = [
 
 const faqs = [
   {
-    q: 'Is there a free trial?',
-    a: 'No. AscenAI is a professional platform. Contact us to discuss your use case before signing up.',
+    q: 'Is there a free trial or setup fee?',
+    a: 'No setup fees, no free trial. Unlike platforms that charge $30,000+ in onboarding fees (Ada, Intercom), AscenAI is fully self-serve. Sign up and have an agent live in minutes.',
   },
   {
     q: 'What counts as a chat message?',
@@ -103,23 +78,27 @@ const faqs = [
   },
   {
     q: 'What counts as a voice minute?',
-    a: 'Billed in 1-minute increments. A 90-second call = 2 minutes. Includes STT (transcription) + TTS (speech synthesis) + AI response time.',
+    a: 'Billed per minute, rounded up. Includes STT (transcription), AI response time, and TTS (speech synthesis). A 90-second call = 2 minutes.',
   },
   {
-    q: 'What happens when I exceed limits?',
-    a: 'Your agent keeps running — we never hard-stop you mid-conversation. Overage is billed at the per-unit rate shown in each plan and appears on your next invoice.',
+    q: 'What happens when I exceed my limits?',
+    a: 'Your agent keeps running — we never cut off an active conversation. Overage is billed at the per-unit rate shown in your plan and appears on your next invoice.',
   },
   {
     q: 'Which AI model powers the agents?',
-    a: 'All plans run on Gemini 2.5 Flash Lite by default — the most cost-efficient multimodal model for real-time voice and chat. Higher Gemini models (Flash, Pro, or future Gemini 3.x releases) are available as an add-on on Business and Enterprise plans.',
+    a: 'All plans run on Gemini 2.5 Flash Lite — Google\'s fastest multimodal model optimised for real-time voice and chat. It handles both audio transcription and text responses in a single model, keeping costs low and latency under 200ms.',
   },
   {
-    q: 'Do I pay per seat or per agent?',
-    a: 'Per agent. Seats (team members who access the dashboard) are included up to the plan limit. Additional seats are $10/seat/month.',
+    q: 'How does this compare to Ada or Intercom Fin?',
+    a: 'Ada charges $30,000+ in setup fees before you deploy a single agent. Intercom Fin bills $0.99 per resolution — a busy support team can easily hit $5,000+/month. AscenAI is flat-rate, self-serve, and includes voice out of the box.',
   },
   {
-    q: 'Can I mix plans across agents?',
-    a: 'Not currently — all agents under an account share the same plan. Enterprise accounts can negotiate per-agent plans.',
+    q: 'Can I have multiple agents on one account?',
+    a: 'Yes. Each agent is billed separately. You could run a booking agent, a support agent, and a sales agent for $297/month on Professional — or $897/month on Business.',
+  },
+  {
+    q: 'What is included in Enterprise?',
+    a: 'Unlimited messages and voice minutes, dedicated infrastructure, custom Gemini model selection (Flash, Pro, or future Gemini 3.x), white-label branding, SLA, HIPAA/SOC2 compliance, and a named account manager.',
   },
 ]
 
@@ -149,19 +128,22 @@ export default function PricingPage() {
 
       {/* Header */}
       <section className="max-w-4xl mx-auto px-8 pt-16 pb-12 text-center">
-        <h1 className="text-5xl font-bold mb-4">Transparent, usage-based pricing</h1>
+        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-500/10 border border-violet-500/20 text-violet-300 text-sm mb-6">
+          No setup fees · No per-resolution billing · Cancel anytime
+        </div>
+        <h1 className="text-5xl font-bold mb-4">Simple pricing, no surprises</h1>
         <p className="text-gray-400 text-lg max-w-2xl mx-auto">
-          Flat monthly rate per agent with clear message and voice limits.
-          Overage billing keeps agents running — you never get cut off mid-conversation.
+          Flat monthly rate per agent. While others charge $30,000+ in setup fees,
+          AscenAI is fully self-serve — live in minutes.
         </p>
-        <p className="mt-4 text-sm text-violet-300">
-          All plans powered by Gemini 2.5 Flash Lite · Google Cloud TTS Neural2 · Twilio voice
+        <p className="mt-3 text-sm text-violet-300">
+          Powered by Gemini 2.5 Flash Lite · Google Cloud TTS · Twilio voice
         </p>
       </section>
 
       {/* Tier cards */}
-      <section className="max-w-6xl mx-auto px-8 pb-16">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <section className="max-w-4xl mx-auto px-8 pb-16">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-3xl mx-auto">
           {tiers.map((tier) => (
             <div
               key={tier.name}
@@ -219,7 +201,7 @@ export default function PricingPage() {
               </div>
 
               <div className="mt-6 pt-5 border-t border-white/5 text-xs text-gray-500 space-y-1">
-                <p className="font-medium text-gray-400 mb-1.5">Overage rates:</p>
+                <p className="font-medium text-gray-400 mb-1.5">Overage (agents never go offline):</p>
                 <p>Chat: {tier.overage.chat}</p>
                 <p>Voice: {tier.overage.voice}</p>
               </div>
@@ -228,71 +210,98 @@ export default function PricingPage() {
         </div>
 
         {/* Enterprise */}
-        <div className="mt-6 rounded-2xl border border-white/10 bg-white/[0.02] p-6 flex flex-col md:flex-row items-center justify-between gap-4">
+        <div className="mt-6 max-w-3xl mx-auto rounded-2xl border border-white/10 bg-white/[0.02] p-6 flex flex-col md:flex-row items-center justify-between gap-4">
           <div>
             <div className="flex items-center gap-2 mb-1">
               <Zap size={16} className="text-yellow-400" />
               <h3 className="font-semibold text-white">Enterprise</h3>
             </div>
             <p className="text-gray-400 text-sm">
-              Unlimited messages & voice · Bring your own API keys · Dedicated infrastructure ·
-              Gemini Pro / future Gemini 3.x models · SLA 99.9% · HIPAA/SOC2 · Custom contracts
+              Unlimited messages & voice · Custom Gemini model (Flash, Pro, Gemini 3.x) ·
+              Dedicated infrastructure · White-label · SLA 99.9% · HIPAA/SOC2 · Named account manager
             </p>
           </div>
           <a
             href="mailto:sales@ascenai.com"
-            className="shrink-0 px-5 py-2.5 rounded-xl border border-white/20 text-white text-sm font-medium hover:bg-white/5 transition-colors"
+            className="shrink-0 px-5 py-2.5 rounded-xl border border-white/20 text-white text-sm font-medium hover:bg-white/5 transition-colors whitespace-nowrap"
           >
-            Contact sales →
+            Talk to sales →
           </a>
         </div>
       </section>
 
-      {/* Cost breakdown — transparent */}
+      {/* Comparison vs competitors */}
       <section className="max-w-3xl mx-auto px-8 pb-20">
-        <h2 className="text-2xl font-bold text-center mb-2">What your $149 pays for</h2>
-        <p className="text-gray-400 text-center text-sm mb-8">
-          Professional plan cost breakdown for 10,000 messages + 300 voice minutes
-        </p>
+        <h2 className="text-2xl font-bold text-center mb-2">How we compare</h2>
+        <p className="text-gray-400 text-sm text-center mb-8">Same outcome, fraction of the cost</p>
         <div className="rounded-2xl border border-white/10 bg-white/[0.02] overflow-hidden">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-white/5">
-                <th className="text-left px-5 py-3 text-gray-400 font-medium">Component</th>
-                <th className="text-right px-5 py-3 text-gray-400 font-medium">Unit rate</th>
-                <th className="text-right px-5 py-3 text-gray-400 font-medium">Est. cost</th>
+                <th className="text-left px-5 py-3 text-gray-400 font-medium">Platform</th>
+                <th className="text-right px-5 py-3 text-gray-400 font-medium">Setup fee</th>
+                <th className="text-right px-5 py-3 text-gray-400 font-medium">Monthly cost</th>
+                <th className="text-right px-5 py-3 text-gray-400 font-medium">Voice included</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/5">
               {[
-                ['Gemini 2.5 Flash Lite — chat LLM (10k msgs)', '$0.10 in / $0.40 out per 1M tok', '$1.85'],
-                ['Gemini 2.5 Flash Lite — voice LLM (300 min)', '$0.10 in / $0.40 out per 1M tok', '$0.17'],
-                ['Gemini audio STT (300 min)', '$0.30 / 1M tokens · 25 tok/sec', '$0.14'],
-                ['Google Cloud TTS Neural2 (300 min)', '$16 / 1M characters', '$2.16'],
-                ['Twilio inbound voice (300 min + number)', '$0.0085 / min + $1.15 / mo', '$3.70'],
-                ['Infrastructure — hosting, DB, Qdrant, Redis', 'shared across tenants', '$1.50'],
-              ].map(([label, rate, cost]) => (
-                <tr key={label}>
-                  <td className="px-5 py-3 text-gray-300">{label}</td>
-                  <td className="px-5 py-3 text-right text-gray-500 text-xs">{rate}</td>
-                  <td className="px-5 py-3 text-right text-gray-300 font-mono">{cost}</td>
+                ['Ada', '$30,000+', 'Custom', 'Extra'],
+                ['Intercom Fin', 'None', '$0.99/resolution', 'No'],
+                ['Bland.ai', 'None', '$0.09/min voice only', 'Yes'],
+                ['VAPI', 'None', '$0.05–0.10/min', 'Yes, no chat'],
+                ['AscenAI Professional', 'None', '$99/agent flat', 'Yes — included'],
+                ['AscenAI Business', 'None', '$299/agent flat', 'Yes — included'],
+              ].map(([platform, setup, monthly, voice], i) => (
+                <tr key={platform} className={i >= 4 ? 'bg-violet-500/5' : ''}>
+                  <td className={`px-5 py-3 ${i >= 4 ? 'text-violet-300 font-medium' : 'text-gray-300'}`}>
+                    {platform}
+                  </td>
+                  <td className="px-5 py-3 text-right text-gray-400">{setup}</td>
+                  <td className={`px-5 py-3 text-right font-mono ${i >= 4 ? 'text-violet-300 font-semibold' : 'text-gray-400'}`}>
+                    {monthly}
+                  </td>
+                  <td className="px-5 py-3 text-right text-gray-400">{voice}</td>
                 </tr>
               ))}
-              <tr className="bg-white/[0.03]">
-                <td className="px-5 py-3 font-semibold text-white" colSpan={2}>API + infra COGS</td>
-                <td className="px-5 py-3 text-right font-semibold text-white font-mono">~$9.52</td>
-              </tr>
-              <tr className="bg-violet-500/10">
-                <td className="px-5 py-3 text-violet-300" colSpan={2}>Your plan price</td>
-                <td className="px-5 py-3 text-right text-violet-300 font-mono font-bold">$149</td>
-              </tr>
             </tbody>
           </table>
         </div>
-        <p className="text-xs text-gray-500 text-center mt-3">
-          The difference funds engineering, support, security, and reliability — not hidden API markups.
-          All third-party API costs are absorbed in your plan price.
+        <p className="text-xs text-gray-600 text-center mt-3">
+          Competitor pricing sourced from public pricing pages. Actual costs vary.
         </p>
+      </section>
+
+      {/* Example calculation */}
+      <section className="max-w-3xl mx-auto px-8 pb-20">
+        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-6">
+          <h3 className="font-semibold text-white mb-1">Example: Multi-location salon group</h3>
+          <p className="text-gray-400 text-sm mb-4">
+            3 locations, each with a booking + support agent
+          </p>
+          <div className="space-y-2 text-sm">
+            {[
+              ['3 agents × $299/month (Business plan)', '$897'],
+              ['Overage: 200 extra voice minutes @ $0.12', '$24'],
+              ['Total / month', '$921'],
+              ['vs. 1 part-time receptionist (Canada avg)', '$2,200+'],
+            ].map(([label, amount], i) => (
+              <div
+                key={label}
+                className={`flex justify-between ${
+                  i === 3
+                    ? 'pt-3 mt-1 border-t border-white/5 text-gray-500 line-through'
+                    : i === 2
+                    ? 'pt-3 mt-1 border-t border-white/5 font-semibold text-white'
+                    : 'text-gray-300'
+                }`}
+              >
+                <span>{label}</span>
+                <span className="font-mono">{amount}</span>
+              </div>
+            ))}
+          </div>
+        </div>
       </section>
 
       {/* FAQ */}
@@ -309,11 +318,12 @@ export default function PricingPage() {
       </section>
 
       <footer className="border-t border-white/5 py-8 text-center text-gray-500 text-sm">
-        © {new Date().getFullYear()} AscenAI.{' '}
+        © {new Date().getFullYear()} AscenAI · Canada{' '}
+        <span className="mx-2">·</span>
         <a href="mailto:billing@ascenai.com" className="hover:text-gray-300 transition-colors">
           billing@ascenai.com
         </a>
-        {' · '}
+        <span className="mx-2">·</span>
         <a href="mailto:sales@ascenai.com" className="hover:text-gray-300 transition-colors">
           sales@ascenai.com
         </a>

@@ -1,33 +1,92 @@
+/**
+ * API client — cookie-based authentication.
+ *
+ * Tokens (access_token, refresh_token) are stored as HttpOnly cookies by the
+ * server and are never accessible from JavaScript. The browser sends them
+ * automatically with every same-origin (or credentialed cross-origin) request
+ * because we set `withCredentials: true`.
+ *
+ * On a 401 response the client silently calls POST /auth/refresh (which also
+ * uses the HttpOnly refresh_token cookie). If the refresh succeeds, the
+ * original request is retried once. If it fails, the user is redirected to
+ * /login and the auth store is cleared.
+ */
 import axios, { AxiosInstance, AxiosError } from 'axios'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+// Separate "bare" instance used only for the refresh call so the response
+// interceptor does not trigger recursively.
+const _refreshClient = axios.create({
+  baseURL: `${API_URL}/api/v1`,
+  withCredentials: true,
+  headers: { 'Content-Type': 'application/json' },
+})
+
+let _isRefreshing = false
+let _pendingQueue: Array<{ resolve: () => void; reject: (e: unknown) => void }> = []
+
+function _drainQueue(error?: unknown) {
+  _pendingQueue.forEach((p) => (error ? p.reject(error) : p.resolve()))
+  _pendingQueue = []
+}
 
 function createApiClient(): AxiosInstance {
   const client = axios.create({
     baseURL: `${API_URL}/api/v1`,
     headers: { 'Content-Type': 'application/json' },
+    // Send HttpOnly auth cookies automatically on every request
+    withCredentials: true,
   })
 
-  // Attach JWT token from localStorage
-  client.interceptors.request.use((config) => {
-    if (typeof window !== 'undefined') {
-      const token = localStorage.getItem('access_token')
-      if (token) {
-        config.headers.Authorization = `Bearer ${token}`
-      }
-    }
-    return config
-  })
-
-  // Handle 401 — redirect to login
+  // 401 → try a silent token refresh, then retry the original request once
   client.interceptors.response.use(
     (res) => res,
     async (error: AxiosError) => {
-      if (error.response?.status === 401 && typeof window !== 'undefined') {
-        localStorage.removeItem('access_token')
-        localStorage.removeItem('refresh_token')
-        window.location.href = '/login'
+      const original = error.config as (typeof error.config & { _retry?: boolean }) | undefined
+      const status = error.response?.status
+
+      // Only attempt refresh for 401s on non-auth endpoints (avoid loops)
+      if (
+        status === 401 &&
+        original &&
+        !original._retry &&
+        !original.url?.includes('/auth/')
+      ) {
+        if (_isRefreshing) {
+          // Queue the retry until the in-flight refresh completes
+          return new Promise<unknown>((resolve, reject) => {
+            _pendingQueue.push({
+              resolve: () => resolve(client(original)),
+              reject,
+            })
+          })
+        }
+
+        original._retry = true
+        _isRefreshing = true
+
+        try {
+          // POST /auth/refresh — sends the refresh_token HttpOnly cookie automatically
+          await _refreshClient.post('/auth/refresh')
+          _drainQueue()
+          return client(original)
+        } catch (refreshError) {
+          _drainQueue(refreshError)
+          // Refresh failed — clear client-side state and send to login
+          if (typeof window !== 'undefined') {
+            const { useAuthStore } = await import('@/store/auth')
+            useAuthStore.getState().logout()
+            // POST /auth/logout so the server clears its cookies too
+            try { await _refreshClient.post('/auth/logout') } catch { /* ignore */ }
+            window.location.href = '/login'
+          }
+          return Promise.reject(refreshError)
+        } finally {
+          _isRefreshing = false
+        }
       }
+
       return Promise.reject(error)
     }
   )
@@ -53,8 +112,10 @@ export const authApi = {
   login: (data: { email: string; password: string }) =>
     api.post('/auth/login', data).then((r) => r.data),
 
-  refresh: (refresh_token: string) =>
-    api.post('/auth/refresh', { refresh_token }).then((r) => r.data),
+  /** Trigger a refresh — the server reads the refresh_token cookie. */
+  refresh: () => api.post('/auth/refresh').then((r) => r.data),
+
+  logout: () => api.post('/auth/logout'),
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +212,12 @@ export const feedbackApi = {
   summary: (params?: { agent_id?: string }) =>
     api.get('/proxy/feedback/summary', { params }).then((r) => r.data),
 
+  /**
+   * Returns a URL for the export endpoint. The browser will send the auth
+   * cookie automatically when navigating to this URL (same-origin).
+   */
   exportUrl: (params?: { format?: string; agent_id?: string; rating?: string }) => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : ''
-    const qs = new URLSearchParams({ ...(params as any) }).toString()
+    const qs = new URLSearchParams({ ...(params as Record<string, string>) }).toString()
     return `${API_URL}/api/v1/proxy/feedback/export${qs ? `?${qs}` : ''}`
   },
 }
@@ -256,8 +320,6 @@ export const documentsApi = {
   upload: (agentId: string, file: File) => {
     const form = new FormData()
     form.append('file', file)
-    // Do NOT set Content-Type manually — axios/browser sets it automatically
-    // with the correct multipart boundary when given FormData
     return api.post(`/proxy/agents/${agentId}/documents`, form).then((r) => r.data)
   },
   delete: (agentId: string, docId: string) =>
@@ -291,16 +353,9 @@ export const billingApi = {
 // ---------------------------------------------------------------------------
 
 export const toolsApi = {
-  /** Static catalog of all available integrations with credential field definitions */
   catalog: () => api.get('/proxy/tools/catalog').then((r) => r.data),
-
-  /** List all tools registered for this tenant (includes their metadata/credentials) */
   list: () => api.get('/proxy/tools').then((r) => r.data),
-
-  /** Get a single tool by name */
   get: (name: string) => api.get(`/proxy/tools/${name}`).then((r) => r.data),
-
-  /** Register / configure a new integration tool for this tenant */
   register: (data: {
     name: string
     description: string
@@ -312,21 +367,13 @@ export const toolsApi = {
     rate_limit_per_minute?: number
     timeout_seconds?: number
   }) => api.post('/proxy/tools', data).then((r) => r.data),
-
-  /** Update an existing tool's config / credentials */
   update: (name: string, data: Record<string, unknown>) =>
     api.patch(`/proxy/tools/${name}`, data).then((r) => r.data),
-
-  /** Delete a tool */
   delete: (name: string) => api.delete(`/proxy/tools/${name}`),
-
-  /** Enable a tool for an agent (adds to agent.tools list) */
   enableForAgent: (agentId: string, toolName: string, currentTools: string[]) => {
     if (currentTools.includes(toolName)) return Promise.resolve()
     return api.patch(`/proxy/agents/${agentId}`, { tools: [...currentTools, toolName] }).then((r) => r.data)
   },
-
-  /** Disable a tool for an agent (removes from agent.tools list) */
   disableForAgent: (agentId: string, toolName: string, currentTools: string[]) =>
     api
       .patch(`/proxy/agents/${agentId}`, { tools: currentTools.filter((t) => t !== toolName) })
@@ -347,11 +394,10 @@ export const complianceApi = {
 }
 
 // ---------------------------------------------------------------------------
-// Embed / Widget public token (future: api-keys with widget scope)
+// Embed / Widget
 // ---------------------------------------------------------------------------
 
 export const embedApi = {
-  // Returns the snippet and SDK info for the current agent
   getSnippet: (agentId: string, apiKey: string, apiUrl: string) => ({
     scriptTag: `<script>\n  window.AscenAI = {\n    agentId: '${agentId}',\n    apiKey: '${apiKey}',\n    apiUrl: '${apiUrl}',\n  };\n</script>\n<script src="${apiUrl}/widget/widget.js" defer></script>`,
     npmInstall: `npm install @ascenai/sdk`,

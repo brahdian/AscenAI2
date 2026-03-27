@@ -39,7 +39,8 @@ class TokenResponse(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    """Body is optional when refresh_token is provided via HttpOnly cookie."""
+    refresh_token: str = ""
 
 
 class ForgotPasswordRequest(BaseModel):

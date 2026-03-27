@@ -58,6 +58,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # Also check X-API-Key header
             token = request.headers.get("X-API-Key")
 
+        # Fall back to HttpOnly cookie (set by login/register/refresh endpoints)
+        if not token:
+            token = request.cookies.get("access_token")
+
         if not token:
             from fastapi.responses import JSONResponse
             return JSONResponse(

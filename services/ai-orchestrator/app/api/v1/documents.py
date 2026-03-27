@@ -196,8 +196,8 @@ async def upload_document(
     tenant_id = _tenant_id(request)
     agent = await _verify_agent(agent_id, tenant_id, db)
 
-    # Validate file extension
-    filename = file.filename or "upload"
+    # Validate file extension — strip path components to prevent path traversal
+    filename = Path(file.filename or "upload").name
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(

@@ -35,5 +35,6 @@ class AuthManager:
 
     @staticmethod
     def _decrypt(encrypted: str) -> str:
-        """Decrypt a stored secret. Placeholder — use Fernet/KMS in production."""
-        return encrypted
+        """Decrypt a Fernet-encrypted stored secret."""
+        from app.core.crypto import decrypt_value
+        return decrypt_value(encrypted)

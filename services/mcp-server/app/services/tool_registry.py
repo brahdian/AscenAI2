@@ -5,6 +5,7 @@ import structlog
 from sqlalchemy import select, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import decrypt_sensitive_fields, encrypt_sensitive_fields
 from app.models.tool import Tool
 from app.schemas.mcp import ToolRegistration, ToolUpdate
 
@@ -41,12 +42,13 @@ class ToolRegistry:
             input_schema=tool_data.input_schema,
             output_schema=tool_data.output_schema,
             endpoint_url=tool_data.endpoint_url,
-            auth_config=tool_data.auth_config,
+            # Encrypt sensitive credential fields before storing
+            auth_config=encrypt_sensitive_fields(tool_data.auth_config),
             rate_limit_per_minute=tool_data.rate_limit_per_minute,
             timeout_seconds=tool_data.timeout_seconds,
             is_active=True,
             is_builtin=tool_data.is_builtin,
-            tool_metadata=tool_data.tool_metadata,
+            tool_metadata=encrypt_sensitive_fields(tool_data.tool_metadata),
         )
         self.db.add(tool)
         await self.db.flush()  # Get the ID without committing
@@ -112,6 +114,9 @@ class ToolRegistry:
 
         update_data = updates.model_dump(exclude_unset=True)
         for field, value in update_data.items():
+            # Encrypt sensitive fields before storing
+            if field in ("tool_metadata", "auth_config") and isinstance(value, dict):
+                value = encrypt_sensitive_fields(value)
             setattr(tool, field, value)
 
         await self.db.flush()

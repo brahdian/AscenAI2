@@ -8,16 +8,16 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ascenai
+      POSTGRES_USER: ${POSTGRES_USER:-ascenai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-ascenai}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./shared/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ascenai}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -25,7 +25,12 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
     ports:
       - "6379:6379"
     volumes:
@@ -63,8 +68,8 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/ascenai
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       MCP_SERVER_URL: http://mcp-server:8001
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       VOICE_PIPELINE_URL: http://voice-pipeline:8003
@@ -89,8 +94,8 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/ascenai
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       QDRANT_HOST: qdrant
       QDRANT_PORT: 6333
     depends_on:
@@ -116,8 +121,8 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/ascenai
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       MCP_SERVER_URL: http://mcp-server:8001
       MCP_WS_URL: ws://mcp-server:8001
     depends_on:
@@ -143,7 +148,7 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       AI_ORCHESTRATOR_WS_URL: ws://ai-orchestrator:8002
     depends_on:
@@ -168,8 +173,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-      NEXT_PUBLIC_WS_URL: ws://localhost:8002
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8002}
     depends_on:
       - api-gateway
 

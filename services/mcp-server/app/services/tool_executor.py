@@ -9,6 +9,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.crypto import decrypt_sensitive_fields
 from app.models.tool import Tool, ToolExecution
 from app.schemas.mcp import MCPToolCall, MCPToolResult
 from app.services.tool_registry import ToolRegistry
@@ -271,8 +272,9 @@ class ToolExecutor:
         handler = handlers.get(tool.name)
         if not handler:
             raise ValueError(f"No built-in handler registered for tool '{tool.name}'")
-        # Merge tool-level metadata (credentials) with tenant_config
-        config = {**self.tenant_config, **(tool.tool_metadata or {})}
+        # Decrypt credentials stored in tool_metadata before passing to handler
+        decrypted_metadata = decrypt_sensitive_fields(tool.tool_metadata or {})
+        config = {**self.tenant_config, **decrypted_metadata}
         return await handler(parameters, config)
 
     # ------------------------------------------------------------------

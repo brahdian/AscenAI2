@@ -12,52 +12,44 @@ interface UserInfo {
 interface AuthState {
   user: UserInfo | null
   tenantId: string | null
-  accessToken: string | null
-  refreshToken: string | null
   isAuthenticated: boolean
   _hasHydrated: boolean
 
-  setTokens: (access: string, refresh: string) => void
   setUser: (user: UserInfo, tenantId: string) => void
+  markAuthenticated: () => void
   logout: () => void
   setHasHydrated: (v: boolean) => void
 }
 
+/**
+ * Auth state store — tokens are NOT stored here or in localStorage.
+ * They live exclusively in HttpOnly cookies (set by the API server) so they are
+ * invisible to JavaScript and immune to XSS token theft.
+ *
+ * Persisted to localStorage: user profile + isAuthenticated flag only.
+ * The flag is a UI hint; the server is the authority (a stale flag just
+ * causes an extra 401 that the interceptor handles gracefully).
+ */
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
       user: null,
       tenantId: null,
-      accessToken: null,
-      refreshToken: null,
       isAuthenticated: false,
       _hasHydrated: false,
 
       setHasHydrated: (v) => set({ _hasHydrated: v }),
 
-      setTokens: (access, refresh) => {
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('access_token', access)
-          localStorage.setItem('refresh_token', refresh)
-        }
-        set({ accessToken: access, refreshToken: refresh, isAuthenticated: true })
-      },
+      setUser: (user, tenantId) => set({ user, tenantId, isAuthenticated: true }),
 
-      setUser: (user, tenantId) => set({ user, tenantId }),
+      markAuthenticated: () => set({ isAuthenticated: true }),
 
-      logout: () => {
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem('access_token')
-          localStorage.removeItem('refresh_token')
-        }
+      logout: () =>
         set({
           user: null,
           tenantId: null,
-          accessToken: null,
-          refreshToken: null,
           isAuthenticated: false,
-        })
-      },
+        }),
     }),
     {
       name: 'ascenai-auth',

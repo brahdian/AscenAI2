@@ -81,15 +81,14 @@ export default function FeedbackPage() {
   }
 
   function handleExport(format: 'jsonl' | 'csv') {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : ''
     const params = new URLSearchParams({
       format,
       ...(agentFilter && { agent_id: agentFilter }),
       ...(ratingFilter && { rating: ratingFilter }),
     })
-    // Download via hidden link with auth header workaround (fetch + blob)
+    // Download via hidden link — HttpOnly auth cookie is sent automatically
     const url = `/api/v1/proxy/feedback/export?${params}`
-    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    fetch(url, { credentials: 'include' })
       .then((r) => r.blob())
       .then((blob) => {
         const a = document.createElement('a')

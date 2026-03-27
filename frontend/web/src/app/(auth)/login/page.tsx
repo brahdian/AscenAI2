@@ -19,7 +19,7 @@ type FormData = z.infer<typeof schema>
 
 export default function LoginPage() {
   const router = useRouter()
-  const { setTokens, setUser } = useAuthStore()
+  const { setUser } = useAuthStore()
   const [loading, setLoading] = useState(false)
 
   const {
@@ -32,7 +32,6 @@ export default function LoginPage() {
     setLoading(true)
     try {
       const res = await authApi.login(data)
-      setTokens(res.access_token, res.refresh_token)
       setUser(res.user, res.tenant_id)
       toast.success('Welcome back!')
       router.push('/dashboard')

@@ -22,7 +22,7 @@ type FormData = z.infer<typeof schema>
 
 export default function RegisterPage() {
   const router = useRouter()
-  const { setTokens, setUser } = useAuthStore()
+  const { setUser } = useAuthStore()
   const [loading, setLoading] = useState(false)
 
   const {
@@ -38,7 +38,6 @@ export default function RegisterPage() {
     setLoading(true)
     try {
       const res = await authApi.register(data)
-      setTokens(res.access_token, res.refresh_token)
       setUser(res.user, res.tenant_id)
       toast.success('Account created! Welcome to AscenAI.')
       router.push('/dashboard')

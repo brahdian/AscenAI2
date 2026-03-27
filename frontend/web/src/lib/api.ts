@@ -287,6 +287,66 @@ export const billingApi = {
 }
 
 // ---------------------------------------------------------------------------
+// Tools / Integrations API (via proxy → mcp-server)
+// ---------------------------------------------------------------------------
+
+export const toolsApi = {
+  /** Static catalog of all available integrations with credential field definitions */
+  catalog: () => api.get('/proxy/tools/catalog').then((r) => r.data),
+
+  /** List all tools registered for this tenant (includes their metadata/credentials) */
+  list: () => api.get('/proxy/tools').then((r) => r.data),
+
+  /** Get a single tool by name */
+  get: (name: string) => api.get(`/proxy/tools/${name}`).then((r) => r.data),
+
+  /** Register / configure a new integration tool for this tenant */
+  register: (data: {
+    name: string
+    description: string
+    category: string
+    input_schema?: Record<string, unknown>
+    output_schema?: Record<string, unknown>
+    is_builtin?: boolean
+    tool_metadata?: Record<string, unknown>
+    rate_limit_per_minute?: number
+    timeout_seconds?: number
+  }) => api.post('/proxy/tools', data).then((r) => r.data),
+
+  /** Update an existing tool's config / credentials */
+  update: (name: string, data: Record<string, unknown>) =>
+    api.patch(`/proxy/tools/${name}`, data).then((r) => r.data),
+
+  /** Delete a tool */
+  delete: (name: string) => api.delete(`/proxy/tools/${name}`),
+
+  /** Enable a tool for an agent (adds to agent.tools list) */
+  enableForAgent: (agentId: string, toolName: string, currentTools: string[]) => {
+    if (currentTools.includes(toolName)) return Promise.resolve()
+    return api.patch(`/proxy/agents/${agentId}`, { tools: [...currentTools, toolName] }).then((r) => r.data)
+  },
+
+  /** Disable a tool for an agent (removes from agent.tools list) */
+  disableForAgent: (agentId: string, toolName: string, currentTools: string[]) =>
+    api
+      .patch(`/proxy/agents/${agentId}`, { tools: currentTools.filter((t) => t !== toolName) })
+      .then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
+// PIPEDA / Compliance API
+// ---------------------------------------------------------------------------
+
+export const complianceApi = {
+  getSettings: () => api.get('/compliance/settings').then((r) => r.data),
+  updateSettings: (data: Record<string, unknown>) =>
+    api.patch('/compliance/settings', data).then((r) => r.data),
+  requestErasure: (data: { contact_identifier: string; reason?: string; requester_name?: string }) =>
+    api.post('/compliance/erasure', data).then((r) => r.data),
+  getErasureLog: () => api.get('/compliance/erasure-log').then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
 // Embed / Widget public token (future: api-keys with widget scope)
 // ---------------------------------------------------------------------------
 

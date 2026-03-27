@@ -12,6 +12,7 @@ import {
   BookOpen,
   FileText,
   Shield,
+  Wrench,
   MessageSquare,
   Send,
   CheckCircle,
@@ -215,11 +216,12 @@ export default function AgentDetailPage() {
       </div>
 
       {/* Quick nav to sub-pages */}
-      <div className="grid grid-cols-3 gap-3 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         {[
-          { href: `/dashboard/agents/${id}/playbooks`, icon: BookOpen, label: 'Playbooks', desc: 'Manage conversation playbooks' },
-          { href: `/dashboard/agents/${id}/documents`, icon: FileText, label: 'Documents', desc: 'Upload RAG knowledge base files' },
-          { href: `/dashboard/agents/${id}/guardrails`, icon: Shield, label: 'Guardrails', desc: 'Content filters & safety rules' },
+          { href: `/dashboard/agents/${id}/playbooks`, icon: BookOpen, label: 'Playbooks', desc: 'Conversation playbooks' },
+          { href: `/dashboard/agents/${id}/documents`, icon: FileText, label: 'Documents', desc: 'RAG knowledge base files' },
+          { href: `/dashboard/agents/${id}/guardrails`, icon: Shield, label: 'Guardrails', desc: 'Content filters & safety' },
+          { href: `/dashboard/agents/${id}/tools`, icon: Wrench, label: 'Tools', desc: 'Integrations & actions' },
         ].map((item) => (
           <Link
             key={item.href}

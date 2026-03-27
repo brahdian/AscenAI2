@@ -30,8 +30,28 @@ async def _get_builtin_handlers() -> dict:
     )
     from app.tools.builtin.crm import handle_crm_lookup, handle_crm_update
     from app.tools.builtin.sms import handle_send_sms
+    from app.tools.integrations.google_calendar import (
+        handle_google_calendar_check,
+        handle_google_calendar_book,
+    )
+    from app.tools.integrations.calendly import (
+        handle_calendly_availability,
+        handle_calendly_book,
+    )
+    from app.tools.integrations.stripe_tool import (
+        handle_stripe_payment_link,
+        handle_stripe_check_payment,
+    )
+    from app.tools.integrations.twilio_sms import handle_twilio_send_sms
+    from app.tools.integrations.gmail_smtp import handle_gmail_send_email
+    from app.tools.integrations.google_sheets import (
+        handle_google_sheets_read,
+        handle_google_sheets_append,
+    )
+    from app.tools.integrations.webhook import handle_custom_webhook
 
     return {
+        # Built-in demo tools
         "pizza_order": handle_pizza_order,
         "order_status": handle_order_status,
         "appointment_book": handle_appointment_book,
@@ -40,6 +60,18 @@ async def _get_builtin_handlers() -> dict:
         "crm_lookup": handle_crm_lookup,
         "crm_update": handle_crm_update,
         "send_sms": handle_send_sms,
+        # Integrations
+        "google_calendar_check": handle_google_calendar_check,
+        "google_calendar_book": handle_google_calendar_book,
+        "calendly_availability": handle_calendly_availability,
+        "calendly_book": handle_calendly_book,
+        "stripe_payment_link": handle_stripe_payment_link,
+        "stripe_check_payment": handle_stripe_check_payment,
+        "twilio_send_sms": handle_twilio_send_sms,
+        "gmail_send_email": handle_gmail_send_email,
+        "google_sheets_read": handle_google_sheets_read,
+        "google_sheets_append": handle_google_sheets_append,
+        "custom_webhook": handle_custom_webhook,
     }
 
 
@@ -227,12 +259,18 @@ class ToolExecutor:
             return response.json()
 
     async def _execute_builtin_tool(self, tool: Tool, parameters: dict) -> dict:
-        """Execute a platform built-in tool handler."""
+        """Execute a platform built-in tool handler.
+
+        Integration tools (calendar, Stripe, etc.) read their credentials from
+        tool.tool_metadata, which is set per-tenant via the tools UI.
+        """
         handlers = await _get_builtin_handlers()
         handler = handlers.get(tool.name)
         if not handler:
             raise ValueError(f"No built-in handler registered for tool '{tool.name}'")
-        return await handler(parameters, self.tenant_config)
+        # Merge tool-level metadata (credentials) with tenant_config
+        config = {**self.tenant_config, **(tool.tool_metadata or {})}
+        return await handler(parameters, config)
 
     # ------------------------------------------------------------------
     # Rate Limiting (per-tool, per-tenant)

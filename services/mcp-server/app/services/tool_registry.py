@@ -172,6 +172,7 @@ class ToolRegistry:
     async def seed_builtin_tools(self, tenant_id: str) -> list[Tool]:
         """
         Register platform-provided built-in tools for a tenant if not already present.
+        Also registers integration tool stubs (disabled by default until configured).
         Returns the list of newly created tools.
         """
         from app.tools.builtin.pizza import PIZZA_ORDER_SCHEMA, PIZZA_ORDER_OUTPUT_SCHEMA
@@ -187,6 +188,25 @@ class ToolRegistry:
             CRM_LOOKUP_OUTPUT_SCHEMA,
             CRM_UPDATE_SCHEMA,
         )
+        from app.tools.integrations.google_calendar import (
+            GOOGLE_CALENDAR_CHECK_SCHEMA,
+            GOOGLE_CALENDAR_BOOK_SCHEMA,
+        )
+        from app.tools.integrations.calendly import (
+            CALENDLY_AVAILABILITY_SCHEMA,
+            CALENDLY_BOOK_SCHEMA,
+        )
+        from app.tools.integrations.stripe_tool import (
+            STRIPE_PAYMENT_LINK_SCHEMA,
+            STRIPE_CHECK_PAYMENT_SCHEMA,
+        )
+        from app.tools.integrations.twilio_sms import TWILIO_SMS_SCHEMA
+        from app.tools.integrations.gmail_smtp import GMAIL_SEND_EMAIL_SCHEMA
+        from app.tools.integrations.google_sheets import (
+            GOOGLE_SHEETS_READ_SCHEMA,
+            GOOGLE_SHEETS_APPEND_SCHEMA,
+        )
+        from app.tools.integrations.webhook import CUSTOM_WEBHOOK_SCHEMA
 
         builtin_definitions = [
             ToolRegistration(
@@ -236,6 +256,95 @@ class ToolRegistry:
                 description="Update a customer record in the CRM",
                 category="crm",
                 input_schema=CRM_UPDATE_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            # Integrations (require credential configuration per tenant)
+            ToolRegistration(
+                name="google_calendar_check",
+                description="Check available slots in a Google Calendar",
+                category="calendar",
+                input_schema=GOOGLE_CALENDAR_CHECK_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="google_calendar_book",
+                description="Create an event in Google Calendar",
+                category="calendar",
+                input_schema=GOOGLE_CALENDAR_BOOK_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="calendly_availability",
+                description="Get available scheduling slots from Calendly",
+                category="calendar",
+                input_schema=CALENDLY_AVAILABILITY_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="calendly_book",
+                description="Schedule an appointment via Calendly",
+                category="calendar",
+                input_schema=CALENDLY_BOOK_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="stripe_payment_link",
+                description="Generate a Stripe payment link for a product or amount",
+                category="payments",
+                input_schema=STRIPE_PAYMENT_LINK_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="stripe_check_payment",
+                description="Check the status of a Stripe payment",
+                category="payments",
+                input_schema=STRIPE_CHECK_PAYMENT_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="twilio_send_sms",
+                description="Send an SMS message via Twilio",
+                category="messaging",
+                input_schema=TWILIO_SMS_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="gmail_send_email",
+                description="Send a confirmation or notification email via SMTP",
+                category="messaging",
+                input_schema=GMAIL_SEND_EMAIL_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="google_sheets_read",
+                description="Read rows from a Google Sheet",
+                category="data",
+                input_schema=GOOGLE_SHEETS_READ_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="google_sheets_append",
+                description="Append a row to a Google Sheet",
+                category="data",
+                input_schema=GOOGLE_SHEETS_APPEND_SCHEMA,
+                output_schema={"type": "object"},
+                is_builtin=True,
+            ),
+            ToolRegistration(
+                name="custom_webhook",
+                description="POST data to any custom HTTP endpoint",
+                category="custom",
+                input_schema=CUSTOM_WEBHOOK_SCHEMA,
                 output_schema={"type": "object"},
                 is_builtin=True,
             ),

@@ -170,7 +170,10 @@ class ToolExecutor:
         await self.db.flush()
 
         # 5. Execute with timeout
-        timeout = tool_call.timeout_override or tool.timeout_seconds
+        # Cap timeout_override to prevent resource exhaustion attacks (High fix)
+        _MAX_TIMEOUT = getattr(settings, "MAX_TOOL_TIMEOUT_SECONDS", 300)
+        raw_timeout = tool_call.timeout_override or tool.timeout_seconds
+        timeout = min(float(raw_timeout), float(_MAX_TIMEOUT))
         result_data: Optional[dict] = None
         error_msg: Optional[str] = None
         status = "completed"
@@ -284,7 +287,15 @@ class ToolExecutor:
         Raises RateLimitError if over limit.
         """
         if self.redis is None:
-            return  # fail open if Redis unavailable
+            # Fail-closed for high-risk tools when Redis is unavailable.
+            # For non-critical tools we fail-open to maintain availability.
+            _HIGH_RISK = {"stripe_payment_link", "stripe_check_payment",
+                          "twilio_send_sms", "gmail_send_email", "send_sms", "send_email"}
+            if tool_name in _HIGH_RISK:
+                raise RateLimitError(
+                    f"Rate-limit service unavailable — '{tool_name}' requires Redis to be online."
+                )
+            return  # fail open for low-risk tools
 
         now = time.time()
         window = 60  # 1 minute

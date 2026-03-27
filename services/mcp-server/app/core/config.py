@@ -58,6 +58,7 @@ class Settings(BaseSettings):
 
     # Tool Execution
     MAX_TOOL_EXECUTION_TIMEOUT: int = 30
+    MAX_TOOL_TIMEOUT_SECONDS: int = 300   # Hard cap on timeout_override (High fix)
     RATE_LIMIT_PER_MINUTE: int = 100
     RATE_LIMIT_WINDOW_SECONDS: int = 60
 

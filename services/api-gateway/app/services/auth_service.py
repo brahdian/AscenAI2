@@ -42,8 +42,11 @@ class AuthService:
 
     async def register(self, request: RegisterRequest, db: AsyncSession) -> TokenResponse:
         """Create a new tenant + owner user and return JWT tokens."""
+        # Normalize email to lowercase for consistent storage and lookup
+        normalized_email = request.email.lower()
+
         # 1. Check email uniqueness
-        existing = await db.execute(select(User).where(User.email == request.email))
+        existing = await db.execute(select(User).where(User.email == normalized_email))
         if existing.scalar_one_or_none():
             from fastapi import HTTPException
             raise HTTPException(status_code=409, detail="Email already registered.")
@@ -60,7 +63,7 @@ class AuthService:
             slug=slug,
             business_type=request.business_type,
             business_name=request.business_name,
-            email=request.email,
+            email=normalized_email,
             phone="",
             address={},
             timezone="UTC",
@@ -85,7 +88,7 @@ class AuthService:
         user = User(
             id=uuid.uuid4(),
             tenant_id=tenant.id,
-            email=request.email,
+            email=normalized_email,
             hashed_password=self.hash_password(request.password),
             full_name=request.full_name,
             role="owner",
@@ -108,7 +111,7 @@ class AuthService:
 
     async def login(self, request: LoginRequest, db: AsyncSession) -> TokenResponse:
         """Authenticate user and return JWT tokens."""
-        result = await db.execute(select(User).where(User.email == request.email))
+        result = await db.execute(select(User).where(User.email == request.email.lower()))
         user: User | None = result.scalar_one_or_none()
 
         from fastapi import HTTPException
@@ -171,9 +174,29 @@ class AuthService:
         """
         Generate a one-time password-reset token, store it in Redis (1-hour TTL),
         and send a reset email. Always succeeds silently to prevent email enumeration.
+        Rate-limited to 3 requests per email per hour to prevent abuse.
         """
         import hashlib
-        result = await db.execute(select(User).where(User.email == email))
+        import asyncio as _asyncio
+        from fastapi import HTTPException as _HTTPException
+
+        # Rate-limit: max 3 reset requests per email per hour
+        if redis:
+            rate_key = f"pwd_reset_rate:{email.lower()}"
+            try:
+                count = await redis.incr(rate_key)
+                if count == 1:
+                    await redis.expire(rate_key, 3600)
+                if count > 3:
+                    # Return silently to avoid revealing the limit exists (prevents timing attacks)
+                    logger.warning("password_reset_rate_limited", email_hash=hashlib.sha256(email.encode()).hexdigest()[:8])
+                    return
+            except Exception:
+                pass  # Redis failure — allow through to avoid availability regression
+
+        # Normalize email before DB lookup
+        normalized_email = email.lower()
+        result = await db.execute(select(User).where(User.email == normalized_email))
         user: User | None = result.scalar_one_or_none()
         if not user or not user.is_active:
             return  # Silent success — don't reveal whether the email exists

@@ -101,3 +101,8 @@ class WebhookResponse(BaseModel):
     created_at: str
 
     model_config = {"from_attributes": True}
+
+
+class WebhookCreatedResponse(WebhookResponse):
+    """Returned only at creation time — includes the signing secret (one-time show)."""
+    secret: str

@@ -147,16 +147,21 @@ async def chat_stream(
     )
 
     async def event_generator():
+        import json as _json
         try:
             async for event in orchestrator.stream_response(
                 agent=agent, session=session, user_message=body.message
             ):
-                import json
-                yield f"data: {json.dumps({'type': event.type, 'data': event.data, 'session_id': event.session_id})}\n\n"
-            await db.commit()
+                yield f"data: {_json.dumps({'type': event.type, 'data': event.data, 'session_id': event.session_id})}\n\n"
         except Exception as exc:
-            import json
             logger.error("stream_error", session_id=str(session.id), error=str(exc))
-            yield f"data: {json.dumps({'type': 'error', 'data': 'An internal error occurred', 'session_id': str(session.id)})}\n\n"
+            yield f"data: {_json.dumps({'type': 'error', 'data': 'An internal error occurred', 'session_id': str(session.id)})}\n\n"
+        finally:
+            # Always commit — whether the stream succeeded or raised an exception.
+            # This ensures partial writes (user message, session state) are persisted.
+            try:
+                await db.commit()
+            except Exception as commit_exc:
+                logger.error("stream_commit_error", session_id=str(session.id), error=str(commit_exc))
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

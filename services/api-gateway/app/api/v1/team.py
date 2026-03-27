@@ -75,14 +75,23 @@ def _user_to_response(user: User) -> TeamMemberResponse:
 async def list_team(
     request: Request,
     db: AsyncSession = Depends(get_db),
+    page: int = 1,
+    limit: int = 50,
 ):
-    """List all users in the tenant. Requires owner or admin role."""
+    """List users in the tenant. Requires owner or admin role. Paginated."""
     tenant_id, _ = _require_management(request)
+
+    if page < 1:
+        page = 1
+    limit = min(max(limit, 1), 200)  # clamp 1–200
+    offset = (page - 1) * limit
 
     result = await db.execute(
         select(User)
         .where(User.tenant_id == uuid.UUID(tenant_id))
         .order_by(User.created_at.asc())
+        .limit(limit)
+        .offset(offset)
     )
     return [_user_to_response(u) for u in result.scalars().all()]
 
@@ -106,9 +115,15 @@ async def invite_user(
             detail=f"Invalid role '{body.role}'. Valid roles: {', '.join(sorted(_VALID_ROLES))}",
         )
 
-    # Check if email already exists in this tenant
+    # Normalize email to lowercase before any comparison or storage
+    normalized_email = body.email.lower()
+
+    # Check uniqueness WITHIN THIS TENANT ONLY (prevents cross-tenant enumeration)
     existing = await db.execute(
-        select(User).where(User.email == body.email)
+        select(User).where(
+            User.email == normalized_email,
+            User.tenant_id == uuid.UUID(tenant_id),
+        )
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A user with this email already exists.")
@@ -119,7 +134,7 @@ async def invite_user(
     new_user = User(
         id=uuid.uuid4(),
         tenant_id=uuid.UUID(tenant_id),
-        email=body.email,
+        email=normalized_email,
         hashed_password=auth_service.hash_password(temp_password),
         full_name=body.full_name,
         role=body.role,

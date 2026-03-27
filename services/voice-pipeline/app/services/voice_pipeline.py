@@ -424,9 +424,31 @@ class VoicePipeline:
         if not spoken_text.strip():
             return
 
-        voice = "alloy"
         try:
-            async for audio_chunk in self.tts.synthesize_stream(spoken_text, voice_id=voice):
+            provider = settings.TTS_PROVIDER.lower()
+            if provider == "cartesia":
+                audio_iter = self.tts.synthesize_cartesia_stream(
+                    spoken_text,
+                    voice_id=settings.CARTESIA_VOICE_ID,
+                )
+            elif provider == "google":
+                # Google Cloud TTS: batch call, yield the whole buffer as one chunk
+                audio_bytes = await self._tts_google_cloud(spoken_text)
+                async def _google_iter():
+                    if audio_bytes:
+                        yield audio_bytes
+                audio_iter = _google_iter()
+            elif provider == "elevenlabs":
+                audio_iter = self.tts.synthesize_elevenlabs(
+                    spoken_text,
+                    voice_id="21m00Tcm4TlvDq8ikWAM",
+                    model_id="eleven_turbo_v2_5",
+                )
+            else:
+                # Default: OpenAI TTS
+                audio_iter = self.tts.synthesize_stream(spoken_text, voice_id="alloy")
+
+            async for audio_chunk in audio_iter:
                 if state.interrupt_tts:
                     return
                 if websocket.client_state == WebSocketState.CONNECTED:

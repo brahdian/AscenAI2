@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     GEMINI_STT_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
 
     # TTS config
-    TTS_PROVIDER: str = "google"  # "google" | "openai" | "elevenlabs"
+    # "cartesia" is the recommended default: cheapest ($0.065/1M chars) + <100ms latency
+    TTS_PROVIDER: str = "cartesia"  # "cartesia" | "google" | "elevenlabs" | "openai"
+    CARTESIA_API_KEY: str = ""
+    CARTESIA_VOICE_ID: str = "a0e99841-438c-4a64-b679-ae501e7d6091"  # neutral English
     ELEVENLABS_API_KEY: str = ""
     GOOGLE_TTS_VOICE: str = "en-US-Neural2-D"
     GOOGLE_APPLICATION_CREDENTIALS: str = ""  # Path to GCP service account JSON

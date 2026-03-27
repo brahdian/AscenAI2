@@ -216,6 +216,72 @@ class TTSService:
             raise
 
     # ------------------------------------------------------------------
+    # Cartesia Sonic streaming synthesis
+    # ------------------------------------------------------------------
+
+    async def synthesize_cartesia_stream(
+        self,
+        text: str,
+        voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091",
+        model_id: str = "sonic-english",
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Cartesia Sonic streaming TTS — cheapest real-time option (~$0.065/1M chars).
+        First audio byte typically arrives in <100 ms.
+
+        Args:
+            text:     Text to synthesize.
+            voice_id: Cartesia voice UUID. Defaults to a neutral English voice.
+            model_id: "sonic-english" (default) or "sonic-multilingual".
+        """
+        if not settings.CARTESIA_API_KEY:
+            raise RuntimeError(
+                "CARTESIA_API_KEY is not configured. "
+                "Get one at https://cartesia.ai and set it in the environment."
+            )
+
+        if not text.strip():
+            return
+
+        url = "https://api.cartesia.ai/tts/bytes"
+        headers = {
+            "X-API-Key": settings.CARTESIA_API_KEY,
+            "Cartesia-Version": "2024-06-10",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model_id": model_id,
+            "transcript": text,
+            "voice": {"mode": "id", "id": voice_id},
+            "output_format": {
+                "container": "mp3",
+                "encoding": "mp3",
+                "sample_rate": 44100,
+            },
+            "stream": True,
+        }
+
+        logger.info(
+            "cartesia_tts_stream_start",
+            chars=len(text),
+            voice_id=voice_id,
+            model_id=model_id,
+        )
+
+        client = self._get_http_client()
+        try:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+
+            logger.info("cartesia_tts_stream_complete", voice_id=voice_id)
+        except Exception as exc:
+            logger.error("cartesia_tts_stream_error", error=str(exc))
+            raise
+
+    # ------------------------------------------------------------------
     # Storage helpers
     # ------------------------------------------------------------------
 

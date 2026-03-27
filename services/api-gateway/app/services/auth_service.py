@@ -61,7 +61,7 @@ class AuthService:
         # Make slug unique by appending random suffix if needed
         slug = await self._unique_slug(slug, db)
 
-        plan = "professional"   # all new tenants start on professional trial
+        plan = "professional"
         tenant = Tenant(
             id=uuid.uuid4(),
             name=request.business_name,
@@ -75,7 +75,6 @@ class AuthService:
             plan=plan,
             plan_limits=PLAN_LIMITS[plan],
             is_active=True,
-            trial_ends_at=_utcnow() + timedelta(days=14),
             metadata_={},
         )
         db.add(tenant)
@@ -452,8 +451,7 @@ class AuthService:
             html_body = f"""
             <html><body>
             <h1>Welcome to AscenAI, {full_name}!</h1>
-            <p>Your account has been created. You're on the <strong>Starter</strong> plan
-            with a 14-day free trial.</p>
+            <p>Your account has been created. You're on the <strong>Professional</strong> plan.</p>
             <p>Get started at <a href="{settings.FRONTEND_URL}">{settings.FRONTEND_URL}</a></p>
             </body></html>
             """

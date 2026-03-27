@@ -323,6 +323,16 @@ class Orchestrator:
         # TC-C01: Strip role/system injection tokens from user input FIRST
         user_message = self._sanitize_user_message(user_message)
 
+        # ── Escalation info-collection state machine ──────────────────────────
+        # When the bot is in the middle of collecting name/phone for a callback,
+        # every incoming message is handled by the state machine, not the LLM.
+        session_meta = dict(session.metadata or {})
+        escalation_state = session_meta.get("_escalation_state")
+        if escalation_state:
+            return await self._handle_escalation_info_collection(
+                agent, session, user_message, start_time, escalation_state, session_meta
+            )
+
         # TC-E01: Emergency bypass — hardcoded response for health agents, no LLM
         emergency_response = self._check_emergency(user_message, agent)
         if emergency_response:
@@ -1154,37 +1164,68 @@ class Orchestrator:
         user_message: str,
         start_time: float,
     ) -> ChatResponse:
-        """Build a response when immediate escalation is needed."""
+        """Build a channel-aware escalation response.
+
+        Routing logic:
+          voice  → phone_transfer (if number configured) or offer_chat_switch
+          text/web, chat_enabled → chat_handoff
+          text/web, no chat     → start multi-turn info collection (collect_info)
+        """
         escalation_config = agent.escalation_config or {}
         escalation_number = escalation_config.get("escalation_number", "")
+        chat_enabled = bool(escalation_config.get("chat_enabled", False))
+        chat_agent_name = escalation_config.get("chat_agent_name", "our support team")
+        channel = (session.channel or "text").lower()
 
-        if escalation_number:
+        # ── Voice channel ──────────────────────────────────────────────────────
+        if channel == "voice":
+            if escalation_number:
+                message = "Transferring you to a human agent now — please hold."
+                action = "phone_transfer"
+                session.status = "escalated"
+            elif chat_enabled:
+                message = (
+                    "I don't have a direct phone transfer set up, but I can switch you "
+                    "to our live chat support. Would you like me to do that?"
+                )
+                action = "offer_chat_switch"
+                # Don't mark escalated yet — waiting for user to confirm
+            else:
+                message = "Connecting you with a human agent now — please hold."
+                action = "phone_transfer"
+                session.status = "escalated"
+
+        # ── Text / web — chat queue available ─────────────────────────────────
+        elif chat_enabled:
             message = (
-                f"I'll connect you with a human agent right away. "
-                f"You can also reach them directly at {escalation_number}."
+                f"I'm transferring you to {chat_agent_name} right now. "
+                f"One of our agents will be with you shortly."
             )
-        else:
-            message = "I'll connect you with a human agent right away. Please hold on."
+            action = "chat_handoff"
+            session.status = "escalated"
 
-        session.status = "escalated"
+        # ── Text / web — no chat queue: collect contact info for callback ─────
+        else:
+            metadata = dict(session.metadata or {})
+            metadata["_escalation_state"] = "collecting_info"
+            session.metadata = metadata
+            message = (
+                "I'd be happy to connect you with a human agent. "
+                "To arrange a callback, could you share your name and phone number?"
+            )
+            action = "collect_info"
+            # Status stays active while we're collecting info
+
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
-        # Save the interaction
         self.db.add(Message(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            role="user",
-            content=user_message,
-            tokens_used=0,
-            latency_ms=0,
+            session_id=session.id, tenant_id=session.tenant_id,
+            role="user", content=user_message, tokens_used=0, latency_ms=0,
         ))
         self.db.add(Message(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            role="assistant",
-            content=message,
-            tokens_used=0,
-            latency_ms=latency_ms,
+            session_id=session.id, tenant_id=session.tenant_id,
+            role="assistant", content=message,
+            tokens_used=0, latency_ms=latency_ms,
         ))
 
         return ChatResponse(
@@ -1192,7 +1233,127 @@ class Orchestrator:
             message=message,
             tool_calls_made=[],
             suggested_actions=[],
-            escalate_to_human=True,
+            escalate_to_human=action not in ("collect_info", "offer_chat_switch"),
+            escalation_action=action,
+            latency_ms=latency_ms,
+            tokens_used=0,
+        )
+
+    # ------------------------------------------------------------------
+    # Multi-turn escalation info-collection (callback flow)
+    # ------------------------------------------------------------------
+
+    async def _handle_escalation_info_collection(
+        self,
+        agent: Agent,
+        session: AgentSession,
+        user_message: str,
+        start_time: float,
+        state: str,
+        metadata: dict,
+    ) -> ChatResponse:
+        """Handle the multi-turn name/phone collection flow for phone-callback escalation.
+
+        State machine:
+          collecting_info → (have name+phone?) → confirming_info
+          confirming_info → (yes) → phone_callback_scheduled  |  (no) → cancel
+        """
+        import re
+
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        action: Optional[str] = None
+
+        if state == "collecting_info":
+            # Extract phone number (7+ contiguous digits with optional separators)
+            phone_match = re.search(r'(\+?[\d][\d\s\-\(\)\.]{5,}\d)', user_message)
+            phone = phone_match.group(1).strip() if phone_match else None
+
+            # Name is everything before the phone number (or whole message if no phone)
+            raw_name = user_message[:phone_match.start()].strip().rstrip(',') if phone_match else user_message.strip()
+            # Accept as name only if it looks reasonable (2–60 chars, no digits dominating)
+            name = raw_name if raw_name and 2 <= len(raw_name) <= 60 and not re.fullmatch(r'[\d\s\-\(\)\+]+', raw_name) else None
+
+            if name and phone:
+                new_meta = {**metadata, "_escalation_state": "confirming_info",
+                            "_escalation_name": name, "_escalation_phone": phone}
+                session.metadata = new_meta
+                message = (
+                    f"Got it! Just to confirm I have the right details:\n"
+                    f"• Name: {name}\n"
+                    f"• Phone: {phone}\n\n"
+                    f"Shall I go ahead and arrange the callback? (Yes / No)"
+                )
+                action = "confirm_info"
+            elif phone and not name:
+                new_meta = {**metadata, "_escalation_phone": phone}
+                session.metadata = new_meta
+                message = "Thanks! And could I get your name so the agent knows who they're calling?"
+                action = "collect_info"
+            elif name and not phone:
+                new_meta = {**metadata, "_escalation_name": name}
+                session.metadata = new_meta
+                message = f"Thanks, {name}! And what's the best phone number to reach you?"
+                action = "collect_info"
+            else:
+                # Couldn't parse anything useful — re-ask
+                message = (
+                    "I just need your name and phone number to arrange a callback. "
+                    "For example: 'Alex Johnson, +1 555-123-4567'"
+                )
+                action = "collect_info"
+
+        elif state == "confirming_info":
+            name = metadata.get("_escalation_name", "")
+            phone = metadata.get("_escalation_phone", "")
+            confirmed = any(
+                w in user_message.lower()
+                for w in ("yes", "yeah", "yep", "yup", "correct", "sure", "ok", "okay", "proceed", "confirm", "please")
+            )
+
+            if confirmed:
+                # Clean up escalation state keys
+                clean_meta = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
+                session.metadata = clean_meta
+                session.status = "escalated"
+
+                escalation_number = (agent.escalation_config or {}).get("escalation_number", "")
+                message = (
+                    f"Perfect — I've notified our team. An agent will call you "
+                    f"at {phone} shortly, {name}."
+                )
+                if escalation_number:
+                    message += f"\n\nYou can also reach us directly at {escalation_number}."
+                action = "phone_callback_scheduled"
+            else:
+                # Cancelled
+                clean_meta = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
+                session.metadata = clean_meta
+                message = "No problem — I've cancelled that. Is there anything else I can help you with?"
+                action = None
+
+        else:
+            # Unknown state — reset and escalate generically
+            session.metadata = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
+            session.status = "escalated"
+            message = "I'll connect you with a human agent right away. Please hold."
+            action = "phone_transfer"
+
+        self.db.add(Message(
+            session_id=session.id, tenant_id=session.tenant_id,
+            role="user", content=user_message, tokens_used=0, latency_ms=0,
+        ))
+        self.db.add(Message(
+            session_id=session.id, tenant_id=session.tenant_id,
+            role="assistant", content=message, tokens_used=0, latency_ms=latency_ms,
+        ))
+
+        return ChatResponse(
+            session_id=session.id,
+            message=message,
+            tool_calls_made=[],
+            suggested_actions=[],
+            escalate_to_human=action == "phone_callback_scheduled",
+            escalation_action=action,
             latency_ms=latency_ms,
             tokens_used=0,
         )

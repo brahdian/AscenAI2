@@ -27,6 +27,14 @@ class ChatResponse(BaseModel):
     tool_calls_made: list[dict] = Field(default_factory=list)
     suggested_actions: list[str] = Field(default_factory=list)
     escalate_to_human: bool = False
+    # Escalation routing hint for the client:
+    #   "phone_transfer"         – voice call: client should initiate transfer to escalation_number
+    #   "offer_chat_switch"      – voice call: no phone configured, offer chat instead
+    #   "chat_handoff"           – text/web: route to live-chat agent queue
+    #   "collect_info"           – text/web: asking user for name + phone
+    #   "confirm_info"           – text/web: confirming collected details before scheduling
+    #   "phone_callback_scheduled" – callback request registered
+    escalation_action: Optional[str] = None
     latency_ms: int
     tokens_used: int
 

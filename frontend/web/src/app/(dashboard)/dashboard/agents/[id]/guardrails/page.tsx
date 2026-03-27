@@ -7,7 +7,7 @@ import { guardrailsApi, agentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
 import {
-  Shield, ChevronLeft, Plus, X, AlertTriangle, Eye, EyeOff,
+  Shield, ChevronLeft, ChevronRight, Plus, X, AlertTriangle, Eye, EyeOff,
   CheckCircle2, Save, Trash2, Info,
 } from 'lucide-react'
 
@@ -267,6 +267,17 @@ export default function GuardrailsPage() {
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
+      {/* Breadcrumbs */}
+      <nav className="flex items-center gap-1.5 text-sm text-gray-400 mb-5">
+        <Link href="/dashboard" className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">Dashboard</Link>
+        <ChevronRight size={13} />
+        <Link href="/dashboard/agents" className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">Agents</Link>
+        <ChevronRight size={13} />
+        <Link href={`/dashboard/agents/${id}`} className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">{agent?.name || '…'}</Link>
+        <ChevronRight size={13} />
+        <span className="text-gray-600 dark:text-gray-300">Guardrails</span>
+      </nav>
+
       {/* Header */}
       <div className="flex items-center gap-3 mb-2">
         <Link

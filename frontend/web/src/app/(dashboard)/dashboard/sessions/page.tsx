@@ -1,13 +1,15 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { sessionsApi, agentsApi, feedbackApi } from '@/lib/api'
+import Link from 'next/link'
 import {
   MessageSquare,
   Clock,
   ChevronDown,
   ChevronUp,
+  ChevronRight,
   ThumbsUp,
   ThumbsDown,
   User,
@@ -15,6 +17,7 @@ import {
   Wrench,
   X,
   Filter,
+  PenLine,
 } from 'lucide-react'
 import { formatDistanceToNow, format } from 'date-fns'
 
@@ -33,15 +36,26 @@ function FeedbackModal({
   message,
   agentId,
   sessionId,
+  focusCorrection = false,
   onClose,
   onSubmitted,
 }: {
   message: any
   agentId: string
   sessionId: string
+  focusCorrection?: boolean
   onClose: () => void
   onSubmitted: () => void
 }) {
+  const correctionRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    if (focusCorrection && correctionRef.current) {
+      correctionRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      correctionRef.current.focus()
+    }
+  }, [focusCorrection])
+
   const [rating, setRating] = useState<'positive' | 'negative' | null>(
     message.feedback?.rating ?? null
   )
@@ -149,6 +163,7 @@ function FeedbackModal({
             What should it have said? <span className="normal-case text-gray-400">(trains the bot)</span>
           </label>
           <textarea
+            ref={correctionRef}
             value={idealResponse}
             onChange={(e) => setIdealResponse(e.target.value)}
             placeholder="Write the ideal response here — it will be used as a training example for future conversations…"
@@ -202,7 +217,11 @@ function MessageBubble({
   sessionId: string
 }) {
   const [showFeedback, setShowFeedback] = useState(false)
+  const [focusCorrection, setFocusCorrection] = useState(false)
   const qc = useQueryClient()
+
+  const openRate = () => { setFocusCorrection(false); setShowFeedback(true) }
+  const openCorrect = () => { setFocusCorrection(true); setShowFeedback(true) }
   const isUser = message.role === 'user'
   const isAssistant = message.role === 'assistant'
 
@@ -236,30 +255,55 @@ function MessageBubble({
               <span className="text-xs text-gray-400">{message.latency_ms}ms</span>
             )}
 
-            {/* Feedback button for assistant messages */}
+            {/* Feedback / correction actions for assistant messages */}
             {isAssistant && (
-              <div className="flex items-center gap-1 ml-1">
+              <div className="flex items-center gap-1.5 ml-1">
                 {message.feedback ? (
-                  <button
-                    onClick={() => setShowFeedback(true)}
-                    title={message.feedback.ideal_response ? 'Has correction — click to edit' : 'Click to edit feedback'}
-                    className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-opacity hover:opacity-80 ${
-                      message.feedback.rating === 'positive'
-                        ? 'bg-green-100 text-green-600 dark:bg-green-900/30'
-                        : 'bg-red-100 text-red-600 dark:bg-red-900/30'
-                    }`}>
-                    {message.feedback.rating === 'positive' ? <ThumbsUp size={11} /> : <ThumbsDown size={11} />}
-                    {message.feedback.labels?.join(', ') || message.feedback.rating}
-                    {message.feedback.ideal_response && <span className="ml-1 text-violet-500">✎</span>}
-                  </button>
+                  <>
+                    {/* Existing feedback badge */}
+                    <button
+                      onClick={openRate}
+                      title="Click to edit feedback"
+                      className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-opacity hover:opacity-80 ${
+                        message.feedback.rating === 'positive'
+                          ? 'bg-green-100 text-green-600 dark:bg-green-900/30'
+                          : 'bg-red-100 text-red-600 dark:bg-red-900/30'
+                      }`}>
+                      {message.feedback.rating === 'positive' ? <ThumbsUp size={11} /> : <ThumbsDown size={11} />}
+                      {message.feedback.labels?.join(', ') || message.feedback.rating}
+                    </button>
+                    {/* Correction indicator / edit button */}
+                    <button
+                      onClick={openCorrect}
+                      title={message.feedback.ideal_response ? 'Correction added — click to edit' : 'Add a correction the bot will learn from'}
+                      className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-colors ${
+                        message.feedback.ideal_response
+                          ? 'bg-violet-100 text-violet-600 dark:bg-violet-900/30 dark:text-violet-300'
+                          : 'text-gray-400 hover:text-violet-500 hover:bg-violet-50 dark:hover:bg-violet-900/20'
+                      }`}>
+                      <PenLine size={11} />
+                      {message.feedback.ideal_response ? 'Corrected' : 'Add correction'}
+                    </button>
+                  </>
                 ) : (
-                  <button
-                    onClick={() => setShowFeedback(true)}
-                    className="text-xs text-gray-400 hover:text-violet-500 transition-colors flex items-center gap-1"
-                  >
-                    <ThumbsUp size={11} />
-                    Rate
-                  </button>
+                  <>
+                    <button
+                      onClick={openRate}
+                      className="text-xs text-gray-400 hover:text-green-600 transition-colors flex items-center gap-1"
+                      title="Rate this response"
+                    >
+                      <ThumbsUp size={11} />
+                      Rate
+                    </button>
+                    <button
+                      onClick={openCorrect}
+                      className="text-xs text-gray-400 hover:text-violet-500 transition-colors flex items-center gap-1"
+                      title="Add a correction the bot will learn from"
+                    >
+                      <PenLine size={11} />
+                      Correct
+                    </button>
+                  </>
                 )}
               </div>
             )}
@@ -272,6 +316,7 @@ function MessageBubble({
           message={message}
           agentId={agentId}
           sessionId={sessionId}
+          focusCorrection={focusCorrection}
           onClose={() => setShowFeedback(false)}
           onSubmitted={() => qc.invalidateQueries({ queryKey: ['session-detail', sessionId] })}
         />
@@ -379,9 +424,14 @@ export default function SessionsPage() {
   return (
     <div className="p-8">
       <div className="mb-6">
+        <nav className="flex items-center gap-1.5 text-sm text-gray-400 mb-3">
+          <Link href="/dashboard" className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">Dashboard</Link>
+          <ChevronRight size={13} />
+          <span className="text-gray-600 dark:text-gray-300">Chat History</span>
+        </nav>
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Chat History</h1>
         <p className="text-gray-500 dark:text-gray-400 mt-1">
-          Browse conversations, read messages, and submit feedback for training.
+          Browse conversations, expand a session to review messages, and click any bot reply to rate it or add a correction the bot will learn from.
         </p>
       </div>
 

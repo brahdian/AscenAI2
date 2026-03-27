@@ -50,10 +50,11 @@ export default function AgentDetailPage() {
   const [chatLoading, setChatLoading] = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
 
-  const { data: agent, isLoading } = useQuery({
+  const { data: agent, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['agent', id],
     queryFn: () => agentsApi.get(id),
     enabled: !!id,
+    retry: 1,
   })
 
   useEffect(() => {
@@ -124,6 +125,33 @@ export default function AgentDetailPage() {
       <div className="p-8 animate-pulse space-y-4">
         <div className="h-6 bg-gray-200 dark:bg-gray-800 rounded w-48" />
         <div className="h-32 bg-gray-200 dark:bg-gray-800 rounded-xl" />
+      </div>
+    )
+  }
+
+  if (isError) {
+    const status = (error as any)?.response?.status
+    return (
+      <div className="p-8 text-center">
+        <p className="text-gray-700 dark:text-gray-300 font-medium mb-1">
+          {status === 404 ? 'Agent not found.' : 'Could not load agent.'}
+        </p>
+        <p className="text-sm text-gray-400 mb-4">
+          {status === 404
+            ? 'This agent may have been deleted or you may not have access to it.'
+            : 'There was a problem connecting to the server. Check that the backend services are running.'}
+        </p>
+        <div className="flex items-center justify-center gap-3">
+          <button
+            onClick={() => refetch()}
+            className="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm hover:bg-violet-700 transition-colors"
+          >
+            Retry
+          </button>
+          <Link href="/dashboard/agents" className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            Back to Agents
+          </Link>
+        </div>
       </div>
     )
   }

@@ -71,8 +71,8 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
-    # CORS
-    ALLOWED_ORIGINS: list[str] = ["*"]
+    # CORS — default to localhost for dev; set ALLOWED_ORIGINS in prod
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:3001"]
 
     # Observability
     SENTRY_DSN: str = ""

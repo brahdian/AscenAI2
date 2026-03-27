@@ -19,6 +19,9 @@ router = APIRouter(prefix="/billing")
 # ---------------------------------------------------------------------------
 
 PLANS: dict[str, dict] = {
+    # Overage rates are set well above COGS:
+    # Real COGS per message ~$0.000185 (Gemini 2.5 Flash Lite @$0.10/$0.40 per 1M tok)
+    # Real COGS per voice minute ~$0.026 (STT $0.14 + LLM $0.057 + TTS $0.72 + Twilio $0.0085 per min)
     "starter": {
         "display_name": "Starter",
         "price_per_agent": 49.00,
@@ -27,7 +30,7 @@ PLANS: dict[str, dict] = {
         "playbooks_per_agent": 2,
         "rag_documents": 10,
         "team_seats": 1,
-        "overage_per_message": 0.020,
+        "overage_per_message": 0.015,
         "overage_per_voice_minute": 0.00,  # voice not available on starter
         "voice_enabled": False,
     },
@@ -39,8 +42,8 @@ PLANS: dict[str, dict] = {
         "playbooks_per_agent": 10,
         "rag_documents": 100,
         "team_seats": 5,
-        "overage_per_message": 0.020,
-        "overage_per_voice_minute": 0.20,
+        "overage_per_message": 0.015,
+        "overage_per_voice_minute": 0.15,
         "voice_enabled": True,
     },
     "business": {
@@ -51,8 +54,8 @@ PLANS: dict[str, dict] = {
         "playbooks_per_agent": None,   # unlimited
         "rag_documents": 500,
         "team_seats": 20,
-        "overage_per_message": 0.015,
-        "overage_per_voice_minute": 0.18,
+        "overage_per_message": 0.012,
+        "overage_per_voice_minute": 0.12,
         "voice_enabled": True,
     },
     "enterprise": {

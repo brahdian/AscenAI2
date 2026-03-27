@@ -259,38 +259,39 @@ export default function PricingPage() {
             <thead>
               <tr className="border-b border-white/5">
                 <th className="text-left px-5 py-3 text-gray-400 font-medium">Component</th>
+                <th className="text-right px-5 py-3 text-gray-400 font-medium">Unit rate</th>
                 <th className="text-right px-5 py-3 text-gray-400 font-medium">Est. cost</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/5">
               {[
-                ['Gemini 2.5 Flash Lite — chat LLM', '$11.25'],
-                ['Gemini 2.5 Flash Lite — voice LLM', '$1.01'],
-                ['Gemini audio STT (300 min)', '$0.58'],
-                ['Google Cloud TTS Neural2 (300 min)', '$2.16'],
-                ['Twilio inbound voice (300 min + number)', '$3.70'],
-                ['Infrastructure (shared)', '$5.00'],
-                ['Support, tooling, overhead', '~$3.00'],
-              ].map(([label, cost]) => (
+                ['Gemini 2.5 Flash Lite — chat LLM (10k msgs)', '$0.10 in / $0.40 out per 1M tok', '$1.85'],
+                ['Gemini 2.5 Flash Lite — voice LLM (300 min)', '$0.10 in / $0.40 out per 1M tok', '$0.17'],
+                ['Gemini audio STT (300 min)', '$0.30 / 1M tokens · 25 tok/sec', '$0.14'],
+                ['Google Cloud TTS Neural2 (300 min)', '$16 / 1M characters', '$2.16'],
+                ['Twilio inbound voice (300 min + number)', '$0.0085 / min + $1.15 / mo', '$3.70'],
+                ['Infrastructure — hosting, DB, Qdrant, Redis', 'shared across tenants', '$1.50'],
+              ].map(([label, rate, cost]) => (
                 <tr key={label}>
                   <td className="px-5 py-3 text-gray-300">{label}</td>
+                  <td className="px-5 py-3 text-right text-gray-500 text-xs">{rate}</td>
                   <td className="px-5 py-3 text-right text-gray-300 font-mono">{cost}</td>
                 </tr>
               ))}
               <tr className="bg-white/[0.03]">
-                <td className="px-5 py-3 font-semibold text-white">Our COGS</td>
-                <td className="px-5 py-3 text-right font-semibold text-white font-mono">~$26.70</td>
+                <td className="px-5 py-3 font-semibold text-white" colSpan={2}>API + infra COGS</td>
+                <td className="px-5 py-3 text-right font-semibold text-white font-mono">~$9.52</td>
               </tr>
               <tr className="bg-violet-500/10">
-                <td className="px-5 py-3 text-violet-300">Your plan price</td>
+                <td className="px-5 py-3 text-violet-300" colSpan={2}>Your plan price</td>
                 <td className="px-5 py-3 text-right text-violet-300 font-mono font-bold">$149</td>
               </tr>
             </tbody>
           </table>
         </div>
         <p className="text-xs text-gray-500 text-center mt-3">
-          Costs shown are estimates based on published API pricing. Actual costs vary by usage pattern.
-          All API costs are absorbed in the plan price — you don&apos;t pay API providers separately.
+          The difference funds engineering, support, security, and reliability — not hidden API markups.
+          All third-party API costs are absorbed in your plan price.
         </p>
       </section>
 

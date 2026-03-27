@@ -20,6 +20,7 @@ import {
   ChevronRight,
   ExternalLink,
   PhoneCall,
+  Mic,
 } from 'lucide-react'
 
 type TabId = 'overview' | 'test'
@@ -224,6 +225,7 @@ export default function AgentDetailPage() {
           { href: `/dashboard/agents/${id}/guardrails`, icon: Shield, label: 'Guardrails', desc: 'Content filters & safety' },
           { href: `/dashboard/agents/${id}/tools`, icon: Wrench, label: 'Tools', desc: 'Integrations & actions' },
           { href: `/dashboard/agents/${id}/escalation`, icon: PhoneCall, label: 'Escalation', desc: 'Human handoff & connectors' },
+          { href: `/dashboard/agents/${id}/greeting`, icon: Mic, label: 'Greeting', desc: 'Voice greeting & language' },
         ].map((item) => (
           <Link
             key={item.href}

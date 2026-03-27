@@ -61,6 +61,18 @@ async def init_db() -> None:
                 "ADD COLUMN IF NOT EXISTS tool_corrections JSONB"
             )
         )
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE agents "
+                "ADD COLUMN IF NOT EXISTS greeting_message TEXT"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE agents "
+                "ADD COLUMN IF NOT EXISTS voice_greeting_url VARCHAR(500)"
+            )
+        )
     logger.info("database_initialized")
 
 

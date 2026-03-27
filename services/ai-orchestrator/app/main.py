@@ -1,7 +1,9 @@
 import asyncio
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import sentry_sdk
@@ -9,6 +11,7 @@ import structlog
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
@@ -143,6 +146,15 @@ app.include_router(playbook_router.router, prefix="/api/v1/agents", tags=["playb
 app.include_router(guardrails_router.router, prefix="/api/v1/agents", tags=["guardrails"])
 app.include_router(learning_router.router, prefix="/api/v1/agents", tags=["learning"])
 app.include_router(documents_router.router, prefix="/api/v1/agents", tags=["documents"])
+
+# Serve pre-recorded voice greetings (cost-free per-call playback)
+_GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))
+_GREETING_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/agent-greetings",
+    StaticFiles(directory=str(_GREETING_AUDIO_DIR)),
+    name="agent-greetings",
+)
 
 # Prometheus metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")

@@ -141,6 +141,9 @@ class VoicePipeline:
         )
 
         try:
+            # Play pre-recorded greeting (zero TTS cost per call) or TTS-synthesise
+            # the text greeting before entering the listening loop.
+            await self._play_greeting(websocket, state)
             await self._run_voice_loop(websocket, state)
         except WebSocketDisconnect:
             logger.info("voice_session_disconnected", session_id=session_id)
@@ -407,6 +410,73 @@ class VoicePipeline:
             await self._tts_and_send(sentence_buffer, websocket, state)
 
         await self._send_json(websocket, {"type": "response_complete"})
+
+    # ------------------------------------------------------------------
+    # Greeting playback (pre-recorded audio saves TTS cost on every call)
+    # ------------------------------------------------------------------
+
+    async def _play_greeting(self, websocket: WebSocket, state: SessionState) -> None:
+        """
+        Fetch the agent's greeting from the orchestrator and play it.
+
+        Cost-saving design:
+          * If agent.voice_greeting_url is set → stream the static audio file
+            directly (no TTS synthesis → $0 TTS cost per call; billed as storage).
+          * Else if agent.greeting_message is set → TTS-synthesise it once per session.
+          * Else → skip silently.
+        """
+        try:
+            url = f"{self.orchestrator_url}/api/v1/agents/{state.agent_id}"
+            headers = {"X-Tenant-ID": state.tenant_id}
+            client = await self._get_http_client()
+            resp = await client.get(url, headers=headers, timeout=5.0)
+            if resp.status_code != 200:
+                return
+            agent_data = resp.json()
+
+            voice_greeting_url: str = agent_data.get("voice_greeting_url") or ""
+            greeting_text: str = agent_data.get("greeting_message") or ""
+
+            if voice_greeting_url:
+                # Resolve relative URL against orchestrator base
+                if voice_greeting_url.startswith("/"):
+                    audio_url = f"{self.orchestrator_url}{voice_greeting_url}"
+                else:
+                    audio_url = voice_greeting_url
+
+                logger.info(
+                    "playing_prerecorded_greeting",
+                    session_id=state.session_id,
+                    url=audio_url,
+                )
+                state.is_speaking = True
+                try:
+                    async with client.stream("GET", audio_url, timeout=10.0) as audio_resp:
+                        async for chunk in audio_resp.aiter_bytes(4096):
+                            if websocket.client_state == WebSocketState.CONNECTED:
+                                await websocket.send_bytes(chunk)
+                finally:
+                    state.is_speaking = False
+                await self._send_json(websocket, {"type": "greeting_complete"})
+
+            elif greeting_text:
+                logger.info(
+                    "synthesising_greeting",
+                    session_id=state.session_id,
+                )
+                state.is_speaking = True
+                try:
+                    await self._tts_and_send(greeting_text, websocket, state)
+                finally:
+                    state.is_speaking = False
+                await self._send_json(websocket, {"type": "greeting_complete"})
+
+        except Exception as exc:
+            logger.warning(
+                "greeting_playback_skipped",
+                session_id=state.session_id,
+                error=str(exc),
+            )
 
     async def _tts_and_send(
         self,

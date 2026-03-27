@@ -32,6 +32,9 @@ class Agent(Base):
     voice_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     voice_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     language: Mapped[str] = mapped_column(String(10), default="en")
+    # Greeting sent at the start of every new session (text + optional pre-recorded audio)
+    greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_greeting_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     tools: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
     knowledge_base_ids: Mapped[Optional[dict]] = mapped_column(
         JSONB, nullable=True, default=list
@@ -74,6 +77,8 @@ class Agent(Base):
             "voice_enabled": self.voice_enabled,
             "voice_id": self.voice_id,
             "language": self.language,
+            "greeting_message": self.greeting_message,
+            "voice_greeting_url": self.voice_greeting_url,
             "tools": self.tools or [],
             "knowledge_base_ids": self.knowledge_base_ids or [],
             "llm_config": self.llm_config or {},

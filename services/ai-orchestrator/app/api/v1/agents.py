@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +43,8 @@ def _agent_to_response(agent: Agent) -> AgentResponse:
         voice_enabled=agent.voice_enabled,
         voice_id=agent.voice_id,
         language=agent.language,
+        greeting_message=agent.greeting_message,
+        voice_greeting_url=agent.voice_greeting_url,
         tools=agent.tools or [],
         knowledge_base_ids=agent.knowledge_base_ids or [],
         llm_config=agent.llm_config or {},
@@ -182,6 +186,91 @@ async def delete_agent(
         raise HTTPException(status_code=404, detail="Agent not found.")
     agent.is_active = False
     await db.commit()
+
+
+_GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))
+_GREETING_CDN_BASE = os.environ.get("GREETING_CDN_BASE", "/agent-greetings")
+
+
+@router.post("/{agent_id}/voice-greeting", status_code=200)
+async def upload_voice_greeting(
+    agent_id: str,
+    request: Request,
+    audio: UploadFile = File(..., description="Recorded greeting audio (webm/mp3/wav, max 5 MB)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload a pre-recorded voice greeting for an agent.
+    The audio is stored on disk and the URL is saved on the agent.
+    Returns {"url": "..."}
+    """
+    tenant_id = _tenant_id(request)
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    # Validate size (5 MB max)
+    data = await audio.read(5 * 1024 * 1024 + 1)
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio file too large (max 5 MB).")
+
+    # Determine extension from content type
+    ext = "webm"
+    ct = (audio.content_type or "").lower()
+    if "mp3" in ct or "mpeg" in ct:
+        ext = "mp3"
+    elif "wav" in ct:
+        ext = "wav"
+    elif "ogg" in ct:
+        ext = "ogg"
+
+    _GREETING_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{agent_id}.{ext}"
+    filepath = _GREETING_AUDIO_DIR / filename
+
+    filepath.write_bytes(data)
+
+    url = f"{_GREETING_CDN_BASE}/{filename}"
+    agent.voice_greeting_url = url
+    await db.commit()
+
+    logger.info("voice_greeting_uploaded", agent_id=agent_id, url=url)
+    return {"url": url}
+
+
+@router.delete("/{agent_id}/voice-greeting", status_code=200)
+async def delete_voice_greeting(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the pre-recorded voice greeting from an agent."""
+    tenant_id = _tenant_id(request)
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    # Delete file if present
+    if agent.voice_greeting_url:
+        filename = Path(agent.voice_greeting_url).name
+        filepath = _GREETING_AUDIO_DIR / filename
+        if filepath.exists():
+            filepath.unlink(missing_ok=True)
+    agent.voice_greeting_url = None
+    await db.commit()
+    return {"ok": True}
 
 
 @router.post("/{agent_id}/test", response_model=ChatResponse)

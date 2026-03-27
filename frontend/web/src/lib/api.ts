@@ -143,6 +143,17 @@ export const agentsApi = {
   delete: (id: string) => api.delete(`/proxy/agents/${id}`),
   test: (id: string, message: string) =>
     api.post(`/proxy/agents/${id}/test`, { message }).then((r) => r.data),
+  uploadVoiceGreeting: (id: string, blob: Blob, ext: string) => {
+    const form = new FormData()
+    form.append('audio', blob, `greeting.${ext}`)
+    return api
+      .post(`/proxy/agents/${id}/voice-greeting`, form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      .then((r) => r.data as { url: string })
+  },
+  deleteVoiceGreeting: (id: string) =>
+    api.delete(`/proxy/agents/${id}/voice-greeting`).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------

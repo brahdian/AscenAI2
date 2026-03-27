@@ -262,12 +262,16 @@ class Orchestrator:
         self, agent: Agent, session: AgentSession, playbook: Optional[AgentPlaybook]
     ) -> Optional[str]:
         """
-        If this is a brand-new session (no messages yet) and the playbook
-        has a greeting, persist it and return the greeting text.
-        """
-        if not playbook or not playbook.greeting_message:
-            return None
+        If this is a brand-new session (no messages yet), return the greeting text.
 
+        Priority:
+          1. Playbook greeting_message (operator-customised per flow)
+          2. Agent-level greeting_message (global default)
+          3. None — caller handles silence / generic opener
+
+        The pre-recorded voice_greeting_url is NOT handled here; it is consumed
+        directly by the voice pipeline to save TTS cost (serve static audio instead).
+        """
         from sqlalchemy import select as sa_select, func as sa_func
         count_result = await self.db.execute(
             sa_select(sa_func.count()).select_from(Message).where(
@@ -278,7 +282,13 @@ class Orchestrator:
         if msg_count > 0:
             return None  # Not a new session
 
-        greeting = playbook.greeting_message
+        greeting = (
+            (playbook.greeting_message if playbook else None)
+            or getattr(agent, "greeting_message", None)
+        )
+        if not greeting:
+            return None
+
         self.db.add(Message(
             session_id=session.id,
             tenant_id=session.tenant_id,

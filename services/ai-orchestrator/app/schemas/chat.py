@@ -57,6 +57,8 @@ class AgentCreate(BaseModel):
     voice_enabled: bool = True
     voice_id: Optional[str] = None
     language: str = "en"
+    greeting_message: Optional[str] = Field(None, max_length=1000)
+    voice_greeting_url: Optional[str] = None
     tools: list[str] = Field(default_factory=list)
     knowledge_base_ids: list[str] = Field(default_factory=list)
     llm_config: dict = Field(default_factory=dict)
@@ -72,6 +74,8 @@ class AgentUpdate(BaseModel):
     voice_enabled: Optional[bool] = None
     voice_id: Optional[str] = None
     language: Optional[str] = None
+    greeting_message: Optional[str] = Field(None, max_length=1000)
+    voice_greeting_url: Optional[str] = None
     tools: Optional[list[str]] = None
     knowledge_base_ids: Optional[list[str]] = None
     llm_config: Optional[dict] = None
@@ -90,6 +94,8 @@ class AgentResponse(BaseModel):
     voice_enabled: bool
     voice_id: Optional[str]
     language: str
+    greeting_message: Optional[str] = None
+    voice_greeting_url: Optional[str] = None
     tools: list
     knowledge_base_ids: list
     llm_config: dict

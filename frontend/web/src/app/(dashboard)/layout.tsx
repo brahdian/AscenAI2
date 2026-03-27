@@ -96,6 +96,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     }
   }, [isAuthenticated, _hasHydrated, router])
 
+  // Wait for store to hydrate from localStorage before deciding to redirect.
+  // Without this, the layout briefly sees isAuthenticated=false on every page
+  // load and immediately redirects to /login even for logged-in users.
   if (!_hasHydrated) return null
 
   // Detect if we're on an agent detail page: /dashboard/agents/[id] or /dashboard/agents/[id]/subpage

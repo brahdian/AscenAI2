@@ -11,7 +11,7 @@ Settings are stored in the tenant's metadata JSON column so no migration is requ
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -202,9 +202,7 @@ async def request_erasure(
         contact_identifier=body.contact_identifier,
         status="pending",
         submitted_at=now.isoformat(),
-        estimated_completion=(
-            now.replace(day=min(now.day + 30, 28)).isoformat()
-        ),
+        estimated_completion=(now + timedelta(days=30)).isoformat(),
         message=(
             "Your erasure request has been received and will be processed within 30 days "
             "as required by PIPEDA. You will be notified at the submitter's contact once complete."

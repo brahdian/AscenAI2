@@ -48,10 +48,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         token: Optional[str] = None
         auth_header = request.headers.get("Authorization", "")
+        auth_header_lower = auth_header.lower()
 
-        if auth_header.startswith("Bearer "):
+        if auth_header_lower.startswith("bearer "):
             token = auth_header[7:]
-        elif auth_header.startswith("ApiKey "):
+        elif auth_header_lower.startswith("apikey "):
             token = auth_header[7:]
         else:
             # Also check X-API-Key header

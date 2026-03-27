@@ -94,14 +94,24 @@ async def create_api_key(
 async def list_api_keys(
     request: Request,
     db: AsyncSession = Depends(get_db),
+    page: int = 1,
+    limit: int = 50,
 ):
-    """List all API keys for the current tenant."""
+    """List all API keys for the current tenant. Paginated."""
     tenant_id = _require_tenant(request)
+    if page < 1:
+        page = 1
+    limit = min(max(limit, 1), 200)
+    offset = (page - 1) * limit
     result = await db.execute(
-        select(APIKey).where(
+        select(APIKey)
+        .where(
             APIKey.tenant_id == uuid.UUID(tenant_id),
             APIKey.is_active.is_(True),
         )
+        .order_by(APIKey.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     keys = result.scalars().all()
     return [

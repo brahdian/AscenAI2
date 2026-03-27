@@ -27,6 +27,11 @@ logger = structlog.get_logger(__name__)
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
+# Pre-computed valid argon2 dummy hash used during login to prevent timing-based
+# user enumeration. Must be a real argon2 hash so verify_password runs in
+# constant time even when the user email does not exist.
+_DUMMY_HASH: str = pwd_context.hash("__ascenai_dummy_password_do_not_use__")
+
 TOKEN_TYPE_ACCESS = "access"
 TOKEN_TYPE_REFRESH = "refresh"
 
@@ -117,8 +122,7 @@ class AuthService:
         from fastapi import HTTPException
         # Always run verify_password even when user is None to prevent timing-based
         # user enumeration (constant-time response regardless of whether email exists).
-        _dummy_hash = "$2b$12$KIXyiB0FkCDybLVc8CxmgOWk6tPn2dIlhXjLuPn4c9BEjyVCh3p9."
-        candidate_hash = user.hashed_password if user else _dummy_hash
+        candidate_hash = user.hashed_password if user else _DUMMY_HASH
         password_ok = self.verify_password(request.password, candidate_hash)
         if not user or not password_ok:
             raise HTTPException(status_code=401, detail="Invalid email or password.")

@@ -139,6 +139,14 @@ POSITIVE_LABELS = ["helpful", "accurate", "fast", "clear", "complete"]
 NEGATIVE_LABELS = ["wrong", "off-topic", "inappropriate", "slow", "incomplete", "confusing"]
 
 
+class ToolCorrectionItem(BaseModel):
+    """Per-tool assessment inside a feedback submission."""
+    tool_name: str = Field(..., description="Name of the tool that was called")
+    was_correct: bool = Field(..., description="Was this tool call appropriate?")
+    correct_tool: Optional[str] = Field(None, description="What tool should have been called instead (if any)")
+    reason: Optional[str] = Field(None, max_length=500, description="Why this tool call was wrong")
+
+
 class FeedbackCreate(BaseModel):
     message_id: str = Field(..., description="UUID of the assistant message being rated")
     session_id: str = Field(..., description="Session the message belongs to")
@@ -149,6 +157,10 @@ class FeedbackCreate(BaseModel):
     ideal_response: Optional[str] = Field(None, max_length=5000, description="What the response should have been")
     correction_reason: Optional[str] = Field(None, max_length=2000, description="Why the original response was wrong")
     feedback_source: str = Field(default="user", description="user or operator")
+    # Playbook correction: {"correct_playbook_id": str, "correct_playbook_name": str}
+    playbook_correction: Optional[dict] = Field(None, description="Which playbook should have been triggered")
+    # Per-tool judgements
+    tool_corrections: list[ToolCorrectionItem] = Field(default_factory=list, description="Per-tool assessments")
 
 
 class FeedbackResponse(BaseModel):
@@ -162,6 +174,8 @@ class FeedbackResponse(BaseModel):
     comment: Optional[str]
     ideal_response: Optional[str]
     correction_reason: Optional[str]
+    playbook_correction: Optional[dict]
+    tool_corrections: list[dict]
     feedback_source: str
     created_at: str
 

@@ -194,14 +194,42 @@ def build_system_prompt(
     if corrections:
         parts.append("\n## Corrections from Previous Reviews")
         parts.append(
-            "These are examples of how you SHOULD have responded in past conversations. "
-            "Use them as guidance:"
+            "An operator has reviewed past conversations and left these corrections. "
+            "Apply this guidance strictly:"
         )
         for c in corrections[-10:]:  # max 10 most recent
             user_msg = c.get("user_message", "")
             ideal = c.get("ideal_response", "")
+            playbook_fix = c.get("playbook_correction") or {}
+            tool_fixes = c.get("tool_corrections") or []
+
+            # Ideal response correction
             if user_msg and ideal:
-                parts.append(f'When asked: "{user_msg[:200]}"\nIdeal answer: "{ideal[:400]}"')
+                parts.append(
+                    f'When asked: "{user_msg[:200]}"\n'
+                    f'Correct answer: "{ideal[:400]}"'
+                )
+
+            # Playbook routing correction
+            if user_msg and playbook_fix.get("correct_playbook_name"):
+                parts.append(
+                    f'For messages like "{user_msg[:150]}": '
+                    f'use the "{playbook_fix["correct_playbook_name"]}" playbook.'
+                )
+
+            # Tool-call corrections
+            wrong_tools = [t for t in tool_fixes if not t.get("was_correct")]
+            if user_msg and wrong_tools:
+                for t in wrong_tools:
+                    name = t.get("tool_name", "")
+                    better = t.get("correct_tool", "")
+                    reason = t.get("reason", "")
+                    line = f'For "{user_msg[:150]}": do NOT call {name}'
+                    if better:
+                        line += f"; call {better} instead"
+                    if reason:
+                        line += f" ({reason})"
+                    parts.append(line)
 
     # ------------------------------------------------------------------ #
     # 5. Customer profile

@@ -47,6 +47,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Idempotent ALTER TABLE migrations for columns added after initial create_all.
+        # Safe to run on every startup — IF NOT EXISTS prevents errors on re-run.
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE message_feedback "
+                "ADD COLUMN IF NOT EXISTS playbook_correction JSONB"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE message_feedback "
+                "ADD COLUMN IF NOT EXISTS tool_corrections JSONB"
+            )
+        )
     logger.info("database_initialized")
 
 

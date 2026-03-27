@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { sessionsApi, agentsApi, feedbackApi } from '@/lib/api'
+import { sessionsApi, agentsApi, feedbackApi, playbooksApi } from '@/lib/api'
 import Link from 'next/link'
 import {
   MessageSquare,
@@ -32,6 +32,14 @@ function statusColor(status: string) {
 const POSITIVE_LABELS = ['helpful', 'accurate', 'fast', 'clear', 'complete']
 const NEGATIVE_LABELS = ['wrong', 'off-topic', 'inappropriate', 'slow', 'incomplete', 'confusing']
 
+// ── Types for correction state ────────────────────────────────────────────────
+type ToolCorrectionState = {
+  tool_name: string
+  was_correct: boolean
+  correct_tool: string
+  reason: string
+}
+
 function FeedbackModal({
   message,
   agentId,
@@ -48,7 +56,9 @@ function FeedbackModal({
   onSubmitted: () => void
 }) {
   const correctionRef = useRef<HTMLTextAreaElement>(null)
+  const qc = useQueryClient()
 
+  // ── Scroll-to-correction on open ────────────────────────────────────────────
   useEffect(() => {
     if (focusCorrection && correctionRef.current) {
       correctionRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -56,6 +66,7 @@ function FeedbackModal({
     }
   }, [focusCorrection])
 
+  // ── Basic feedback state ─────────────────────────────────────────────────────
   const [rating, setRating] = useState<'positive' | 'negative' | null>(
     message.feedback?.rating ?? null
   )
@@ -63,11 +74,58 @@ function FeedbackModal({
   const [comment, setComment] = useState(message.feedback?.comment ?? '')
   const [idealResponse, setIdealResponse] = useState(message.feedback?.ideal_response ?? '')
   const [correctionReason, setCorrectionReason] = useState(message.feedback?.correction_reason ?? '')
-  const qc = useQueryClient()
 
+  // ── Tool corrections state ───────────────────────────────────────────────────
+  const rawToolCalls: Array<{ tool_name?: string; name?: string }> = Array.isArray(message.tool_calls)
+    ? message.tool_calls
+    : message.tool_calls
+      ? [message.tool_calls]
+      : []
+
+  const [toolCorrections, setToolCorrections] = useState<ToolCorrectionState[]>(() => {
+    const existing: Record<string, any> = {}
+    for (const tc of message.feedback?.tool_corrections ?? []) {
+      existing[tc.tool_name] = tc
+    }
+    return rawToolCalls.map((tc) => {
+      const name = tc.tool_name ?? tc.name ?? 'unknown'
+      return existing[name] ?? { tool_name: name, was_correct: true, correct_tool: '', reason: '' }
+    })
+  })
+
+  const updateToolCorrection = (idx: number, patch: Partial<ToolCorrectionState>) => {
+    setToolCorrections((prev) => prev.map((t, i) => i === idx ? { ...t, ...patch } : t))
+  }
+
+  // ── Playbook correction state ────────────────────────────────────────────────
+  const { data: playbooks = [] } = useQuery({
+    queryKey: ['playbooks', agentId],
+    queryFn: () => playbooksApi.list(agentId),
+    staleTime: 60_000,
+  })
+
+  const [selectedPlaybookId, setSelectedPlaybookId] = useState<string>(
+    message.feedback?.playbook_correction?.correct_playbook_id ?? ''
+  )
+
+  // ── Submit ──────────────────────────────────────────────────────────────────
   const submit = useMutation({
-    mutationFn: () =>
-      feedbackApi.submit({
+    mutationFn: () => {
+      const playbookCorrection = selectedPlaybookId
+        ? {
+            correct_playbook_id: selectedPlaybookId,
+            correct_playbook_name: (playbooks as any[]).find((p: any) => p.id === selectedPlaybookId)?.name ?? '',
+          }
+        : null
+
+      const filteredToolCorrections = toolCorrections.map((tc) => ({
+        tool_name: tc.tool_name,
+        was_correct: tc.was_correct,
+        correct_tool: tc.correct_tool || undefined,
+        reason: tc.reason || undefined,
+      }))
+
+      return feedbackApi.submit({
         message_id: message.id,
         session_id: sessionId,
         agent_id: agentId,
@@ -77,7 +135,10 @@ function FeedbackModal({
         ideal_response: idealResponse || undefined,
         correction_reason: correctionReason || undefined,
         feedback_source: 'operator',
-      }),
+        playbook_correction: playbookCorrection,
+        tool_corrections: filteredToolCorrections,
+      })
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['session-detail'] })
       onSubmitted()
@@ -88,8 +149,8 @@ function FeedbackModal({
   const availableLabels = rating === 'positive' ? POSITIVE_LABELS : NEGATIVE_LABELS
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl w-full max-w-md p-6 relative">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+      <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 relative">
         <button
           onClick={onClose}
           className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
@@ -97,7 +158,7 @@ function FeedbackModal({
           <X size={18} />
         </button>
         <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-4">
-          Rate this response
+          Review this response
         </h3>
 
         {/* Message preview */}
@@ -105,7 +166,7 @@ function FeedbackModal({
           {message.content}
         </p>
 
-        {/* Rating */}
+        {/* ── Rating ─────────────────────────────────────────────────────── */}
         <div className="flex gap-3 mb-5">
           <button
             onClick={() => { setRating('positive'); setLabels([]) }}
@@ -131,7 +192,7 @@ function FeedbackModal({
           </button>
         </div>
 
-        {/* Labels */}
+        {/* ── Labels ─────────────────────────────────────────────────────── */}
         {rating && (
           <div className="mb-5">
             <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Labels</p>
@@ -157,10 +218,98 @@ function FeedbackModal({
           </div>
         )}
 
-        {/* Ideal response — shown for negative or when operator wants to correct */}
+        {/* ── Tool-call corrections ───────────────────────────────────────── */}
+        {toolCorrections.length > 0 && (
+          <div className="mb-5">
+            <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">
+              Tool calls — were these correct?
+            </p>
+            <div className="space-y-3">
+              {toolCorrections.map((tc, idx) => (
+                <div
+                  key={idx}
+                  className={`rounded-xl border p-3 text-sm transition-colors ${
+                    tc.was_correct
+                      ? 'border-gray-200 dark:border-gray-700'
+                      : 'border-red-200 dark:border-red-800 bg-red-50/40 dark:bg-red-900/10'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-mono text-xs bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded text-gray-700 dark:text-gray-300">
+                      {tc.tool_name}
+                    </span>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => updateToolCorrection(idx, { was_correct: true })}
+                        className={`text-xs px-2.5 py-1 rounded-full border transition-all ${
+                          tc.was_correct
+                            ? 'border-green-500 bg-green-50 text-green-700 dark:bg-green-900/30'
+                            : 'border-gray-200 dark:border-gray-700 text-gray-500 hover:border-green-400'
+                        }`}
+                      >
+                        Correct
+                      </button>
+                      <button
+                        onClick={() => updateToolCorrection(idx, { was_correct: false })}
+                        className={`text-xs px-2.5 py-1 rounded-full border transition-all ${
+                          !tc.was_correct
+                            ? 'border-red-500 bg-red-50 text-red-700 dark:bg-red-900/30'
+                            : 'border-gray-200 dark:border-gray-700 text-gray-500 hover:border-red-400'
+                        }`}
+                      >
+                        Wrong
+                      </button>
+                    </div>
+                  </div>
+                  {!tc.was_correct && (
+                    <div className="space-y-1.5 mt-2">
+                      <input
+                        type="text"
+                        value={tc.correct_tool}
+                        onChange={(e) => updateToolCorrection(idx, { correct_tool: e.target.value })}
+                        placeholder="Correct tool name (leave blank if none)"
+                        className="w-full text-xs rounded-lg border border-gray-200 dark:border-gray-700 bg-transparent px-2.5 py-1.5 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-violet-400"
+                      />
+                      <input
+                        type="text"
+                        value={tc.reason}
+                        onChange={(e) => updateToolCorrection(idx, { reason: e.target.value })}
+                        placeholder="Why was it wrong? (optional)"
+                        className="w-full text-xs rounded-lg border border-gray-200 dark:border-gray-700 bg-transparent px-2.5 py-1.5 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-violet-400"
+                      />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Playbook correction ─────────────────────────────────────────── */}
+        {(playbooks as any[]).length > 0 && (
+          <div className="mb-5">
+            <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">
+              Playbook that should have handled this
+              <span className="normal-case text-gray-400 ml-1">(optional)</span>
+            </label>
+            <select
+              value={selectedPlaybookId}
+              onChange={(e) => setSelectedPlaybookId(e.target.value)}
+              className="w-full text-sm rounded-xl border border-gray-200 dark:border-gray-700 bg-transparent px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-400"
+            >
+              <option value="">— No change / not applicable —</option>
+              {(playbooks as any[]).map((p: any) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* ── Ideal response ─────────────────────────────────────────────── */}
         <div className="mb-4">
           <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">
-            What should it have said? <span className="normal-case text-gray-400">(trains the bot)</span>
+            What should it have said?
+            <span className="normal-case text-gray-400 ml-1">(trains the bot)</span>
           </label>
           <textarea
             ref={correctionRef}
@@ -172,10 +321,11 @@ function FeedbackModal({
           />
         </div>
 
-        {/* Correction reason */}
+        {/* ── Correction reason ───────────────────────────────────────────── */}
         <div className="mb-4">
           <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">
-            Why was it wrong? <span className="normal-case text-gray-400">(optional)</span>
+            Why was it wrong?
+            <span className="normal-case text-gray-400 ml-1">(optional)</span>
           </label>
           <input
             type="text"
@@ -186,7 +336,7 @@ function FeedbackModal({
           />
         </div>
 
-        {/* Comment */}
+        {/* ── Comment ────────────────────────────────────────────────────── */}
         <textarea
           value={comment}
           onChange={(e) => setComment(e.target.value)}
@@ -200,7 +350,7 @@ function FeedbackModal({
           onClick={() => submit.mutate()}
           className="w-full py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white text-sm font-medium transition-colors"
         >
-          {submit.isPending ? 'Saving…' : 'Save Feedback'}
+          {submit.isPending ? 'Saving…' : 'Save & Learn'}
         </button>
       </div>
     </div>

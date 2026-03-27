@@ -199,6 +199,8 @@ export const feedbackApi = {
     ideal_response?: string
     correction_reason?: string
     feedback_source?: string
+    playbook_correction?: { correct_playbook_id: string; correct_playbook_name: string } | null
+    tool_corrections?: Array<{ tool_name: string; was_correct: boolean; correct_tool?: string; reason?: string }>
   }) => api.post('/proxy/feedback', data).then((r) => r.data),
 
   list: (params?: {

@@ -45,6 +45,8 @@ def _fb_to_response(fb: MessageFeedback) -> FeedbackResponse:
         comment=fb.comment,
         ideal_response=fb.ideal_response,
         correction_reason=fb.correction_reason,
+        playbook_correction=fb.playbook_correction,
+        tool_corrections=fb.tool_corrections or [],
         feedback_source=fb.feedback_source,
         created_at=fb.created_at.isoformat() if fb.created_at else "",
     )
@@ -54,11 +56,18 @@ async def _store_correction_in_redis(
     request: Request,
     agent_id: str,
     user_message_content: str,
-    ideal_response: str,
+    ideal_response: Optional[str],
+    playbook_correction: Optional[dict],
+    tool_corrections: list[dict],
 ) -> None:
     """
-    Push an operator correction into Redis so the orchestrator can inject it
+    Push an operator correction into Redis so the orchestrator injects it
     as a few-shot example on future turns for this agent.
+
+    The entry includes:
+      - ideal_response:      corrected text answer
+      - playbook_correction: which playbook should have been triggered
+      - tool_corrections:    per-tool judgements (wrong tool, correct alternative)
     """
     import json, time
     redis = getattr(request.app.state, "redis", None)
@@ -67,7 +76,9 @@ async def _store_correction_in_redis(
     key = CORRECTIONS_KEY.format(agent_id=agent_id)
     entry = json.dumps({
         "user_message": user_message_content[:300],
-        "ideal_response": ideal_response[:800],
+        "ideal_response": (ideal_response or "")[:800],
+        "playbook_correction": playbook_correction,
+        "tool_corrections": tool_corrections,
         "ts": time.time(),
     })
     pipe = redis.pipeline()
@@ -100,6 +111,8 @@ async def submit_feedback(
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found.")
 
+    tool_corrections_raw = [tc.model_dump() for tc in (body.tool_corrections or [])]
+
     fb = MessageFeedback(
         message_id=uuid.UUID(body.message_id),
         session_id=body.session_id,
@@ -110,22 +123,30 @@ async def submit_feedback(
         comment=body.comment,
         ideal_response=body.ideal_response,
         correction_reason=body.correction_reason,
+        playbook_correction=body.playbook_correction,
+        tool_corrections=tool_corrections_raw or None,
         feedback_source=body.feedback_source or "user",
     )
     db.add(fb)
     await db.commit()
     await db.refresh(fb)
-    logger.info("feedback_submitted", tenant_id=tenant_id, rating=body.rating,
-                has_correction=bool(body.ideal_response))
 
-    # If an ideal response was provided, push a correction into Redis so
-    # the orchestrator injects it as a few-shot example on future turns.
-    if body.ideal_response and msg:
+    has_correction = bool(body.ideal_response or body.playbook_correction or tool_corrections_raw)
+    logger.info("feedback_submitted", tenant_id=tenant_id, rating=body.rating,
+                has_correction=has_correction,
+                tool_corrections=len(tool_corrections_raw),
+                has_playbook_correction=bool(body.playbook_correction))
+
+    # Push correction into Redis whenever any corrective signal is present
+    # so the orchestrator injects it as a few-shot example on future turns.
+    if has_correction and msg:
         await _store_correction_in_redis(
             request=request,
             agent_id=body.agent_id,
             user_message_content=msg.content,
             ideal_response=body.ideal_response,
+            playbook_correction=body.playbook_correction,
+            tool_corrections=tool_corrections_raw,
         )
 
     return _fb_to_response(fb)

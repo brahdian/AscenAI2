@@ -261,6 +261,12 @@ class MessageFeedback(Base):
     ideal_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Short explanation of why the original response was wrong
     correction_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Playbook correction: {"correct_playbook_id": str, "correct_playbook_name": str}
+    # Set when the operator identifies a wrong playbook was triggered
+    playbook_correction: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Tool-call corrections: list of {tool_name, was_correct, correct_tool, reason}
+    # Set per-tool when the operator marks incorrect tool calls
+    tool_corrections: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
     def to_dict(self) -> dict:
         return {
@@ -274,6 +280,8 @@ class MessageFeedback(Base):
             "comment": self.comment,
             "ideal_response": self.ideal_response,
             "correction_reason": self.correction_reason,
+            "playbook_correction": self.playbook_correction,
+            "tool_corrections": self.tool_corrections or [],
             "feedback_source": self.feedback_source,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

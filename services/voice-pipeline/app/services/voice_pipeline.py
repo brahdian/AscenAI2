@@ -256,10 +256,16 @@ class VoicePipeline:
           STT → orchestrator → TTS → WebSocket
         """
         try:
-            # 1. Transcribe
-            transcript: TranscriptResult = await self.stt.transcribe_audio(
-                audio_data, language="en", format="webm"
-            )
+            # 1. Transcribe — use Gemini audio STT if configured (44× cheaper)
+            if settings.STT_PROVIDER == "gemini" and settings.GEMINI_API_KEY:
+                raw_text = await self._transcribe_gemini(audio_data)
+                transcript = TranscriptResult(
+                    text=raw_text, confidence=1.0, language="en", duration_ms=0
+                )
+            else:
+                transcript = await self.stt.transcribe_audio(
+                    audio_data, language="en", format="webm"
+                )
 
             if not transcript.text.strip():
                 logger.debug("empty_transcript_skipped", session_id=state.session_id)

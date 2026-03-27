@@ -6,10 +6,10 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi } from '@/lib/api'
+import { agentsApi, guardrailsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
-import { ArrowLeft } from 'lucide-react'
+import { ArrowLeft, ChevronDown, ChevronUp, Shield } from 'lucide-react'
 
 const schema = z.object({
   name: z.string().min(1, 'Name required'),
@@ -26,6 +26,11 @@ type FormData = z.infer<typeof schema>
 export default function NewAgentPage() {
   const router = useRouter()
   const qc = useQueryClient()
+  const [showGuardrails, setShowGuardrails] = useState(false)
+  const [blockedKeywords, setBlockedKeywords] = useState('')
+  const [profanityFilter, setProfanityFilter] = useState(true)
+  const [piiRedaction, setPiiRedaction] = useState(false)
+  const [contentFilterLevel, setContentFilterLevel] = useState('medium')
 
   const {
     register,
@@ -37,7 +42,24 @@ export default function NewAgentPage() {
   })
 
   const mutation = useMutation({
-    mutationFn: (data: FormData) => agentsApi.create(data),
+    mutationFn: async (data: FormData) => {
+      const agent = await agentsApi.create(data)
+      // Create default guardrails if any were configured
+      const keywords = blockedKeywords.split(',').map((k) => k.trim()).filter(Boolean)
+      if (keywords.length > 0 || profanityFilter || piiRedaction || contentFilterLevel !== 'medium') {
+        try {
+          await guardrailsApi.upsert(agent.id, {
+            blocked_keywords: keywords,
+            profanity_filter: profanityFilter,
+            pii_redaction: piiRedaction,
+            content_filter_level: contentFilterLevel,
+          })
+        } catch {
+          // Non-fatal — guardrails can be set later
+        }
+      }
+      return agent
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agents'] })
       toast.success('Agent created!')
@@ -141,6 +163,71 @@ export default function NewAgentPage() {
           <label htmlFor="voice_enabled" className="text-sm text-gray-700 dark:text-gray-300">
             Enable voice (STT/TTS)
           </label>
+        </div>
+
+        {/* Guardrails section */}
+        <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowGuardrails(!showGuardrails)}
+            className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 dark:bg-gray-800 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+          >
+            <span className="flex items-center gap-2">
+              <Shield size={15} className="text-orange-500" /> Guardrails (optional)
+            </span>
+            {showGuardrails ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </button>
+          {showGuardrails && (
+            <div className="p-4 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                  Blocked keywords
+                  <span className="text-gray-400 font-normal ml-1">(comma-separated)</span>
+                </label>
+                <input
+                  value={blockedKeywords}
+                  onChange={(e) => setBlockedKeywords(e.target.value)}
+                  placeholder="e.g. competitor, refund, lawsuit"
+                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                  Content filter level
+                </label>
+                <select
+                  value={contentFilterLevel}
+                  onChange={(e) => setContentFilterLevel(e.target.value)}
+                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+                >
+                  <option value="none">None</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium (recommended)</option>
+                  <option value="strict">Strict</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-6">
+                <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={profanityFilter}
+                    onChange={(e) => setProfanityFilter(e.target.checked)}
+                    className="w-4 h-4 accent-violet-600"
+                  />
+                  Profanity filter
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={piiRedaction}
+                    onChange={(e) => setPiiRedaction(e.target.checked)}
+                    className="w-4 h-4 accent-violet-600"
+                  />
+                  PII redaction
+                </label>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex gap-3 pt-2">

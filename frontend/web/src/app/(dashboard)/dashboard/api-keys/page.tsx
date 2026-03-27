@@ -2,13 +2,14 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiKeysApi } from '@/lib/api'
+import { apiKeysApi, agentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
-import { Key, Plus, Trash2, Copy, Eye, EyeOff } from 'lucide-react'
+import { Key, Plus, Trash2, Copy, Eye, EyeOff, Lock } from 'lucide-react'
 
 export default function ApiKeysPage() {
   const qc = useQueryClient()
   const [newKeyName, setNewKeyName] = useState('')
+  const [selectedAgentId, setSelectedAgentId] = useState<string>('')
   const [createdKey, setCreatedKey] = useState<string | null>(null)
   const [showCreated, setShowCreated] = useState(true)
 
@@ -17,12 +18,18 @@ export default function ApiKeysPage() {
     queryFn: apiKeysApi.list,
   })
 
+  const { data: agents } = useQuery({
+    queryKey: ['agents'],
+    queryFn: agentsApi.list,
+  })
+
   const createMutation = useMutation({
-    mutationFn: (name: string) => apiKeysApi.create({ name }),
+    mutationFn: (payload: { name: string; agent_id?: string }) => apiKeysApi.create(payload),
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['api-keys'] })
       setCreatedKey(data.raw_key)
       setNewKeyName('')
+      setSelectedAgentId('')
       toast.success('API key created!')
     },
     onError: () => toast.error('Failed to create key'),
@@ -36,12 +43,15 @@ export default function ApiKeysPage() {
     },
   })
 
+  const agentName = (agentId: string) =>
+    (agents as any[])?.find((a: any) => a.id === agentId)?.name ?? agentId
+
   return (
     <div className="p-8 max-w-3xl">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">API Keys</h1>
         <p className="text-gray-500 dark:text-gray-400 mt-1">
-          Create and manage API keys for programmatic access.
+          Create and manage API keys. Optionally scope a key to a single agent.
         </p>
       </div>
 
@@ -50,20 +60,47 @@ export default function ApiKeysPage() {
         <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">
           Create new API key
         </h2>
-        <div className="flex gap-2">
-          <input
-            value={newKeyName}
-            onChange={(e) => setNewKeyName(e.target.value)}
-            placeholder="Key name e.g. Production"
-            className="flex-1 px-3 py-2.5 rounded-lg text-sm border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-violet-500"
-          />
-          <button
-            onClick={() => newKeyName.trim() && createMutation.mutate(newKeyName.trim())}
-            disabled={!newKeyName.trim() || createMutation.isPending}
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-700 disabled:opacity-50 transition-colors"
-          >
-            <Plus size={16} /> Create
-          </button>
+        <div className="space-y-3">
+          <div className="flex gap-2">
+            <input
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+              placeholder="Key name e.g. Production"
+              className="flex-1 px-3 py-2.5 rounded-lg text-sm border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+          </div>
+          <div className="flex gap-2 items-center">
+            <select
+              value={selectedAgentId}
+              onChange={(e) => setSelectedAgentId(e.target.value)}
+              className="flex-1 px-3 py-2.5 rounded-lg text-sm border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-violet-500"
+            >
+              <option value="">All agents (unrestricted)</option>
+              {(agents as any[])?.map((agent: any) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={() => {
+                if (!newKeyName.trim()) return
+                createMutation.mutate({
+                  name: newKeyName.trim(),
+                  ...(selectedAgentId ? { agent_id: selectedAgentId } : {}),
+                })
+              }}
+              disabled={!newKeyName.trim() || createMutation.isPending}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+            >
+              <Plus size={16} /> Create
+            </button>
+          </div>
+          {selectedAgentId && (
+            <p className="text-xs text-amber-600 dark:text-amber-400 flex items-center gap-1">
+              <Lock size={12} /> This key will only work for agent &quot;{agentName(selectedAgentId)}&quot;
+            </p>
+          )}
         </div>
       </div>
 
@@ -118,7 +155,14 @@ export default function ApiKeysPage() {
               <div className="flex items-center gap-3">
                 <Key size={16} className="text-gray-400" />
                 <div>
-                  <p className="text-sm font-medium text-gray-900 dark:text-white">{key.name}</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium text-gray-900 dark:text-white">{key.name}</p>
+                    {key.agent_id && (
+                      <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-violet-100 dark:bg-violet-900/30 text-violet-700 dark:text-violet-300">
+                        <Lock size={10} /> {agentName(key.agent_id)}
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-gray-500 font-mono">{key.key_prefix}…</p>
                 </div>
               </div>

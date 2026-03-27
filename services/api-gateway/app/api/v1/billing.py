@@ -127,11 +127,11 @@ async def billing_overview(
     usage_row = usage_result.scalar_one_or_none()
 
     if usage_row:
-        sessions = usage_row.sessions_this_month or 0
-        messages = usage_row.messages_this_month or 0
-        tokens = usage_row.tokens_this_month or 0
-        voice_minutes = float(usage_row.voice_minutes_this_month or 0)
-        agent_count = usage_row.agents_count or 0
+        sessions = usage_row.current_month_sessions or 0
+        messages = usage_row.current_month_messages or 0
+        tokens = usage_row.current_month_tokens or 0
+        voice_minutes = float(usage_row.current_month_voice_minutes or 0)
+        agent_count = usage_row.agent_count or 0
     else:
         sessions, messages, tokens, voice_minutes, agent_count = 0, 0, 0, 0.0, 0
 
@@ -196,14 +196,14 @@ async def billing_agents(
         )
         usage_row = usage_result.scalar_one_or_none()
 
-        if not usage_row or not (usage_row.agents_count or 0):
+        if not usage_row or not (usage_row.agent_count or 0):
             return []
 
-        agent_count = usage_row.agents_count or 0
-        total_sessions = (usage_row.sessions_this_month or 0)
-        total_messages = (usage_row.messages_this_month or 0)
-        total_tokens = (usage_row.tokens_this_month or 0)
-        total_voice = float(usage_row.voice_minutes_this_month or 0)
+        agent_count = usage_row.agent_count or 0
+        total_sessions = (usage_row.current_month_sessions or 0)
+        total_messages = (usage_row.current_month_messages or 0)
+        total_tokens = (usage_row.current_month_tokens or 0)
+        total_voice = float(usage_row.current_month_voice_minutes or 0)
 
         avg_sessions = total_sessions // agent_count if agent_count else 0
         avg_messages = total_messages // agent_count if agent_count else 0

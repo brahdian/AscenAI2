@@ -61,7 +61,7 @@ class AuthService:
         # Make slug unique by appending random suffix if needed
         slug = await self._unique_slug(slug, db)
 
-        plan = "starter"
+        plan = "professional"   # all new tenants start on professional trial
         tenant = Tenant(
             id=uuid.uuid4(),
             name=request.business_name,

@@ -1,17 +1,92 @@
 from __future__ import annotations
 
 import json as _json
+import re
 
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import get_db
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/proxy")
+
+# ── Plan enforcement helpers ──────────────────────────────────────────────────
+
+async def _get_tenant_and_usage(tenant_id: str, db: AsyncSession):
+    """Load Tenant + TenantUsage in a single round-trip."""
+    from app.models.tenant import Tenant, TenantUsage
+    t_res = await db.execute(select(Tenant).where(Tenant.id == __import__("uuid").UUID(tenant_id)))
+    u_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == __import__("uuid").UUID(tenant_id)))
+    return t_res.scalar_one_or_none(), u_res.scalar_one_or_none()
+
+
+async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
+    """Raise 429 if tenant is at or above max_agents for their plan."""
+    from app.services.tenant_service import get_plan_limits, check_limit
+    tenant, usage = await _get_tenant_and_usage(tenant_id, db)
+    if tenant is None:
+        return
+    limits = get_plan_limits(tenant.plan or "professional")
+    current = usage.agent_count if usage else 0
+    if not check_limit(limits["max_agents"], current):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Plan limit reached: your {tenant.plan} plan allows up to "
+                   f"{limits['max_agents']} agent(s). Upgrade to add more.",
+        )
+
+
+async def _check_message_limit(tenant_id: str, db: AsyncSession) -> None:
+    """Raise 429 if tenant has exhausted their monthly message quota."""
+    from app.services.tenant_service import get_plan_limits, check_limit
+    tenant, usage = await _get_tenant_and_usage(tenant_id, db)
+    if tenant is None:
+        return
+    limits = get_plan_limits(tenant.plan or "professional")
+    current = usage.current_month_messages if usage else 0
+    if not check_limit(limits["max_messages_per_month"], current):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Monthly message limit reached ({limits['max_messages_per_month']} messages "
+                   f"on the {tenant.plan} plan). Upgrade or wait until next billing cycle.",
+        )
+
+
+async def _increment_agent_count(tenant_id: str, delta: int, db: AsyncSession) -> None:
+    """Increment or decrement the agent_count on TenantUsage."""
+    from app.models.tenant import TenantUsage
+    import uuid as _uuid
+    tid = _uuid.UUID(tenant_id)
+    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tid))
+    usage = usage_res.scalar_one_or_none()
+    if usage:
+        usage.agent_count = max(0, (usage.agent_count or 0) + delta)
+        await db.commit()
+
+
+async def _increment_message_count(tenant_id: str, db: AsyncSession) -> None:
+    """Increment current_month_messages on TenantUsage."""
+    from app.models.tenant import TenantUsage
+    import uuid as _uuid
+    tid = _uuid.UUID(tenant_id)
+    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tid))
+    usage = usage_res.scalar_one_or_none()
+    if usage:
+        usage.current_month_messages = (usage.current_month_messages or 0) + 1
+        await db.commit()
+
+
+# Regex patterns for routes that need plan enforcement
+_AGENT_CREATE = re.compile(r"^agents/?$")                     # POST /proxy/agents
+_AGENT_DELETE = re.compile(r"^agents/[^/]+/?$")               # DELETE /proxy/agents/{id}
+_CHAT_SEND    = re.compile(r"^agents/[^/]+/chat/?$")          # POST /proxy/agents/{id}/chat
 
 # Downstream service URL map
 _SERVICE_MAP = {
@@ -109,7 +184,34 @@ async def _proxy_request(request: Request, url: str, service: str = "") -> Respo
     "/{service}/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
 )
-async def proxy(service: str, path: str, request: Request) -> Response:
-    """Generic reverse proxy to downstream services."""
+async def proxy(
+    service: str,
+    path: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Generic reverse proxy with plan-limit enforcement and usage tracking."""
+    tenant_id: str = getattr(request.state, "tenant_id", "") or ""
+    method = request.method.upper()
+
+    # ── Pre-request plan limit checks ────────────────────────────────────────
+    if tenant_id and service == "agents":
+        if method == "POST" and _AGENT_CREATE.match(path.lstrip("/")):
+            await _check_agent_limit(tenant_id, db)
+        elif method == "POST" and _CHAT_SEND.match(path.lstrip("/")):
+            await _check_message_limit(tenant_id, db)
+
+    # ── Forward the request ───────────────────────────────────────────────────
     url = _get_downstream_url(service, f"/{path}" if path else "")
-    return await _proxy_request(request, url, service=service)
+    resp = await _proxy_request(request, url, service=service)
+
+    # ── Post-request usage tracking ───────────────────────────────────────────
+    if tenant_id and service == "agents" and resp.status_code < 300:
+        if method == "POST" and _AGENT_CREATE.match(path.lstrip("/")):
+            await _increment_agent_count(tenant_id, +1, db)
+        elif method == "DELETE" and _AGENT_DELETE.match(path.lstrip("/")):
+            await _increment_agent_count(tenant_id, -1, db)
+        elif method == "POST" and _CHAT_SEND.match(path.lstrip("/")):
+            await _increment_message_count(tenant_id, db)
+
+    return resp

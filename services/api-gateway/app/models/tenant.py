@@ -112,6 +112,9 @@ class TenantUsage(Base):
         unique=True,
     )
 
+    # Running count of active agents for this tenant (incremented/decremented via proxy)
+    agent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     current_month_sessions: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )

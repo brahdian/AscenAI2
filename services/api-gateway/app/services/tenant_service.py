@@ -11,36 +11,57 @@ from app.models.tenant import Tenant, TenantUsage
 
 logger = structlog.get_logger(__name__)
 
-# Plan limits definition (used by auth_service and tenant routes)
+# Plan limits definition — single source of truth, aligned with billing.py pricing.
+# -1 = unlimited.  Keys match Tenant.plan values.
 PLAN_LIMITS: dict[str, dict] = {
-    "starter": {
-        "max_sessions_per_month": 500,
-        "max_messages_per_month": 5000,
-        "max_tokens_per_month": 1_000_000,
-        "max_voice_minutes_per_month": 60,
-        "max_agents": 1,
-        "max_api_keys": 3,
-        "max_webhooks": 2,
-    },
-    "growth": {
-        "max_sessions_per_month": 5000,
-        "max_messages_per_month": 50_000,
-        "max_tokens_per_month": 10_000_000,
-        "max_voice_minutes_per_month": 600,
+    "professional": {
+        "max_messages_per_month": 5_000,
+        "max_voice_minutes_per_month": 200,
         "max_agents": 5,
-        "max_api_keys": 10,
-        "max_webhooks": 10,
+        "max_api_keys": 5,
+        "max_webhooks": 5,
+        "max_playbooks_per_agent": 5,
+        "max_rag_documents": 25,
+        "max_team_seats": 3,
+    },
+    "business": {
+        "max_messages_per_month": 25_000,
+        "max_voice_minutes_per_month": 1_000,
+        "max_agents": 20,
+        "max_api_keys": 20,
+        "max_webhooks": 20,
+        "max_playbooks_per_agent": -1,   # unlimited
+        "max_rag_documents": 200,
+        "max_team_seats": 10,
     },
     "enterprise": {
-        "max_sessions_per_month": -1,  # unlimited
         "max_messages_per_month": -1,
-        "max_tokens_per_month": -1,
         "max_voice_minutes_per_month": -1,
         "max_agents": -1,
         "max_api_keys": -1,
         "max_webhooks": -1,
+        "max_playbooks_per_agent": -1,
+        "max_rag_documents": -1,
+        "max_team_seats": -1,
     },
 }
+
+# Legacy plan name aliases (tenants registered before unification)
+PLAN_LIMITS["starter"] = PLAN_LIMITS["professional"]
+PLAN_LIMITS["growth"] = PLAN_LIMITS["business"]
+
+
+def get_plan_limits(plan: str) -> dict:
+    """Return the limits dict for a plan, defaulting to professional."""
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS["professional"])
+
+
+def check_limit(limit_value: int, current: int) -> bool:
+    """Return True when the tenant is within the limit.
+    -1 means unlimited and always passes."""
+    if limit_value == -1:
+        return True
+    return current < limit_value
 
 
 class TenantService:

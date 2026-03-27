@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     # Orchestration limits
     MAX_TOOL_ITERATIONS: int = 3
     TOOL_TIMEOUT_SECONDS: int = 30
+    LLM_TIMEOUT_SECONDS: int = 30  # TC-F02: hard timeout per LLM call
 
     # Service settings
     APP_NAME: str = "AI Orchestrator"

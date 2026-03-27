@@ -418,9 +418,15 @@ class VoicePipeline:
         if state.interrupt_tts:
             return
 
+        # TC-A03: Strip markdown/formatting that TTS engines read literally
+        # (e.g. "**bold**" → "asterisk asterisk bold asterisk asterisk").
+        spoken_text = _strip_markdown_for_tts(text)
+        if not spoken_text.strip():
+            return
+
         voice = "alloy"
         try:
-            async for audio_chunk in self.tts.synthesize_stream(text, voice_id=voice):
+            async for audio_chunk in self.tts.synthesize_stream(spoken_text, voice_id=voice):
                 if state.interrupt_tts:
                     return
                 if websocket.client_state == WebSocketState.CONNECTED:
@@ -644,6 +650,68 @@ class VoicePipeline:
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+
+
+# ---------------------------------------------------------------------------
+# TC-A03: Markdown stripper for TTS
+# ---------------------------------------------------------------------------
+
+def _strip_markdown_for_tts(text: str) -> str:
+    """
+    Remove markdown syntax that TTS engines read as literal symbols.
+
+    Handles: bold/italic (**text**, *text*, __text__, _text_), headers (# ## ###),
+    inline code (`code`), code fences (```), bullet symbols (- * •), numbered
+    list prefixes (1. 2.), horizontal rules (---), HTML tags, and links [text](url).
+    """
+    import re
+
+    # Code fences (``` ... ```) → remove entirely
+    text = re.sub(r"```[\s\S]*?```", "", text)
+
+    # Inline code → just the content
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+
+    # Bold+italic: ***text*** or ___text___
+    text = re.sub(r"\*{3}(.+?)\*{3}", r"\1", text)
+    text = re.sub(r"_{3}(.+?)_{3}", r"\1", text)
+
+    # Bold: **text** or __text__
+    text = re.sub(r"\*{2}(.+?)\*{2}", r"\1", text)
+    text = re.sub(r"_{2}(.+?)_{2}", r"\1", text)
+
+    # Italic: *text* or _text_ (single word boundary to avoid contractions)
+    text = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+
+    # Markdown links: [label](url) → label
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # Images: ![alt](url) → alt
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+
+    # Headers: # ## ### at start of line
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+
+    # Horizontal rules: --- or *** or ___ on their own line
+    text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+
+    # Numbered list prefixes: "1. " "2. " at start of line
+    text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
+
+    # Unordered bullets: "- " or "* " or "• " at start of line
+    text = re.sub(r"^[-*•]\s+", "", text, flags=re.MULTILINE)
+
+    # HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+
+    # Blockquote markers: "> "
+    text = re.sub(r"^>\s+", "", text, flags=re.MULTILINE)
+
+    # Collapse multiple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------

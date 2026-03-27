@@ -81,6 +81,57 @@ _ROLE_INJECTION_PATTERN = _re.compile(
     _re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# TC-B04/B05: Roleplay / jailbreak injection detection.
+# ---------------------------------------------------------------------------
+_JAILBREAK_PATTERN = _re.compile(
+    r"(ignore (all |your )?(previous |prior )?instructions?"
+    r"|you are now (in )?(developer|jailbreak|dan|unrestricted|god) mode"
+    r"|pretend (you are|you're|to be) (an? )?(evil|unrestricted|uncensored|unfiltered)"
+    r"|act as if you (have no|without) (rules|restrictions|guidelines)"
+    r"|disregard (your|all) (training|guidelines|rules|instructions)"
+    r"|bypass (your|all) (safety|content|ethical) (filters?|guidelines?)"
+    r"|you (have|has) no (restrictions|limits|rules|guidelines)"
+    r"|enter (jailbreak|developer|unrestricted) mode)",
+    _re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# TC-C03: Consecutive fallback escalation (Redis counter per session).
+# ---------------------------------------------------------------------------
+_FALLBACK_COUNTER_PREFIX = "session:fallbacks:"
+_FALLBACK_ESCALATION_THRESHOLD = 3
+
+# ---------------------------------------------------------------------------
+# TC-E02: Professional claim prevention — output check.
+# ---------------------------------------------------------------------------
+_PROFESSIONAL_CLAIM_PHRASES = [
+    "as your doctor", "as a doctor", "i diagnose", "my diagnosis is",
+    "you should take this medication", "i prescribe", "this is legal advice",
+    "as your lawyer", "as a legal expert", "as your financial advisor",
+    "i guarantee your investment",
+]
+_PROFESSIONAL_DISCLAIMER = (
+    " Note: I am an AI assistant, not a licensed professional. "
+    "Please consult a qualified professional for medical, legal, or financial guidance."
+)
+
+# ---------------------------------------------------------------------------
+# TC-E05: Credential scrubber for tool error messages.
+# ---------------------------------------------------------------------------
+_CREDENTIAL_SCRUB_PATTERN = _re.compile(
+    r"(Bearer\s+[A-Za-z0-9\-._~+/]+=*"
+    r"|sk-[A-Za-z0-9]{20,}"
+    r"|AIza[A-Za-z0-9\-_]{35}"
+    r"|(?:key|token|secret|password)[_\-]?[A-Za-z0-9]{16,})",
+    _re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# TC-F02: LLM call timeout.
+# ---------------------------------------------------------------------------
+LLM_TIMEOUT_SECONDS: int = getattr(settings, "LLM_TIMEOUT_SECONDS", 30)
+
 
 class Orchestrator:
     """
@@ -292,6 +343,16 @@ class Orchestrator:
                 escalate_to_human=True, latency_ms=latency_ms, tokens_used=0,
             )
 
+        # TC-B04/B05: Jailbreak / roleplay injection detection
+        jailbreak_response = self._check_jailbreak(user_message, agent)
+        if jailbreak_response:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return ChatResponse(
+                session_id=session_id, message=jailbreak_response,
+                tool_calls_made=[], suggested_actions=[],
+                escalate_to_human=False, latency_ms=latency_ms, tokens_used=0,
+            )
+
         # --- Pre-classification ---
         intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
@@ -387,8 +448,11 @@ class Orchestrator:
         final_response: Optional[str] = None
         iterations = 0
 
+        enabled_tools = agent.tools or []
+
         while iterations < MAX_TOOL_ITERATIONS:
-            llm_response: LLMResponse = await self.llm.complete(
+            # TC-F02: LLM call with hard timeout
+            llm_response: LLMResponse = await self._llm_complete_with_timeout(
                 messages=messages,
                 tools=tool_schemas if tool_schemas else None,
                 temperature=temperature,
@@ -398,12 +462,25 @@ class Orchestrator:
 
             total_tokens += llm_response.usage.total_tokens
 
+            # TC-F02: On timeout the finish_reason is "timeout" — break immediately
+            if llm_response.finish_reason == "timeout":
+                final_response = llm_response.content
+                break
+
             if llm_response.tool_calls:
                 iterations += 1
 
+                # TC-D01: Filter tool calls not in agent's enabled list
+                allowed_calls = self._filter_unauthorized_tool_calls(
+                    llm_response.tool_calls, enabled_tools
+                )
+                if not allowed_calls:
+                    final_response = llm_response.content or "I wasn't able to complete that action."
+                    break
+
                 # TC-D02: High-risk tool confirmation gate
                 confirmation_prompt = self._requires_confirmation(
-                    llm_response.tool_calls, user_message, history
+                    allowed_calls, user_message, history
                 )
                 if confirmation_prompt:
                     final_response = confirmation_prompt
@@ -411,13 +488,20 @@ class Orchestrator:
 
                 # Execute all tool calls in parallel
                 tool_results = await self._execute_tool_calls(
-                    tool_calls=llm_response.tool_calls,
+                    tool_calls=allowed_calls,
                     tenant_id=tenant_id,
                     session_id=session_id,
                 )
 
+                # TC-E05: Scrub credentials from tool error messages
+                tool_results = [
+                    {k: self._scrub_credentials(str(v)) if isinstance(v, str) else v
+                     for k, v in r.items()} if isinstance(r, dict) else r
+                    for r in tool_results
+                ]
+
                 # Record tool calls for response metadata
-                for tc, result in zip(llm_response.tool_calls, tool_results):
+                for tc, result in zip(allowed_calls, tool_results):
                     tool_calls_made.append({
                         "tool": tc.name,
                         "arguments": tc.arguments,
@@ -430,12 +514,12 @@ class Orchestrator:
                     "content": llm_response.content or "",
                     "tool_calls": [
                         {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in llm_response.tool_calls
+                        for tc in allowed_calls
                     ],
                 })
 
                 # Append tool results
-                for tc, result in zip(llm_response.tool_calls, tool_results):
+                for tc, result in zip(allowed_calls, tool_results):
                     messages.append({
                         "role": "tool",
                         "name": tc.name,
@@ -448,13 +532,47 @@ class Orchestrator:
                 break
 
         if final_response is None:
-            # Max iterations reached; use last response content
-            final_response = llm_response.content or "I'm sorry, I was unable to complete your request."
+            # TC-D04: Max iterations reached — log warning and return graceful message
+            logger.warning(
+                "max_tool_iterations_reached",
+                session_id=session_id,
+                iterations=MAX_TOOL_ITERATIONS,
+                agent_id=str(agent.id),
+            )
+            final_response = (
+                llm_response.content
+                or "I wasn't able to fully complete your request. Please try rephrasing or contact support."
+            )
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
+        # TC-D03: Append receipt summary after high-risk tool executions
+        receipt = self._build_receipt_summary(tool_calls_made)
+        if receipt:
+            final_response = final_response.rstrip() + " " + receipt
+
         final_response = self._apply_output_guardrails(final_response, guardrails)
+        # TC-E02: Append professional disclaimer if needed
+        final_response = self._check_professional_claims(final_response)
         is_fallback = self._is_fallback_response(final_response, playbook)
+
+        # TC-C03: Fallback escalation counter
+        if is_fallback:
+            fallback_count = await self._increment_fallback_counter(session_id)
+            if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
+                logger.info(
+                    "auto_escalating_consecutive_fallbacks",
+                    session_id=session_id,
+                    count=fallback_count,
+                )
+                session.status = "escalated"
+                final_response = (
+                    "I've been unable to help with your last few requests. "
+                    "Let me connect you with a human agent who can assist you better."
+                )
+                await self._reset_fallback_counter(session_id)
+        else:
+            await self._reset_fallback_counter(session_id)
 
         # --- Step 8: Persist to memory ---
         await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
@@ -544,6 +662,18 @@ class Orchestrator:
                 type="done",
                 data={"escalate": True, "session_id": session_id,
                       "suggested_actions": ["Call 911"]},
+                session_id=session_id,
+            )
+            return
+
+        # TC-B04/B05: Jailbreak detection (streaming path)
+        jailbreak_response = self._check_jailbreak(user_message, agent)
+        if jailbreak_response:
+            yield StreamChatEvent(type="text_delta", data=jailbreak_response, session_id=session_id)
+            yield StreamChatEvent(
+                type="done",
+                data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
+                      "tool_calls_made": 0, "escalate_to_human": False},
                 session_id=session_id,
             )
             return
@@ -640,12 +770,15 @@ class Orchestrator:
         total_tokens = 0
         full_response_text = ""
 
+        enabled_tools = agent.tools or []
+
         # If there are tools, do non-streaming tool loop first, then stream the final answer
         if tool_schemas:
             iterations = 0
             llm_response = None
             while iterations < MAX_TOOL_ITERATIONS:
-                llm_response = await self.llm.complete(
+                # TC-F02: LLM call with hard timeout
+                llm_response = await self._llm_complete_with_timeout(
                     messages=messages,
                     tools=tool_schemas,
                     temperature=temperature,
@@ -654,26 +787,50 @@ class Orchestrator:
                 )
                 total_tokens += llm_response.usage.total_tokens
 
+                if llm_response.finish_reason == "timeout":
+                    full_response_text = llm_response.content or ""
+                    break
+
                 if llm_response.tool_calls:
                     iterations += 1
+
+                    # TC-D01: Filter unauthorized tool calls
+                    allowed_calls = self._filter_unauthorized_tool_calls(
+                        llm_response.tool_calls, enabled_tools
+                    )
+                    if not allowed_calls:
+                        full_response_text = llm_response.content or "I wasn't able to complete that action."
+                        break
+
+                    # TC-D02: Confirmation gate
+                    confirmation_prompt = self._requires_confirmation(
+                        allowed_calls, user_message, history
+                    )
+                    if confirmation_prompt:
+                        full_response_text = confirmation_prompt
+                        break
+
                     yield StreamChatEvent(
                         type="tool_call",
-                        data={
-                            "tools": [
-                                {"name": tc.name, "arguments": tc.arguments}
-                                for tc in llm_response.tool_calls
-                            ]
-                        },
+                        data={"tools": [{"name": tc.name, "arguments": tc.arguments}
+                                        for tc in allowed_calls]},
                         session_id=session_id,
                     )
 
                     tool_results = await self._execute_tool_calls(
-                        tool_calls=llm_response.tool_calls,
+                        tool_calls=allowed_calls,
                         tenant_id=tenant_id,
                         session_id=session_id,
                     )
 
-                    for tc, result in zip(llm_response.tool_calls, tool_results):
+                    # TC-E05: Scrub credentials from tool error strings
+                    tool_results = [
+                        {k: self._scrub_credentials(str(v)) if isinstance(v, str) else v
+                         for k, v in r.items()} if isinstance(r, dict) else r
+                        for r in tool_results
+                    ]
+
+                    for tc, result in zip(allowed_calls, tool_results):
                         tool_calls_made.append({
                             "tool": tc.name,
                             "arguments": tc.arguments,
@@ -690,10 +847,10 @@ class Orchestrator:
                         "content": llm_response.content or "",
                         "tool_calls": [
                             {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                            for tc in llm_response.tool_calls
+                            for tc in allowed_calls
                         ],
                     })
-                    for tc, result in zip(llm_response.tool_calls, tool_results):
+                    for tc, result in zip(allowed_calls, tool_results):
                         messages.append({
                             "role": "tool",
                             "name": tc.name,
@@ -705,7 +862,21 @@ class Orchestrator:
                     break
 
             if not full_response_text and llm_response:
-                full_response_text = llm_response.content or "I was unable to complete your request."
+                # TC-D04: Max iterations — log warning
+                logger.warning(
+                    "stream_max_tool_iterations_reached",
+                    session_id=session_id,
+                    iterations=MAX_TOOL_ITERATIONS,
+                )
+                full_response_text = (
+                    llm_response.content
+                    or "I wasn't able to fully complete your request. Please try again or contact support."
+                )
+
+            # TC-D03: Append receipt summary
+            receipt = self._build_receipt_summary(tool_calls_made)
+            if receipt:
+                full_response_text = full_response_text.rstrip() + " " + receipt
 
             # Stream the final text word by word for a natural feel
             words = full_response_text.split(" ")
@@ -717,26 +888,49 @@ class Orchestrator:
                 )
                 await asyncio.sleep(0.01)
         else:
-            # No tools — use real streaming
-            gen = await self.llm.complete(
-                messages=messages,
-                tools=None,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            async for chunk in gen:
-                full_response_text += chunk
-                yield StreamChatEvent(
-                    type="text_delta",
-                    data=chunk,
-                    session_id=session_id,
+            # No tools — use real streaming with TC-F02 timeout
+            try:
+                gen = await asyncio.wait_for(
+                    self.llm.complete(
+                        messages=messages,
+                        tools=None,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=True,
+                    ),
+                    timeout=LLM_TIMEOUT_SECONDS,
                 )
+                async for chunk in gen:
+                    full_response_text += chunk
+                    yield StreamChatEvent(type="text_delta", data=chunk, session_id=session_id)
+            except asyncio.TimeoutError:
+                logger.error("stream_llm_timeout", session_id=session_id)
+                timeout_msg = (
+                    "I'm sorry, I'm taking longer than expected. Please try again in a moment."
+                )
+                full_response_text = timeout_msg
+                yield StreamChatEvent(type="text_delta", data=timeout_msg, session_id=session_id)
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
         full_response_text = self._apply_output_guardrails(full_response_text, guardrails)
+        # TC-E02: Professional disclaimer check
+        full_response_text = self._check_professional_claims(full_response_text)
         is_fallback = self._is_fallback_response(full_response_text, playbook)
+
+        # TC-C03: Consecutive fallback escalation
+        if is_fallback:
+            fallback_count = await self._increment_fallback_counter(session_id)
+            if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
+                logger.info("stream_auto_escalating_fallbacks", session_id=session_id)
+                session.status = "escalated"
+                full_response_text = (
+                    "I've been unable to help with your last few requests. "
+                    "Let me connect you with a human agent who can assist you better."
+                )
+                await self._reset_fallback_counter(session_id)
+        else:
+            await self._reset_fallback_counter(session_id)
 
         # Persist to memory and DB
         await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
@@ -1072,6 +1266,168 @@ class Orchestrator:
         if sanitized != text:
             logger.warning("role_injection_stripped", original_len=len(text))
         return sanitized
+
+    # ------------------------------------------------------------------
+    # TC-B04/B05: Jailbreak / roleplay injection detection
+    # ------------------------------------------------------------------
+
+    def _check_jailbreak(self, user_message: str, agent: Agent) -> Optional[str]:
+        """
+        Return a canned refusal if the message is a clear jailbreak attempt (TC-B04/B05).
+        Runs BEFORE the LLM — avoids spending tokens on adversarial prompts.
+        """
+        if _JAILBREAK_PATTERN.search(user_message):
+            business_type = (agent.business_type or "our business").replace("_", " ").title()
+            logger.warning(
+                "jailbreak_attempt_detected",
+                agent_id=str(agent.id),
+                snippet=user_message[:80],
+            )
+            return (
+                f"I'm only here to help with {business_type} services. "
+                "How can I assist you today?"
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    # TC-C03: Consecutive fallback counter
+    # ------------------------------------------------------------------
+
+    async def _increment_fallback_counter(self, session_id: str) -> int:
+        """Increment the per-session fallback counter in Redis and return new value."""
+        if self.redis is None:
+            return 0
+        key = f"{_FALLBACK_COUNTER_PREFIX}{session_id}"
+        try:
+            count = await self.redis.incr(key)
+            await self.redis.expire(key, 3600)  # reset after 1 hour of inactivity
+            return int(count)
+        except Exception:
+            return 0
+
+    async def _reset_fallback_counter(self, session_id: str) -> None:
+        """Reset the fallback counter after a successful (non-fallback) response."""
+        if self.redis is None:
+            return
+        key = f"{_FALLBACK_COUNTER_PREFIX}{session_id}"
+        try:
+            await self.redis.delete(key)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # TC-D01: Tool call name validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _filter_unauthorized_tool_calls(
+        tool_calls: list, enabled_tools: list[str]
+    ) -> list:
+        """
+        Drop tool calls whose name is not in the agent's enabled tools list (TC-D01).
+        Logs a warning for each dropped call.
+        """
+        if not enabled_tools:
+            return tool_calls
+        allowed = set(enabled_tools)
+        filtered = []
+        for tc in tool_calls:
+            if tc.name in allowed:
+                filtered.append(tc)
+            else:
+                logger.warning(
+                    "unauthorized_tool_call_blocked",
+                    tool=tc.name,
+                    enabled=list(allowed),
+                )
+        return filtered
+
+    # ------------------------------------------------------------------
+    # TC-D03: Receipt summary after high-risk tool
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_receipt_summary(tool_calls_made: list[dict]) -> str:
+        """
+        Return a brief spoken receipt for completed high-risk tool calls (TC-D03).
+        Only includes tools that actually executed (not confirmation-gated ones).
+        """
+        receipts = []
+        for entry in tool_calls_made:
+            tool = entry.get("tool", "")
+            if tool not in _HIGH_RISK_TOOLS:
+                continue
+            result = entry.get("result", {})
+            if isinstance(result, dict) and result.get("error"):
+                continue  # Only receipt for successful calls
+            args = entry.get("arguments", {})
+            if "stripe" in tool:
+                amount = args.get("amount", "")
+                currency = args.get("currency", "USD").upper()
+                ref = (result or {}).get("payment_link_id", (result or {}).get("id", "N/A"))
+                receipts.append(f"Payment of {amount} {currency} created. Reference: {ref}.")
+            elif "sms" in tool or "twilio" in tool:
+                to = args.get("to", args.get("phone_number", ""))
+                receipts.append(f"SMS sent to {to}.")
+            elif "email" in tool or "gmail" in tool:
+                to = args.get("to", args.get("recipient", ""))
+                receipts.append(f"Email sent to {to}.")
+        return " ".join(receipts)
+
+    # ------------------------------------------------------------------
+    # TC-E02: Professional claim check (output side)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_professional_claims(response: str) -> str:
+        """
+        Append a disclaimer if the response contains professional claim phrases (TC-E02).
+        """
+        lower = response.lower()
+        for phrase in _PROFESSIONAL_CLAIM_PHRASES:
+            if phrase in lower:
+                return response + _PROFESSIONAL_DISCLAIMER
+        return response
+
+    # ------------------------------------------------------------------
+    # TC-E05: Credential scrubber
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _scrub_credentials(text: str) -> str:
+        """Replace API key / token patterns with [REDACTED] (TC-E05)."""
+        return _CREDENTIAL_SCRUB_PATTERN.sub("[REDACTED]", text)
+
+    # ------------------------------------------------------------------
+    # TC-F02: LLM call with timeout
+    # ------------------------------------------------------------------
+
+    async def _llm_complete_with_timeout(self, **kwargs) -> LLMResponse:
+        """
+        Wrap self.llm.complete() with a hard timeout (TC-F02).
+        Returns a graceful fallback LLMResponse on timeout.
+        """
+        try:
+            return await asyncio.wait_for(
+                self.llm.complete(**kwargs),
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "llm_timeout",
+                timeout_s=LLM_TIMEOUT_SECONDS,
+                model=getattr(self.llm, "model", "unknown"),
+            )
+            from app.services.llm_client import LLMResponse, TokenUsage
+            return LLMResponse(
+                content=(
+                    "I'm sorry, I'm taking longer than expected to respond. "
+                    "Please try again in a moment."
+                ),
+                tool_calls=None,
+                finish_reason="timeout",
+                usage=TokenUsage(),
+            )
 
     def _extract_suggested_actions(self, response: str, intent: str) -> list[str]:
         """

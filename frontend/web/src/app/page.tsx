@@ -31,7 +31,7 @@ export default function HomePage() {
       <section className="max-w-7xl mx-auto px-8 pt-24 pb-32 text-center">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-violet-500/10 border border-violet-500/20 text-violet-300 text-sm mb-8">
           <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-          $100 per agent · no usage caps
+          From $49/agent/month · no hidden fees
         </div>
         <h1 className="text-5xl sm:text-7xl font-bold mb-6 leading-tight">
           AI Agents that{' '}
@@ -48,7 +48,7 @@ export default function HomePage() {
             href="/register"
             className="px-8 py-4 rounded-xl bg-gradient-to-r from-violet-600 to-blue-600 text-white font-semibold hover:opacity-90 transition-all hover:shadow-[0_0_30px_rgba(124,58,237,0.5)]"
           >
-            Get started — $100/agent/month
+            Get started — from $49/agent/month
           </Link>
           <Link
             href="/pricing"

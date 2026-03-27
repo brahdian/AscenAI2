@@ -20,9 +20,15 @@ class Settings(BaseSettings):
     # LLM config
     LLM_PROVIDER: str = "gemini"  # "gemini" | "openai" | "vertex"
     GEMINI_API_KEY: str = ""
+
+    # Gemini model selection — change GEMINI_MODEL to upgrade to newer releases:
+    #   gemini-2.5-flash-lite-preview-06-17  ← default (cheapest, fastest)
+    #   gemini-2.5-flash                     ← better quality, ~3× cost
+    #   gemini-2.5-pro                       ← highest quality, ~10× cost
+    #   gemini-3.1-flash                     ← future — update string when released
     GEMINI_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
 
-    # Vertex AI (set LLM_PROVIDER=vertex to use Gemini via Google Cloud)
+    # Vertex AI (set LLM_PROVIDER=vertex to use Gemini via Google Cloud IAM auth)
     VERTEX_PROJECT_ID: str = ""
     VERTEX_LOCATION: str = "us-central1"
 

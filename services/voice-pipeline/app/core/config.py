@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY: str = ""
 
     # Gemini STT / LLM
+    # Change GEMINI_STT_MODEL to upgrade — same model string as ai-orchestrator:
+    #   gemini-2.5-flash-lite-preview-06-17  ← default ($1.00/1M audio tokens)
+    #   gemini-2.5-flash                     ← better accuracy, ~2× cost
+    #   gemini-3.1-flash                     ← future — update string when released
     GEMINI_API_KEY: str = ""
     GEMINI_STT_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
 

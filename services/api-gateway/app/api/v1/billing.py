@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+import calendar
+from datetime import date
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, func, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -13,8 +14,66 @@ from app.core.database import get_db
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/billing")
 
-# Pricing: $100 per active agent per month
-AGENT_MONTHLY_COST = 100.00
+# ---------------------------------------------------------------------------
+# Plan definitions — update here when pricing changes
+# ---------------------------------------------------------------------------
+
+PLANS: dict[str, dict] = {
+    "starter": {
+        "display_name": "Starter",
+        "price_per_agent": 49.00,
+        "chat_messages_included": 2_000,
+        "voice_minutes_included": 0,
+        "playbooks_per_agent": 2,
+        "rag_documents": 10,
+        "team_seats": 1,
+        "overage_per_message": 0.020,
+        "overage_per_voice_minute": 0.00,  # voice not available on starter
+        "voice_enabled": False,
+    },
+    "professional": {
+        "display_name": "Professional",
+        "price_per_agent": 149.00,
+        "chat_messages_included": 10_000,
+        "voice_minutes_included": 300,
+        "playbooks_per_agent": 10,
+        "rag_documents": 100,
+        "team_seats": 5,
+        "overage_per_message": 0.020,
+        "overage_per_voice_minute": 0.20,
+        "voice_enabled": True,
+    },
+    "business": {
+        "display_name": "Business",
+        "price_per_agent": 399.00,
+        "chat_messages_included": 50_000,
+        "voice_minutes_included": 2_000,
+        "playbooks_per_agent": None,   # unlimited
+        "rag_documents": 500,
+        "team_seats": 20,
+        "overage_per_message": 0.015,
+        "overage_per_voice_minute": 0.18,
+        "voice_enabled": True,
+    },
+    "enterprise": {
+        "display_name": "Enterprise",
+        "price_per_agent": None,       # custom
+        "chat_messages_included": None,
+        "voice_minutes_included": None,
+        "playbooks_per_agent": None,
+        "rag_documents": None,
+        "team_seats": None,
+        "overage_per_message": 0.00,
+        "overage_per_voice_minute": 0.00,
+        "voice_enabled": True,
+    },
+}
+
+DEFAULT_PLAN = "professional"
+
+
+def _get_plan(plan_key: str) -> dict:
+    return PLANS.get(plan_key, PLANS[DEFAULT_PLAN])
 
 
 def _require_tenant(request: Request) -> str:
@@ -25,19 +84,35 @@ def _require_tenant(request: Request) -> str:
 
 
 def _billing_period() -> tuple[str, str]:
-    """Returns (start, end) ISO date strings for the current calendar month."""
     today = date.today()
     start = date(today.year, today.month, 1)
-    # End of current month
-    if today.month == 12:
-        end = date(today.year + 1, 1, 1)
-    else:
-        end = date(today.year, today.month + 1, 1)
-    # Last day of this month
-    import calendar
     last_day = calendar.monthrange(today.year, today.month)[1]
     end = date(today.year, today.month, last_day)
     return start.isoformat(), end.isoformat()
+
+
+def _calc_overage(plan: dict, messages: int, voice_minutes: float) -> float:
+    """Calculate overage charges above plan limits."""
+    included_msgs = plan["chat_messages_included"] or 0
+    included_voice = plan["voice_minutes_included"] or 0
+
+    msg_overage = max(0, messages - included_msgs)
+    voice_overage = max(0.0, voice_minutes - included_voice)
+
+    return round(
+        msg_overage * plan["overage_per_message"]
+        + voice_overage * plan["overage_per_voice_minute"],
+        2,
+    )
+
+
+@router.get("/plans")
+async def list_plans() -> dict:
+    """Return all available plan definitions (used by the frontend pricing page)."""
+    return {
+        key: {k: v for k, v in plan.items()}
+        for key, plan in PLANS.items()
+    }
 
 
 @router.get("/overview")
@@ -45,34 +120,21 @@ async def billing_overview(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """
-    Returns billing overview for the current tenant.
-    Pricing: $100/agent/month flat rate (counts active agents).
-    """
     tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
-    # Import models here to avoid circular imports at module level
-    from app.models.tenant import Tenant
+    from app.models.tenant import Tenant, TenantUsage
 
-    # Get tenant plan
-    tenant_result = await db.execute(
-        select(Tenant).where(Tenant.id == tenant_uuid)
-    )
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
-    plan = tenant.plan if tenant else "professional"
+    plan_key = (tenant.plan if tenant else DEFAULT_PLAN) or DEFAULT_PLAN
+    plan = _get_plan(plan_key)
 
-    # Count active agents via orchestrator DB or usage data
-    # We query usage from TenantUsage or approximate via analytics
-    # For billing, we need the agent count — proxy via analytics or a direct count
-    # Since agents live in ai-orchestrator DB, we use TenantUsage.agents_count if available
-    from app.models.tenant import TenantUsage
     usage_result = await db.execute(
         select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
     )
     usage_row = usage_result.scalar_one_or_none()
 
-    # Pull usage figures from TenantUsage
     if usage_row:
         sessions = usage_row.sessions_this_month or 0
         messages = usage_row.messages_this_month or 0
@@ -82,23 +144,37 @@ async def billing_overview(
     else:
         sessions, messages, tokens, voice_minutes, agent_count = 0, 0, 0, 0.0, 0
 
-    monthly_agent_cost = round(agent_count * AGENT_MONTHLY_COST, 2)
+    price_per_agent = plan["price_per_agent"] or 0
+    base_cost = round(agent_count * price_per_agent, 2)
+    overage = _calc_overage(plan, messages, voice_minutes)
     billing_start, billing_end = _billing_period()
 
+    # Usage vs limits (None = unlimited)
+    included_msgs = plan["chat_messages_included"]
+    included_voice = plan["voice_minutes_included"]
+
     return {
-        "plan": plan,
+        "plan": plan_key,
+        "plan_display_name": plan["display_name"],
+        "price_per_agent": price_per_agent,
         "agent_count": agent_count,
-        "monthly_agent_cost": monthly_agent_cost,
+        "limits": {
+            "chat_messages": included_msgs,
+            "voice_minutes": included_voice,
+            "team_seats": plan["team_seats"],
+        },
         "usage": {
             "sessions": sessions,
             "messages": messages,
             "tokens": tokens,
             "voice_minutes": round(voice_minutes, 2),
+            "messages_pct": round(messages / included_msgs * 100, 1) if included_msgs else None,
+            "voice_pct": round(voice_minutes / included_voice * 100, 1) if included_voice else None,
         },
         "estimated_bill": {
-            "agents": monthly_agent_cost,
-            "overage": 0.00,
-            "total": monthly_agent_cost,
+            "base": base_cost,
+            "overage": overage,
+            "total": round(base_cost + overage, 2),
         },
         "billing_period": {
             "start": billing_start,
@@ -112,22 +188,18 @@ async def billing_agents(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    """
-    Per-agent cost breakdown.
-    Returns agent name, sessions, tokens, and cost for the current billing period.
-    """
     tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
-    today = date.today()
-    period_start = date(today.year, today.month, 1)
+    from app.models.tenant import Tenant, TenantUsage
 
-    # Query analytics aggregated by agent for this month
-    # AgentAnalytics lives in ai-orchestrator, but we proxy via the orchestrator URL
-    # For now, return data from TenantUsage or empty if not available
-    # A production implementation would query the orchestrator's analytics endpoint
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+    tenant = tenant_result.scalar_one_or_none()
+    plan_key = (tenant.plan if tenant else DEFAULT_PLAN) or DEFAULT_PLAN
+    plan = _get_plan(plan_key)
+    price_per_agent = plan["price_per_agent"] or 0
+
     try:
-        from app.models.tenant import TenantUsage
         usage_result = await db.execute(
             select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
         )
@@ -136,21 +208,30 @@ async def billing_agents(
         if not usage_row or not (usage_row.agents_count or 0):
             return []
 
-        # Return a summary-level breakdown (agent-level data requires orchestrator DB access)
         agent_count = usage_row.agents_count or 0
         total_sessions = (usage_row.sessions_this_month or 0)
+        total_messages = (usage_row.messages_this_month or 0)
         total_tokens = (usage_row.tokens_this_month or 0)
+        total_voice = float(usage_row.voice_minutes_this_month or 0)
 
         avg_sessions = total_sessions // agent_count if agent_count else 0
+        avg_messages = total_messages // agent_count if agent_count else 0
         avg_tokens = total_tokens // agent_count if agent_count else 0
+        avg_voice = round(total_voice / agent_count, 1) if agent_count else 0.0
 
         return [
             {
                 "agent_id": None,
                 "agent_name": f"Agent {i + 1}",
                 "sessions": avg_sessions,
+                "messages": avg_messages,
                 "tokens": avg_tokens,
-                "cost": AGENT_MONTHLY_COST,
+                "voice_minutes": avg_voice,
+                "base_cost": price_per_agent,
+                "overage": _calc_overage(plan, avg_messages, avg_voice),
+                "total_cost": round(
+                    price_per_agent + _calc_overage(plan, avg_messages, avg_voice), 2
+                ),
             }
             for i in range(agent_count)
         ]

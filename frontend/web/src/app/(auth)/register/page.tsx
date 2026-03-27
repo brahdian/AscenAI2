@@ -59,7 +59,7 @@ export default function RegisterPage() {
             </div>
             <span className="text-2xl font-bold text-white">AscenAI</span>
           </Link>
-          <p className="text-gray-400 mt-3">$100 per agent · no usage caps</p>
+          <p className="text-gray-400 mt-3">From $49/agent/month · no hidden fees</p>
         </div>
 
         <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-8 backdrop-blur-sm">

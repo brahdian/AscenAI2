@@ -119,6 +119,7 @@ export default function AgentDetailPage() {
   const [feedbackMessageIndex, setFeedbackMessageIndex] = useState<number | null>(null)
   const [feedbackMode, setFeedbackMode] = useState<'rate' | 'correct'>('rate')
 
+
   const { data: agent, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['agent', id],
     queryFn: () => agentsApi.get(id),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json as _json
+
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -25,6 +27,10 @@ _SERVICE_MAP = {
 
 _TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 
+# Fields that clients must never be allowed to inject into downstream requests.
+# Prevents prompt-injection via system_prompt override (TC-E04).
+_STRIP_FROM_CHAT = frozenset(["system_prompt", "system", "instructions"])
+
 
 def _get_downstream_url(service: str, path: str) -> str:
     base = _SERVICE_MAP.get(service)
@@ -33,7 +39,29 @@ def _get_downstream_url(service: str, path: str) -> str:
     return f"{base}/api/v1/{service}{path}"
 
 
-async def _proxy_request(request: Request, url: str) -> Response:
+def _sanitize_chat_body(body: bytes, content_type: str) -> bytes:
+    """
+    Strip attacker-controlled system-prompt fields from chat request bodies.
+    Only operates on JSON bodies sent to the chat service (TC-E04).
+    """
+    if "application/json" not in content_type or not body:
+        return body
+    try:
+        parsed = _json.loads(body)
+        if isinstance(parsed, dict):
+            stripped = {k: v for k, v in parsed.items() if k not in _STRIP_FROM_CHAT}
+            if len(stripped) != len(parsed):
+                logger.warning(
+                    "proxy_stripped_forbidden_fields",
+                    fields=[k for k in parsed if k in _STRIP_FROM_CHAT],
+                )
+                return _json.dumps(stripped).encode()
+    except Exception:
+        pass
+    return body
+
+
+async def _proxy_request(request: Request, url: str, service: str = "") -> Response:
     """Forward a request to a downstream service and return the response."""
     # Forward auth headers plus tenant context
     headers = {
@@ -45,6 +73,10 @@ async def _proxy_request(request: Request, url: str) -> Response:
     }
 
     body = await request.body()
+
+    # Strip forbidden fields from chat/stream requests (TC-E04)
+    if service == "chat":
+        body = _sanitize_chat_body(body, headers["Content-Type"])
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -80,4 +112,4 @@ async def _proxy_request(request: Request, url: str) -> Response:
 async def proxy(service: str, path: str, request: Request) -> Response:
     """Generic reverse proxy to downstream services."""
     url = _get_downstream_url(service, f"/{path}" if path else "")
-    return await _proxy_request(request, url)
+    return await _proxy_request(request, url, service=service)

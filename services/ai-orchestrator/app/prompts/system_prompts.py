@@ -15,6 +15,8 @@ from typing import Any, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from app.models.agent import Agent, AgentPlaybook
 
+from app.guardrails.voice_agent_guardrails import build_voice_system_prompt
+
 
 # ---------------------------------------------------------------------------
 # Tone templates
@@ -52,12 +54,42 @@ def build_system_prompt(
     parts: list[str] = []
 
     # ------------------------------------------------------------------ #
-    # 1. Base persona
+    # 1. Base persona — voice agents get the hardened voice-first prompt
     # ------------------------------------------------------------------ #
     agent_name = agent.name or "Assistant"
     business_type = (agent.business_type or "general").replace("_", " ").title()
 
-    parts.append(f"You are {agent_name}, an AI assistant for a {business_type} business.")
+    # Detect voice channel: agent.channel field or metadata flag
+    agent_metadata = agent.metadata_ if hasattr(agent, "metadata_") else {}
+    is_voice = (
+        getattr(agent, "channel", None) == "voice"
+        or (isinstance(agent_metadata, dict) and agent_metadata.get("channel") == "voice")
+    )
+
+    if is_voice:
+        # Use the adversarial-QA-hardened voice-first system prompt as the base
+        tone_key = "friendly"
+        if playbook:
+            tone_key = (playbook.tone or "friendly").lower()
+        tone_desc = TONE_DESCRIPTIONS.get(tone_key, TONE_DESCRIPTIONS["friendly"])
+
+        allowed_topics = business_type + " services"
+        if guardrails and guardrails.allowed_topics:
+            allowed_topics = ", ".join(guardrails.allowed_topics)
+
+        out_of_scope = "I can only help with topics related to our service."
+        if playbook and playbook.out_of_scope_response:
+            out_of_scope = playbook.out_of_scope_response
+
+        parts.append(build_voice_system_prompt(
+            agent_name=agent_name,
+            business_name=business_type,
+            allowed_topics=allowed_topics,
+            out_of_scope_response=out_of_scope,
+            tone_description=tone_desc,
+        ))
+    else:
+        parts.append(f"You are {agent_name}, an AI assistant for a {business_type} business.")
 
     if agent.personality:
         parts.append(f"\nPersonality: {agent.personality}")

@@ -31,6 +31,56 @@ _PROFANITY_LIST = frozenset([
     "fuck", "shit", "bitch", "asshole", "cunt", "bastard",
 ])
 
+# ---------------------------------------------------------------------------
+# TC-E01: Emergency keyword bypass — fires BEFORE the LLM pipeline.
+# For clinic/medical/healthcare agents, if the user mentions an emergency,
+# return a hardcoded life-safety response immediately; do NOT send to LLM.
+# ---------------------------------------------------------------------------
+_EMERGENCY_KEYWORDS = frozenset([
+    "911", "emergency", "chest pain", "can't breathe", "cannot breathe",
+    "heart attack", "stroke", "overdose", "suicidal", "suicide", "seizure",
+    "unconscious", "not breathing", "choking", "severe bleeding", "anaphylaxis",
+    "allergic reaction", "call ambulance", "dying", "help me please",
+])
+_EMERGENCY_BUSINESS_TYPES = frozenset([
+    "clinic", "medical", "healthcare", "dental", "pharmacy", "hospital",
+    "health", "therapy", "mental_health",
+])
+_EMERGENCY_RESPONSE = (
+    "This sounds like a medical emergency. Please call 911 immediately "
+    "or go to your nearest emergency room. Do not wait for online assistance. "
+    "If someone is in immediate danger, call emergency services now."
+)
+
+# ---------------------------------------------------------------------------
+# TC-D02: High-risk tool confirmation gate.
+# Before executing tools that trigger irreversible real-world actions
+# (payments, SMS, email), require the user to have explicitly confirmed.
+# ---------------------------------------------------------------------------
+_HIGH_RISK_TOOLS = frozenset([
+    "stripe_create_payment_link", "stripe_check_payment",
+    "twilio_send_sms",
+    "gmail_send_email",
+    "send_sms", "send_email", "create_payment_link",
+])
+_CONFIRMATION_PHRASES = frozenset([
+    "yes", "confirm", "go ahead", "please do", "do it", "send it",
+    "i confirm", "proceed", "ok", "okay", "correct", "that's right",
+    "sure", "absolutely", "affirmative", "yep", "yeah",
+])
+
+# ---------------------------------------------------------------------------
+# TC-C01: Role/system injection strip.
+# Prevent a user message from containing [SYSTEM], <system>, or similar tags
+# that could trick the LLM into treating user input as a system instruction.
+# ---------------------------------------------------------------------------
+import re as _re
+_ROLE_INJECTION_PATTERN = _re.compile(
+    r"(\[SYSTEM\]|\[INST\]|<system>|<\/system>|\[\/INST\]"
+    r"|<<SYS>>|<</SYS>>|\[ASSISTANT\]|\[USER\])",
+    _re.IGNORECASE,
+)
+
 
 class Orchestrator:
     """
@@ -219,6 +269,29 @@ class Orchestrator:
         tenant_id = str(session.tenant_id)
         session_id = session.id
 
+        # TC-C01: Strip role/system injection tokens from user input FIRST
+        user_message = self._sanitize_user_message(user_message)
+
+        # TC-E01: Emergency bypass — hardcoded response for health agents, no LLM
+        emergency_response = self._check_emergency(user_message, agent)
+        if emergency_response:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            self.db.add(Message(
+                session_id=session_id, tenant_id=session.tenant_id,
+                role="user", content=user_message, tokens_used=0, latency_ms=0,
+            ))
+            self.db.add(Message(
+                session_id=session_id, tenant_id=session.tenant_id,
+                role="assistant", content=emergency_response,
+                tokens_used=0, latency_ms=latency_ms,
+            ))
+            session.status = "escalated"
+            return ChatResponse(
+                session_id=session_id, message=emergency_response,
+                tool_calls_made=[], suggested_actions=["Call 911"],
+                escalate_to_human=True, latency_ms=latency_ms, tokens_used=0,
+            )
+
         # --- Pre-classification ---
         intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
@@ -327,6 +400,15 @@ class Orchestrator:
 
             if llm_response.tool_calls:
                 iterations += 1
+
+                # TC-D02: High-risk tool confirmation gate
+                confirmation_prompt = self._requires_confirmation(
+                    llm_response.tool_calls, user_message, history
+                )
+                if confirmation_prompt:
+                    final_response = confirmation_prompt
+                    break
+
                 # Execute all tool calls in parallel
                 tool_results = await self._execute_tool_calls(
                     tool_calls=llm_response.tool_calls,
@@ -439,6 +521,32 @@ class Orchestrator:
         tenant_id = str(session.tenant_id)
         session_id = session.id
         start_time = time.monotonic()
+
+        # TC-C01: Strip role/system injection tokens
+        user_message = self._sanitize_user_message(user_message)
+
+        # TC-E01: Emergency bypass for health agents (streaming path)
+        emergency_response = self._check_emergency(user_message, agent)
+        if emergency_response:
+            self.db.add(Message(
+                session_id=session_id, tenant_id=session.tenant_id,
+                role="user", content=user_message, tokens_used=0, latency_ms=0,
+            ))
+            self.db.add(Message(
+                session_id=session_id, tenant_id=session.tenant_id,
+                role="assistant", content=emergency_response, tokens_used=0, latency_ms=0,
+            ))
+            session.status = "escalated"
+            yield StreamChatEvent(
+                type="text_delta", data=emergency_response, session_id=session_id,
+            )
+            yield StreamChatEvent(
+                type="done",
+                data={"escalate": True, "session_id": session_id,
+                      "suggested_actions": ["Call 911"]},
+                session_id=session_id,
+            )
+            return
 
         intent = self.intent_detector.detect_intent(user_message)
 
@@ -894,6 +1002,76 @@ class Orchestrator:
             latency_ms=latency_ms,
             tokens_used=0,
         )
+
+    # ------------------------------------------------------------------
+    # TC-E01: Emergency bypass
+    # ------------------------------------------------------------------
+
+    def _check_emergency(self, user_message: str, agent: Agent) -> Optional[str]:
+        """
+        Return a hardcoded life-safety response if the agent is in a health
+        context and the user message contains emergency keywords (TC-E01).
+        Runs BEFORE the LLM pipeline — latency ~0 ms.
+        """
+        business_type = (agent.business_type or "").lower().replace(" ", "_")
+        if business_type not in _EMERGENCY_BUSINESS_TYPES:
+            return None
+        msg_lower = user_message.lower()
+        for kw in _EMERGENCY_KEYWORDS:
+            if kw in msg_lower:
+                logger.warning(
+                    "emergency_keyword_detected",
+                    keyword=kw,
+                    agent_id=str(agent.id),
+                    business_type=business_type,
+                )
+                return _EMERGENCY_RESPONSE
+        return None
+
+    # ------------------------------------------------------------------
+    # TC-D02: High-risk tool confirmation gate
+    # ------------------------------------------------------------------
+
+    def _requires_confirmation(
+        self, tool_calls: list, user_message: str, history: list
+    ) -> Optional[str]:
+        """
+        Return a confirmation prompt string if the LLM wants to call a
+        high-risk tool but the user's most recent message is not an
+        explicit confirmation (TC-D02).
+
+        Returns None if no confirmation is required.
+        """
+        high_risk = [tc for tc in tool_calls if tc.name in _HIGH_RISK_TOOLS]
+        if not high_risk:
+            return None
+
+        # Check if the user's current message (or immediately prior) is a confirm
+        msg_lower = user_message.lower().strip().rstrip(".,!")
+        if any(phrase in msg_lower for phrase in _CONFIRMATION_PHRASES):
+            return None  # User has confirmed — proceed
+
+        # Build a natural-language summary of what will happen
+        tool_names = ", ".join(tc.name.replace("_", " ") for tc in high_risk)
+        return (
+            f"I'm about to {tool_names}. This action cannot be undone. "
+            "Please reply 'confirm' to proceed or 'cancel' to abort."
+        )
+
+    # ------------------------------------------------------------------
+    # TC-C01: Role/system injection sanitiser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_user_message(text: str) -> str:
+        """
+        Strip role-injection tokens from user input before passing to the LLM.
+        Prevents prompt injection via [SYSTEM], <system>, <<SYS>>, etc. (TC-C01).
+        """
+        sanitized = _ROLE_INJECTION_PATTERN.sub("", text).strip()
+        if sanitized != text:
+            logger.warning("role_injection_stripped", original_len=len(text))
+        return sanitized
 
     def _extract_suggested_actions(self, response: str, intent: str) -> list[str]:
         """

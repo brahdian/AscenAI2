@@ -52,6 +52,11 @@ class SessionState:
     interrupt_tts: bool = False
     current_tts_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
     speech_detected: bool = False  # at least one voiced frame in current utterance
+    # Per-session mutex: prevents concurrent utterance processing (TC-A02).
+    # Only one utterance may run the STT→orchestrator→TTS pipeline at a time.
+    # Barge-in cancels the TTS task, but the *next* utterance must wait for the
+    # lock to be released before starting a new pipeline pass.
+    utterance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Derived timing helpers ---------------------------------------------------
 
@@ -254,7 +259,28 @@ class VoicePipeline:
         """
         Full pipeline for a single utterance:
           STT → orchestrator → TTS → WebSocket
+
+        Serialised per session via utterance_lock (TC-A02): if barge-in fires
+        while the previous utterance is still in the STT/orchestrator phase,
+        the new utterance waits until the lock is released rather than racing.
         """
+        # Non-blocking try: if another utterance is already being processed,
+        # drop this one (the user barged in before the previous was done).
+        if state.utterance_lock.locked():
+            logger.debug("utterance_dropped_lock_busy", session_id=state.session_id)
+            state.is_listening = True
+            return
+
+        async with state.utterance_lock:
+            await self._run_utterance_pipeline(audio_data, websocket, state)
+
+    async def _run_utterance_pipeline(
+        self,
+        audio_data: bytes,
+        websocket: WebSocket,
+        state: SessionState,
+    ) -> None:
+        """Internal: execute STT → orchestrator → TTS under the utterance lock."""
         try:
             # 1. Transcribe — use Gemini audio STT if configured (44× cheaper)
             if settings.STT_PROVIDER == "gemini" and settings.GEMINI_API_KEY:
@@ -270,6 +296,37 @@ class VoicePipeline:
             if not transcript.text.strip():
                 logger.debug("empty_transcript_skipped", session_id=state.session_id)
                 state.is_listening = True
+                return
+
+            # TC-A01: Low-confidence transcript gate.
+            # If the STT provider returns confidence < 0.6, ask the user to
+            # repeat rather than processing a potentially mis-transcribed utterance.
+            if transcript.confidence < 0.6:
+                logger.info(
+                    "low_confidence_transcript",
+                    session_id=state.session_id,
+                    confidence=transcript.confidence,
+                    text=transcript.text[:60],
+                )
+                await self._send_json(
+                    websocket,
+                    {
+                        "type": "transcript",
+                        "text": transcript.text,
+                        "is_final": False,
+                        "confidence": transcript.confidence,
+                    },
+                )
+                state.is_listening = True
+                tts_task = asyncio.create_task(
+                    self._tts_and_send(
+                        "Sorry, I didn't quite catch that. Could you say that again?",
+                        websocket,
+                        state,
+                    )
+                )
+                state.current_tts_task = tts_task
+                await tts_task
                 return
 
             logger.info(

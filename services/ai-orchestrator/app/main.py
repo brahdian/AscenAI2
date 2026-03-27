@@ -8,7 +8,7 @@ from typing import Optional
 
 import sentry_sdk
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -109,6 +109,7 @@ async def lifespan(app: FastAPI):
     app.state.mcp_client = _mcp_client
     logger.info("mcp_client_ready", url=settings.MCP_SERVER_URL)
 
+    app.state.startup_complete = True
     logger.info("ai_orchestrator_started")
     yield
 
@@ -176,6 +177,85 @@ async def health_check():
         health_status["status"] = "degraded"
 
     return JSONResponse(content=health_status)
+
+
+@app.get("/health/startup", include_in_schema=False)
+async def health_startup(request: Request):
+    """Kubernetes startupProbe — DB + Redis + MCP health. Returns 503 until startup_complete."""
+    if not getattr(request.app.state, "startup_complete", False):
+        return JSONResponse(status_code=503, content={"status": "starting", "service": settings.APP_NAME})
+
+    checks: dict = {"status": "ok", "service": settings.APP_NAME}
+    failed = False
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        failed = True
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{settings.MCP_SERVER_URL}/health")
+            resp.raise_for_status()
+        checks["mcp"] = "ok"
+    except Exception as exc:
+        checks["mcp"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready():
+    """Kubernetes readinessProbe — DB + Redis fast check. Returns 503 if a critical dependency is down."""
+    checks: dict = {"status": "ok", "service": settings.APP_NAME}
+    failed = False
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        failed = True
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Kubernetes livenessProbe — lightweight check that process and event loop are alive."""
+    return {"alive": True}
 
 
 @app.get("/", tags=["health"])
@@ -283,62 +363,89 @@ async def websocket_endpoint(
                 continue
 
             async with AsyncSessionLocal() as db:
-                # Load agent — must belong to this tenant
-                result = await db.execute(
-                    select(Agent).where(
-                        Agent.id == agent_uuid,
-                        Agent.tenant_id == tenant_uuid,
-                        Agent.is_active.is_(True),
+                try:
+                    # Load agent — must belong to this tenant
+                    result = await db.execute(
+                        select(Agent).where(
+                            Agent.id == agent_uuid,
+                            Agent.tenant_id == tenant_uuid,
+                            Agent.is_active.is_(True),
+                        )
                     )
-                )
-                agent = result.scalar_one_or_none()
-                if not agent:
-                    await websocket.send_json({"type": "error", "data": "Agent not found", "session_id": session_id})
-                    continue
+                    agent = result.scalar_one_or_none()
+                    if not agent:
+                        await websocket.send_json({"type": "error", "data": "Agent not found", "session_id": session_id})
+                        continue
 
-                # Load or create session — enforce tenant ownership
-                sess_result = await db.execute(
-                    select(AgentSession).where(
-                        AgentSession.id == session_id,
-                        AgentSession.tenant_id == tenant_uuid,
+                    # Load or create session — enforce tenant ownership
+                    sess_result = await db.execute(
+                        select(AgentSession).where(
+                            AgentSession.id == session_id,
+                            AgentSession.tenant_id == tenant_uuid,
+                        )
                     )
-                )
-                session_obj = sess_result.scalar_one_or_none()
-                if not session_obj:
-                    session_obj = AgentSession(
-                        id=session_id,
-                        tenant_id=tenant_uuid,
-                        agent_id=agent.id,
-                        customer_identifier=customer_identifier,
-                        channel="web",
-                        status="active",
+                    session_obj = sess_result.scalar_one_or_none()
+                    if not session_obj:
+                        session_obj = AgentSession(
+                            id=session_id,
+                            tenant_id=tenant_uuid,
+                            agent_id=agent.id,
+                            customer_identifier=customer_identifier,
+                            channel="web",
+                            status="active",
+                        )
+                        db.add(session_obj)
+                        await db.flush()
+
+                    redis_client = app.state.redis
+                    memory_manager = MemoryManager(redis_client=redis_client, db=db)
+                    orchestrator = Orchestrator(
+                        llm_client=app.state.llm_client,
+                        mcp_client=app.state.mcp_client,
+                        memory_manager=memory_manager,
+                        db=db,
+                        redis_client=redis_client,
                     )
-                    db.add(session_obj)
-                    await db.flush()
 
-                redis_client = app.state.redis
-                memory_manager = MemoryManager(redis_client=redis_client, db=db)
-                orchestrator = Orchestrator(
-                    llm_client=app.state.llm_client,
-                    mcp_client=app.state.mcp_client,
-                    memory_manager=memory_manager,
-                    db=db,
-                    redis_client=redis_client,
-                )
+                    # Stream response via WebSocket with hard timeout
+                    try:
+                        async for event in orchestrator.stream_response(
+                            agent=agent,
+                            session=session_obj,
+                            user_message=message,
+                        ):
+                            await websocket.send_json({
+                                "type": event.type,
+                                "data": event.data,
+                                "session_id": session_id,
+                            })
+                    except (TimeoutError, asyncio.TimeoutError):
+                        logger.warning("websocket_stream_timeout", session_key=session_key)
+                        await websocket.send_json({
+                            "type": "error",
+                            "data": "Response timed out. Please try again.",
+                            "session_id": session_id,
+                        })
 
-                # Stream response via WebSocket
-                async for event in orchestrator.stream_response(
-                    agent=agent,
-                    session=session_obj,
-                    user_message=message,
-                ):
+                    # Always commit even if stream had errors (persists user message + partial state)
+                    try:
+                        await db.commit()
+                    except Exception as commit_exc:
+                        logger.error("websocket_commit_failed", session_key=session_key, error=str(commit_exc))
+                        await db.rollback()
+
+                except Exception as turn_exc:
+                    # Per-turn error — roll back, notify client, but keep WebSocket alive
+                    logger.error("websocket_turn_error", session_key=session_key, error=str(turn_exc))
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
                     await websocket.send_json({
-                        "type": event.type,
-                        "data": event.data,
+                        "type": "error",
+                        "data": "An error occurred processing your message.",
                         "session_id": session_id,
                     })
-
-                await db.commit()
 
     except WebSocketDisconnect:
         manager.disconnect(session_key)

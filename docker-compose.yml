@@ -21,6 +21,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
 
   redis:
     image: redis:7-alpine
@@ -40,6 +48,14 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
 
   qdrant:
     image: qdrant/qdrant:v1.11.0
@@ -54,6 +70,14 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
 
   # ---------------------------------------------------------------------------
   # Backend Services
@@ -79,10 +103,18 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f --max-time 10 http://localhost:8000/health || exit 1"]
       interval: 20s
-      timeout: 5s
+      timeout: 10s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
 
   mcp-server:
     build:
@@ -110,6 +142,14 @@ services:
       interval: 20s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
 
   ai-orchestrator:
     build:
@@ -133,10 +173,18 @@ services:
       mcp-server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f --max-time 10 http://localhost:8002/health || exit 1"]
       interval: 20s
-      timeout: 5s
+      timeout: 10s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
 
   voice-pipeline:
     build:
@@ -157,10 +205,18 @@ services:
       ai-orchestrator:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8003/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f --max-time 10 http://localhost:8003/health || exit 1"]
       interval: 20s
-      timeout: 5s
+      timeout: 10s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
 
   # ---------------------------------------------------------------------------
   # Frontend
@@ -177,6 +233,14 @@ services:
       NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8002}
     depends_on:
       - api-gateway
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
 
 volumes:
   postgres_data:

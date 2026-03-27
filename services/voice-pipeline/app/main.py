@@ -7,14 +7,14 @@ from typing import AsyncGenerator
 
 import sentry_sdk
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 
 from app.core.config import settings
-from app.core.redis_client import init_redis, close_redis
+from app.core.redis_client import init_redis, close_redis, get_redis
 from app.api.v1 import voice as voice_router
 
 # ---------------------------------------------------------------------------
@@ -91,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("voice_pipeline_starting", version=settings.APP_VERSION)
     redis = await init_redis()
     app.state.redis = redis
+    app.state.startup_complete = True
     logger.info("voice_pipeline_ready")
     yield
     await close_redis()
@@ -121,6 +122,55 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 @app.get("/health", tags=["health"])
 async def health():
     return {"status": "ok", "service": settings.APP_NAME, "version": settings.APP_VERSION}
+
+
+@app.get("/health/startup", include_in_schema=False)
+async def health_startup(request: Request):
+    """Kubernetes startupProbe — Redis check. Returns 503 until startup_complete."""
+    if not getattr(request.app.state, "startup_complete", False):
+        return JSONResponse(status_code=503, content={"status": "starting", "service": settings.APP_NAME})
+
+    checks: dict = {"status": "ok", "service": settings.APP_NAME}
+    failed = False
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready():
+    """Kubernetes readinessProbe — Redis fast check. Returns 503 if Redis is down."""
+    checks: dict = {"status": "ok", "service": settings.APP_NAME}
+    failed = False
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Kubernetes livenessProbe — lightweight check that process and event loop are alive."""
+    return {"alive": True}
 
 
 def _verify_ws_token(token: str, path_tenant_id: str) -> bool:

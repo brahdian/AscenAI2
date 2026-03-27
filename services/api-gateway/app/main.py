@@ -62,7 +62,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     Default: 300 requests / minute per tenant, 30 / minute for unauthenticated.
     """
 
-    EXEMPT_PATHS = {"/health", "/metrics"}
+    EXEMPT_PATHS = {"/health", "/health/startup", "/health/ready", "/health/live", "/metrics"}
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
         if request.url.path in self.EXEMPT_PATHS:
@@ -184,6 +184,9 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis_client  # expose for password reset and other routes
     logger.info("redis_connected", url=settings.REDIS_URL)
 
+    app.state.startup_complete = True
+    logger.info("api_gateway_started")
+
     yield
 
     await close_db()
@@ -263,3 +266,72 @@ async def health():
         checks["redis"] = f"error: {exc}"
         checks["status"] = "degraded"
     return checks
+
+
+@app.get("/health/startup", include_in_schema=False)
+async def health_startup(request: Request):
+    """Kubernetes startupProbe — heavy check: DB + Redis. Returns 503 until startup_complete."""
+    if not getattr(request.app.state, "startup_complete", False):
+        return JSONResponse(status_code=503, content={"status": "starting", "service": "api-gateway"})
+
+    checks: dict = {"status": "ok", "service": "api-gateway"}
+    failed = False
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        failed = True
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready(request: Request):
+    """Kubernetes readinessProbe — checks DB + Redis. Returns 503 if a critical dependency is down."""
+    checks: dict = {"status": "ok", "service": "api-gateway"}
+    failed = False
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        failed = True
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Kubernetes livenessProbe — lightweight check that process and event loop are alive."""
+    return {"alive": True}

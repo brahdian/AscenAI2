@@ -36,23 +36,32 @@ export default function EmbedPage() {
 </script>
 <script src="${API_URL}/widget/widget.js" defer></script>`
 
-  const sdkInstall = `npm install @ascenai/sdk`
+  const sdkUsage = `// AscenAI JavaScript client — copy this into your project
+// (npm package @ascenai/sdk coming soon)
 
-  const sdkUsage = `import { AscenAIClient } from '@ascenai/sdk';
+const ASCENAI_API = '${API_URL}';
+const API_KEY     = '${keyPrefix || 'YOUR_API_KEY'}';
+const AGENT_ID    = '${agentId || 'YOUR_AGENT_ID'}';
 
-const client = new AscenAIClient({
-  apiKey: '${keyPrefix || 'YOUR_API_KEY'}',
-  apiUrl: '${API_URL}',
-  agentId: '${agentId || 'YOUR_AGENT_ID'}',
-});
+async function chat(message, sessionId = null) {
+  const res = await fetch(\`\${ASCENAI_API}/api/v1/proxy/chat\`, {
+    method: 'POST',
+    headers: {
+      'Authorization': \`Bearer \${API_KEY}\`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ agent_id: AGENT_ID, message, session_id: sessionId, channel: 'api' }),
+  });
+  if (!res.ok) throw new Error(\`AscenAI error: \${res.status}\`);
+  return res.json(); // { message, session_id, ... }
+}
 
-// Send a message
-const response = await client.chat('Hello!');
-console.log(response.message);
+// Usage
+const reply = await chat('Hello, I need to book an appointment');
+console.log(reply.message);
 
-// Start a session
-const session = await client.startSession();
-const reply = await session.send('How can I book an appointment?');`
+// Continue same session
+const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
 
   const curlExample = `curl -X POST ${API_URL}/api/v1/proxy/chat \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
@@ -133,7 +142,7 @@ const reply = await session.send('How can I book an appointment?');`
         <div className="flex gap-1 mb-5 bg-gray-100 dark:bg-gray-800 rounded-lg p-1 w-fit">
           {[
             { id: 'widget', label: 'Web Widget', icon: Globe },
-            { id: 'sdk', label: 'JavaScript SDK', icon: Package },
+            { id: 'sdk', label: 'JavaScript', icon: Package },
             { id: 'api', label: 'REST API', icon: Terminal },
           ].map(({ id, label, icon: Icon }) => (
             <button
@@ -173,15 +182,14 @@ const reply = await session.send('How can I book an appointment?');`
 
         {activeTab === 'sdk' && (
           <div className="space-y-4">
-            <div>
-              <p className="text-xs text-gray-500 mb-2">Install</p>
-              <div className="relative">
-                <pre className="bg-gray-950 text-gray-100 rounded-lg p-4 text-xs">{sdkInstall}</pre>
-                <CopyBtn text={sdkInstall} id="npm" />
-              </div>
+            <div className="flex items-start gap-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
+              <Package size={15} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-700 dark:text-amber-300">
+                <strong>npm package coming soon.</strong> Copy the vanilla JS snippet below into your project — it works in any browser or Node.js environment today.
+              </p>
             </div>
             <div>
-              <p className="text-xs text-gray-500 mb-2">Usage</p>
+              <p className="text-xs text-gray-500 mb-2">Vanilla JavaScript (copy into your project)</p>
               <div className="relative">
                 <pre className="bg-gray-950 text-gray-100 rounded-lg p-4 text-xs overflow-x-auto leading-relaxed">{sdkUsage}</pre>
                 <CopyBtn text={sdkUsage} id="sdk" />

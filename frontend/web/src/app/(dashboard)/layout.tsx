@@ -39,15 +39,18 @@ const navItems = [
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const pathname = usePathname()
-  const { isAuthenticated, user, logout } = useAuthStore()
+  const { isAuthenticated, _hasHydrated, user, logout } = useAuthStore()
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (_hasHydrated && !isAuthenticated) {
       router.replace('/login')
     }
-  }, [isAuthenticated, router])
+  }, [isAuthenticated, _hasHydrated, router])
 
-  if (!isAuthenticated) return null
+  // Wait for store to hydrate from localStorage before deciding to redirect.
+  // Without this, the layout briefly sees isAuthenticated=false on every page
+  // load and immediately redirects to /login even for logged-in users.
+  if (!_hasHydrated) return null
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-950">

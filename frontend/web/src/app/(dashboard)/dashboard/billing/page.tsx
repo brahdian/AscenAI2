@@ -6,16 +6,24 @@ import { CreditCard, Zap, MessageSquare, Bot, Mic } from 'lucide-react'
 
 interface BillingOverview {
   plan: string
+  plan_display_name: string
+  price_per_agent: number
   agent_count: number
-  monthly_agent_cost: number
+  limits: {
+    chat_messages: number | null
+    voice_minutes: number | null
+    team_seats: number | null
+  }
   usage: {
     sessions: number
     messages: number
     tokens: number
     voice_minutes: number
+    messages_pct: number | null
+    voice_pct: number | null
   }
   estimated_bill: {
-    agents: number
+    base: number
     overage: number
     total: number
   }
@@ -26,12 +34,15 @@ interface BillingOverview {
 }
 
 interface AgentBilling {
-  agent_id: string
+  agent_id: string | null
   agent_name: string
   sessions: number
   messages: number
   tokens: number
-  monthly_cost: number
+  voice_minutes: number
+  base_cost: number
+  overage: number
+  total_cost: number
 }
 
 export default function BillingPage() {
@@ -56,6 +67,7 @@ export default function BillingPage() {
 
   const fmt = (n: number) => `$${n.toFixed(2)}`
   const fmtNum = (n: number) => n.toLocaleString()
+  const fmtLimit = (n: number | null) => n == null ? 'Unlimited' : fmtNum(n)
 
   return (
     <div className="p-8 max-w-4xl mx-auto">
@@ -64,17 +76,24 @@ export default function BillingPage() {
           <CreditCard size={24} className="text-violet-500" />
           Billing
         </h1>
-        <p className="text-gray-500 mt-1">$100 per active agent per month.</p>
+        <p className="text-gray-500 mt-1">
+          {overview?.plan_display_name || 'Plan'} · {fmt(overview?.price_per_agent || 0)} per active agent/month
+        </p>
       </div>
 
       {/* Plan summary */}
       <div className="bg-gradient-to-br from-violet-600 to-blue-600 rounded-xl p-6 text-white mb-6">
         <div className="flex items-start justify-between">
           <div>
-            <p className="text-violet-200 text-sm font-medium mb-1">Professional Plan</p>
+            <p className="text-violet-200 text-sm font-medium mb-1">
+              {overview?.plan_display_name || 'Plan'}
+            </p>
             <p className="text-3xl font-bold">{fmt(overview?.estimated_bill.total || 0)}</p>
             <p className="text-violet-200 text-sm mt-1">
-              {overview?.agent_count || 0} active agent{(overview?.agent_count || 0) !== 1 ? 's' : ''} × $100/month
+              {overview?.agent_count || 0} agent{(overview?.agent_count || 0) !== 1 ? 's' : ''} × {fmt(overview?.price_per_agent || 0)}/month
+              {(overview?.estimated_bill.overage || 0) > 0 && (
+                <span> + {fmt(overview?.estimated_bill.overage || 0)} overage</span>
+              )}
             </p>
           </div>
           <div className="text-right">
@@ -86,11 +105,41 @@ export default function BillingPage() {
         </div>
         <div className="mt-4 pt-4 border-t border-violet-500/40">
           <p className="text-violet-100 text-xs">
-            Agents are billed from the date they are created. Contact{' '}
-            <a href="mailto:billing@ascenai.com" className="underline">billing@ascenai.com</a> to manage your subscription.
+            Contact{' '}
+            <a href="mailto:billing@ascenai.com" className="underline">billing@ascenai.com</a>{' '}
+            to manage your subscription or upgrade your plan.
           </p>
         </div>
       </div>
+
+      {/* Plan limits */}
+      {overview?.limits && (
+        <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-5 mb-6">
+          <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Plan limits</h2>
+          <div className="grid grid-cols-3 gap-4">
+            {[
+              { label: 'Chat messages', used: overview.usage.messages, limit: overview.limits.chat_messages, pct: overview.usage.messages_pct },
+              { label: 'Voice minutes', used: overview.usage.voice_minutes, limit: overview.limits.voice_minutes, pct: overview.usage.voice_pct },
+              { label: 'Team seats', used: null, limit: overview.limits.team_seats, pct: null },
+            ].map(({ label, used, limit, pct }) => (
+              <div key={label}>
+                <div className="flex justify-between text-xs text-gray-500 mb-1">
+                  <span>{label}</span>
+                  <span>{used != null ? `${fmtNum(Math.round(used))} / ` : ''}{fmtLimit(limit)}</span>
+                </div>
+                {pct != null && (
+                  <div className="h-1.5 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-amber-500' : 'bg-violet-500'}`}
+                      style={{ width: `${Math.min(pct, 100)}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Usage cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
@@ -103,7 +152,7 @@ export default function BillingPage() {
           <div key={label} className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-4">
             <Icon size={18} className={`${color} mb-2`} />
             <p className="text-2xl font-bold text-gray-900 dark:text-white">{value}</p>
-            <p className="text-xs text-gray-500 mt-0.5">{label} this month</p>
+            <p className="text-xs text-gray-500 mt-0.5">{label} · {overview?.billing_period.start} – {overview?.billing_period.end}</p>
           </div>
         ))}
       </div>
@@ -120,15 +169,16 @@ export default function BillingPage() {
             <thead>
               <tr className="border-b border-gray-50 dark:border-gray-800">
                 <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase">Agent</th>
-                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Sessions</th>
                 <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Messages</th>
-                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Tokens</th>
-                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Cost</th>
+                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Voice min</th>
+                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Base</th>
+                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Overage</th>
+                <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Total</th>
               </tr>
             </thead>
             <tbody>
-              {agents.map((a) => (
-                <tr key={a.agent_id} className="border-b border-gray-50 dark:border-gray-800 last:border-0 hover:bg-gray-50 dark:hover:bg-gray-800/30">
+              {agents.map((a, i) => (
+                <tr key={a.agent_id ?? i} className="border-b border-gray-50 dark:border-gray-800 last:border-0 hover:bg-gray-50 dark:hover:bg-gray-800/30">
                   <td className="px-6 py-4">
                     <div className="flex items-center gap-2">
                       <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-blue-500 flex items-center justify-center text-white text-xs font-bold">
@@ -137,18 +187,19 @@ export default function BillingPage() {
                       <span className="text-sm font-medium text-gray-900 dark:text-white">{a.agent_name}</span>
                     </div>
                   </td>
-                  <td className="px-6 py-4 text-right text-sm text-gray-600 dark:text-gray-400">{fmtNum(a.sessions)}</td>
                   <td className="px-6 py-4 text-right text-sm text-gray-600 dark:text-gray-400">{fmtNum(a.messages)}</td>
-                  <td className="px-6 py-4 text-right text-sm text-gray-600 dark:text-gray-400">{fmtNum(a.tokens)}</td>
+                  <td className="px-6 py-4 text-right text-sm text-gray-600 dark:text-gray-400">{a.voice_minutes.toFixed(1)}</td>
+                  <td className="px-6 py-4 text-right text-sm text-gray-600 dark:text-gray-400">{fmt(a.base_cost)}</td>
+                  <td className="px-6 py-4 text-right text-sm text-gray-600 dark:text-gray-400">{fmt(a.overage)}</td>
                   <td className="px-6 py-4 text-right">
-                    <span className="text-sm font-semibold text-gray-900 dark:text-white">{fmt(a.monthly_cost)}</span>
+                    <span className="text-sm font-semibold text-gray-900 dark:text-white">{fmt(a.total_cost)}</span>
                   </td>
                 </tr>
               ))}
             </tbody>
             <tfoot>
               <tr className="bg-gray-50 dark:bg-gray-800/50">
-                <td colSpan={4} className="px-6 py-3 text-sm font-semibold text-gray-700 dark:text-gray-300 text-right">Total</td>
+                <td colSpan={5} className="px-6 py-3 text-sm font-semibold text-gray-700 dark:text-gray-300 text-right">Total</td>
                 <td className="px-6 py-3 text-right">
                   <span className="text-sm font-bold text-violet-600 dark:text-violet-400">
                     {fmt(overview?.estimated_bill.total || 0)}

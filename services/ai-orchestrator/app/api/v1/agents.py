@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentPlaybook
 from app.schemas.chat import (
     AgentCreate,
     AgentResponse,
@@ -77,6 +77,24 @@ async def create_agent(
         is_active=True,
     )
     db.add(agent)
+
+    # Auto-create a default playbook so the agent is ready to use immediately
+    default_playbook = AgentPlaybook(
+        id=uuid.uuid4(),
+        agent_id=agent.id,
+        tenant_id=agent.id,  # will be overridden below after commit
+        name="Default",
+        description="Default playbook — edit to add instructions for your agent.",
+        is_default=True,
+        intent_triggers=[],
+        greeting_message=f"Hi! I'm {body.name}. How can I help you today?",
+        instructions=body.system_prompt or "",
+        tone=body.personality or "professional",
+    )
+    # Set the correct tenant_id
+    default_playbook.tenant_id = uuid.UUID(tenant_id)
+    db.add(default_playbook)
+
     await db.commit()
     await db.refresh(agent)
     logger.info("agent_created", agent_id=str(agent.id), tenant_id=tenant_id)

@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     MAX_RESPONSE_TOKENS: int = 1000
     MEMORY_WINDOW_SIZE: int = 20
 
+    # Document storage — mount a persistent volume and set this path
+    DOCUMENT_STORAGE_PATH: str = "/data/documents"  # override in prod with volume mount
+
     # Orchestration limits
     MAX_TOOL_ITERATIONS: int = 3
     TOOL_TIMEOUT_SECONDS: int = 30

@@ -10,6 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Re
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.agent import Agent, AgentDocument
 
@@ -212,9 +213,9 @@ async def upload_document(
             detail=f"File too large. Maximum size is {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
         )
 
-    # Store file
+    # Store file — use persistent storage path (configure DOCUMENT_STORAGE_PATH env var)
     doc_uuid = uuid.uuid4()
-    storage_dir = Path(f"/tmp/agent_docs/{tenant_id}/{agent_id}")
+    storage_dir = Path(settings.DOCUMENT_STORAGE_PATH) / tenant_id / agent_id
     storage_dir.mkdir(parents=True, exist_ok=True)
     safe_filename = f"{doc_uuid}_{filename}"
     storage_path = str(storage_dir / safe_filename)

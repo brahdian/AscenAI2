@@ -55,15 +55,15 @@ export default function NewAgentPage() {
             content_filter_level: contentFilterLevel,
           })
         } catch {
-          // Non-fatal — guardrails can be set later
+          toast.error('Agent created but guardrails failed — configure them on the Guardrails page.')
         }
       }
       return agent
     },
-    onSuccess: () => {
+    onSuccess: (agent) => {
       qc.invalidateQueries({ queryKey: ['agents'] })
-      toast.success('Agent created!')
-      router.push('/dashboard/agents')
+      toast.success('Agent created! Configure your playbooks and settings.')
+      router.push(`/dashboard/agents/${agent.id}`)
     },
     onError: (err: any) =>
       toast.error(err?.response?.data?.detail || 'Failed to create agent'),

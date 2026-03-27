@@ -256,9 +256,9 @@ export const documentsApi = {
   upload: (agentId: string, file: File) => {
     const form = new FormData()
     form.append('file', file)
-    return api.post(`/proxy/agents/${agentId}/documents`, form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    }).then((r) => r.data)
+    // Do NOT set Content-Type manually — axios/browser sets it automatically
+    // with the correct multipart boundary when given FormData
+    return api.post(`/proxy/agents/${agentId}/documents`, form).then((r) => r.data)
   },
   delete: (agentId: string, docId: string) =>
     api.delete(`/proxy/agents/${agentId}/documents/${docId}`),

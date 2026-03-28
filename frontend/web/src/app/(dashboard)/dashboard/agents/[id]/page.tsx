@@ -199,7 +199,7 @@ export default function AgentDetailPage() {
   }
 
   return (
-    <div className="p-8 max-w-4xl">
+    <div className="p-8 max-w-4xl mx-auto">
       {/* Breadcrumbs */}
       <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 mb-6">
         <Link href="/dashboard" className="hover:text-gray-900 dark:hover:text-white transition-colors">

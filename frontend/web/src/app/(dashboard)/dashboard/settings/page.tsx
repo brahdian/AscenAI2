@@ -114,7 +114,7 @@ export default function SettingsPage() {
   if (isLoading) return <div className="p-8 animate-pulse">Loading…</div>
 
   return (
-    <div className="p-8 max-w-2xl">
+    <div className="p-8 max-w-2xl mx-auto">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Settings</h1>
         <p className="text-gray-500 dark:text-gray-400 mt-1">

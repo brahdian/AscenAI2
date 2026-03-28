@@ -23,6 +23,33 @@ import {
   Mic,
 } from 'lucide-react'
 
+const LANGUAGES = [
+  { code: 'en',    label: 'English (Global)' },
+  { code: 'en-CA', label: 'English (Canada)' },
+  { code: 'fr',    label: 'French (France)' },
+  { code: 'fr-CA', label: 'French (Canada / Québec)' },
+  { code: 'es',    label: 'Spanish' },
+  { code: 'es-MX', label: 'Spanish (Mexico)' },
+  { code: 'de',    label: 'German' },
+  { code: 'it',    label: 'Italian' },
+  { code: 'pt',    label: 'Portuguese' },
+  { code: 'pt-BR', label: 'Portuguese (Brazil)' },
+  { code: 'nl',    label: 'Dutch' },
+  { code: 'pl',    label: 'Polish' },
+  { code: 'ru',    label: 'Russian' },
+  { code: 'zh',    label: 'Chinese (Mandarin)' },
+  { code: 'ja',    label: 'Japanese' },
+  { code: 'ko',    label: 'Korean' },
+  { code: 'hi',    label: 'Hindi' },
+  { code: 'pa',    label: 'Punjabi' },
+  { code: 'ar',    label: 'Arabic' },
+  { code: 'tr',    label: 'Turkish' },
+  { code: 'uk',    label: 'Ukrainian' },
+  { code: 'vi',    label: 'Vietnamese' },
+  { code: 'id',    label: 'Indonesian' },
+  { code: 'tl',    label: 'Tagalog / Filipino' },
+]
+
 type TabId = 'overview' | 'test'
 
 const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
@@ -69,6 +96,7 @@ export default function AgentDetailPage() {
         language: agent.language || 'en',
         personality: agent.personality || '',
         system_prompt: agent.system_prompt || '',
+        greeting_message: agent.greeting_message || '',
         voice_enabled: agent.voice_enabled ?? true,
       })
     }
@@ -315,11 +343,9 @@ export default function AgentDetailPage() {
                 onChange={(e) => setFormData((p) => ({ ...p, language: e.target.value }))}
                 className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
               >
-                <option value="en">English</option>
-                <option value="es">Spanish</option>
-                <option value="fr">French</option>
-                <option value="de">German</option>
-                <option value="pt">Portuguese</option>
+                {LANGUAGES.map((l) => (
+                  <option key={l.code} value={l.code}>{l.label}</option>
+                ))}
               </select>
             </div>
           </div>
@@ -347,6 +373,28 @@ export default function AgentDetailPage() {
               placeholder="You are a helpful assistant for {business_name}..."
               className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
             />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+              Greeting message
+              <span className="ml-2 text-xs font-normal text-gray-400">(shown at start of every conversation)</span>
+            </label>
+            <textarea
+              value={(formData.greeting_message as string) || ''}
+              onChange={(e) => setFormData((p) => ({ ...p, greeting_message: e.target.value }))}
+              rows={2}
+              maxLength={1000}
+              placeholder={`Hi! I'm ${agent.name}. How can I help you today?`}
+              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              For voice recording, go to{' '}
+              <Link href={`/dashboard/agents/${id}/greeting`} className="text-violet-600 hover:underline">
+                Greeting &amp; Language
+              </Link>
+              .
+            </p>
           </div>
 
           <div className="flex items-center gap-3">

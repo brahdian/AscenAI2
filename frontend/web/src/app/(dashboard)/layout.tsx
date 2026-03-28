@@ -12,14 +12,19 @@ import {
   Key,
   Settings,
   LogOut,
-  Zap,
   BarChart2,
   ThumbsUp,
-  Shield,
   BrainCircuit,
   Code2,
   Users,
   CreditCard,
+  BookOpen,
+  FileText,
+  Shield,
+  Wrench,
+  PhoneCall,
+  Mic,
+  ChevronLeft,
 } from 'lucide-react'
 
 const navItems = [
@@ -36,6 +41,16 @@ const navItems = [
   { href: '/dashboard/settings', icon: Settings, label: 'Settings' },
 ]
 
+const agentSubNav = [
+  { slug: '',            icon: Bot,          label: 'Overview' },
+  { slug: 'playbooks',   icon: BookOpen,     label: 'Playbooks' },
+  { slug: 'documents',   icon: FileText,     label: 'Documents' },
+  { slug: 'guardrails',  icon: Shield,       label: 'Guardrails' },
+  { slug: 'tools',       icon: Wrench,       label: 'Tools' },
+  { slug: 'escalation',  icon: PhoneCall,    label: 'Escalation' },
+  { slug: 'greeting',    icon: Mic,          label: 'Greeting & Language' },
+]
+
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const pathname = usePathname()
@@ -47,10 +62,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     }
   }, [isAuthenticated, _hasHydrated, router])
 
-  // Wait for store to hydrate from localStorage before deciding to redirect.
-  // Without this, the layout briefly sees isAuthenticated=false on every page
-  // load and immediately redirects to /login even for logged-in users.
   if (!_hasHydrated) return null
+
+  // Detect if we're on an agent detail page: /dashboard/agents/[id] or /dashboard/agents/[id]/subpage
+  const agentMatch = pathname.match(/^\/dashboard\/agents\/([^/]+)(\/.*)?$/)
+  const agentId = agentMatch?.[1]
+  const isAgentPage = !!agentId && agentId !== 'new'
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-950">
@@ -67,24 +84,87 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 px-3 py-4 space-y-1">
-          {navItems.map((item) => {
-            const active = pathname === item.href || (item.href !== '/dashboard' && pathname.startsWith(item.href))
-            return (
+        <nav className="flex-1 px-3 py-4 overflow-y-auto space-y-1">
+          {isAgentPage ? (
+            <>
+              {/* Back to agents list */}
               <Link
-                key={item.href}
-                href={item.href}
-                className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                  active
-                    ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
-                    : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
-                }`}
+                href="/dashboard/agents"
+                className="flex items-center gap-2 px-3 py-2 mb-2 text-xs font-medium text-gray-500 hover:text-violet-600 dark:hover:text-violet-400 transition-colors"
               >
-                <item.icon size={18} />
-                {item.label}
+                <ChevronLeft size={14} />
+                All Agents
               </Link>
-            )
-          })}
+
+              <p className="px-3 py-1 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">
+                Agent Settings
+              </p>
+
+              {agentSubNav.map((item) => {
+                const href = item.slug
+                  ? `/dashboard/agents/${agentId}/${item.slug}`
+                  : `/dashboard/agents/${agentId}`
+                const active = item.slug
+                  ? pathname === href || pathname.startsWith(href + '/')
+                  : pathname === href
+                return (
+                  <Link
+                    key={href}
+                    href={href}
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                      active
+                        ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
+                        : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
+                    }`}
+                  >
+                    <item.icon size={18} />
+                    {item.label}
+                  </Link>
+                )
+              })}
+
+              <div className="pt-3 mt-2 border-t border-gray-100 dark:border-gray-800 space-y-1">
+                <p className="px-3 py-1 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">
+                  Main Menu
+                </p>
+                {navItems.map((item) => {
+                  const active = pathname === item.href
+                  return (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
+                        active
+                          ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
+                          : 'text-gray-500 hover:bg-gray-100 dark:text-gray-500 dark:hover:bg-gray-800'
+                      }`}
+                    >
+                      <item.icon size={16} />
+                      {item.label}
+                    </Link>
+                  )
+                })}
+              </div>
+            </>
+          ) : (
+            navItems.map((item) => {
+              const active = pathname === item.href || (item.href !== '/dashboard' && pathname.startsWith(item.href))
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                    active
+                      ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
+                      : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  <item.icon size={18} />
+                  {item.label}
+                </Link>
+              )
+            })
+          )}
         </nav>
 
         {/* User */}

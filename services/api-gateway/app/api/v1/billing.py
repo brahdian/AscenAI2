@@ -22,6 +22,18 @@ PLANS: dict[str, dict] = {
     # Overage rates are set well above COGS:
     # Real COGS per message ~$0.000185 (Gemini 2.5 Flash Lite @$0.10/$0.40 per 1M tok)
     # Real COGS per voice minute ~$0.026 (STT $0.14 + LLM $0.057 + TTS $0.72 + Twilio $0.0085 per min)
+    "starter": {
+        "display_name": "Starter",
+        "price_per_agent": 49.00,
+        "chat_messages_included": 1_000,
+        "voice_minutes_included": 60,
+        "playbooks_per_agent": 2,
+        "rag_documents": 10,
+        "team_seats": 1,
+        "overage_per_message": 0.020,
+        "overage_per_voice_minute": 0.20,
+        "voice_enabled": True,
+    },
     "professional": {
         "display_name": "Professional",
         "price_per_agent": 99.00,
@@ -32,6 +44,19 @@ PLANS: dict[str, dict] = {
         "team_seats": 3,
         "overage_per_message": 0.015,
         "overage_per_voice_minute": 0.15,
+        "voice_enabled": True,
+    },
+    # "growth" kept as alias for "business" — older tenants may have this key
+    "growth": {
+        "display_name": "Growth",
+        "price_per_agent": 149.00,
+        "chat_messages_included": 10_000,
+        "voice_minutes_included": 500,
+        "playbooks_per_agent": None,
+        "rag_documents": 100,
+        "team_seats": 5,
+        "overage_per_message": 0.013,
+        "overage_per_voice_minute": 0.13,
         "voice_enabled": True,
     },
     "business": {
@@ -60,7 +85,7 @@ PLANS: dict[str, dict] = {
     },
 }
 
-DEFAULT_PLAN = "professional"
+DEFAULT_PLAN = "starter"
 
 
 def _get_plan(plan_key: str) -> dict:

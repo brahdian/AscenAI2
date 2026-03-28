@@ -12,7 +12,7 @@ import json
 
 from app.core.config import settings
 from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, Session as AgentSession, Message, AgentAnalytics
-from app.schemas.chat import ChatResponse, StreamChatEvent
+from app.schemas.chat import ChatResponse, SourceCitation, StreamChatEvent
 from app.services.llm_client import LLMClient, LLMResponse, ToolCall
 from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
@@ -225,24 +225,31 @@ class Orchestrator:
 
         return None
 
-    def _apply_output_guardrails(self, response: str, guardrails) -> str:
-        """Apply output-side guardrails: PII redaction, length cap, disclaimer."""
+    def _apply_output_guardrails(self, response: str, guardrails) -> tuple[str, list[str]]:
+        """Apply output-side guardrails: PII redaction, length cap, disclaimer.
+        Returns (modified_response, list_of_actions_applied)."""
         import re
+        actions: list[str] = []
         if not guardrails:
-            return response
+            return response, actions
 
         if guardrails.pii_redaction:
-            response = re.sub(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b', '[EMAIL]', response)
-            response = re.sub(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b', '[PHONE]', response)
-            response = re.sub(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b', '[CARD]', response)
+            new_response = re.sub(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b', '[EMAIL]', response)
+            new_response = re.sub(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b', '[PHONE]', new_response)
+            new_response = re.sub(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b', '[CARD]', new_response)
+            if new_response != response:
+                actions.append("pii_redaction")
+            response = new_response
 
         if guardrails.max_response_length and len(response) > guardrails.max_response_length:
             response = response[:guardrails.max_response_length].rstrip() + "…"
+            actions.append("length_cap")
 
         if guardrails.require_disclaimer:
             response = response + "\n\n" + guardrails.require_disclaimer
+            actions.append("disclaimer_appended")
 
-        return response
+        return response, actions
 
     def _is_fallback_response(self, response: str, playbook) -> bool:
         """Detect if the response is a fallback/uncertain reply."""
@@ -412,6 +419,7 @@ class Orchestrator:
                 escalate_to_human=False,
                 latency_ms=latency_ms,
                 tokens_used=0,
+                guardrail_triggered=block_reason,
             )
 
         # --- Step 1: Load short-term memory ---
@@ -427,6 +435,22 @@ class Orchestrator:
             context_types=["knowledge", "history"],
             knowledge_base_ids=kb_ids if kb_ids else None,
         )
+
+        # Build RAG source citations from retrieved context
+        source_citations: list[SourceCitation] = []
+        for item in context_items:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata", {}) or {}
+            source_citations.append(SourceCitation(
+                type=item.get("type", "knowledge"),
+                title=meta.get("title"),
+                source_url=meta.get("source_url"),
+                excerpt=(item.get("content", "") or "")[:150],
+                score=float(item.get("score", 1.0)),
+                document_id=str(meta["document_id"]) if meta.get("document_id") else None,
+                chunk_id=str(meta["chunk_id"]) if meta.get("chunk_id") else None,
+            ))
 
         # --- Step 3: Build system prompt ---
         customer_profile: dict = {}
@@ -572,7 +596,7 @@ class Orchestrator:
         if receipt:
             final_response = final_response.rstrip() + " " + receipt
 
-        final_response = self._apply_output_guardrails(final_response, guardrails)
+        final_response, guardrail_actions = self._apply_output_guardrails(final_response, guardrails)
         # TC-E02: Append professional disclaimer if needed
         final_response = self._check_professional_claims(final_response)
         is_fallback = self._is_fallback_response(final_response, playbook)
@@ -645,6 +669,8 @@ class Orchestrator:
             escalate_to_human=should_escalate,
             latency_ms=latency_ms,
             tokens_used=total_tokens,
+            sources=source_citations,
+            guardrail_actions=guardrail_actions,
         )
 
     async def stream_response(
@@ -743,7 +769,8 @@ class Orchestrator:
             yield StreamChatEvent(
                 type="done",
                 data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
-                      "tool_calls_made": 0, "escalate_to_human": False},
+                      "tool_calls_made": 0, "escalate_to_human": False,
+                      "guardrail_triggered": block_reason},
                 session_id=session_id,
             )
             return
@@ -759,6 +786,22 @@ class Orchestrator:
             context_types=["knowledge", "history"],
             knowledge_base_ids=kb_ids if kb_ids else None,
         )
+
+        # Build RAG source citations from retrieved context
+        stream_source_citations: list[SourceCitation] = []
+        for item in context_items:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata", {}) or {}
+            stream_source_citations.append(SourceCitation(
+                type=item.get("type", "knowledge"),
+                title=meta.get("title"),
+                source_url=meta.get("source_url"),
+                excerpt=(item.get("content", "") or "")[:150],
+                score=float(item.get("score", 1.0)),
+                document_id=str(meta["document_id"]) if meta.get("document_id") else None,
+                chunk_id=str(meta["chunk_id"]) if meta.get("chunk_id") else None,
+            ))
 
         customer_profile: dict = {}
         if session.customer_identifier:
@@ -934,7 +977,7 @@ class Orchestrator:
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
-        full_response_text = self._apply_output_guardrails(full_response_text, guardrails)
+        full_response_text, stream_guardrail_actions = self._apply_output_guardrails(full_response_text, guardrails)
         # TC-E02: Professional disclaimer check
         full_response_text = self._check_professional_claims(full_response_text)
         is_fallback = self._is_fallback_response(full_response_text, playbook)
@@ -990,6 +1033,14 @@ class Orchestrator:
         if should_escalate:
             session.status = "escalated"
 
+        # Emit source citations as a discrete event before done
+        if stream_source_citations:
+            yield StreamChatEvent(
+                type="sources",
+                data=[c.model_dump() for c in stream_source_citations],
+                session_id=session_id,
+            )
+
         yield StreamChatEvent(
             type="done",
             data={
@@ -998,6 +1049,7 @@ class Orchestrator:
                 "tokens_used": total_tokens,
                 "tool_calls_made": len(tool_calls_made),
                 "escalate_to_human": should_escalate,
+                "guardrail_actions": stream_guardrail_actions,
             },
             session_id=session_id,
         )

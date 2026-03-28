@@ -30,6 +30,17 @@ class ChatRequest(BaseModel):
     )
 
 
+class SourceCitation(BaseModel):
+    """A single RAG source returned alongside the assistant reply."""
+    type: str = Field(..., description="Context type: knowledge | history | customer | product")
+    title: Optional[str] = None
+    source_url: Optional[str] = None
+    excerpt: str = Field(..., description="First 150 chars of the context content")
+    score: float = Field(..., description="Relevance score 0-1")
+    document_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+
+
 class ChatResponse(BaseModel):
     session_id: str
     message: str
@@ -46,14 +57,24 @@ class ChatResponse(BaseModel):
     escalation_action: Optional[str] = None
     latency_ms: int
     tokens_used: int
+    # RAG breadcrumbs — which knowledge/history items informed this response
+    sources: list[SourceCitation] = Field(default_factory=list)
+    # Guardrail breadcrumbs
+    guardrail_triggered: Optional[str] = Field(
+        None, description="Reason the input was blocked (e.g. 'blocked_keyword:xyz', 'profanity')"
+    )
+    guardrail_actions: list[str] = Field(
+        default_factory=list,
+        description="Output guardrails applied (e.g. 'pii_redaction', 'length_cap', 'disclaimer_appended')",
+    )
 
 
 class StreamChatEvent(BaseModel):
     type: str = Field(
         ...,
-        description="Event type: text_delta, tool_call, tool_result, done, error",
+        description="Event type: text_delta, tool_call, tool_result, sources, done, error",
     )
-    data: Union[str, dict]
+    data: Union[str, dict, list]
     session_id: str
 
 

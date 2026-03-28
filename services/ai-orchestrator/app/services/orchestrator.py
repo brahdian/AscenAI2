@@ -574,6 +574,16 @@ class Orchestrator:
                     final_response = confirmation_prompt
                     break
 
+                # De-tokenize tool arguments before execution so real values
+                # reach the booking/CRM APIs — not placeholder tokens.
+                if pii_ctx is not None and pii_ctx.token_to_value:
+                    for tc in allowed_calls:
+                        if isinstance(tc.arguments, dict):
+                            tc.arguments = {
+                                k: pii_ctx.restore(v) if isinstance(v, str) else v
+                                for k, v in tc.arguments.items()
+                            }
+
                 # Execute all tool calls in parallel
                 tool_results = await self._execute_tool_calls(
                     tool_calls=allowed_calls,
@@ -587,6 +597,16 @@ class Orchestrator:
                      for k, v in r.items()} if isinstance(r, dict) else r
                     for r in tool_results
                 ]
+
+                # Re-anonymize tool results before adding to LLM context so PII
+                # in confirmation data (names, emails echoed by the booking API)
+                # doesn't re-enter the LLM messages in plaintext.
+                if pii_ctx is not None:
+                    tool_results = [
+                        {k: pii_ctx.anonymize(str(v)) if isinstance(v, str) else v
+                         for k, v in r.items()} if isinstance(r, dict) else r
+                        for r in tool_results
+                    ]
 
                 # Record tool calls for response metadata
                 for tc, result in zip(allowed_calls, tool_results):
@@ -956,6 +976,15 @@ class Orchestrator:
                         session_id=session_id,
                     )
 
+                    # De-tokenize args before execution (streaming path)
+                    if stream_pii_ctx is not None and stream_pii_ctx.token_to_value:
+                        for tc in allowed_calls:
+                            if isinstance(tc.arguments, dict):
+                                tc.arguments = {
+                                    k: stream_pii_ctx.restore(v) if isinstance(v, str) else v
+                                    for k, v in tc.arguments.items()
+                                }
+
                     tool_results = await self._execute_tool_calls(
                         tool_calls=allowed_calls,
                         tenant_id=tenant_id,
@@ -968,6 +997,14 @@ class Orchestrator:
                          for k, v in r.items()} if isinstance(r, dict) else r
                         for r in tool_results
                     ]
+
+                    # Re-anonymize tool results before LLM context (streaming path)
+                    if stream_pii_ctx is not None:
+                        tool_results = [
+                            {k: stream_pii_ctx.anonymize(str(v)) if isinstance(v, str) else v
+                             for k, v in r.items()} if isinstance(r, dict) else r
+                            for r in tool_results
+                        ]
 
                     for tc, result in zip(allowed_calls, tool_results):
                         tool_calls_made.append({

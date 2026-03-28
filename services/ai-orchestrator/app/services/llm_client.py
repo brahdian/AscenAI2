@@ -583,6 +583,38 @@ def _build_vertex_schema(prop: dict):
     return Schema(**kwargs)
 
 
+def get_embedding_fn():
+    """
+    Return an async callable that embeds a text string into a float vector.
+
+    Uses sentence-transformers (all-MiniLM-L6-v2, 384-dim) in a thread pool
+    so the CPU-bound call doesn't block the event loop.
+    """
+    _model = None
+
+    async def _embed(text: str) -> list[float]:
+        nonlocal _model
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _run():
+            nonlocal _model
+            if _model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer  # type: ignore
+                    _model = SentenceTransformer("all-MiniLM-L6-v2")
+                except ImportError:
+                    # Fallback: return zero vector
+                    return [0.0] * 384
+            return _model.encode(text, normalize_embeddings=True).tolist()
+
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return await loop.run_in_executor(executor, _run)
+
+    return _embed
+
+
 def create_llm_client() -> LLMClient:
     if settings.LLM_PROVIDER == "gemini":
         return LLMClient(provider="gemini", model=settings.GEMINI_MODEL, api_key=settings.GEMINI_API_KEY)

@@ -20,6 +20,7 @@ from app.core.database import close_db, init_db
 from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
 from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
+from app.api.v1 import channels as channels_router
 
 logger = structlog.get_logger(__name__)
 
@@ -255,6 +256,7 @@ app.include_router(team.router, prefix="/api/v1", tags=["team"])
 app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 app.include_router(compliance.router, prefix="/api/v1", tags=["compliance"])
 app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
+app.include_router(channels_router.router, prefix="/api/v1/channels", tags=["channels"])
 
 # ── Static assets — widget.js served at /widget/widget.js ─────────────────
 import os as _os

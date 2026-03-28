@@ -392,6 +392,35 @@ class Orchestrator:
                 escalate_to_human=False, latency_ms=latency_ms, tokens_used=0,
             )
 
+        # --- ML moderation check (input) ---
+        try:
+            from app.services.moderation_service import ModerationService
+            _mod_svc = getattr(self, "_moderation_service", None)
+            if _mod_svc is None:
+                from app.core.config import settings as _cfg
+                _mod_svc = ModerationService(
+                    openai_api_key=getattr(_cfg, "OPENAI_API_KEY", None) or None
+                )
+                self._moderation_service = _mod_svc
+            _mod_result = await _mod_svc.check_input(user_message)
+            if _mod_result.is_blocked:
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                logger.warning(
+                    "ml_moderation_input_blocked",
+                    session_id=session_id,
+                    categories=_mod_result.categories,
+                    provider=_mod_result.provider,
+                )
+                return ChatResponse(
+                    session_id=session_id,
+                    message="I'm sorry, I can't respond to that type of message.",
+                    tool_calls_made=[], suggested_actions=[],
+                    escalate_to_human=False, latency_ms=latency_ms, tokens_used=0,
+                    guardrail_triggered="ml_moderation_blocked",
+                )
+        except Exception as _mod_exc:
+            logger.warning("ml_moderation_error", error=str(_mod_exc))
+
         # --- Pre-classification ---
         intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
@@ -507,6 +536,34 @@ class Orchestrator:
         messages.extend(history)
         # Use anonymized message if pseudonymization is active
         messages.append({"role": "user", "content": llm_user_message})
+
+        # --- Semantic cache check (skip LLM for near-duplicate queries) ---
+        _semantic_cache_hit = None
+        try:
+            from app.services.semantic_cache import SemanticCache
+            _sc = getattr(self, "_semantic_cache", None)
+            if _sc is None and self.redis:
+                from app.services.llm_client import get_embedding_fn
+                _sc = SemanticCache(redis_client=self.redis, embed_fn=get_embedding_fn())
+                self._semantic_cache = _sc
+            if _sc and not (guardrails and guardrails.pii_pseudonymization):
+                _semantic_cache_hit = await _sc.get(
+                    query=user_message,
+                    tenant_id=session.tenant_id,
+                    agent_id=session.agent_id,
+                )
+            if _semantic_cache_hit:
+                logger.info("semantic_cache_served", session_id=session_id)
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                return ChatResponse(
+                    session_id=session_id,
+                    message=_semantic_cache_hit,
+                    tool_calls_made=[], suggested_actions=[],
+                    escalate_to_human=False, latency_ms=latency_ms, tokens_used=0,
+                    sources=source_citations,
+                )
+        except Exception as _sc_exc:
+            logger.warning("semantic_cache_error", error=str(_sc_exc))
 
         # --- Budget check: prevent runaway spend ---
         if not await self._check_token_budget(tenant_id):
@@ -687,9 +744,89 @@ class Orchestrator:
         else:
             await self._reset_fallback_counter(session_id)
 
+        # --- Store in semantic cache for future near-duplicate queries ---
+        try:
+            _sc = getattr(self, "_semantic_cache", None)
+            if _sc:
+                await _sc.set(
+                    query=user_message,
+                    response=final_response,
+                    tenant_id=session.tenant_id,
+                    agent_id=session.agent_id,
+                    tool_calls_made=bool(tool_calls_made),
+                    pii_active=bool(pii_ctx and not pii_ctx.is_empty()),
+                    guardrail_actions=guardrail_actions if guardrail_actions else None,
+                )
+        except Exception:
+            pass
+
+        # --- Persist ConversationTrace ---
+        try:
+            from app.services.trace_logger import TraceLogger
+            _turn_idx = (
+                await self.db.execute(
+                    select(func.count()).select_from(Message).where(
+                        Message.session_id == session_id, Message.role == "user"
+                    )
+                )
+            ).scalar() or 0
+            _tracer = TraceLogger(
+                session_id=session_id,
+                tenant_id=session.tenant_id,
+                agent_id=session.agent_id,
+                turn_index=_turn_idx,
+            )
+            _tracer.set_system_prompt(system_prompt)
+            _tracer.set_memory(history, summary or "", {})
+            _tracer.set_retrieved_chunks(
+                [
+                    {
+                        "content": (item.get("content", "") or "")[:200],
+                        "score": item.get("score", 0),
+                        "document_id": str(item.get("metadata", {}).get("document_id", "")),
+                        "title": item.get("metadata", {}).get("title", ""),
+                    }
+                    for item in context_items
+                    if isinstance(item, dict)
+                ]
+            )
+            _tracer.set_messages_sent(messages)
+            _tracer.set_llm_response(
+                final_response,
+                provider=getattr(settings, "LLM_PROVIDER", ""),
+                model=getattr(agent.llm_config or {}, "get", lambda k, d: d)("model", ""),
+            )
+            for _tc_rec in tool_calls_made:
+                _tracer.add_tool_call(
+                    tool_name=_tc_rec.get("tool", ""),
+                    args={k: "***" for k in (_tc_rec.get("arguments") or {})},
+                    result="[redacted]",
+                    latency_ms=0,
+                )
+            _tracer.set_guardrail_actions(guardrail_actions or [])
+            _tracer.set_final_response(final_response)
+            await _tracer.persist(self.db, tokens_used=total_tokens)
+        except Exception as _trace_exc:
+            logger.warning("trace_persist_error", error=str(_trace_exc))
+
         # --- Step 8: Persist to memory ---
         await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
         await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": final_response})
+
+        # --- Context window auto-summarization (at 18 turns) + LTM write ---
+        try:
+            await self.memory.maybe_summarize(session_id, self.llm)
+            if session.customer_identifier:
+                await self.memory.extract_and_store_long_term_memory(
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    customer_identifier=session.customer_identifier,
+                    user_message=user_message,
+                    assistant_response=final_response,
+                    llm_client=self.llm,
+                )
+        except Exception as _mem_exc:
+            logger.warning("memory_post_turn_error", error=str(_mem_exc))
 
         # --- Persist messages to DB ---
         user_msg = Message(
@@ -1130,6 +1267,21 @@ class Orchestrator:
         # Persist to memory and DB
         await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
         await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": full_response_text})
+
+        # --- Context window auto-summarization + LTM write (streaming path) ---
+        try:
+            await self.memory.maybe_summarize(session_id, self.llm)
+            if session.customer_identifier:
+                await self.memory.extract_and_store_long_term_memory(
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    customer_identifier=session.customer_identifier,
+                    user_message=user_message,
+                    assistant_response=full_response_text,
+                    llm_client=self.llm,
+                )
+        except Exception as _mem_exc:
+            logger.warning("stream_memory_post_turn_error", error=str(_mem_exc))
 
         user_msg = Message(
             session_id=session_id,

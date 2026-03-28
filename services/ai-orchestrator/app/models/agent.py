@@ -412,6 +412,41 @@ class AgentDocument(Base):
         }
 
 
+class PlaybookExecution(Base):
+    """
+    Durable checkpoint for a PlaybookEngine state machine execution.
+    One row per (session_id, playbook_id) pair.
+    Updated on every step transition.
+    """
+    __tablename__ = "playbook_executions"
+    __table_args__ = (
+        Index("ix_pb_exec_session", "session_id"),
+        Index("ix_pb_exec_tenant_agent", "tenant_id", "agent_id"),
+        Index("ix_pb_exec_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    playbook_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
+    current_step_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    variables: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    history: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    step_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AgentGuardrails(Base):
     """
     Per-agent content policy: keyword blocks, topic restrictions,

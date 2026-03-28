@@ -50,6 +50,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
+    # Import all ORM models so they register with Base.metadata before create_all
+    import app.models  # noqa: F401 — side-effect: registers all models
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Idempotent ALTER TABLE migrations for columns added after initial create_all.
@@ -109,6 +111,44 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS ix_escalation_status "
             "ON escalation_attempts (status)"
         ))
+        # ── PostgreSQL Row-Level Security (RLS) ─────────────────────────────
+        # Skip RLS for SQLite (dev/test environment)
+        if not _is_sqlite:
+            _rls_tables = [
+                "agents", "sessions", "messages", "agent_playbooks",
+                "agent_guardrails", "agent_documents", "agent_analytics",
+                "message_feedback", "conversation_traces", "playbook_executions",
+                "eval_cases", "eval_runs", "eval_scores",
+                "prompt_versions", "prompt_ab_tests",
+            ]
+
+            # Create helper function to read current_tenant_id from session variables
+            await conn.execute(_t("""
+                CREATE OR REPLACE FUNCTION current_tenant_id() RETURNS UUID AS $$
+                BEGIN
+                    RETURN current_setting('app.current_tenant_id', TRUE)::UUID;
+                EXCEPTION
+                    WHEN invalid_text_representation OR undefined_object THEN
+                        RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+            """))
+
+            for _tbl in _rls_tables:
+                # Enable RLS
+                await conn.execute(_t(f"ALTER TABLE {_tbl} ENABLE ROW LEVEL SECURITY"))
+                # Allow table owners (app role) to bypass RLS for internal queries
+                await conn.execute(_t(
+                    f"DROP POLICY IF EXISTS tenant_isolation ON {_tbl}"
+                ))
+                await conn.execute(_t(f"""
+                    CREATE POLICY tenant_isolation ON {_tbl}
+                    USING (
+                        tenant_id = current_tenant_id()
+                        OR current_tenant_id() IS NULL
+                    )
+                """))
+
     logger.info("database_initialized")
 
 

@@ -74,6 +74,9 @@ from app.api.v1 import guardrails as guardrails_router
 from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import internal as internal_router
+from app.api.v1 import replay as replay_router
+from app.api.v1 import evals as evals_router
+from app.api.v1 import prompt_versions as prompt_versions_router
 from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
@@ -116,12 +119,47 @@ async def lifespan(app: FastAPI):
     app.state.mcp_client = _mcp_client
     logger.info("mcp_client_ready", url=settings.MCP_SERVER_URL)
 
+    # Initialize moderation service
+    from app.services.moderation_service import ModerationService
+    openai_key = getattr(settings, "OPENAI_API_KEY", "") or ""
+    app.state.moderation_service = ModerationService(openai_api_key=openai_key or None)
+    logger.info("moderation_service_ready")
+
+    # Initialize semantic cache
+    from app.services.semantic_cache import SemanticCache
+    from app.services.llm_client import get_embedding_fn
+    embed_fn = get_embedding_fn()
+    app.state.semantic_cache = SemanticCache(redis_client=redis_client, embed_fn=embed_fn)
+    logger.info("semantic_cache_ready")
+
+    # Initialize model router
+    from app.services.model_router import ModelRouter
+    app.state.model_router = ModelRouter(
+        provider=settings.LLM_PROVIDER,
+        settings=settings,
+    )
+    logger.info("model_router_ready")
+
+    # Start background document indexer
+    from app.workers.document_indexer import DocumentIndexer
+    from app.core.database import AsyncSessionLocal
+    indexer = DocumentIndexer(
+        redis_client=redis_client,
+        db_factory=AsyncSessionLocal,
+        mcp_client=_mcp_client,
+    )
+    app.state.document_indexer = indexer
+    asyncio.create_task(indexer.start())
+    logger.info("document_indexer_started")
+
     app.state.startup_complete = True
     logger.info("ai_orchestrator_started")
     yield
 
     # Shutdown
     logger.info("ai_orchestrator_shutting_down")
+    if hasattr(app.state, "document_indexer"):
+        app.state.document_indexer.stop()
     await _mcp_client.close()
     await close_redis()
     await close_db()
@@ -158,6 +196,9 @@ app.include_router(guardrails_router.router, prefix="/api/v1/agents", tags=["gua
 app.include_router(learning_router.router, prefix="/api/v1/agents", tags=["learning"])
 app.include_router(documents_router.router, prefix="/api/v1/agents", tags=["documents"])
 app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
+app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
+app.include_router(evals_router.router, prefix="/api/v1/agents", tags=["evals"])
+app.include_router(prompt_versions_router.router, prefix="/api/v1/agents", tags=["prompts"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

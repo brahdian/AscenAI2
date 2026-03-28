@@ -483,6 +483,23 @@ class Orchestrator:
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
 
+        # --- Budget check: prevent runaway spend ---
+        if not await self._check_token_budget(tenant_id):
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            logger.warning("token_budget_exceeded", tenant_id=tenant_id)
+            return ChatResponse(
+                session_id=session_id,
+                message=(
+                    "I'm temporarily unavailable due to high usage. "
+                    "Please try again later or contact support."
+                ),
+                tool_calls_made=[],
+                suggested_actions=[],
+                escalate_to_human=False,
+                latency_ms=latency_ms,
+                tokens_used=0,
+            )
+
         # --- Step 5-7: Tool-augmented LLM loop ---
         tool_calls_made: list[dict] = []
         total_tokens = 0
@@ -645,7 +662,7 @@ class Orchestrator:
         self.db.add(user_msg)
         self.db.add(assistant_msg)
 
-        # --- Step 9: Update analytics ---
+        # --- Step 9: Update analytics and token budget ---
         await self._update_analytics(
             tenant_id=session.tenant_id,
             agent_id=session.agent_id,
@@ -653,6 +670,7 @@ class Orchestrator:
             latency_ms=latency_ms,
             tool_count=len(tool_calls_made),
         )
+        await self._record_token_usage(tenant_id, total_tokens)
 
         # --- Step 10: Escalation check ---
         should_escalate = await self._should_escalate(agent, final_response, messages)
@@ -819,6 +837,22 @@ class Orchestrator:
         )
 
         tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)
+
+        # Budget check before any LLM call
+        if not await self._check_token_budget(tenant_id):
+            logger.warning("token_budget_exceeded_stream", tenant_id=tenant_id)
+            budget_msg = (
+                "I'm temporarily unavailable due to high usage. "
+                "Please try again later or contact support."
+            )
+            yield StreamChatEvent(type="text_delta", data=budget_msg, session_id=session_id)
+            yield StreamChatEvent(
+                type="done",
+                data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
+                      "tool_calls_made": 0, "escalate_to_human": False},
+                session_id=session_id,
+            )
+            return
 
         messages = [{"role": "system", "content": system_prompt}]
         if summary:
@@ -1028,6 +1062,7 @@ class Orchestrator:
             latency_ms=latency_ms,
             tool_count=len(tool_calls_made),
         )
+        await self._record_token_usage(tenant_id, total_tokens)
 
         should_escalate = await self._should_escalate(agent, full_response_text, messages)
         if should_escalate:
@@ -1658,6 +1693,38 @@ class Orchestrator:
         key = f"{_FALLBACK_COUNTER_PREFIX}{session_id}"
         try:
             await self.redis.delete(key)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Per-tenant daily token budget (prevents runaway LLM spend)
+    # ------------------------------------------------------------------
+
+    _DAILY_TOKEN_LIMIT = 2_000_000  # 2M tokens/day per tenant (~$0.40 Gemini Flash)
+
+    async def _check_token_budget(self, tenant_id: str) -> bool:
+        """Return True if tenant is within budget, False if exceeded."""
+        if self.redis is None:
+            return True  # fail-open when Redis unavailable
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"token_budget:{tenant_id}:{today}"
+        try:
+            used = await self.redis.get(key)
+            return int(used or 0) < self._DAILY_TOKEN_LIMIT
+        except Exception:
+            return True  # fail-open
+
+    async def _record_token_usage(self, tenant_id: str, tokens: int) -> None:
+        """Increment daily token counter for the tenant."""
+        if self.redis is None or tokens <= 0:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"token_budget:{tenant_id}:{today}"
+        try:
+            pipe = self.redis.pipeline()
+            pipe.incrby(key, tokens)
+            pipe.expire(key, 86400 * 2)  # keep for 2 days for debugging
+            await pipe.execute()
         except Exception:
             pass
 

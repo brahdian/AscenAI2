@@ -227,26 +227,27 @@ class Orchestrator:
 
         return None
 
-    def _apply_output_guardrails(
+    async def _apply_output_guardrails(
         self,
         response: str,
         guardrails,
         pii_ctx: Optional[PseudonymizationContext] = None,
+        session_id: str = "unknown",
     ) -> tuple[str, list[str]]:
-        """Apply output-side guardrails: PII de-anonymization, redaction, length cap, disclaimer.
+        """Apply output-side guardrails: envelope parse + token restore, redaction, length cap, disclaimer.
         Returns (modified_response, list_of_actions_applied)."""
         actions: list[str] = []
         if not guardrails:
             return response, actions
 
-        # Step 1: Restore pseudonymized tokens BEFORE any other processing
-        if pii_ctx and pii_ctx.token_to_value:
-            response = pii_ctx.restore(response)
+        # Step 1: Parse structured JSON envelope + restore pseudonymized tokens BEFORE anything else
+        if pii_ctx and not pii_ctx.is_empty():
+            response = pii_service.parse_envelope(response, pii_ctx, session_id)
             actions.append("pii_pseudonymization_restored")
 
-        # Step 2: One-way PII redaction on the final output (Presidio-backed)
+        # Step 2: One-way PII redaction on the final output (Presidio-backed, async)
         if guardrails.pii_redaction:
-            redacted = pii_service.redact(response)
+            redacted = await pii_service.redact(response)
             if redacted != response:
                 actions.append("pii_redaction")
             response = redacted
@@ -441,9 +442,7 @@ class Orchestrator:
         llm_user_message = user_message  # message sent to LLM (may be anonymized)
         if guardrails and getattr(guardrails, "pii_pseudonymization", False):
             pii_ctx = await pii_service.load_context(session_id, self.redis)
-            llm_user_message = pii_ctx.anonymize(user_message)
-            if llm_user_message != user_message:
-                logger.debug("pii_pseudonymized_input", session_id=session_id)
+            llm_user_message = await pii_service.anonymize_message(user_message, pii_ctx, session_id)
 
         # --- Step 2: Retrieve MCP context ---
         kb_ids = agent.knowledge_base_ids or []
@@ -496,7 +495,7 @@ class Orchestrator:
         if pii_ctx is not None:
             messages.append({
                 "role": "system",
-                "content": pii_service.PSEUDONYMIZATION_SYSTEM_NOTE,
+                "content": pii_service.ENVELOPE_SYSTEM_PROMPT,
             })
 
         if summary:
@@ -576,13 +575,12 @@ class Orchestrator:
 
                 # De-tokenize tool arguments before execution so real values
                 # reach the booking/CRM APIs — not placeholder tokens.
-                if pii_ctx is not None and pii_ctx.token_to_value:
+                if pii_ctx is not None and not pii_ctx.is_empty():
                     for tc in allowed_calls:
                         if isinstance(tc.arguments, dict):
-                            tc.arguments = {
-                                k: pii_ctx.restore(v) if isinstance(v, str) else v
-                                for k, v in tc.arguments.items()
-                            }
+                            tc.arguments = pii_service.restore_dict(
+                                tc.arguments, pii_ctx, session_id
+                            )
 
                 # Execute all tool calls in parallel
                 tool_results = await self._execute_tool_calls(
@@ -602,11 +600,13 @@ class Orchestrator:
                 # in confirmation data (names, emails echoed by the booking API)
                 # doesn't re-enter the LLM messages in plaintext.
                 if pii_ctx is not None:
-                    tool_results = [
-                        {k: pii_ctx.anonymize(str(v)) if isinstance(v, str) else v
-                         for k, v in r.items()} if isinstance(r, dict) else r
-                        for r in tool_results
-                    ]
+                    _re_anon: list = []
+                    for _r in tool_results:
+                        if isinstance(_r, dict):
+                            _re_anon.append(await pii_service.re_anonymize_dict(_r, pii_ctx, session_id))
+                        else:
+                            _re_anon.append(_r)
+                    tool_results = _re_anon
 
                 # Record tool calls for response metadata
                 for tc, result in zip(allowed_calls, tool_results):
@@ -659,8 +659,8 @@ class Orchestrator:
         if receipt:
             final_response = final_response.rstrip() + " " + receipt
 
-        final_response, guardrail_actions = self._apply_output_guardrails(
-            final_response, guardrails, pii_ctx=pii_ctx
+        final_response, guardrail_actions = await self._apply_output_guardrails(
+            final_response, guardrails, pii_ctx=pii_ctx, session_id=session_id
         )
         # Persist updated pseudonymization context for next turn
         if pii_ctx is not None:
@@ -852,7 +852,7 @@ class Orchestrator:
         stream_llm_message = user_message
         if guardrails and getattr(guardrails, "pii_pseudonymization", False):
             stream_pii_ctx = await pii_service.load_context(session_id, self.redis)
-            stream_llm_message = stream_pii_ctx.anonymize(user_message)
+            stream_llm_message = await pii_service.anonymize_message(user_message, stream_pii_ctx, session_id)
 
         kb_ids = agent.knowledge_base_ids or []
 
@@ -915,7 +915,7 @@ class Orchestrator:
 
         messages = [{"role": "system", "content": system_prompt}]
         if stream_pii_ctx is not None:
-            messages.append({"role": "system", "content": pii_service.PSEUDONYMIZATION_SYSTEM_NOTE})
+            messages.append({"role": "system", "content": pii_service.ENVELOPE_SYSTEM_PROMPT})
         if summary:
             messages.append({"role": "system", "content": f"[Summary]: {summary}"})
         messages.extend(history)
@@ -977,13 +977,12 @@ class Orchestrator:
                     )
 
                     # De-tokenize args before execution (streaming path)
-                    if stream_pii_ctx is not None and stream_pii_ctx.token_to_value:
+                    if stream_pii_ctx is not None and not stream_pii_ctx.is_empty():
                         for tc in allowed_calls:
                             if isinstance(tc.arguments, dict):
-                                tc.arguments = {
-                                    k: stream_pii_ctx.restore(v) if isinstance(v, str) else v
-                                    for k, v in tc.arguments.items()
-                                }
+                                tc.arguments = pii_service.restore_dict(
+                                    tc.arguments, stream_pii_ctx, session_id
+                                )
 
                     tool_results = await self._execute_tool_calls(
                         tool_calls=allowed_calls,
@@ -1000,11 +999,13 @@ class Orchestrator:
 
                     # Re-anonymize tool results before LLM context (streaming path)
                     if stream_pii_ctx is not None:
-                        tool_results = [
-                            {k: stream_pii_ctx.anonymize(str(v)) if isinstance(v, str) else v
-                             for k, v in r.items()} if isinstance(r, dict) else r
-                            for r in tool_results
-                        ]
+                        _re_anon_s: list = []
+                        for _r in tool_results:
+                            if isinstance(_r, dict):
+                                _re_anon_s.append(await pii_service.re_anonymize_dict(_r, stream_pii_ctx, session_id))
+                            else:
+                                _re_anon_s.append(_r)
+                        tool_results = _re_anon_s
 
                     for tc, result in zip(allowed_calls, tool_results):
                         tool_calls_made.append({
@@ -1064,7 +1065,11 @@ class Orchestrator:
                 )
                 await asyncio.sleep(0.01)
         else:
-            # No tools — use real streaming with TC-F02 timeout
+            # No tools — use real streaming with TC-F02 timeout.
+            # When pseudonymization is active, buffer the full response so the JSON
+            # envelope can be parsed and all tokens restored BEFORE anything reaches
+            # the client.  Otherwise stream chunks as they arrive for minimal latency.
+            _pii_active = stream_pii_ctx is not None and not stream_pii_ctx.is_empty()
             try:
                 gen = await asyncio.wait_for(
                     self.llm.complete(
@@ -1078,19 +1083,29 @@ class Orchestrator:
                 )
                 async for chunk in gen:
                     full_response_text += chunk
-                    yield StreamChatEvent(type="text_delta", data=chunk, session_id=session_id)
+                    if not _pii_active:
+                        yield StreamChatEvent(type="text_delta", data=chunk, session_id=session_id)
             except asyncio.TimeoutError:
                 logger.error("stream_llm_timeout", session_id=session_id)
                 timeout_msg = (
                     "I'm sorry, I'm taking longer than expected. Please try again in a moment."
                 )
                 full_response_text = timeout_msg
-                yield StreamChatEvent(type="text_delta", data=timeout_msg, session_id=session_id)
+                if not _pii_active:
+                    yield StreamChatEvent(type="text_delta", data=timeout_msg, session_id=session_id)
+
+            # Pseudonymization active: parse envelope, restore tokens, then stream clean text
+            if _pii_active and full_response_text:
+                restored = pii_service.parse_envelope(full_response_text, stream_pii_ctx, session_id)
+                full_response_text = restored  # _apply_output_guardrails will receive clean text
+                for word in restored.split(" "):
+                    yield StreamChatEvent(type="text_delta", data=word + " ", session_id=session_id)
+                    await asyncio.sleep(0.01)
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
-        full_response_text, stream_guardrail_actions = self._apply_output_guardrails(
-            full_response_text, guardrails, pii_ctx=stream_pii_ctx
+        full_response_text, stream_guardrail_actions = await self._apply_output_guardrails(
+            full_response_text, guardrails, pii_ctx=stream_pii_ctx, session_id=session_id
         )
         if stream_pii_ctx is not None:
             await pii_service.save_context(session_id, stream_pii_ctx, self.redis)

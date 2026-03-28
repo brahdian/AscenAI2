@@ -74,6 +74,7 @@ from app.api.v1 import guardrails as guardrails_router
 from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import internal as internal_router
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -96,6 +97,10 @@ async def lifespan(app: FastAPI):
     redis_client = await init_redis()
     app.state.redis = redis_client
     logger.info("redis_ready")
+
+    # Pre-warm Presidio NLP models — eliminates cold-start latency on first chat
+    await pii_service.warmup()
+    logger.info("pii_service_ready")
 
     # Initialize LLM client
     _llm_client = create_llm_client()

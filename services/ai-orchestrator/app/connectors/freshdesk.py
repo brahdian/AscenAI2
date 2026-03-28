@@ -5,7 +5,7 @@ Creates a Freshdesk ticket with the full conversation transcript.
 Note: separate from Freshchat (freshchat.py) — Freshdesk is the ticketing product.
 
 Required connector_config keys:
-  subdomain   — your Freshdesk subdomain (e.g. "acme" for acme.freshdesk.com)
+  domain      — your Freshdesk subdomain (e.g. "acme" for acme.freshdesk.com)
   api_key     — Freshdesk API key (from Profile Settings)
 
 Optional connector_config keys:
@@ -18,7 +18,6 @@ Optional connector_config keys:
 from __future__ import annotations
 
 import structlog
-import httpx
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
 
@@ -26,13 +25,17 @@ logger = structlog.get_logger(__name__)
 
 
 class FreshdeskConnector(BaseConnector):
-    async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
-        subdomain = self.config.get("subdomain", "")
-        api_key = self.config.get("api_key", "")
-        if not subdomain or not api_key:
-            return ConnectorResult(success=False, error="Freshdesk subdomain and api_key are required")
 
-        base = f"https://{subdomain}.freshdesk.com/api/v2"
+    def _required_config_keys(self) -> list[str]:
+        return ["domain", "api_key"]
+
+    async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
+        domain = self.config.get("domain", "")
+        api_key = self.config.get("api_key", "")
+        if not domain or not api_key:
+            return ConnectorResult(success=False, error="Freshdesk domain and api_key are required")
+
+        base = f"https://{domain}.freshdesk.com/api/v2"
         # Freshdesk uses Basic Auth with API key as username, "X" as password
         auth = (api_key, "X")
 
@@ -71,15 +74,20 @@ class FreshdeskConnector(BaseConnector):
         if self.config.get("group_id"):
             ticket["group_id"] = int(self.config["group_id"])
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{base}/tickets", json=ticket, auth=auth)
-            if resp.status_code not in (200, 201):
-                logger.error("freshdesk_create_ticket_failed", status=resp.status_code, body=resp.text[:300])
-                return ConnectorResult(success=False, error=f"Freshdesk API {resp.status_code}: {resp.text[:200]}")
+        resp = await self._http_post(f"{base}/tickets", headers={}, json=ticket, auth=auth)
 
-            data = resp.json()
-            ticket_id = str(data.get("id", ""))
-            url = f"https://{subdomain}.freshdesk.com/helpdesk/tickets/{ticket_id}"
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", "60"))
+            logger.warning("connector_rate_limited", connector=self.__class__.__name__, retry_after=retry_after)
+            return ConnectorResult(success=False, error=f"Rate limited. Retry after {retry_after}s")
 
-            logger.info("freshdesk_handoff_success", ticket_id=ticket_id, session_id=payload.session_id)
-            return ConnectorResult(success=True, ticket_id=ticket_id, conversation_url=url, raw=data)
+        if resp.status_code not in (200, 201):
+            logger.error("freshdesk_create_ticket_failed", status=resp.status_code, body=self._scrub_pii(resp.text))
+            return ConnectorResult(success=False, error=f"Freshdesk API {resp.status_code}: {self._scrub_pii(resp.text)}")
+
+        data = resp.json()
+        ticket_id = str(data.get("id", ""))
+        url = f"https://{domain}.freshdesk.com/helpdesk/tickets/{ticket_id}"
+
+        logger.info("freshdesk_handoff_success", ticket_id=ticket_id, session_id=payload.session_id)
+        return ConnectorResult(success=True, ticket_id=ticket_id, conversation_url=url, raw=data)

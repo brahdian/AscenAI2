@@ -19,6 +19,15 @@ class ChatRequest(BaseModel):
         None, description="Phone, email, or anonymous identifier"
     )
     metadata: dict = Field(default_factory=dict, description="Optional extra metadata")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=128,
+        description=(
+            "Client-supplied deduplication key. If a response was already returned "
+            "for this key within 5 minutes the same response is returned without "
+            "re-processing. Use a UUID per user send action."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):

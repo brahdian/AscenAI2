@@ -360,14 +360,22 @@ class VoicePipeline:
 
         except asyncio.CancelledError:
             logger.info("utterance_processing_cancelled", session_id=state.session_id)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("utterance_processing_timeout", session_id=state.session_id)
+            await self._tts_and_send(
+                "Sorry, I'm taking too long to respond right now. Please try again.",
+                websocket, state,
+            )
         except Exception as exc:
             logger.error(
                 "utterance_processing_error",
                 session_id=state.session_id,
-                error=str(exc),
+                error=type(exc).__name__,  # no stack details to client
             )
-            await self._send_json(
-                websocket, {"type": "error", "message": "Processing error"}
+            # Graceful fallback — keep the call alive and let the user retry
+            await self._tts_and_send(
+                "Sorry, something went wrong on my end. Could you repeat that?",
+                websocket, state,
             )
         finally:
             state.is_speaking = False

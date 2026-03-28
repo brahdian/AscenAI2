@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import uuid
 from typing import Optional
 
@@ -7,7 +8,42 @@ import httpx
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from app.core.metrics import TOOL_EXECUTIONS, TOOL_LATENCY, MCP_CIRCUIT_OPENS, CONTEXT_RETRIEVALS, CONTEXT_ITEMS_RETURNED
+
 logger = structlog.get_logger(__name__)
+
+
+class _MCPCircuitBreaker:
+    """Simple circuit breaker for the MCP server."""
+    _FAILURE_THRESHOLD = 5
+    _COOLDOWN_SECONDS = 30.0
+
+    def __init__(self):
+        self._failures = 0
+        self._opened_at: Optional[float] = None
+
+    def is_open(self) -> bool:
+        if self._opened_at is None:
+            return False
+        if time.monotonic() - self._opened_at >= self._COOLDOWN_SECONDS:
+            self._opened_at = None  # transition to HALF_OPEN; allow probe
+            return False
+        return True
+
+    def on_success(self):
+        self._failures = 0
+        self._opened_at = None
+
+    def on_failure(self):
+        self._failures += 1
+        if self._failures >= self._FAILURE_THRESHOLD and self._opened_at is None:
+            self._opened_at = time.monotonic()
+            MCP_CIRCUIT_OPENS.inc()
+            logger.error(
+                "mcp_circuit_breaker_opened",
+                failures=self._failures,
+                cooldown_s=self._COOLDOWN_SECONDS,
+            )
 
 
 class MCPClient:
@@ -20,6 +56,7 @@ class MCPClient:
         self.base_url = base_url.rstrip("/")
         self.ws_url = ws_url.rstrip("/")
         self._client: Optional[httpx.AsyncClient] = None
+        self._breaker = _MCPCircuitBreaker()
 
     async def initialize(self):
         self._client = httpx.AsyncClient(
@@ -68,11 +105,20 @@ class MCPClient:
             "trace_id": trace_id,
         }
 
+        if self._breaker.is_open():
+            logger.warning("mcp_circuit_open_fast_fail", tool=tool_name)
+            TOOL_EXECUTIONS.labels(tool_name=tool_name, status="circuit_open").inc()
+            return {"success": False, "error": "MCP service circuit breaker open", "tool_name": tool_name}
+
+        _t0 = time.monotonic()
         try:
             client = self._get_client()
             response = await client.post("/execute", json=payload)
             response.raise_for_status()
             result = response.json()
+            self._breaker.on_success()
+            TOOL_EXECUTIONS.labels(tool_name=tool_name, status="success").inc()
+            TOOL_LATENCY.labels(tool_name=tool_name).observe(time.monotonic() - _t0)
             logger.info(
                 "mcp_tool_executed",
                 tool=tool_name,
@@ -82,20 +128,25 @@ class MCPClient:
             )
             return result
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                self._breaker.on_failure()
+            TOOL_EXECUTIONS.labels(tool_name=tool_name, status="error").inc()
+            TOOL_LATENCY.labels(tool_name=tool_name).observe(time.monotonic() - _t0)
             logger.error(
                 "mcp_tool_http_error",
                 tool=tool_name,
                 status=exc.response.status_code,
-                detail=exc.response.text,
             )
-            # Return a graceful error result instead of raising
             return {
                 "success": False,
                 "error": f"Tool execution failed with status {exc.response.status_code}",
                 "tool_name": tool_name,
             }
         except Exception as exc:
-            logger.error("mcp_tool_error", tool=tool_name, error=str(exc))
+            self._breaker.on_failure()
+            TOOL_EXECUTIONS.labels(tool_name=tool_name, status="error").inc()
+            TOOL_LATENCY.labels(tool_name=tool_name).observe(time.monotonic() - _t0)
+            logger.error("mcp_tool_error", tool=tool_name, error=type(exc).__name__)
             return {
                 "success": False,
                 "error": str(exc),
@@ -133,28 +184,39 @@ class MCPClient:
         if knowledge_base_ids:
             payload["knowledge_base_ids"] = knowledge_base_ids
 
+        if self._breaker.is_open():
+            logger.warning("mcp_circuit_open_context_skip")
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            return []
+
         try:
             client = self._get_client()
             response = await client.post("/context/retrieve", json=payload)
             response.raise_for_status()
             data = response.json()
             items = data.get("items", data) if isinstance(data, dict) else data
+            items = items if isinstance(items, list) else []
+            self._breaker.on_success()
+            status = "hit" if items else "miss"
+            CONTEXT_RETRIEVALS.labels(status=status).inc()
+            CONTEXT_ITEMS_RETURNED.observe(len(items))
             logger.info(
                 "mcp_context_retrieved",
                 tenant_id=tenant_id,
                 query_len=len(query),
                 items_count=len(items),
             )
-            return items if isinstance(items, list) else []
+            return items
         except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "mcp_context_http_error",
-                status=exc.response.status_code,
-                detail=exc.response.text,
-            )
+            if exc.response.status_code >= 500:
+                self._breaker.on_failure()
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            logger.warning("mcp_context_http_error", status=exc.response.status_code)
             return []
         except Exception as exc:
-            logger.warning("mcp_context_error", error=str(exc))
+            self._breaker.on_failure()
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            logger.warning("mcp_context_error", error=type(exc).__name__)
             return []
 
     async def list_tools(self, tenant_id: str) -> list[dict]:

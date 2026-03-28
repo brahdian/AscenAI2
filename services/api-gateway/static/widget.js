@@ -180,6 +180,50 @@
   // ──────────────────────────────────────────────────────────────────────────
   // Messaging
   // ──────────────────────────────────────────────────────────────────────────
+
+  var MAX_RETRIES = 3;
+  var BASE_BACKOFF_MS = 1000; // 1s, 2s, 4s
+
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function fetchWithRetry(url, options, attempt) {
+    attempt = attempt || 0;
+    return fetch(url, options).then(function (res) {
+      // Rate limited — honour Retry-After if present
+      if (res.status === 429) {
+        if (attempt >= MAX_RETRIES) {
+          return Promise.reject(new Error('Rate limited after ' + MAX_RETRIES + ' retries'));
+        }
+        var retryAfterSec = parseFloat(res.headers.get('Retry-After') || '0');
+        var waitMs = retryAfterSec > 0
+          ? retryAfterSec * 1000
+          : BASE_BACKOFF_MS * Math.pow(2, attempt);
+        return delay(waitMs).then(function () {
+          return fetchWithRetry(url, options, attempt + 1);
+        });
+      }
+      // Transient server errors — retry with exponential backoff
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < MAX_RETRIES) {
+        var backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
+        return delay(backoff).then(function () {
+          return fetchWithRetry(url, options, attempt + 1);
+        });
+      }
+      return res;
+    }).catch(function (err) {
+      // Network-level error (offline, DNS failure, etc.)
+      if (attempt < MAX_RETRIES) {
+        var backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
+        return delay(backoff).then(function () {
+          return fetchWithRetry(url, options, attempt + 1);
+        });
+      }
+      return Promise.reject(err);
+    });
+  }
+
   function sendMessage() {
     var text = inputEl.value.trim();
     if (!text || isTyping) return;
@@ -198,7 +242,7 @@
     };
     if (sessionId) body.session_id = sessionId;
 
-    fetch(API_URL + '/api/v1/proxy/chat', {
+    fetchWithRetry(API_URL + '/api/v1/proxy/chat', {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + API_KEY,

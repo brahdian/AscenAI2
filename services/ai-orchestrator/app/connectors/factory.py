@@ -17,6 +17,7 @@ import structlog
 from typing import Any
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
+from app.core.metrics import ESCALATION_ATTEMPTS
 
 logger = structlog.get_logger(__name__)
 
@@ -110,21 +111,49 @@ async def trigger_connector(
     if connector is None:
         return None
 
+    connector_type = escalation_config.get("connector_type") or "unknown"
     try:
         result = await connector.handoff(payload)
-        if not result.success:
+        if result.success:
+            ESCALATION_ATTEMPTS.labels(connector_type=connector_type, status="success").inc()
+        else:
+            ESCALATION_ATTEMPTS.labels(connector_type=connector_type, status="failed").inc()
             logger.warning(
                 "connector_handoff_failed",
-                connector_type=escalation_config.get("connector_type"),
+                connector_type=connector_type,
                 error=result.error,
                 session_id=payload.session_id,
             )
         return result
     except Exception as exc:
+        ESCALATION_ATTEMPTS.labels(connector_type=connector_type, status="failed").inc()
         logger.error(
             "connector_handoff_exception",
-            connector_type=escalation_config.get("connector_type"),
+            connector_type=connector_type,
             error=str(exc),
             session_id=payload.session_id,
         )
         return ConnectorResult(success=False, error=str(exc))
+
+
+async def trigger_connector_with_idempotency(
+    escalation_config: dict[str, Any],
+    payload: EscalationPayload,
+    redis=None,
+) -> ConnectorResult | None:
+    """
+    Like trigger_connector(), but uses a Redis SET NX guard to prevent
+    duplicate escalations for the same session within a 10-minute window.
+
+    If redis is None, falls through to trigger_connector() with no dedup.
+    Returns None if no connector is configured.
+    """
+    if redis is not None:
+        idem_key = f"escalation:fired:{payload.session_id}"
+        was_set = await redis.set(idem_key, "1", nx=True, ex=600)
+        if not was_set:
+            logger.info("escalation_deduplicated", session_id=payload.session_id)
+            connector_type = escalation_config.get("connector_type") or "unknown"
+            ESCALATION_ATTEMPTS.labels(connector_type=connector_type, status="deduplicated").inc()
+            return ConnectorResult(success=True, ticket_id="deduplicated", error="")
+    return await trigger_connector(escalation_config, payload)

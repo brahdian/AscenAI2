@@ -14,7 +14,6 @@ Optional connector_config keys:
 from __future__ import annotations
 
 import structlog
-import httpx
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
 
@@ -23,6 +22,10 @@ _BASE = "https://api.livechatinc.com"
 
 
 class LiveChatConnector(BaseConnector):
+
+    def _required_config_keys(self) -> list[str]:
+        return ["login", "api_key"]
+
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         login = self.config.get("login", "")
         api_key = self.config.get("api_key", "")
@@ -58,15 +61,20 @@ class LiveChatConnector(BaseConnector):
         if tags:
             ticket["tags"] = tags
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{_BASE}/tickets", json=ticket, auth=auth, headers=headers)
-            if resp.status_code not in (200, 201):
-                logger.error("livechat_create_ticket_failed", status=resp.status_code, body=resp.text[:300])
-                return ConnectorResult(success=False, error=f"LiveChat API {resp.status_code}: {resp.text[:200]}")
+        resp = await self._http_post(f"{_BASE}/tickets", headers=headers, json=ticket, auth=auth)
 
-            data = resp.json()
-            ticket_id = str(data.get("id", ""))
-            url = f"https://my.livechat.com/tickets/{ticket_id}"
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", "60"))
+            logger.warning("connector_rate_limited", connector=self.__class__.__name__, retry_after=retry_after)
+            return ConnectorResult(success=False, error=f"Rate limited. Retry after {retry_after}s")
 
-            logger.info("livechat_handoff_success", ticket_id=ticket_id, session_id=payload.session_id)
-            return ConnectorResult(success=True, ticket_id=ticket_id, conversation_url=url, raw=data)
+        if resp.status_code not in (200, 201):
+            logger.error("livechat_create_ticket_failed", status=resp.status_code, body=self._scrub_pii(resp.text))
+            return ConnectorResult(success=False, error=f"LiveChat API {resp.status_code}: {self._scrub_pii(resp.text)}")
+
+        data = resp.json()
+        ticket_id = str(data.get("id", ""))
+        url = f"https://my.livechat.com/tickets/{ticket_id}"
+
+        logger.info("livechat_handoff_success", ticket_id=ticket_id, session_id=payload.session_id)
+        return ConnectorResult(success=True, ticket_id=ticket_id, conversation_url=url, raw=data)

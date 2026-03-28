@@ -113,8 +113,10 @@ class STTService:
             )
 
         except Exception as exc:
-            logger.error("stt_transcribe_error", error=str(exc))
-            raise
+            logger.error("stt_transcribe_error", error=type(exc).__name__)
+            # Return empty result instead of raising — the caller will treat
+            # this as silence and prompt the user to repeat themselves.
+            return TranscriptResult(text="", confidence=0.0, language=language, duration_ms=0)
 
     async def transcribe_stream(
         self,

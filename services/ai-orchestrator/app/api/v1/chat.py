@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as _json
 import time
 import uuid
 from typing import Optional
@@ -11,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.metrics import MESSAGES_PROCESSED, SESSIONS_CREATED
 from app.models.agent import Agent, Session as AgentSession
 from app.schemas.chat import ChatRequest, ChatResponse, StreamChatEvent
 from app.services.memory_manager import MemoryManager
@@ -18,6 +20,31 @@ from app.services.orchestrator import Orchestrator
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/chat")
+
+_IDEMPOTENCY_TTL = 300  # 5 minutes
+
+
+async def _check_idempotency(key: str, redis) -> Optional[ChatResponse]:
+    """Return cached ChatResponse if key was seen recently, else None."""
+    if not key or redis is None:
+        return None
+    try:
+        cached = await redis.get(f"idem:chat:{key}")
+        if cached:
+            return ChatResponse(**_json.loads(cached))
+    except Exception:
+        pass
+    return None
+
+
+async def _store_idempotency(key: str, response: ChatResponse, redis) -> None:
+    """Cache the response under the idempotency key for TTL seconds."""
+    if not key or redis is None:
+        return
+    try:
+        await redis.setex(f"idem:chat:{key}", _IDEMPOTENCY_TTL, _json.dumps(response.model_dump()))
+    except Exception:
+        pass
 
 
 def _tenant_id(request: Request) -> str:
@@ -71,6 +98,7 @@ async def _get_or_create_session(
     )
     db.add(sess)
     await db.flush()
+    SESSIONS_CREATED.labels(channel=channel).inc()
     return sess
 
 
@@ -82,6 +110,15 @@ async def chat(
 ):
     """Process a chat message and return the AI response."""
     tenant_id = _tenant_id(request)
+    redis_client = getattr(request.app.state, "redis", None)
+
+    # Idempotency check — return cached response for duplicate client retries
+    if body.idempotency_key:
+        cached = await _check_idempotency(body.idempotency_key, redis_client)
+        if cached:
+            logger.info("chat_idempotent_hit", key=body.idempotency_key, session_id=body.session_id)
+            return cached
+
     agent = await _load_agent(tenant_id, body.agent_id, db)
     session = await _get_or_create_session(
         body.session_id,
@@ -92,7 +129,6 @@ async def chat(
         db,
     )
 
-    redis_client = getattr(request.app.state, "redis", None)
     llm_client = getattr(request.app.state, "llm_client", None)
     mcp_client = getattr(request.app.state, "mcp_client", None)
 
@@ -112,6 +148,13 @@ async def chat(
         stream=False,
     )
     await db.commit()
+
+    MESSAGES_PROCESSED.labels(channel=body.channel).inc()
+
+    # Store for idempotency deduplication
+    if body.idempotency_key:
+        await _store_idempotency(body.idempotency_key, response, redis_client)
+
     return response
 
 

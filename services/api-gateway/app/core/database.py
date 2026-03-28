@@ -25,6 +25,10 @@ if "sqlite" not in settings.DATABASE_URL:
         "pool_size": 10,
         "max_overflow": 20,
         "pool_pre_ping": True,
+        # Recycle connections every 30 min to avoid stale connections after
+        # PostgreSQL keepalive / firewall idle-connection timeouts.
+        "pool_recycle": 1800,
+        "pool_timeout": 30,
     }
 else:
     _pool_kwargs = {"poolclass": NullPool}

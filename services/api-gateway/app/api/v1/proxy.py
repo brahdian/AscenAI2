@@ -139,13 +139,18 @@ def _sanitize_chat_body(body: bytes, content_type: str) -> bytes:
 async def _proxy_request(request: Request, url: str, service: str = "") -> Response:
     """Forward a request to a downstream service and return the response."""
     # Forward auth headers plus tenant context
+    _trace_id = getattr(request.state, "trace_id", "")
+    _span_id = getattr(request.state, "span_id", "")
     headers = {
         "X-Tenant-ID": getattr(request.state, "tenant_id", ""),
         "X-User-ID": getattr(request.state, "user_id", ""),
         "X-Role": getattr(request.state, "role", ""),
-        "X-Trace-ID": getattr(request.state, "trace_id", ""),
+        "X-Trace-ID": _trace_id,
         "Content-Type": request.headers.get("Content-Type", "application/json"),
     }
+    # Propagate W3C traceparent so downstream services continue the same trace
+    if _trace_id and _span_id:
+        headers["traceparent"] = f"00-{_trace_id}-{_span_id}-01"
 
     body = await request.body()
 

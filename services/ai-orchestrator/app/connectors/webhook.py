@@ -15,7 +15,6 @@ import hmac
 import json
 import time
 import structlog
-import httpx
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
 
@@ -27,6 +26,9 @@ class WebhookConnector(BaseConnector):
     POSTs a JSON escalation payload to any HTTPS webhook URL.
     Useful for custom integrations, internal ticketing, Slack, etc.
     """
+
+    def _required_config_keys(self) -> list[str]:
+        return ["url"]
 
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         url = self.config.get("url", "").strip()
@@ -64,11 +66,16 @@ class WebhookConnector(BaseConnector):
         for k, v in (self.config.get("headers") or {}).items():
             headers[k] = str(v)
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, content=raw_body, headers=headers)
-            if resp.status_code >= 400:
-                logger.error("webhook_escalation_failed", status=resp.status_code, url=url, body=resp.text[:200])
-                return ConnectorResult(success=False, error=f"Webhook {resp.status_code}: {resp.text[:200]}")
+        resp = await self._http_post_content(url, headers=headers, content=raw_body)
+
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", "60"))
+            logger.warning("connector_rate_limited", connector=self.__class__.__name__, retry_after=retry_after)
+            return ConnectorResult(success=False, error=f"Rate limited. Retry after {retry_after}s")
+
+        if resp.status_code >= 400:
+            logger.error("webhook_escalation_failed", status=resp.status_code, url=url, body=self._scrub_pii(resp.text))
+            return ConnectorResult(success=False, error=f"Webhook {resp.status_code}: {self._scrub_pii(resp.text)}")
 
         logger.info("webhook_escalation_sent", url=url, session_id=payload.session_id)
         return ConnectorResult(success=True, raw={"status": resp.status_code})

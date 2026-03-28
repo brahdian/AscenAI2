@@ -17,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.database import close_db, init_db
+from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
 from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
 
@@ -91,8 +92,17 @@ if c == 1 then redis.call('EXPIRE', KEYS[1], 120) end
 return c
 """
             count = await redis.eval(_lua, 1, window_key)
-        except Exception:
-            # If Redis is down, allow the request through
+        except Exception as _redis_err:
+            logger.warning("rate_limiter_redis_unavailable", error=type(_redis_err).__name__)
+            if settings.ENVIRONMENT == "production":
+                # Fail-closed in production: return 503 so we don't silently
+                # disable rate limiting when Redis is down.
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Service temporarily unavailable. Please try again shortly."},
+                    headers={"Retry-After": "5"},
+                )
+            # In dev/staging: fail-open so Redis outages don't block development
             count = 0
 
         if count > limit:
@@ -226,6 +236,9 @@ app.add_middleware(AuthMiddleware)
 
 # --- Rate limiting (reads tenant_id set by AuthMiddleware) -----------------
 app.add_middleware(RateLimitMiddleware)
+
+# --- W3C traceparent propagation (outermost — wraps everything) -------------
+app.add_middleware(TracingMiddleware)
 
 # --- Prometheus metrics -----------------------------------------------------
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")

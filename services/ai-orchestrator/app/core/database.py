@@ -13,13 +13,18 @@ class Base(DeclarativeBase):
     pass
 
 
+_is_sqlite = "sqlite" in settings.DATABASE_URL
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    poolclass=NullPool if "sqlite" in settings.DATABASE_URL else None,
+    poolclass=NullPool if _is_sqlite else None,
     pool_pre_ping=True,
-    pool_size=10 if "sqlite" not in settings.DATABASE_URL else None,
-    max_overflow=20 if "sqlite" not in settings.DATABASE_URL else None,
+    pool_size=10 if not _is_sqlite else None,
+    max_overflow=20 if not _is_sqlite else None,
+    # Recycle connections every 30 min to avoid stale TCP connections after
+    # PostgreSQL's tcp_keepalives_idle or firewall idle-connection timeouts.
+    pool_recycle=1800 if not _is_sqlite else None,
+    pool_timeout=30 if not _is_sqlite else None,
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -73,6 +78,37 @@ async def init_db() -> None:
                 "ADD COLUMN IF NOT EXISTS voice_greeting_url VARCHAR(500)"
             )
         )
+        # Escalation audit trail — DLQ for failed connector attempts
+        _t = __import__("sqlalchemy", fromlist=["text"]).text
+        await conn.execute(_t(
+            "CREATE TABLE IF NOT EXISTS escalation_attempts ("
+            "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+            "  tenant_id UUID NOT NULL,"
+            "  session_id VARCHAR(255) NOT NULL,"
+            "  agent_name VARCHAR(255) NOT NULL DEFAULT '',"
+            "  connector_type VARCHAR(50) NOT NULL DEFAULT '',"
+            "  channel VARCHAR(20) NOT NULL DEFAULT 'web',"
+            "  contact_name VARCHAR(255),"
+            "  contact_phone VARCHAR(50),"
+            "  contact_email VARCHAR(255),"
+            "  trigger_message TEXT,"
+            "  status VARCHAR(20) NOT NULL DEFAULT 'pending',"
+            "  ticket_id VARCHAR(255),"
+            "  conversation_url VARCHAR(500),"
+            "  error_message TEXT,"
+            "  payload_snapshot JSONB,"
+            "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ")"
+        ))
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_escalation_tenant_session "
+            "ON escalation_attempts (tenant_id, session_id)"
+        ))
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_escalation_status "
+            "ON escalation_attempts (status)"
+        ))
     logger.info("database_initialized")
 
 

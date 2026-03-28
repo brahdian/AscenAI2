@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 import sentry_sdk
@@ -86,14 +90,55 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+_AUDIO_CLEANUP_DIRS = [
+    Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings")),
+    Path(os.environ.get("TTS_AUDIO_PATH", "/tmp/tts-cache")),
+]
+_AUDIO_MAX_AGE_SECONDS = 86400  # 24 hours
+
+
+async def _cleanup_audio_files() -> None:
+    """Periodically remove audio files older than 24 hours to prevent disk exhaustion."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # run every hour
+            cutoff = time.time() - _AUDIO_MAX_AGE_SECONDS
+            for base_dir in _AUDIO_CLEANUP_DIRS:
+                if not base_dir.exists():
+                    continue
+                removed = 0
+                for f in base_dir.iterdir():
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+                if removed:
+                    logger.info("audio_cleanup_complete", directory=str(base_dir), removed=removed)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("audio_cleanup_error", error=type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("voice_pipeline_starting", version=settings.APP_VERSION)
+
+    # Ensure audio directories exist
+    for d in _AUDIO_CLEANUP_DIRS:
+        d.mkdir(parents=True, exist_ok=True)
+
     redis = await init_redis()
     app.state.redis = redis
+
+    # Start audio cleanup background task
+    cleanup_task = asyncio.create_task(_cleanup_audio_files())
+
     app.state.startup_complete = True
     logger.info("voice_pipeline_ready")
     yield
+
+    cleanup_task.cancel()
+    await asyncio.gather(cleanup_task, return_exceptions=True)
     await close_redis()
     logger.info("voice_pipeline_stopped")
 

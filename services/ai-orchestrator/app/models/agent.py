@@ -488,3 +488,54 @@ class AgentGuardrails(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class EscalationAttempt(Base):
+    """
+    Persistent audit trail for every live-agent escalation attempt.
+
+    Created BEFORE firing the connector (so we have a record even if the
+    orchestrator crashes), then updated with the result.  This also serves as
+    the dead-letter log — failed rows can be retried via a background job.
+    """
+    __tablename__ = "escalation_attempts"
+    __table_args__ = (
+        Index("ix_escalation_tenant_session", "tenant_id", "session_id"),
+        Index("ix_escalation_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    # Connector info
+    connector_type: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    channel: Mapped[str] = mapped_column(String(20), nullable=False, default="web")
+
+    # Contact info (stored encrypted in prod; plain for dev)
+    contact_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Escalation trigger
+    trigger_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Result — updated after connector fires
+    # status: "pending" | "success" | "failed" | "deduplicated"
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    ticket_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    conversation_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Full payload snapshot for replay
+    payload_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

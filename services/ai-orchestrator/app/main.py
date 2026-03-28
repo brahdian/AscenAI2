@@ -59,6 +59,7 @@ def _setup_opentelemetry() -> None:
 
 _setup_opentelemetry()
 
+from app.core.tracing import TracingMiddleware
 from app.services.llm_client import create_llm_client
 from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
@@ -136,6 +137,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# W3C traceparent propagation — must be outermost after CORS
+app.add_middleware(TracingMiddleware)
 
 # Include routers
 app.include_router(chat_router.router, prefix="/api/v1", tags=["chat"])

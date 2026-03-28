@@ -1403,11 +1403,17 @@ class Orchestrator:
         contact_email: str = "",
     ) -> None:
         """
-        Asynchronously trigger the configured live-agent connector.
-        Loads conversation history from the current session and fires the
-        handoff in the background — escalation proceeds even if the connector
-        call fails.
+        Asynchronously trigger the configured live-agent connector with:
+          1. Idempotency guard — Redis SET NX prevents duplicate escalations
+          2. Persistent audit record — written BEFORE the background task fires
+             so a crash doesn't lose the attempt
+          3. Non-blocking — connector latency never delays the chat response
         """
+        from app.models.agent import EscalationAttempt
+        from app.connectors.factory import trigger_connector_with_idempotency
+
+        connector_type = (escalation_config.get("connector_type") or "").lower().strip()
+
         # Fetch recent messages for the transcript (last 30 turns)
         try:
             result = await self.db.execute(
@@ -1432,8 +1438,58 @@ class Orchestrator:
             channel=session.channel or "web",
         )
 
+        # Persist audit record BEFORE background task (DLQ pattern)
+        attempt = EscalationAttempt(
+            tenant_id=session.tenant_id,
+            session_id=str(session.id),
+            agent_name=agent.name or "AscenAI Bot",
+            connector_type=connector_type,
+            channel=session.channel or "web",
+            contact_name=contact_name or None,
+            contact_phone=contact_phone or None,
+            contact_email=contact_email or None,
+            trigger_message=trigger_message[:1000] if trigger_message else None,
+            status="pending",
+            payload_snapshot={
+                "history_len": len(history),
+                "trigger": trigger_message[:200] if trigger_message else "",
+            },
+        )
+        try:
+            self.db.add(attempt)
+            await self.db.flush()
+            attempt_id = str(attempt.id)
+        except Exception as exc:
+            logger.warning("escalation_attempt_persist_failed", error=str(exc))
+            attempt_id = None
+
+        async def _run_and_update():
+            try:
+                from app.core.database import AsyncSessionLocal
+                result = await trigger_connector_with_idempotency(
+                    escalation_config, payload, redis=self.redis
+                )
+                if attempt_id:
+                    async with AsyncSessionLocal() as db2:
+                        row = await db2.get(EscalationAttempt, attempt_id)
+                        if row:
+                            if result is None:
+                                row.status = "skipped"
+                            elif result.ticket_id == "deduplicated":
+                                row.status = "deduplicated"
+                            elif result.success:
+                                row.status = "success"
+                                row.ticket_id = result.ticket_id or None
+                                row.conversation_url = result.conversation_url or None
+                            else:
+                                row.status = "failed"
+                                row.error_message = result.error[:1000] if result.error else None
+                            await db2.commit()
+            except Exception as exc:
+                logger.error("escalation_background_task_failed", attempt_id=attempt_id, error=str(exc))
+
         # Run in background so connector latency doesn't delay the response
-        asyncio.create_task(trigger_connector(escalation_config, payload))
+        asyncio.create_task(_run_and_update())
 
     # ------------------------------------------------------------------
     # TC-E01: Emergency bypass

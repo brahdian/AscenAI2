@@ -36,6 +36,24 @@ from app.services.tts_service import TTSService
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# PII redaction helper — strip PII from log messages before emitting
+# ---------------------------------------------------------------------------
+import re as _re
+
+_EMAIL_RE = _re.compile(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b')
+_PHONE_RE = _re.compile(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b')
+_CARD_RE  = _re.compile(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b')
+
+
+def _redact_pii(text: str) -> str:
+    """Replace common PII patterns with safe placeholders before logging."""
+    text = _EMAIL_RE.sub('[EMAIL]', text)
+    text = _PHONE_RE.sub('[PHONE]', text)
+    text = _CARD_RE.sub('[CARD]', text)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
@@ -335,7 +353,7 @@ class VoicePipeline:
             logger.info(
                 "utterance_transcribed",
                 session_id=state.session_id,
-                text=transcript.text[:80],
+                text=_redact_pii(transcript.text)[:80],
             )
             await self._send_json(
                 websocket,

@@ -73,6 +73,7 @@ from app.api.v1 import playbook as playbook_router
 from app.api.v1 import guardrails as guardrails_router
 from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
+from app.api.v1 import internal as internal_router
 
 logger = structlog.get_logger(__name__)
 
@@ -151,6 +152,7 @@ app.include_router(playbook_router.router, prefix="/api/v1/agents", tags=["playb
 app.include_router(guardrails_router.router, prefix="/api/v1/agents", tags=["guardrails"])
 app.include_router(learning_router.router, prefix="/api/v1/agents", tags=["learning"])
 app.include_router(documents_router.router, prefix="/api/v1/agents", tags=["documents"])
+app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

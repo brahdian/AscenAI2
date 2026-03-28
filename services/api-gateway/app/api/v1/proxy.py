@@ -154,6 +154,10 @@ async def _proxy_request(request: Request, url: str, service: str = "") -> Respo
 
     body = await request.body()
 
+    _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+    if len(body) > _MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Request body too large (max 10 MB).")
+
     # Strip forbidden fields from chat/stream requests (TC-E04)
     if service == "chat":
         body = _sanitize_chat_body(body, headers["Content-Type"])

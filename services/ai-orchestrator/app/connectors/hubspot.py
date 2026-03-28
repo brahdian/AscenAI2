@@ -30,6 +30,35 @@ class HubSpotConnector(BaseConnector):
     conversation transcript as the ticket body.
     """
 
+    def _required_config_keys(self) -> list[str]:
+        return ["access_token"]
+
+    async def validate_credentials(self) -> tuple[bool, str]:
+        """Verify HubSpot credentials with a lightweight GET /crm/v3/objects/tickets?limit=1 call."""
+        token = self.config.get("access_token", "")
+        if not token:
+            return False, "Missing required config key: access_token"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                resp = await client.get(
+                    f"{_BASE}/crm/v3/objects/tickets",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    params={"limit": 1},
+                )
+            if resp.status_code == 200:
+                return True, "Connected successfully"
+            if resp.status_code == 401:
+                return False, "Invalid access token (401 Unauthorized)"
+            if resp.status_code == 403:
+                return False, "Access token lacks required scopes (403 Forbidden)"
+            return False, f"HubSpot returned HTTP {resp.status_code}"
+        except httpx.ConnectError:
+            return False, "Could not connect to api.hubapi.com"
+        except httpx.TimeoutException:
+            return False, "Connection timed out"
+        except Exception as exc:
+            return False, str(exc)
+
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         token = self.config.get("access_token", "")
         if not token:

@@ -18,6 +18,7 @@ Optional connector_config keys:
 from __future__ import annotations
 
 import structlog
+import httpx
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
 
@@ -28,6 +29,34 @@ class FreshdeskConnector(BaseConnector):
 
     def _required_config_keys(self) -> list[str]:
         return ["domain", "api_key"]
+
+    async def validate_credentials(self) -> tuple[bool, str]:
+        """Verify Freshdesk credentials with a lightweight GET /api/v2/tickets?per_page=1 call."""
+        domain = self.config.get("domain", "")
+        api_key = self.config.get("api_key", "")
+        missing = [k for k, v in [("domain", domain), ("api_key", api_key)] if not v]
+        if missing:
+            return False, f"Missing required config keys: {', '.join(missing)}"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                resp = await client.get(
+                    f"https://{domain}.freshdesk.com/api/v2/tickets",
+                    auth=(api_key, "X"),
+                    params={"per_page": 1},
+                )
+            if resp.status_code == 200:
+                return True, "Connected successfully"
+            if resp.status_code == 401:
+                return False, "Invalid API key (401 Unauthorized)"
+            if resp.status_code == 404:
+                return False, f"Subdomain '{domain}' not found — check your Freshdesk subdomain"
+            return False, f"Freshdesk returned HTTP {resp.status_code}"
+        except httpx.ConnectError:
+            return False, f"Could not connect to {domain}.freshdesk.com — check subdomain"
+        except httpx.TimeoutException:
+            return False, "Connection timed out"
+        except Exception as exc:
+            return False, str(exc)
 
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         domain = self.config.get("domain", "")

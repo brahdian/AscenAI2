@@ -154,6 +154,13 @@ export const agentsApi = {
   },
   deleteVoiceGreeting: (id: string) =>
     api.delete(`/proxy/agents/${id}/voice-greeting`).then((r) => r.data),
+  testEscalationConnector: (id: string) =>
+    api.post(`/proxy/agents/${id}/escalation/test`).then((r) => r.data as {
+      success: boolean
+      connector_type: string
+      message: string
+      latency_ms: number
+    }),
 }
 
 // ---------------------------------------------------------------------------

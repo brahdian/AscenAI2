@@ -15,6 +15,7 @@ Optional connector_config keys:
 from __future__ import annotations
 
 import structlog
+import httpx
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
 
@@ -29,6 +30,34 @@ class ZendeskConnector(BaseConnector):
 
     def _required_config_keys(self) -> list[str]:
         return ["subdomain", "email", "api_token"]
+
+    async def validate_credentials(self) -> tuple[bool, str]:
+        """Verify Zendesk credentials with a lightweight GET /api/v2/users/me.json call."""
+        subdomain = self.config.get("subdomain", "")
+        email = self.config.get("email", "")
+        token = self.config.get("api_token", "")
+        missing = [k for k, v in [("subdomain", subdomain), ("email", email), ("api_token", token)] if not v]
+        if missing:
+            return False, f"Missing required config keys: {', '.join(missing)}"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                resp = await client.get(
+                    f"https://{subdomain}.zendesk.com/api/v2/users/me.json",
+                    auth=(f"{email}/token", token),
+                )
+            if resp.status_code == 200:
+                return True, "Connected successfully"
+            if resp.status_code == 401:
+                return False, "Invalid credentials (401 Unauthorized)"
+            if resp.status_code == 404:
+                return False, f"Subdomain '{subdomain}' not found — check your Zendesk subdomain"
+            return False, f"Zendesk returned HTTP {resp.status_code}"
+        except httpx.ConnectError:
+            return False, f"Could not connect to {subdomain}.zendesk.com — check subdomain"
+        except httpx.TimeoutException:
+            return False, "Connection timed out"
+        except Exception as exc:
+            return False, str(exc)
 
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         subdomain = self.config.get("subdomain", "")

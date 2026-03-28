@@ -36,6 +36,34 @@ class IntercomConnector(BaseConnector):
       3. Optionally assign to inbox / admin / tag
     """
 
+    def _required_config_keys(self) -> list[str]:
+        return ["access_token"]
+
+    async def validate_credentials(self) -> tuple[bool, str]:
+        """Verify Intercom credentials with a lightweight GET /me call."""
+        token = self.config.get("access_token", "")
+        if not token:
+            return False, "Missing required config key: access_token"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                resp = await client.get(
+                    f"{_BASE}/me",
+                    headers={**_HEADERS_BASE, "Authorization": f"Bearer {token}"},
+                )
+            if resp.status_code == 200:
+                return True, "Connected successfully"
+            if resp.status_code == 401:
+                return False, "Invalid access token (401 Unauthorized)"
+            if resp.status_code == 403:
+                return False, "Access token lacks required scopes (403 Forbidden)"
+            return False, f"Intercom returned HTTP {resp.status_code}"
+        except httpx.ConnectError:
+            return False, "Could not connect to api.intercom.io"
+        except httpx.TimeoutException:
+            return False, "Connection timed out"
+        except Exception as exc:
+            return False, str(exc)
+
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         token = self.config.get("access_token", "")
         if not token:

@@ -8,7 +8,7 @@ import { agentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ChevronRight, PhoneCall, MessageSquare, Webhook, Save,
-  Info, ExternalLink, AlertCircle, CheckCircle2,
+  Info, ExternalLink, AlertCircle, CheckCircle2, XCircle, Loader2,
 } from 'lucide-react'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,6 +173,8 @@ export default function EscalationPage() {
   const [connectorType, setConnectorType] = useState('')
   const [connectorConfig, setConnectorConfig] = useState<Record<string, string>>({})
   const [saved, setSaved] = useState(false)
+  const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle')
+  const [testMessage, setTestMessage] = useState('')
 
   useEffect(() => {
     if (!agent) return
@@ -210,8 +212,34 @@ export default function EscalationPage() {
     mutation.mutate({ escalation_config })
   }
 
-  const setField = (key: string, value: string) =>
+  const setField = (key: string, value: string) => {
+    setTestStatus('idle')
+    setTestMessage('')
     setConnectorConfig(prev => ({ ...prev, [key]: value }))
+  }
+
+  const handleTestConnection = async () => {
+    setTestStatus('testing')
+    setTestMessage('')
+    try {
+      const result = await agentsApi.testEscalationConnector(id)
+      if (result.success) {
+        setTestStatus('success')
+        setTestMessage(result.message || 'Connected successfully')
+      } else {
+        setTestStatus('error')
+        setTestMessage(result.message || 'Connection failed')
+      }
+    } catch (err: unknown) {
+      setTestStatus('error')
+      const axiosErr = err as { response?: { data?: { detail?: string } } }
+      setTestMessage(axiosErr?.response?.data?.detail || 'Connection test failed')
+    }
+  }
+
+  // Show the test button only when a connector is selected and at least one required field is filled
+  const showTestButton = !!connectorType && selectedConnector.fields &&
+    selectedConnector.fields.some(f => f.required && !!connectorConfig[f.key])
 
   if (isLoading) return <div className="p-8 text-gray-500">Loading…</div>
 
@@ -341,6 +369,8 @@ export default function EscalationPage() {
                   onChange={e => {
                     setConnectorType(e.target.value)
                     setConnectorConfig({})
+                    setTestStatus('idle')
+                    setTestMessage('')
                   }}
                   className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white"
                 >
@@ -371,6 +401,36 @@ export default function EscalationPage() {
                       />
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* Test Connection */}
+              {showTestButton && (
+                <div className="flex flex-col gap-2 pt-1">
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={handleTestConnection}
+                      disabled={testStatus === 'testing'}
+                      className="flex items-center gap-2 px-4 py-2 rounded-lg border border-violet-500 text-violet-600 dark:text-violet-400 text-sm font-medium hover:bg-violet-50 dark:hover:bg-violet-900/20 transition-colors disabled:opacity-60"
+                    >
+                      {testStatus === 'testing'
+                        ? <><Loader2 size={14} className="animate-spin" /> Testing…</>
+                        : 'Test Connection'
+                      }
+                    </button>
+                    {testStatus === 'success' && (
+                      <span className="flex items-center gap-1.5 text-sm text-green-600 dark:text-green-400">
+                        <CheckCircle2 size={15} />
+                        {testMessage}
+                      </span>
+                    )}
+                    {testStatus === 'error' && (
+                      <span className="flex items-center gap-1.5 text-sm text-red-600 dark:text-red-400">
+                        <XCircle size={15} />
+                        {testMessage}
+                      </span>
+                    )}
+                  </div>
                 </div>
               )}
 

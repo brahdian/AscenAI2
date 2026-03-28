@@ -146,6 +146,13 @@ class AgentTestRequest(BaseModel):
     customer_identifier: Optional[str] = "test-user"
 
 
+class ConnectorTestResult(BaseModel):
+    success: bool
+    connector_type: str
+    message: str
+    latency_ms: int
+
+
 # ---------------------------------------------------------------------------
 # Feedback / Training Labels
 # ---------------------------------------------------------------------------

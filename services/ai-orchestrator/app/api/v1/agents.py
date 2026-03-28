@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.schemas.chat import (
     AgentTestRequest,
     AgentUpdate,
     ChatResponse,
+    ConnectorTestResult,
 )
 
 logger = structlog.get_logger(__name__)
@@ -271,6 +273,54 @@ async def delete_voice_greeting(
     agent.voice_greeting_url = None
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/{agent_id}/escalation/test", response_model=ConnectorTestResult)
+async def test_escalation_connector(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Test connector credentials without firing a real escalation."""
+    from app.connectors.factory import get_connector
+
+    tenant_id = _tenant_id(request)
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    escalation_config = agent.escalation_config or {}
+    connector_type = (escalation_config.get("connector_type") or "").strip()
+    if not connector_type:
+        raise HTTPException(status_code=400, detail="No connector_type configured for this agent.")
+
+    connector = get_connector(escalation_config)
+    if connector is None:
+        raise HTTPException(status_code=400, detail=f"Unknown connector type: {connector_type!r}")
+
+    t0 = time.monotonic()
+    success, message = await connector.validate_credentials()
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    logger.info(
+        "connector_test",
+        agent_id=agent_id,
+        connector_type=connector_type,
+        success=success,
+        latency_ms=latency_ms,
+    )
+    return ConnectorTestResult(
+        success=success,
+        connector_type=connector_type,
+        message=message or ("Connected successfully" if success else "Validation failed"),
+        latency_ms=latency_ms,
+    )
 
 
 @router.post("/{agent_id}/test", response_model=ChatResponse)

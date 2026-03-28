@@ -234,9 +234,64 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
 </html>`}
                   />
                 ) : (
-                  <div className="flex flex-col items-center justify-center h-full gap-3 text-gray-400">
-                    <MessageSquare size={36} className="opacity-30" />
-                    <p className="text-sm">Select an agent and API key above to preview the widget</p>
+                  /* Static demo widget — visible without agent/key selection */
+                  <div className="relative w-full h-full select-none">
+                    {/* Fake page background */}
+                    <div className="p-8 text-gray-400 text-sm">
+                      <p className="text-gray-600 dark:text-gray-300 font-medium text-base mb-1">Your website</p>
+                      <p>This is how the chat widget appears on your customers&apos; site.</p>
+                      <p className="mt-1">Click the bubble in the bottom-right to open it.</p>
+                    </div>
+
+                    {/* Demo open panel */}
+                    <div className="absolute bottom-16 right-4 w-72 rounded-2xl overflow-hidden shadow-2xl border border-gray-100 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col" style={{ height: '300px' }}>
+                      {/* Header */}
+                      <div className="flex items-center gap-2.5 px-4 py-3 flex-shrink-0" style={{ background: '#7c3aed' }}>
+                        <div className="w-8 h-8 rounded-full bg-white/20 flex items-center justify-center">
+                          <MessageSquare size={14} className="text-white" />
+                        </div>
+                        <div>
+                          <p className="text-white text-sm font-semibold leading-tight">Support</p>
+                          <p className="text-white/70 text-xs">Online now</p>
+                        </div>
+                      </div>
+                      {/* Messages */}
+                      <div className="flex-1 overflow-hidden p-3 space-y-2 bg-gray-50 dark:bg-gray-900">
+                        <div className="flex gap-2 items-end">
+                          <div className="w-6 h-6 rounded-full flex-shrink-0" style={{ background: '#7c3aed' }} />
+                          <div className="bg-white dark:bg-gray-800 rounded-2xl rounded-bl-sm px-3 py-2 text-xs text-gray-700 dark:text-gray-200 shadow-sm max-w-[75%]">
+                            Hi! How can I help you today?
+                          </div>
+                        </div>
+                        <div className="flex justify-end">
+                          <div className="rounded-2xl rounded-br-sm px-3 py-2 text-xs text-white max-w-[75%]" style={{ background: '#7c3aed' }}>
+                            I&apos;d like to book an appointment
+                          </div>
+                        </div>
+                        <div className="flex gap-2 items-end">
+                          <div className="w-6 h-6 rounded-full flex-shrink-0" style={{ background: '#7c3aed' }} />
+                          <div className="bg-white dark:bg-gray-800 rounded-2xl rounded-bl-sm px-3 py-2 text-xs text-gray-700 dark:text-gray-200 shadow-sm max-w-[75%]">
+                            I&apos;d be happy to help! What day works best for you?
+                          </div>
+                        </div>
+                      </div>
+                      {/* Input */}
+                      <div className="flex items-center gap-2 px-3 py-2.5 border-t border-gray-100 dark:border-gray-700 bg-white dark:bg-gray-800 flex-shrink-0">
+                        <div className="flex-1 rounded-full border border-gray-200 dark:border-gray-600 px-3 py-1.5 text-xs text-gray-400">Type a message…</div>
+                        <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0" style={{ background: '#7c3aed' }}>
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="white"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Bubble */}
+                    <div className="absolute bottom-4 right-4 w-12 h-12 rounded-full flex items-center justify-center shadow-lg" style={{ background: '#7c3aed' }}>
+                      <MessageSquare size={20} className="text-white" />
+                    </div>
+
+                    <p className="absolute bottom-4 left-4 text-xs text-gray-400 dark:text-gray-500">
+                      Select an agent &amp; key above to generate your embed code
+                    </p>
                   </div>
                 )}
               </div>

@@ -48,8 +48,8 @@ class Tenant(Base):
 
     # Subscription
     plan: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="starter"
-    )  # "starter", "growth", "enterprise"
+        String(50), nullable=False, default="professional"
+    )  # "professional", "business", "enterprise"
     plan_limits: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     # Status

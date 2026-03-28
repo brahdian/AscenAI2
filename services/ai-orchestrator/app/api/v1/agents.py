@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,32 @@ from app.schemas.chat import (
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+
+# Patterns that indicate prompt injection attempts in stored system prompts
+_PROMPT_INJECTION_RE = re.compile(
+    r"(\[SYSTEM\]|\[INST\]|<system>|<\/system>|\[\/INST\]|<<SYS>>|<</SYS>>"
+    r"|ignore (all |your )?(previous |prior )?instructions?"
+    r"|you are now (in )?(developer|jailbreak|dan|unrestricted) mode"
+    r"|disregard (your|all) (training|guidelines|rules|instructions)"
+    r"|bypass (your|all) (safety|content|ethical) (filters?|guidelines?))",
+    re.IGNORECASE,
+)
+_MAX_SYSTEM_PROMPT_LEN = 8_000
+
+
+def _validate_system_prompt(prompt: str | None) -> None:
+    if not prompt:
+        return
+    if len(prompt) > _MAX_SYSTEM_PROMPT_LEN:
+        raise HTTPException(
+            status_code=422,
+            detail=f"system_prompt exceeds maximum length of {_MAX_SYSTEM_PROMPT_LEN} characters.",
+        )
+    if _PROMPT_INJECTION_RE.search(prompt):
+        raise HTTPException(
+            status_code=422,
+            detail="system_prompt contains disallowed injection patterns.",
+        )
 
 
 def _tenant_id(request: Request) -> str:
@@ -65,6 +92,7 @@ async def create_agent(
 ):
     """Create a new AI agent for the tenant."""
     tenant_id = _tenant_id(request)
+    _validate_system_prompt(body.system_prompt)
     agent = Agent(
         id=uuid.uuid4(),
         tenant_id=uuid.UUID(tenant_id),
@@ -151,6 +179,8 @@ async def update_agent(
 ):
     """Update an agent's configuration."""
     tenant_id = _tenant_id(request)
+    if body.system_prompt is not None:
+        _validate_system_prompt(body.system_prompt)
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),

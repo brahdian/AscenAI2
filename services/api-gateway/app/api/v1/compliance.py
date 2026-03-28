@@ -14,11 +14,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.database import get_db
+from app.core.database import get_db, engine as _db_engine
 from app.services.tenant_service import tenant_service
 
 logger = structlog.get_logger(__name__)
@@ -153,10 +154,62 @@ async def update_compliance_settings(
     return body
 
 
+async def _execute_erasure(
+    tenant_id: str,
+    contact_identifier: str,
+    request_id: str,
+) -> None:
+    """Background task: hard-delete all messages and sessions for the contact."""
+    _session_factory = async_sessionmaker(_db_engine, expire_on_commit=False)
+    async with _session_factory() as db:
+        try:
+            # Delete messages belonging to the contact's sessions in this tenant
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM messages
+                    WHERE session_id IN (
+                        SELECT id FROM sessions
+                        WHERE tenant_id = :tid
+                          AND customer_identifier = :contact
+                    )
+                    """
+                ),
+                {"tid": tenant_id, "contact": contact_identifier},
+            )
+            # Delete the sessions themselves
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM sessions
+                    WHERE tenant_id = :tid
+                      AND customer_identifier = :contact
+                    """
+                ),
+                {"tid": tenant_id, "contact": contact_identifier},
+            )
+            await db.commit()
+            logger.info(
+                "erasure_executed",
+                tenant_id=tenant_id,
+                request_id=request_id,
+                contact=contact_identifier,
+            )
+        except Exception as exc:
+            await db.rollback()
+            logger.error(
+                "erasure_execution_failed",
+                tenant_id=tenant_id,
+                request_id=request_id,
+                error=str(exc),
+            )
+
+
 @router.post("/erasure", response_model=ErasureResponse, status_code=202)
 async def request_erasure(
     body: ErasureRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ErasureResponse:
     """
@@ -195,6 +248,14 @@ async def request_erasure(
         request_id=request_id,
         contact=body.contact_identifier,
         reason=body.reason,
+    )
+
+    # Kick off actual deletion in the background
+    background_tasks.add_task(
+        _execute_erasure,
+        tenant_id=tenant_id,
+        contact_identifier=body.contact_identifier,
+        request_id=request_id,
     )
 
     return ErasureResponse(

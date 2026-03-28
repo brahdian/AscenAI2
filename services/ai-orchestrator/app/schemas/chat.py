@@ -332,6 +332,14 @@ class GuardrailsUpsert(BaseModel):
     allowed_topics: list[str] = Field(default_factory=list)
     profanity_filter: bool = True
     pii_redaction: bool = False
+    pii_pseudonymization: bool = Field(
+        default=False,
+        description=(
+            "When enabled, PII in user messages is replaced with reversible tokens "
+            "before being sent to the LLM. The response tokens are replaced back with "
+            "original values before delivery. Recommended for healthcare/financial agents."
+        ),
+    )
     max_response_length: int = Field(default=0, ge=0)
     require_disclaimer: Optional[str] = Field(None, max_length=1000)
     blocked_message: str = Field(default="I'm sorry, I can't help with that.", max_length=500)
@@ -349,6 +357,7 @@ class GuardrailsResponse(BaseModel):
     allowed_topics: list[str]
     profanity_filter: bool
     pii_redaction: bool
+    pii_pseudonymization: bool = False
     max_response_length: int
     require_disclaimer: Optional[str]
     blocked_message: str

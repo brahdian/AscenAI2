@@ -201,6 +201,7 @@ export default function GuardrailsPage() {
   const [allowedTopics, setAllowedTopics] = useState<string[]>([])
   const [profanityFilter, setProfanityFilter] = useState(true)
   const [piiRedaction, setPiiRedaction] = useState(false)
+  const [piiPseudonymization, setPiiPseudonymization] = useState(false)
   const [maxLength, setMaxLength] = useState(0)
   const [requireDisclaimer, setRequireDisclaimer] = useState('')
   const [blockedMessage, setBlockedMessage] = useState(
@@ -220,6 +221,7 @@ export default function GuardrailsPage() {
     setAllowedTopics(existing.allowed_topics ?? [])
     setProfanityFilter(existing.profanity_filter ?? true)
     setPiiRedaction(existing.pii_redaction ?? false)
+    setPiiPseudonymization(existing.pii_pseudonymization ?? false)
     setMaxLength(existing.max_response_length ?? 0)
     setRequireDisclaimer(existing.require_disclaimer ?? '')
     setBlockedMessage(existing.blocked_message ?? "I'm sorry, I can't help with that.")
@@ -239,6 +241,7 @@ export default function GuardrailsPage() {
         allowed_topics: allowedTopics,
         profanity_filter: profanityFilter,
         pii_redaction: piiRedaction,
+        pii_pseudonymization: piiPseudonymization,
         max_response_length: maxLength,
         require_disclaimer: requireDisclaimer || undefined,
         blocked_message: blockedMessage,
@@ -400,7 +403,13 @@ export default function GuardrailsPage() {
               checked={piiRedaction}
               onChange={(v) => { setPiiRedaction(v); mark() }}
               label="PII Redaction in Responses"
-              description="Automatically redact email addresses, phone numbers, and credit card numbers from agent responses."
+              description="Automatically redact 50+ PII types (email, phone, SSN, IBAN, passport, etc.) from agent responses using Microsoft Presidio NLP."
+            />
+            <Toggle
+              checked={piiPseudonymization}
+              onChange={(v) => { setPiiPseudonymization(v); mark() }}
+              label="PII Pseudonymization Before LLM"
+              description="Replace PII in user messages with reversible tokens before sending to the AI model. Tokens are swapped back in the response so users receive personalised replies — but PII never reaches the LLM provider. Recommended for healthcare, financial, and legal agents."
             />
           </div>
         </Section>

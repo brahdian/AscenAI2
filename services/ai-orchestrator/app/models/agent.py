@@ -442,6 +442,8 @@ class AgentGuardrails(Base):
 
     # Output checks
     pii_redaction: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Reversible input pseudonymization — anonymize before LLM, restore in response
+    pii_pseudonymization: Mapped[bool] = mapped_column(Boolean, default=False)
     max_response_length: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
     require_disclaimer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -479,6 +481,7 @@ class AgentGuardrails(Base):
             "allowed_topics": self.allowed_topics or [],
             "profanity_filter": self.profanity_filter,
             "pii_redaction": self.pii_redaction,
+            "pii_pseudonymization": self.pii_pseudonymization,
             "max_response_length": self.max_response_length,
             "require_disclaimer": self.require_disclaimer,
             "blocked_message": self.blocked_message,

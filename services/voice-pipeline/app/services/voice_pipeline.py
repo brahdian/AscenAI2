@@ -37,6 +37,7 @@ logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # PII redaction helper — strip PII from log messages before emitting
+# Uses Presidio when available (50+ entity types); regex fallback otherwise.
 # ---------------------------------------------------------------------------
 import re as _re
 
@@ -44,12 +45,46 @@ _EMAIL_RE = _re.compile(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b')
 _PHONE_RE = _re.compile(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b')
 _CARD_RE  = _re.compile(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b')
 
+_presidio_redact = None
+
 
 def _redact_pii(text: str) -> str:
-    """Replace common PII patterns with safe placeholders before logging."""
-    text = _EMAIL_RE.sub('[EMAIL]', text)
-    text = _PHONE_RE.sub('[PHONE]', text)
-    text = _CARD_RE.sub('[CARD]', text)
+    """Replace PII with safe placeholders. Presidio-backed with regex fallback."""
+    global _presidio_redact
+    if _presidio_redact is None:
+        try:
+            from presidio_analyzer import AnalyzerEngine
+            from presidio_anonymizer import AnonymizerEngine
+            from presidio_anonymizer.entities import OperatorConfig
+            _analyzer = AnalyzerEngine()
+            _anon = AnonymizerEngine()
+
+            def _presidio_fn(t: str) -> str:
+                results = _analyzer.analyze(text=t, language="en",
+                                            score_threshold=0.6)
+                if not results:
+                    return t
+                return _anon.anonymize(
+                    text=t, analyzer_results=results,
+                    operators={"DEFAULT": OperatorConfig(
+                        "replace", {"new_value": lambda r: f"[{r.entity_type}]"}
+                    )},
+                ).text
+
+            _presidio_redact = _presidio_fn
+        except Exception:
+            _presidio_redact = False  # mark as unavailable
+
+    if _presidio_redact:
+        try:
+            return _presidio_redact(text)
+        except Exception:
+            pass
+
+    # Regex fallback
+    text = _EMAIL_RE.sub('[EMAIL_ADDRESS]', text)
+    text = _PHONE_RE.sub('[PHONE_NUMBER]', text)
+    text = _CARD_RE.sub('[CREDIT_CARD]', text)
     return text
 
 

@@ -13,6 +13,8 @@ import json
 from app.core.config import settings
 from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, Session as AgentSession, Message, AgentAnalytics
 from app.schemas.chat import ChatResponse, SourceCitation, StreamChatEvent
+from app.services import pii_service
+from app.services.pii_service import PseudonymizationContext
 from app.services.llm_client import LLMClient, LLMResponse, ToolCall
 from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
@@ -225,21 +227,29 @@ class Orchestrator:
 
         return None
 
-    def _apply_output_guardrails(self, response: str, guardrails) -> tuple[str, list[str]]:
-        """Apply output-side guardrails: PII redaction, length cap, disclaimer.
+    def _apply_output_guardrails(
+        self,
+        response: str,
+        guardrails,
+        pii_ctx: Optional[PseudonymizationContext] = None,
+    ) -> tuple[str, list[str]]:
+        """Apply output-side guardrails: PII de-anonymization, redaction, length cap, disclaimer.
         Returns (modified_response, list_of_actions_applied)."""
-        import re
         actions: list[str] = []
         if not guardrails:
             return response, actions
 
+        # Step 1: Restore pseudonymized tokens BEFORE any other processing
+        if pii_ctx and pii_ctx.token_to_value:
+            response = pii_ctx.restore(response)
+            actions.append("pii_pseudonymization_restored")
+
+        # Step 2: One-way PII redaction on the final output (Presidio-backed)
         if guardrails.pii_redaction:
-            new_response = re.sub(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b', '[EMAIL]', response)
-            new_response = re.sub(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b', '[PHONE]', new_response)
-            new_response = re.sub(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b', '[CARD]', new_response)
-            if new_response != response:
+            redacted = pii_service.redact(response)
+            if redacted != response:
                 actions.append("pii_redaction")
-            response = new_response
+            response = redacted
 
         if guardrails.max_response_length and len(response) > guardrails.max_response_length:
             response = response[:guardrails.max_response_length].rstrip() + "…"
@@ -426,6 +436,15 @@ class Orchestrator:
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
 
+        # --- PII pseudonymization: anonymize user message before LLM ---
+        pii_ctx: Optional[PseudonymizationContext] = None
+        llm_user_message = user_message  # message sent to LLM (may be anonymized)
+        if guardrails and getattr(guardrails, "pii_pseudonymization", False):
+            pii_ctx = await pii_service.load_context(session_id, self.redis)
+            llm_user_message = pii_ctx.anonymize(user_message)
+            if llm_user_message != user_message:
+                logger.debug("pii_pseudonymized_input", session_id=session_id)
+
         # --- Step 2: Retrieve MCP context ---
         kb_ids = agent.knowledge_base_ids or []
         context_items = await self.mcp.retrieve_context(
@@ -474,6 +493,12 @@ class Orchestrator:
         # --- Build message list for LLM ---
         messages = [{"role": "system", "content": system_prompt}]
 
+        if pii_ctx is not None:
+            messages.append({
+                "role": "system",
+                "content": pii_service.PSEUDONYMIZATION_SYSTEM_NOTE,
+            })
+
         if summary:
             messages.append({
                 "role": "system",
@@ -481,7 +506,8 @@ class Orchestrator:
             })
 
         messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+        # Use anonymized message if pseudonymization is active
+        messages.append({"role": "user", "content": llm_user_message})
 
         # --- Budget check: prevent runaway spend ---
         if not await self._check_token_budget(tenant_id):
@@ -613,7 +639,12 @@ class Orchestrator:
         if receipt:
             final_response = final_response.rstrip() + " " + receipt
 
-        final_response, guardrail_actions = self._apply_output_guardrails(final_response, guardrails)
+        final_response, guardrail_actions = self._apply_output_guardrails(
+            final_response, guardrails, pii_ctx=pii_ctx
+        )
+        # Persist updated pseudonymization context for next turn
+        if pii_ctx is not None:
+            await pii_service.save_context(session_id, pii_ctx, self.redis)
         # TC-E02: Append professional disclaimer if needed
         final_response = self._check_professional_claims(final_response)
         is_fallback = self._is_fallback_response(final_response, playbook)
@@ -795,6 +826,14 @@ class Orchestrator:
 
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
+
+        # PII pseudonymization — anonymize user message before LLM (streaming path)
+        stream_pii_ctx: Optional[PseudonymizationContext] = None
+        stream_llm_message = user_message
+        if guardrails and getattr(guardrails, "pii_pseudonymization", False):
+            stream_pii_ctx = await pii_service.load_context(session_id, self.redis)
+            stream_llm_message = stream_pii_ctx.anonymize(user_message)
+
         kb_ids = agent.knowledge_base_ids or []
 
         context_items = await self.mcp.retrieve_context(
@@ -855,10 +894,12 @@ class Orchestrator:
             return
 
         messages = [{"role": "system", "content": system_prompt}]
+        if stream_pii_ctx is not None:
+            messages.append({"role": "system", "content": pii_service.PSEUDONYMIZATION_SYSTEM_NOTE})
         if summary:
             messages.append({"role": "system", "content": f"[Summary]: {summary}"})
         messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": stream_llm_message})
 
         llm_config = agent.llm_config or {}
         temperature = llm_config.get("temperature", 0.7)
@@ -1011,7 +1052,11 @@ class Orchestrator:
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
-        full_response_text, stream_guardrail_actions = self._apply_output_guardrails(full_response_text, guardrails)
+        full_response_text, stream_guardrail_actions = self._apply_output_guardrails(
+            full_response_text, guardrails, pii_ctx=stream_pii_ctx
+        )
+        if stream_pii_ctx is not None:
+            await pii_service.save_context(session_id, stream_pii_ctx, self.redis)
         # TC-E02: Professional disclaimer check
         full_response_text = self._check_professional_claims(full_response_text)
         is_fallback = self._is_fallback_response(full_response_text, playbook)

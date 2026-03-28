@@ -13,7 +13,7 @@ class ChatRequest(BaseModel):
         None, description="Existing session ID; if None a new session is created"
     )
     agent_id: str = Field(..., description="UUID of the agent to use")
-    message: str = Field(..., description="The user message")
+    message: str = Field(..., max_length=10_000, description="The user message")
     channel: str = Field("text", description="Channel: text, voice, or web")
     customer_identifier: Optional[str] = Field(
         None, description="Phone, email, or anonymous identifier"

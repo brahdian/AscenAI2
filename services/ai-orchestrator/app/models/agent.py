@@ -528,6 +528,62 @@ class AgentGuardrails(Base):
         }
 
 
+class AgentFlow(Base):
+    """
+    Visual state-machine workflow (flow builder) attached to an agent.
+    steps stores the full PlaybookDefinition steps dict; ui_layout stores
+    {step_id: {x, y}} canvas coordinates so the frontend can render the DAG.
+    """
+    __tablename__ = "agent_flows"
+    __table_args__ = (
+        Index("ix_agent_flows_agent_id", "agent_id"),
+        Index("ix_agent_flows_tenant_id", "tenant_id"),
+        Index("ix_agent_flows_active", "agent_id", "is_active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="Untitled Flow")
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # keywords that trigger this flow (JSONB list[str])
+    trigger_keywords: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    initial_step_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # full PlaybookDefinition steps — {step_id: {type, ...}}
+    steps: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # visual positions — {step_id: {x: int, y: int}}
+    ui_layout: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "agent_id": str(self.agent_id),
+            "tenant_id": str(self.tenant_id),
+            "name": self.name,
+            "description": self.description,
+            "version": self.version,
+            "trigger_keywords": self.trigger_keywords or [],
+            "initial_step_id": self.initial_step_id,
+            "steps": self.steps or {},
+            "ui_layout": self.ui_layout or {},
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class EscalationAttempt(Base):
     """
     Persistent audit trail for every live-agent escalation attempt.

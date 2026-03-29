@@ -25,6 +25,7 @@ import {
   PhoneCall,
   Mic,
   ChevronLeft,
+  GitBranch,
 } from 'lucide-react'
 
 const navItems = [
@@ -49,6 +50,7 @@ const agentSubNav = [
   { slug: 'tools',       icon: Wrench,       label: 'Tools' },
   { slug: 'escalation',  icon: PhoneCall,    label: 'Escalation' },
   { slug: 'greeting',    icon: Mic,          label: 'Greeting & Language' },
+  { slug: 'workflows',   icon: GitBranch,    label: 'Workflows' },
 ]
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {

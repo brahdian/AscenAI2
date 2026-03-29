@@ -414,6 +414,31 @@ export const complianceApi = {
 }
 
 // ---------------------------------------------------------------------------
+// Flows (visual DAG workflow builder)
+// ---------------------------------------------------------------------------
+
+export const flowsApi = {
+  list: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/flows`).then((r) => r.data),
+  create: (agentId: string, data: Record<string, unknown>) =>
+    api.post(`/proxy/agents/${agentId}/flows`, data).then((r) => r.data),
+  get: (agentId: string, flowId: string) =>
+    api.get(`/proxy/agents/${agentId}/flows/${flowId}`).then((r) => r.data),
+  update: (agentId: string, flowId: string, data: Record<string, unknown>) =>
+    api.put(`/proxy/agents/${agentId}/flows/${flowId}`, data).then((r) => r.data),
+  patch: (agentId: string, flowId: string, data: Record<string, unknown>) =>
+    api.patch(`/proxy/agents/${agentId}/flows/${flowId}`, data).then((r) => r.data),
+  delete: (agentId: string, flowId: string) =>
+    api.delete(`/proxy/agents/${agentId}/flows/${flowId}`),
+  activate: (agentId: string, flowId: string) =>
+    api.post(`/proxy/agents/${agentId}/flows/${flowId}/activate`).then((r) => r.data),
+  getExecution: (agentId: string, flowId: string, sessionId: string) =>
+    api
+      .get(`/proxy/agents/${agentId}/flows/${flowId}/execution/${sessionId}`)
+      .then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
 // Embed / Widget
 // ---------------------------------------------------------------------------
 

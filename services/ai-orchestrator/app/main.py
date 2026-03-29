@@ -77,6 +77,7 @@ from app.api.v1 import internal as internal_router
 from app.api.v1 import replay as replay_router
 from app.api.v1 import evals as evals_router
 from app.api.v1 import prompt_versions as prompt_versions_router
+from app.api.v1 import flows as flows_router
 from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
@@ -199,6 +200,7 @@ app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
 app.include_router(evals_router.router, prefix="/api/v1/agents", tags=["evals"])
 app.include_router(prompt_versions_router.router, prefix="/api/v1/agents", tags=["prompts"])
+app.include_router(flows_router.router, prefix="/api/v1/agents", tags=["flows"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

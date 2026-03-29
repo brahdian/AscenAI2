@@ -4,6 +4,7 @@ from app.models.agent import (  # noqa: F401
     Agent,
     AgentAnalytics,
     AgentDocument,
+    AgentFlow,
     AgentGuardrails,
     AgentPlaybook,
     Message,

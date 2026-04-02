@@ -244,17 +244,7 @@ export default function EscalationPage() {
   if (isLoading) return <div className="p-8 text-gray-500">Loading…</div>
 
   return (
-    <div className="p-8 max-w-3xl mx-auto">
-      {/* Breadcrumb */}
-      <nav className="flex items-center gap-1 text-sm text-gray-500 dark:text-gray-400 mb-6">
-        <Link href="/dashboard" className="hover:text-gray-700 dark:hover:text-gray-200">Dashboard</Link>
-        <ChevronRight size={14} />
-        <Link href="/dashboard/agents" className="hover:text-gray-700 dark:hover:text-gray-200">Agents</Link>
-        <ChevronRight size={14} />
-        <Link href={`/dashboard/agents/${id}`} className="hover:text-gray-700 dark:hover:text-gray-200">{agent?.name}</Link>
-        <ChevronRight size={14} />
-        <span className="text-gray-900 dark:text-white font-medium">Escalation</span>
-      </nav>
+    <div className="p-8 w-full">
 
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">

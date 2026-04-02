@@ -211,5 +211,4 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     redis: str
-    qdrant: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

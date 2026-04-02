@@ -16,7 +16,11 @@ import {
   X,
   ChevronDown,
   ChevronUp,
+  BoxSelect,
+  Save,
 } from 'lucide-react'
+import { variablesApi, toolsApi, documentsApi } from '@/lib/api'
+import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 
 interface Scenario {
   trigger: string
@@ -28,7 +32,6 @@ interface PlaybookForm {
   description: string
   intent_triggers: string
   is_default: boolean
-  greeting_message: string
   instructions: string
   tone: string
   dos: string[]
@@ -37,6 +40,9 @@ interface PlaybookForm {
   out_of_scope_response: string
   fallback_response: string
   escalation_message: string
+  tools: string[]
+  input_schema: string
+  output_schema: string
 }
 
 const EMPTY_FORM: PlaybookForm = {
@@ -44,7 +50,6 @@ const EMPTY_FORM: PlaybookForm = {
   description: '',
   intent_triggers: '',
   is_default: false,
-  greeting_message: '',
   instructions: '',
   tone: 'professional',
   dos: [],
@@ -53,6 +58,9 @@ const EMPTY_FORM: PlaybookForm = {
   out_of_scope_response: '',
   fallback_response: '',
   escalation_message: '',
+  tools: [],
+  input_schema: '',
+  output_schema: '',
 }
 
 function TagInput({
@@ -180,6 +188,180 @@ function ScenarioEditor({
   )
 }
 
+function LocalVariablesSection({ agentId, playbookId }: { agentId: string; playbookId: string }) {
+  const qc = useQueryClient()
+  const { data: variables, isLoading } = useQuery({
+    queryKey: ['variables', agentId],
+    queryFn: () => variablesApi.list(agentId),
+    enabled: !!agentId,
+  })
+
+  const [form, setForm] = useState({ id: '', name: '', data_type: 'string', default_value: '' })
+  const [editing, setEditing] = useState(false)
+
+  const saveMutation = useMutation({
+    mutationFn: (data: Record<string, unknown>) => {
+      if (form.id) {
+        return variablesApi.update(agentId, form.id, data)
+      }
+      return variablesApi.create(agentId, data)
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['variables', agentId] })
+      toast.success(form.id ? 'Local variable updated' : 'Local variable created')
+      setEditing(false)
+      setForm({ id: '', name: '', data_type: 'string', default_value: '' })
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || 'Failed to save variable'),
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (vId: string) => variablesApi.delete(agentId, vId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['variables', agentId] })
+      toast.success('Local variable deleted')
+    },
+  })
+
+  const locals = Array.isArray(variables) 
+    ? variables.filter((v: any) => v.playbook_id === playbookId && v.scope === 'local') 
+    : []
+
+  if (isLoading) return <div className="animate-pulse bg-gray-100 dark:bg-gray-800 h-10 rounded" />
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+          Playbook-Local Variables
+        </label>
+        {!editing && (
+          <button
+            type="button"
+            onClick={() => {
+              setForm({ id: '', name: '', data_type: 'string', default_value: '' })
+              setEditing(true)
+            }}
+            className="text-xs flex items-center gap-1 text-violet-600 hover:text-violet-700 dark:text-violet-400 font-medium"
+          >
+            <Plus size={14} /> New Variable
+          </button>
+        )}
+      </div>
+
+      {locals.length === 0 && !editing ? (
+        <div className="text-xs text-center py-4 bg-gray-50 dark:bg-gray-800/50 rounded-lg text-gray-500 border border-dashed border-gray-300 dark:border-gray-700">
+          No local variables yet. These variables only exist while this playbook is active.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {locals.map((v: any) => (
+            <div key={v.id} className="flex items-center justify-between p-2.5 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700">
+              <div className="flex flex-col">
+                <div className="flex items-center gap-2">
+                  <BoxSelect size={14} className="text-orange-500" />
+                  <span className="text-sm font-bold font-mono text-gray-900 dark:text-white">{v.name}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300 uppercase font-bold tracking-wider">{v.data_type}</span>
+                </div>
+                {v.default_value && (
+                  <span className="text-xs text-gray-500 mt-1 pl-6">Default: {JSON.stringify(v.default_value)}</span>
+                )}
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForm({
+                      id: v.id,
+                      name: v.name,
+                      data_type: v.data_type,
+                      default_value: v.default_value ? JSON.stringify(v.default_value) : ''
+                    })
+                    setEditing(true)
+                  }}
+                  className="p-1 text-gray-400 hover:text-violet-500 transition-colors"
+                >
+                  <Edit2 size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => confirm('Delete local variable?') && deleteMutation.mutate(v.id)}
+                  className="p-1 text-gray-400 hover:text-red-500 transition-colors"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <div className="p-3 bg-white dark:bg-gray-900 border border-violet-200 dark:border-violet-900/50 rounded-lg shadow-sm space-y-3">
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={form.name}
+              onChange={(e) => setForm((p) => ({ ...p, name: e.target.value.replace(/[^a-zA-Z0-9_]/g, '') }))}
+              placeholder="Variable Name"
+              className="flex-1 px-3 py-1.5 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+            <select
+              value={form.data_type}
+              onChange={(e) => setForm((p) => ({ ...p, data_type: e.target.value }))}
+              className="w-28 px-2 py-1.5 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+            >
+              <option value="string">String</option>
+              <option value="number">Number</option>
+              <option value="boolean">Boolean</option>
+              <option value="object">JSON</option>
+            </select>
+          </div>
+          <input
+            value={form.default_value}
+            onChange={(e) => setForm((p) => ({ ...p, default_value: e.target.value }))}
+            placeholder="Default value (optional)"
+            className="w-full px-3 py-1.5 font-mono text-xs rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 focus:outline-none focus:ring-1 focus:ring-violet-500"
+          />
+          <div className="flex gap-2 justify-end">
+            <button
+              type="button"
+              onClick={() => {
+                setEditing(false)
+                setForm({ id: '', name: '', data_type: 'string', default_value: '' })
+              }}
+              className="text-xs px-3 py-1.5 text-gray-500 hover:text-gray-700 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={!form.name || saveMutation.isPending}
+              onClick={() => {
+                let parsedDefault = null
+                if (form.default_value) {
+                  try { parsedDefault = JSON.parse(form.default_value) }
+                  catch { parsedDefault = form.default_value }
+                }
+                saveMutation.mutate({
+                  name: form.name,
+                  scope: 'local',
+                  playbook_id: playbookId,
+                  data_type: form.data_type,
+                  default_value: parsedDefault,
+                })
+              }}
+              className="text-xs px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white font-medium rounded transition-colors disabled:opacity-50"
+            >
+              <span className="flex items-center gap-1"><Save size={12} /> Save</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function PlaybookFormPanel({
   agentId,
   initial,
@@ -199,7 +381,7 @@ function PlaybookFormPanel({
           ? (initial.intent_triggers as string[]).join(', ')
           : (initial.intent_triggers as string) || '',
         is_default: !!(initial.is_default),
-        greeting_message: (initial.greeting_message as string) || '',
+
         instructions: (initial.instructions as string) || '',
         tone: (initial.tone as string) || 'professional',
         dos: Array.isArray(initial.dos) ? (initial.dos as string[]) : [],
@@ -213,6 +395,9 @@ function PlaybookFormPanel({
           (initial.custom_escalation_message as string) ||
           (initial.escalation_message as string) ||
           '',
+        tools: Array.isArray(initial.tools) ? (initial.tools as string[]) : [],
+        input_schema: initial.input_schema ? JSON.stringify(initial.input_schema, null, 2) : '',
+        output_schema: initial.output_schema ? JSON.stringify(initial.output_schema, null, 2) : '',
       }
     }
     return EMPTY_FORM
@@ -221,11 +406,27 @@ function PlaybookFormPanel({
   const [expanded, setExpanded] = useState<Record<string, boolean>>({
     basic: true,
     content: false,
+    tools: false,
     advanced: false,
   })
 
   const toggle = (section: string) =>
     setExpanded((p) => ({ ...p, [section]: !p[section] }))
+
+  const { data: variables = [] } = useQuery({
+    queryKey: ['variables', agentId],
+    queryFn: () => variablesApi.list(agentId),
+  })
+
+  const { data: tools = [] } = useQuery({
+    queryKey: ['tools', agentId],
+    queryFn: () => toolsApi.list(agentId),
+  })
+
+  const { data: documents = [] } = useQuery({
+    queryKey: ['documents', agentId],
+    queryFn: () => documentsApi.list(agentId),
+  })
 
   const saveMutation = useMutation({
     mutationFn: (data: Record<string, unknown>) => {
@@ -249,10 +450,23 @@ function PlaybookFormPanel({
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean)
+      
+    let parsedInput = null
+    let parsedOutput = null
+    try {
+      if (form.input_schema) parsedInput = JSON.parse(form.input_schema)
+      if (form.output_schema) parsedOutput = JSON.parse(form.output_schema)
+    } catch (e) {
+      toast.error("Invalid JSON inside Input or Output Schema")
+      return
+    }
+
     saveMutation.mutate({
       ...form,
       intent_triggers: triggers,
       custom_escalation_message: form.escalation_message,
+      input_schema: parsedInput,
+      output_schema: parsedOutput,
     })
   }
 
@@ -359,17 +573,7 @@ function PlaybookFormPanel({
                   </select>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
-                    Greeting Message
-                  </label>
-                  <input
-                    value={form.greeting_message}
-                    onChange={(e) => setForm((p) => ({ ...p, greeting_message: e.target.value }))}
-                    placeholder="Hello! How can I help you today?"
-                    className={inputCls}
-                  />
-                </div>
+
               </div>
             )}
           </div>
@@ -392,12 +596,13 @@ function PlaybookFormPanel({
                   <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                     Instructions
                   </label>
-                  <textarea
+                  <PlaybookMentionsEditor
                     value={form.instructions}
-                    onChange={(e) => setForm((p) => ({ ...p, instructions: e.target.value }))}
-                    rows={5}
-                    placeholder="Detailed instructions for how the agent should behave..."
-                    className={`${inputCls} resize-none`}
+                    onChange={(val) => setForm((p) => ({ ...p, instructions: val }))}
+                    tools={tools}
+                    variables={variables}
+                    documents={documents}
+                    placeholder="Detailed instructions... Use $tools:, $vars:, or $rag: to reference context."
                   />
                 </div>
 
@@ -432,6 +637,69 @@ function PlaybookFormPanel({
                     onChange={(s) => setForm((p) => ({ ...p, scenarios: s }))}
                   />
                 </div>
+              </div>
+            )}
+          </div>
+
+          <hr className="border-gray-100 dark:border-gray-800" />
+
+          {/* Tools & Data section */}
+          <div>
+            <button
+              type="button"
+              onClick={() => toggle('tools')}
+              className="flex items-center justify-between w-full text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3"
+            >
+              Tools & Variables
+              {expanded.tools ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
+            {expanded.tools && (
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-2">
+                    Available Tools
+                  </label>
+                  <TagInput
+                    items={form.tools}
+                    onChange={(items) => setForm((p) => ({ ...p, tools: items }))}
+                    placeholder="E.g. cancel_order, get_shipping_status"
+                  />
+                  <p className="text-xs text-gray-400 mt-1">Specify tool names the agent can call while in this playbook.</p>
+                </div>
+                
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+                    Input Schema (JSON)
+                  </label>
+                  <textarea
+                    value={form.input_schema}
+                    onChange={(e) => setForm((p) => ({ ...p, input_schema: e.target.value }))}
+                    rows={4}
+                    placeholder={'{\n  "type": "object",\n  "properties": {}\n}'}
+                    className={`${inputCls} font-mono text-xs resize-none`}
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+                    Output Schema (JSON)
+                  </label>
+                  <textarea
+                    value={form.output_schema}
+                    onChange={(e) => setForm((p) => ({ ...p, output_schema: e.target.value }))}
+                    rows={4}
+                    placeholder={'{\n  "type": "object",\n  "properties": {}\n}'}
+                    className={`${inputCls} font-mono text-xs resize-none`}
+                  />
+                </div>
+
+                {initial?.id ? (
+                  <LocalVariablesSection agentId={agentId} playbookId={initial.id as string} />
+                ) : (
+                  <div className="text-xs text-gray-400 italic p-3 bg-gray-50 dark:bg-gray-800/50 rounded text-center">
+                    Save the playbook to add Playbook-Local Variables.
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -521,7 +789,7 @@ export default function PlaybooksPage() {
   const qc = useQueryClient()
 
   const [showForm, setShowForm] = useState(false)
-  const [editing, setEditing] = useState<Record<string, unknown> | null>(null)
+  const [editing, setEditing] = useState<{ id: string } & Record<string, unknown> | null>(null)
 
   const { data: playbooks, isLoading } = useQuery({
     queryKey: ['playbooks', agentId],
@@ -552,19 +820,7 @@ export default function PlaybooksPage() {
     : (playbooks as any)?.items || []
 
   return (
-    <div className="p-8 max-w-4xl mx-auto">
-      {/* Breadcrumbs */}
-      <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 mb-6">
-        <Link href="/dashboard/agents" className="hover:text-gray-900 dark:hover:text-white transition-colors">
-          Agents
-        </Link>
-        <span>/</span>
-        <Link href={`/dashboard/agents/${agentId}`} className="hover:text-gray-900 dark:hover:text-white transition-colors">
-          Agent
-        </Link>
-        <span>/</span>
-        <span className="text-gray-900 dark:text-white font-medium">Playbooks</span>
-      </div>
+    <div className="p-8 w-full">
 
       {/* Header */}
       <div className="flex items-center justify-between mb-6">

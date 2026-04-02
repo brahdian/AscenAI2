@@ -1,8 +1,10 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
+import { useSearchParams } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { sessionsApi, agentsApi, feedbackApi, playbooksApi } from '@/lib/api'
+import { maskSensitivePII } from '@/lib/pii-mask'
 import Link from 'next/link'
 import {
   MessageSquare,
@@ -18,6 +20,9 @@ import {
   X,
   Filter,
   PenLine,
+  Zap,
+  BookOpen,
+  ScrollText,
 } from 'lucide-react'
 import { formatDistanceToNow, format } from 'date-fns'
 
@@ -129,8 +134,8 @@ function FeedbackModal({
         message_id: message.id,
         session_id: sessionId,
         agent_id: agentId,
-        rating: rating!,
-        labels,
+        rating: rating || undefined,
+        labels: labels.length > 0 ? labels : undefined,
         comment: comment || undefined,
         ideal_response: idealResponse || undefined,
         correction_reason: correctionReason || undefined,
@@ -163,7 +168,7 @@ function FeedbackModal({
 
         {/* Message preview */}
         <p className="text-sm text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 rounded-lg p-3 mb-5 line-clamp-3">
-          {message.content}
+          {maskSensitivePII(message.content)}
         </p>
 
         {/* ── Rating ─────────────────────────────────────────────────────── */}
@@ -346,11 +351,11 @@ function FeedbackModal({
         />
 
         <button
-          disabled={!rating || submit.isPending}
+          disabled={!rating && !idealResponse}
           onClick={() => submit.mutate()}
           className="w-full py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white text-sm font-medium transition-colors"
         >
-          {submit.isPending ? 'Saving…' : 'Save & Learn'}
+          {submit.isPending ? 'Saving…' : idealResponse ? 'Save Correction' : 'Save & Learn'}
         </button>
       </div>
     </div>
@@ -392,15 +397,80 @@ function MessageBubble({
               ? 'bg-blue-500 text-white rounded-tr-sm'
               : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white rounded-tl-sm'
           }`}>
-            {message.content}
+            {maskSensitivePII(message.content)}
+            
+            {/* Metadata enrichment: Playbook, Tools, Rerieval */}
+            {(message.playbook_name || message.tool_calls || (message.sources && message.sources.length > 0)) && (
+              <div className="mt-3 pt-3 border-t border-gray-200/50 dark:border-gray-700/50 flex flex-col gap-2">
+                {/* Active Playbook */}
+                {message.playbook_name && (
+                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-violet-600 dark:text-violet-400 bg-violet-50 dark:bg-violet-900/20 px-2 py-0.5 rounded-md w-fit">
+                    <ScrollText size={10} />
+                    Playbook: {message.playbook_name}
+                  </div>
+                )}
+
+                {/* Tools Invoked */}
+                {message.tool_calls && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {Array.isArray(message.tool_calls) ? (
+                      message.tool_calls.map((tc: any, i: number) => (
+                        <div key={i} className="flex items-center gap-1 text-[10px] bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 px-1.5 py-0.5 rounded border border-amber-200/50 dark:border-amber-800/50">
+                          <Zap size={10} />
+                          {tc.tool_name || tc.name || 'tool'}
+                        </div>
+                      ))
+                    ) : (
+                      <div className="flex items-center gap-1 text-[10px] bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 px-1.5 py-0.5 rounded border border-amber-200/50 dark:border-amber-800/50">
+                        <Zap size={10} />
+                        {(message.tool_calls as any).tool_name || (message.tool_calls as any).name || 'tool'}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* RAG Sources */}
+                {message.sources && message.sources.length > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-1 text-[10px] text-gray-500 dark:text-gray-400 font-medium">
+                      <BookOpen size={10} />
+                      Sources ({message.sources.length})
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      {message.sources.slice(0, 3).map((src: any, i: number) => (
+                        <div key={i} className="text-[10px] bg-white/50 dark:bg-gray-900/30 p-1.5 rounded border border-gray-200/50 dark:border-gray-700/50 text-gray-600 dark:text-gray-400 break-words">
+                          <span className="font-bold block mb-0.5 text-gray-800 dark:text-gray-200">{src.title || 'Untitled Document'}</span>
+                          <span className="line-clamp-2 italic">"{src.content || src.text || '...'}"</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <span className="text-xs text-gray-400">
               {message.created_at ? format(new Date(message.created_at), 'HH:mm') : ''}
             </span>
-            {message.tokens_used > 0 && (
-              <span className="text-xs text-gray-400">{message.tokens_used} tok</span>
-            )}
+            {(() => {
+              let turnInfo = null
+              const hasTool = message.tool_calls && (Array.isArray(message.tool_calls) ? message.tool_calls.length > 0 : true)
+              const hasPlaybook = message.playbook_name
+              const hasSources = message.sources && message.sources.length > 0
+              if (hasTool) {
+                const toolNames = Array.isArray(message.tool_calls) 
+                  ? message.tool_calls.map((tc: any) => tc.tool_name || tc.name || 'tool').join(', ')
+                  : (message.tool_calls?.tool_name || message.tool_calls?.name || 'tool')
+                turnInfo = <span key="tool" className="text-xs text-amber-600 dark:text-amber-400">{toolNames}</span>
+              } else if (hasPlaybook) {
+                turnInfo = <span key="playbook" className="text-xs text-violet-600 dark:text-violet-400">{message.playbook_name}</span>
+              } else if (hasSources) {
+                const docNames = message.sources.slice(0, 2).map((s: any) => s.title || 'Doc').join(', ')
+                turnInfo = <span key="sources" className="text-xs text-blue-600 dark:text-blue-400">{docNames}</span>
+              }
+              return turnInfo
+            })()}
             {message.latency_ms > 0 && (
               <span className="text-xs text-gray-400">{message.latency_ms}ms</span>
             )}
@@ -475,8 +545,8 @@ function MessageBubble({
   )
 }
 
-function SessionRow({ session, agentName }: { session: any; agentName: string }) {
-  const [expanded, setExpanded] = useState(false)
+function SessionRow({ session, agentName, initialExpanded = false }: { session: any; agentName: string; initialExpanded?: boolean }) {
+  const [expanded, setExpanded] = useState(initialExpanded)
 
   const { data: detail, isLoading } = useQuery({
     queryKey: ['session-detail', session.id],
@@ -486,7 +556,7 @@ function SessionRow({ session, agentName }: { session: any; agentName: string })
   })
 
   return (
-    <div className="border border-gray-200 dark:border-gray-800 rounded-xl overflow-hidden mb-3">
+    <div id={`session-${session.id}`} className="border border-gray-200 dark:border-gray-800 rounded-xl overflow-hidden mb-3">
       {/* Header row */}
       <button
         className="w-full flex items-center gap-4 px-4 py-3 bg-white dark:bg-gray-900 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors text-left"
@@ -551,6 +621,17 @@ function SessionRow({ session, agentName }: { session: any; agentName: string })
 export default function SessionsPage() {
   const [agentFilter, setAgentFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
+  const searchParams = useSearchParams()
+  const highlightId = searchParams.get('highlight')
+
+  useEffect(() => {
+    if (highlightId) {
+      const element = document.getElementById(`session-${highlightId}`)
+      if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+    }
+  }, [highlightId])
 
   const { data: agents } = useQuery({
     queryKey: ['agents'],
@@ -645,6 +726,7 @@ export default function SessionsPage() {
               key={sess.id}
               session={sess}
               agentName={agentMap[sess.agent_id] || 'Unknown Agent'}
+              initialExpanded={highlightId === sess.id}
             />
           ))}
         </div>

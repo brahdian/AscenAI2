@@ -1,22 +1,12 @@
-"""
-Build the dynamic system prompt injected at the start of every LLM call.
-
-Layers (in order):
-1. Base persona (name, personality, business type)
-2. Playbook instructions, tone, dos/don'ts, scenarios
-3. Retrieved knowledge-base / history context items
-4. Operator corrections from past reviews
-5. Customer profile (if present)
-"""
 from __future__ import annotations
-
+import re
 from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.models.agent import Agent, AgentPlaybook
+    from app.models.variable import AgentVariable
 
 from app.guardrails.voice_agent_guardrails import build_voice_system_prompt
-
 
 # ---------------------------------------------------------------------------
 # Tone templates
@@ -28,6 +18,58 @@ TONE_DESCRIPTIONS = {
     "empathetic": "You are empathetic and patient. Acknowledge the customer's feelings before responding.",
 }
 
+def expand_playbook_references(
+    text: str,
+    variables: list["AgentVariable"] = None,
+    session_metadata: dict = None,
+    agent_tools: list[dict] = None,
+    agent: "Agent" = None
+) -> str:
+    """
+    Parse $[tools:name], $[vars:name], $[rag:id] syntax in instructions.
+    Replaces them with context-aware descriptions or values.
+    """
+    if not text:
+        return ""
+
+    variables = variables or []
+    session_metadata = session_metadata or {}
+    runtime_vars = session_metadata.get("variables", {})
+    agent_tools = agent_tools or []
+
+    # 1. Expand variables: $[vars:name] or $vars:name
+    def var_sub(match):
+        name = match.group(1) or match.group(2)
+        val = runtime_vars.get(name)
+        if val is None:
+            v_obj = next((v for v in variables if v.name == name), None)
+            if v_obj and isinstance(v_obj.default_value, dict):
+                val = v_obj.default_value.get("value")
+        
+        if val is not None:
+            return f"{val} (variable: {name})"
+        return f"[unknown variable: {name}]"
+
+    text = re.sub(r'\$\[vars:(\w+)\]|\$vars:(\w+)', var_sub, text)
+
+    # 2. Expand tools: $[tools:name] or $tools:name
+    def tool_sub(match):
+        name = match.group(1) or match.group(2)
+        found = any(t.get("name") == name if isinstance(t, dict) else t.name == name for t in agent_tools)
+        if found:
+            return f"the `{name}` tool"
+        return f"[unregistered tool: {name}]"
+
+    text = re.sub(r'\$\[tools:(\w+)\]|\$tools:(\w+)', tool_sub, text)
+
+    # 3. Expand RAG: $[rag:name] or $rag:name
+    def rag_sub(match):
+        name = match.group(1) or match.group(2)
+        return f"the '{name}' knowledge base"
+
+    text = re.sub(r'\$\[rag:(\w+)\]|\$rag:(\w+)', rag_sub, text)
+    return text
+
 
 def build_system_prompt(
     agent: "Agent",
@@ -36,30 +78,24 @@ def build_system_prompt(
     playbook: Optional["AgentPlaybook"] = None,
     corrections: list[dict] = None,
     guardrails=None,
+    variables: list["AgentVariable"] = None,
+    session_metadata: dict = None,
 ) -> str:
     """
     Assemble the full system prompt for an agent turn.
-
-    Args:
-        agent:        ORM Agent instance
-        context_items: List of ContextItem dicts from MCP
-        business_info: Dict with customer_profile, intent, etc.
-        playbook:     Optional AgentPlaybook ORM instance
-        corrections:  List of {user_message, ideal_response} dicts from Redis
     """
     context_items = context_items or []
     business_info = business_info or {}
     corrections = corrections or []
+    variables = variables or []
+    session_metadata = session_metadata or {}
 
+    agent_tools = agent.tools or []
     parts: list[str] = []
 
-    # ------------------------------------------------------------------ #
-    # 1. Base persona — voice agents get the hardened voice-first prompt
-    # ------------------------------------------------------------------ #
     agent_name = agent.name or "Assistant"
     business_type = (agent.business_type or "general").replace("_", " ").title()
 
-    # Detect voice channel: agent.channel field or metadata flag
     agent_metadata = agent.metadata_ if hasattr(agent, "metadata_") else {}
     is_voice = (
         getattr(agent, "channel", None) == "voice"
@@ -67,7 +103,6 @@ def build_system_prompt(
     )
 
     if is_voice:
-        # Use the adversarial-QA-hardened voice-first system prompt as the base
         tone_key = "friendly"
         if playbook:
             tone_key = (playbook.tone or "friendly").lower()
@@ -87,6 +122,7 @@ def build_system_prompt(
             allowed_topics=allowed_topics,
             out_of_scope_response=out_of_scope,
             tone_description=tone_desc,
+            voice_protocol=getattr(agent, "voice_system_prompt", "") or "",
         ))
     else:
         parts.append(f"You are {agent_name}, an AI assistant for a {business_type} business.")
@@ -95,29 +131,46 @@ def build_system_prompt(
         parts.append(f"\nPersonality: {agent.personality}")
 
     if agent.system_prompt:
-        parts.append(f"\n{agent.system_prompt}")
+        expanded_prompt = expand_playbook_references(
+            agent.system_prompt, variables, session_metadata, agent_tools, agent
+        )
+        parts.append(f"\n{expanded_prompt}")
 
-    parts.append(f"\nAlways respond in language: {agent.language or 'en'}.")
+    session_lang = business_info.get("session_language")
+    if getattr(agent, "auto_detect_language", False) and session_lang:
+        lang_str = session_lang
+    else:
+        lang_str = agent.language or "en"
 
-    # ------------------------------------------------------------------ #
-    # 2. Playbook instructions
-    # ------------------------------------------------------------------ #
+    lang_instruction = f"\nAlways respond in language: {lang_str}."
+    
+    supported_langs = getattr(agent, "supported_languages", None)
+    if getattr(agent, "auto_detect_language", False) and supported_langs:
+        langs_joined = ", ".join(supported_langs)
+        lang_instruction += f"\nIf the user speaks a language not in [{langs_joined}], politely inform them you only support [{langs_joined}]."
+    parts.append(lang_instruction)
+
     if playbook:
         tone_key = (playbook.tone or "professional").lower()
         tone_desc = TONE_DESCRIPTIONS.get(tone_key, TONE_DESCRIPTIONS["professional"])
         parts.append(f"\n## Tone & Style\n{tone_desc}")
 
         if playbook.instructions:
-            parts.append(f"\n## Operator Instructions\n{playbook.instructions}")
+            expanded_instructions = expand_playbook_references(
+                playbook.instructions, variables, session_metadata, agent_tools, agent
+            )
+            parts.append(f"\n## Operator Instructions\n{expanded_instructions}")
 
         dos = playbook.dos or []
         donts = playbook.donts or []
         if dos or donts:
             parts.append("\n## Rules")
             if dos:
-                parts.append("Always:\n" + "\n".join(f"- {d}" for d in dos))
+                expanded_dos = [expand_playbook_references(d, variables, session_metadata, agent_tools, agent) for d in dos]
+                parts.append("Always:\n" + "\n".join(f"- {d}" for d in expanded_dos))
             if donts:
-                parts.append("Never:\n" + "\n".join(f"- {d}" for d in donts))
+                expanded_donts = [expand_playbook_references(d, variables, session_metadata, agent_tools, agent) for d in donts]
+                parts.append("Never:\n" + "\n".join(f"- {d}" for d in expanded_donts))
 
         scenarios = playbook.scenarios or []
         if scenarios:
@@ -126,121 +179,57 @@ def build_system_prompt(
                 trigger = s.get("trigger", "")
                 response = s.get("response", "")
                 if trigger and response:
-                    parts.append(f'If the user asks about "{trigger}":\n→ {response}')
+                    exp_response = expand_playbook_references(response, variables, session_metadata, agent_tools, agent)
+                    parts.append(f'If the user asks about "{trigger}":\n→ {exp_response}')
 
         if playbook.out_of_scope_response:
-            parts.append(
-                f"\n## Out-of-scope\nIf asked something outside your scope, say:\n"
-                f'"{playbook.out_of_scope_response}"'
-            )
+            parts.append(f"\n## Out-of-scope\nIf asked something outside your scope, say:\n\"{playbook.out_of_scope_response}\"")
 
         if playbook.fallback_response:
-            parts.append(
-                f"\n## Fallback\nIf you don't know the answer, say:\n"
-                f'"{playbook.fallback_response}"'
-            )
+            parts.append(f"\n## Fallback\nIf you don't know the answer, say:\n\"{playbook.fallback_response}\"")
 
-    # ------------------------------------------------------------------ #
-    # 2b. Guardrails — content policy injected into prompt
-    # ------------------------------------------------------------------ #
-    if guardrails and guardrails.is_active:
-        gr_parts: list[str] = []
-
-        if guardrails.allowed_topics:
-            topics_str = ", ".join(guardrails.allowed_topics)
-            off_msg = guardrails.off_topic_message or "I can only help with topics related to our service."
-            gr_parts.append(
-                f"You are ONLY permitted to discuss these topics: {topics_str}. "
-                f'For anything outside this list, respond with: "{off_msg}"'
-            )
-        elif guardrails.blocked_topics:
-            topics_str = ", ".join(guardrails.blocked_topics)
-            off_msg = guardrails.off_topic_message or "I cannot help with that topic."
-            gr_parts.append(
-                f"You must REFUSE to discuss the following topics: {topics_str}. "
-                f'If asked, say: "{off_msg}"'
-            )
-
-        if guardrails.require_disclaimer:
-            gr_parts.append(
-                f'Always end your response with this disclaimer: "{guardrails.require_disclaimer}"'
-            )
-
-        if gr_parts:
-            parts.append("\n## Content Policy\n" + "\n".join(gr_parts))
-
-    # ------------------------------------------------------------------ #
-    # 3. Retrieved context
-    # ------------------------------------------------------------------ #
     knowledge_items = [c for c in context_items if getattr(c, "type", None) == "knowledge"]
     if knowledge_items:
         parts.append("\n## Knowledge Base Context")
         for item in knowledge_items[:5]:
             content = getattr(item, "content", "")
-            if content:
-                parts.append(f"- {content[:500]}")
+            if content: parts.append(f"- {content[:500]}")
 
     history_items = [c for c in context_items if getattr(c, "type", None) == "history"]
     if history_items:
         parts.append("\n## Relevant Past Interactions")
         for item in history_items[:3]:
             content = getattr(item, "content", "")
-            if content:
-                parts.append(f"- {content[:300]}")
+            if content: parts.append(f"- {content[:300]}")
 
-    # ------------------------------------------------------------------ #
-    # 4. Operator corrections (few-shot examples from reviewed chats)
-    # ------------------------------------------------------------------ #
+    parts.append("\n## Data Source Priority")
+    parts.append("You MUST use available data sources in this order:")
+    parts.append("1. First, use the PLAYBOOK instructions above if one is matched")
+    parts.append("2. Second, use the KNOWLEDGE BASE CONTEXT if provided")
+    parts.append("3. Third, use any TOOLS available to you to fetch information")
+    parts.append("If none of these sources can answer the question, respond with: \"I don't have enough information to answer that. Could you rephrase or provide more details?\"")
+
     if corrections:
         parts.append("\n## Corrections from Previous Reviews")
-        parts.append(
-            "An operator has reviewed past conversations and left these corrections. "
-            "Apply this guidance strictly:"
-        )
-        for c in corrections[-10:]:  # max 10 most recent
+        for c in corrections[-10:]:
             user_msg = c.get("user_message", "")
             ideal = c.get("ideal_response", "")
-            playbook_fix = c.get("playbook_correction") or {}
-            tool_fixes = c.get("tool_corrections") or []
-
-            # Ideal response correction
             if user_msg and ideal:
-                parts.append(
-                    f'When asked: "{user_msg[:200]}"\n'
-                    f'Correct answer: "{ideal[:400]}"'
-                )
+                parts.append(f'When asked: "{user_msg[:200]}" -> Correct answer: "{ideal[:400]}"')
 
-            # Playbook routing correction
-            if user_msg and playbook_fix.get("correct_playbook_name"):
-                parts.append(
-                    f'For messages like "{user_msg[:150]}": '
-                    f'use the "{playbook_fix["correct_playbook_name"]}" playbook.'
-                )
-
-            # Tool-call corrections
-            wrong_tools = [t for t in tool_fixes if not t.get("was_correct")]
-            if user_msg and wrong_tools:
-                for t in wrong_tools:
-                    name = t.get("tool_name", "")
-                    better = t.get("correct_tool", "")
-                    reason = t.get("reason", "")
-                    line = f'For "{user_msg[:150]}": do NOT call {name}'
-                    if better:
-                        line += f"; call {better} instead"
-                    if reason:
-                        line += f" ({reason})"
-                    parts.append(line)
-
-    # ------------------------------------------------------------------ #
-    # 5. Customer profile
-    # ------------------------------------------------------------------ #
     customer_profile = business_info.get("customer_profile", {})
     if customer_profile:
         name = customer_profile.get("name", "")
-        prefs = customer_profile.get("preferences", {})
-        if name:
-            parts.append(f"\n## Customer\nYou are speaking with {name}.")
-        if prefs:
-            parts.append(f"Known preferences: {prefs}")
+        if name: parts.append(f"\n## Customer\nYou are speaking with {name}.")
+
+    if variables:
+        parts.append("\n## Context Variables (State)")
+        runtime_vars = session_metadata.get("variables", {})
+        for v in variables:
+            val = runtime_vars.get(v.name)
+            if val is None and isinstance(v.default_value, dict):
+                val = v.default_value.get("value")
+            val_str = f'"{val}"' if isinstance(val, str) else str(val) if val is not None else "null"
+            parts.append(f"- {v.name} ({v.data_type}): {val_str}")
 
     return "\n".join(parts)

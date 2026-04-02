@@ -8,11 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.models.agent import Agent, AgentPlaybook
 from app.schemas.chat import (
     AgentCreate,
@@ -22,6 +23,7 @@ from app.schemas.chat import (
     ChatResponse,
     ConnectorTestResult,
 )
+from app.guardrails.voice_agent_guardrails import DEFAULT_VOICE_PROTOCOL
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -72,8 +74,11 @@ def _agent_to_response(agent: Agent) -> AgentResponse:
         voice_enabled=agent.voice_enabled,
         voice_id=agent.voice_id,
         language=agent.language,
+        auto_detect_language=getattr(agent, 'auto_detect_language', False),
+        supported_languages=getattr(agent, 'supported_languages', None) or [],
         greeting_message=agent.greeting_message,
         voice_greeting_url=agent.voice_greeting_url,
+        voice_system_prompt=agent.voice_system_prompt,
         tools=agent.tools or [],
         knowledge_base_ids=agent.knowledge_base_ids or [],
         llm_config=agent.llm_config or {},
@@ -88,7 +93,7 @@ def _agent_to_response(agent: Agent) -> AgentResponse:
 async def create_agent(
     body: AgentCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Create a new AI agent for the tenant."""
     tenant_id = _tenant_id(request)
@@ -108,26 +113,40 @@ async def create_agent(
         knowledge_base_ids=body.knowledge_base_ids,
         llm_config=body.llm_config,
         escalation_config=body.escalation_config,
+        greeting_message=f"Hi! I'm {body.name}. How can I help you today?",
+        voice_system_prompt=body.voice_system_prompt or DEFAULT_VOICE_PROTOCOL,
         is_active=True,
     )
     db.add(agent)
 
     # Auto-create a default playbook so the agent is ready to use immediately
+    tenant_uuid = uuid.UUID(tenant_id)
     default_playbook = AgentPlaybook(
         id=uuid.uuid4(),
         agent_id=agent.id,
-        tenant_id=agent.id,  # will be overridden below after commit
+        tenant_id=tenant_uuid,  # must be the TENANT's UUID, not the agent's
         name="Default",
         description="Default playbook — edit to add instructions for your agent.",
         is_default=True,
         intent_triggers=[],
-        greeting_message=f"Hi! I'm {body.name}. How can I help you today?",
         instructions=body.system_prompt or "",
         tone=body.personality or "professional",
     )
-    # Set the correct tenant_id
-    default_playbook.tenant_id = uuid.UUID(tenant_id)
     db.add(default_playbook)
+
+    # Auto-create a "General Chat" default playbook for handling unmatched messages
+    general_chat_playbook = AgentPlaybook(
+        id=uuid.uuid4(),
+        agent_id=agent.id,
+        tenant_id=tenant_uuid,
+        name="General Chat",
+        description="Handle general conversations and questions not covered by other playbooks",
+        is_active=True,
+        intent_triggers=[],
+        instructions=body.system_prompt or "",
+        tone=body.personality or "professional",
+    )
+    db.add(general_chat_playbook)
 
     await db.commit()
     await db.refresh(agent)
@@ -137,11 +156,10 @@ async def create_agent(
 
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
-    """List all active agents for the tenant."""
-    tenant_id = _tenant_id(request)
+    """List all agents for the tenant."""
     result = await db.execute(
         select(Agent)
         .where(Agent.tenant_id == uuid.UUID(tenant_id), Agent.is_active.is_(True))
@@ -154,7 +172,7 @@ async def list_agents(
 async def get_agent(
     agent_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Get a specific agent by ID."""
     tenant_id = _tenant_id(request)
@@ -175,7 +193,7 @@ async def update_agent(
     agent_id: str,
     body: AgentUpdate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Update an agent's configuration."""
     tenant_id = _tenant_id(request)
@@ -199,14 +217,13 @@ async def update_agent(
     return _agent_to_response(agent)
 
 
-@router.delete("/{agent_id}", status_code=204)
+@router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agent(
     agent_id: str,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Deactivate an agent."""
-    tenant_id = _tenant_id(request)
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -216,7 +233,10 @@ async def delete_agent(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
+    
     agent.is_active = False
+    # Also deactivate associated guardrails and playbooks if needed?
+    # Usually is_active on Agent is enough to hide it.
     await db.commit()
 
 
@@ -229,7 +249,7 @@ async def upload_voice_greeting(
     agent_id: str,
     request: Request,
     audio: UploadFile = File(..., description="Recorded greeting audio (webm/mp3/wav, max 5 MB)"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """
     Upload a pre-recorded voice greeting for an agent.
@@ -280,7 +300,7 @@ async def upload_voice_greeting(
 async def delete_voice_greeting(
     agent_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Remove the pre-recorded voice greeting from an agent."""
     tenant_id = _tenant_id(request)
@@ -309,7 +329,7 @@ async def delete_voice_greeting(
 async def test_escalation_connector(
     agent_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Test connector credentials without firing a real escalation."""
     from app.connectors.factory import get_connector
@@ -358,7 +378,7 @@ async def test_agent(
     agent_id: str,
     body: AgentTestRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Send a test message to an agent."""
     from app.schemas.chat import ChatRequest

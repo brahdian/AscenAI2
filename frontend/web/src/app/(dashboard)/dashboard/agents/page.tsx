@@ -16,6 +16,7 @@ export default function AgentsPage() {
   const { data: agents, isLoading } = useQuery({
     queryKey: ['agents'],
     queryFn: agentsApi.list,
+    staleTime: 30000, // 30s stability
   })
 
   const deleteMutation = useMutation({
@@ -26,6 +27,29 @@ export default function AgentsPage() {
     },
     onError: () => toast.error('Failed to remove agent'),
   })
+
+  const handleDelete = (agent: any) => {
+    toast((t) => (
+      <div className="flex items-center gap-3">
+        <span className="text-sm">Delete <b>{agent.name}</b>?</span>
+        <button
+          onClick={() => {
+            deleteMutation.mutate(agent.id)
+            toast.dismiss(t.id)
+          }}
+          className="px-3 py-1 bg-red-600 text-white text-xs font-bold rounded hover:bg-red-700 transition-colors"
+        >
+          CONFIRM
+        </button>
+        <button
+          onClick={() => toast.dismiss(t.id)}
+          className="px-3 py-1 bg-gray-200 dark:bg-gray-800 text-gray-600 dark:text-gray-400 text-xs font-bold rounded hover:bg-gray-300 dark:hover:bg-gray-700 transition-colors"
+        >
+          CANCEL
+        </button>
+      </div>
+    ), { duration: 5000, position: 'top-center' })
+  }
 
   const testMutation = useMutation({
     mutationFn: ({ id, message }: { id: string; message: string }) =>
@@ -139,16 +163,15 @@ export default function AgentsPage() {
                   >
                     <Edit2 size={16} />
                   </Link>
-                  <button
-                    onClick={() => {
-                      if (confirm(`Remove agent "${agent.name}"?`)) {
-                        deleteMutation.mutate(agent.id)
-                      }
-                    }}
-                    className="p-2 text-gray-400 hover:text-red-500 transition-colors"
-                  >
-                    <Trash2 size={16} />
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => handleDelete(agent)}
+                      className="p-2 text-gray-400 hover:text-red-500 transition-colors"
+                      title="Delete agent"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
                 </div>
               </div>
 

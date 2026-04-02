@@ -8,6 +8,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db
 from app.core.security import get_current_tenant
 from app.models.agent import Agent, Session, Message, MessageFeedback
 from app.schemas.chat import (
@@ -37,7 +38,7 @@ async def get_learning_insights(
     agent_id: str,
     request: Request,
     limit: int = Query(default=20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
     tenant=Depends(get_current_tenant),
 ):
     """
@@ -47,7 +48,7 @@ async def get_learning_insights(
     - guardrail_triggers: user messages blocked by guardrails
     - suggested_training_pairs: positively-rated messages worth formalizing
     """
-    tenant_id = str(tenant.id)
+    tenant_id = str(tenant)
     agent_uuid = uuid.UUID(agent_id)
     await _get_agent(agent_id, tenant_id, db)
 

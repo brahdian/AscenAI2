@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db
 from app.core.metrics import MESSAGES_PROCESSED, SESSIONS_CREATED
 from app.models.agent import Agent, Session as AgentSession
 from app.schemas.chat import ChatRequest, ChatResponse, StreamChatEvent
@@ -85,9 +86,20 @@ async def _get_or_create_session(
         )
         sess = result.scalar_one_or_none()
         if sess:
-            return sess
+            # Auto-close expired sessions
+            from app.core.config import settings as _settings
+            expiry_minutes = getattr(_settings, "SESSION_EXPIRY_MINUTES", 30)
+            if sess.is_expired(expiry_minutes):
+                sess.close()
+                await db.flush()
+                logger.info("expired_session_replaced", old_session_id=session_id)
+                # Fall through to create a new session with a new ID
+            else:
+                return sess
 
-    new_id = session_id or str(uuid.uuid4())
+    from datetime import datetime, timezone as _tz
+    # Always generate a new ID when creating a fresh session
+    new_id = str(uuid.uuid4())
     sess = AgentSession(
         id=new_id,
         tenant_id=uuid.UUID(tenant_id),
@@ -95,6 +107,7 @@ async def _get_or_create_session(
         customer_identifier=customer_identifier,
         channel=channel,
         status="active",
+        last_activity_at=datetime.now(_tz.utc),
     )
     db.add(sess)
     await db.flush()
@@ -106,7 +119,7 @@ async def _get_or_create_session(
 async def chat(
     body: ChatRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Process a chat message and return the AI response."""
     tenant_id = _tenant_id(request)
@@ -162,7 +175,7 @@ async def chat(
 async def chat_stream(
     body: ChatRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Stream a chat response as Server-Sent Events."""
     tenant_id = _tenant_id(request)

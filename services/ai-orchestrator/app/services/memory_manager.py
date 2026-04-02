@@ -218,87 +218,80 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     async def maybe_summarize(self, session_id: str, llm_client: "LLMClient") -> None:
-        """
-        Check whether the session history has exceeded SUMMARY_TRIGGER_TURNS.
-        If so, attempt to acquire a Redis SETNX lock and run LLM summarization
-        on the oldest SUMMARY_COMPRESS_TURNS turns, then trim the history list
-        so only the last SUMMARY_RETAIN_TURNS turns remain in Redis.
+        """Check whether the session history has exceeded SUMMARY_TRIGGER_TURNS.
 
-        If another coroutine/process already holds the lock, wait up to
-        SUMMARY_LOCK_WAIT_SECONDS then return (proceeding with full history).
+        Context trimming is *always* performed regardless of whether the
+        summarization lock is available.  This guarantees that the active
+        context window never grows unboundedly, even under high concurrency.
+
+        If another coroutine/process holds the summarization lock we skip only
+        the expensive LLM compression step and return early — the context has
+        already been trimmed to a safe size.
         """
         session_key = self._session_key(session_id)
         lock_key = self._lock_key(session_id)
 
         try:
-            # Count current turns (each turn = 2 messages: user + assistant)
-            length = await self.redis.llen(session_key)
+            raw_messages = await self.redis.lrange(session_key, 0, -1)
+            length = len(raw_messages)
             turn_count = length // 2
 
             if turn_count < SUMMARY_TRIGGER_TURNS:
                 return
 
-            # Try to acquire SETNX lock
+            all_messages: list[dict] = []
+            for raw in raw_messages:
+                try:
+                    all_messages.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    pass
+
+            compress_count = SUMMARY_COMPRESS_TURNS * 2
+            messages_to_compress = all_messages[:compress_count]
+            messages_to_keep = all_messages[compress_count:]
+            retain_count = SUMMARY_RETAIN_TURNS * 2
+            tail_messages = (
+                messages_to_keep[-retain_count:]
+                if len(messages_to_keep) >= retain_count
+                else messages_to_keep
+            )
+
+            # ── ALWAYS trim the live window ─────────────────────────────────
+            # This runs regardless of lock state so context cannot balloon.
+            pipe = self.redis.pipeline()
+            pipe.delete(session_key)
+            for msg in tail_messages:
+                pipe.rpush(session_key, json.dumps(msg, default=str))
+            pipe.expire(session_key, MEMORY_TTL_SECONDS)
+            await pipe.execute()
+
+            logger.info(
+                "context_window_trimmed",
+                session_id=session_id,
+                before=length,
+                after=len(tail_messages),
+            )
+
+            # ── Attempt LLM summarization (requires lock) ───────────────────
             lock_acquired = await self.redis.set(
                 lock_key, "1", nx=True, ex=SUMMARY_LOCK_TTL
             )
 
             if not lock_acquired:
-                # Another request is already summarizing — wait briefly then continue
+                # Another worker is summarizing — trimming is already done,
+                # so we can safely return without summary degradation.
                 logger.info(
-                    "summary_lock_contention_waiting",
+                    "summary_lock_contention_trimmed_safely",
                     session_id=session_id,
-                    wait_seconds=SUMMARY_LOCK_WAIT_SECONDS,
                 )
-                await asyncio.sleep(SUMMARY_LOCK_WAIT_SECONDS)
                 return
 
-            # Lock acquired — perform summarization
-            logger.info(
-                "auto_summarization_triggered",
-                session_id=session_id,
-                turn_count=turn_count,
-                compress_turns=SUMMARY_COMPRESS_TURNS,
-            )
             try:
-                # Fetch all current messages
-                raw_messages = await self.redis.lrange(session_key, 0, -1)
-                all_messages: list[dict] = []
-                for raw in raw_messages:
-                    try:
-                        all_messages.append(json.loads(raw))
-                    except json.JSONDecodeError:
-                        pass
-
-                # The oldest SUMMARY_COMPRESS_TURNS * 2 raw messages (user+assistant pairs)
-                compress_count = SUMMARY_COMPRESS_TURNS * 2
-                messages_to_compress = all_messages[:compress_count]
-                messages_to_keep = all_messages[compress_count:]
-
                 summary_text = await self._run_llm_summarization(
                     session_id, messages_to_compress, llm_client
                 )
-
-                # Persist summary to Redis
                 summary_key = self._summary_key(session_id)
                 await self.redis.set(summary_key, summary_text, ex=MEMORY_TTL_SECONDS)
-
-                # Replace the history list: keep only the retained tail
-                retain_count = SUMMARY_RETAIN_TURNS * 2
-                tail_messages = (
-                    messages_to_keep[-retain_count:]
-                    if len(messages_to_keep) >= retain_count
-                    else messages_to_keep
-                )
-
-                # Atomically replace the list
-                pipe = self.redis.pipeline()
-                pipe.delete(session_key)
-                for msg in tail_messages:
-                    pipe.rpush(session_key, json.dumps(msg, default=str))
-                pipe.expire(session_key, MEMORY_TTL_SECONDS)
-                await pipe.execute()
-
                 logger.info(
                     "auto_summarization_complete",
                     session_id=session_id,
@@ -306,7 +299,6 @@ class MemoryManager:
                     retained=len(tail_messages),
                 )
             finally:
-                # Always release the lock
                 await self.redis.delete(lock_key)
 
         except Exception as exc:
@@ -315,11 +307,12 @@ class MemoryManager:
                 session_id=session_id,
                 error=str(exc),
             )
-            # Best-effort: attempt lock cleanup
             try:
                 await self.redis.delete(lock_key)
             except Exception:
                 pass
+
+
 
     async def _run_llm_summarization(
         self,

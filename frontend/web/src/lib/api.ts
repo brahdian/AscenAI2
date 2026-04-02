@@ -107,6 +107,7 @@ export const authApi = {
     full_name: string
     business_name: string
     business_type?: string
+    plan?: string
   }) => api.post('/auth/register', data).then((r) => r.data),
 
   login: (data: { email: string; password: string }) =>
@@ -150,7 +151,7 @@ export const agentsApi = {
       .post(`/proxy/agents/${id}/voice-greeting`, form, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
-      .then((r) => r.data as { url: string })
+      .then((r) => r.data)
   },
   deleteVoiceGreeting: (id: string) =>
     api.delete(`/proxy/agents/${id}/voice-greeting`).then((r) => r.data),
@@ -163,6 +164,23 @@ export const agentsApi = {
     }),
 }
 
+
+// ---------------------------------------------------------------------------
+// Templates (via proxy)
+// ---------------------------------------------------------------------------
+
+export const templatesApi = {
+  list: () => api.get('/proxy/templates').then((r) => r.data),
+  get: (id: string) => api.get(`/proxy/templates/${id}`).then((r) => r.data),
+  instantiate: (id: string, data: Record<string, unknown>) =>
+    api.post(`/proxy/templates/${id}/instantiate`, data).then((r) => r.data),
+  getInstanceByAgent: (agentId: string) =>
+    api.get(`/proxy/templates/instances/by-agent/${agentId}`).then((r) => r.data),
+  updateInstance: (instanceId: string, data: { variable_values: Record<string, any> }) =>
+    api.patch(`/proxy/templates/instances/${instanceId}`, data).then((r) => r.data),
+}
+
+
 // ---------------------------------------------------------------------------
 // Chat (via proxy)
 // ---------------------------------------------------------------------------
@@ -174,6 +192,140 @@ export const chatApi = {
     session_id?: string
     channel?: string
   }) => api.post('/proxy/chat', data).then((r) => r.data),
+
+  stream: async (data: {
+    agent_id: string
+    message: string
+    session_id?: string
+    channel?: string
+  }, onChunk: (chunk: string, meta?: Record<string, any>) => void, onSession?: (sessionId: string) => void) => {
+    const response = await fetch(`${API_URL}/api/v1/proxy/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    })
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const reader = response.body?.getReader()
+    if (!reader) return
+
+    const decoder = new TextDecoder()
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      
+      const chunk = decoder.decode(value, { stream: true })
+      const lines = chunk.split('\n')
+      
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const parsed = JSON.parse(line.substring(6))
+            if (parsed.type === 'text_delta' && parsed.data) {
+              const meta: Record<string, any> = {}
+              if (parsed.session_status) meta.session_status = parsed.session_status
+              if (parsed.minutes_until_expiry != null) meta.minutes_until_expiry = parsed.minutes_until_expiry
+              if (parsed.expiry_warning != null) meta.expiry_warning = parsed.expiry_warning
+              onChunk(parsed.data, Object.keys(meta).length > 0 ? meta : undefined)
+            } else if (parsed.type === 'done' && parsed.data) {
+              const d = typeof parsed.data === 'string' ? JSON.parse(parsed.data) : parsed.data
+              if (d.session_status) onChunk('', { session_status: d.session_status })
+              if (onSession && d.session_id) onSession(d.session_id)
+            } else if (parsed.type === 'session' || parsed.session_id) {
+              if (onSession) onSession(parsed.session_id || parsed.data)
+            }
+          } catch (e) {
+            // Ignore partial/invalid SSE lines
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Voice / TTS (via proxy)
+// ---------------------------------------------------------------------------
+
+export const voiceApi = {
+  /**
+   * Stream TTS audio for a text response.
+   * Returns a ReadableStream of MP3 audio bytes for immediate playback.
+   */
+  streamTts: async (text: string, voiceId?: string): Promise<ReadableStream<Uint8Array> | null> => {
+    if (!text.trim()) return null
+    const response = await fetch(`${API_URL}/api/v1/proxy/voice/tts/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice_id: voiceId || 'alloy' }),
+    })
+    if (!response.ok) return null
+    return response.body
+  },
+
+  /**
+   * Play streamed TTS audio using the Web Audio API.
+   * Accumulates chunks and plays as they arrive for low-latency voice preview.
+   * Returns a function to stop playback.
+   */
+  playStreamedAudio: async (
+    stream: ReadableStream<Uint8Array>,
+    onChunk?: (bytesReceived: number) => void
+  ): Promise<() => void> => {
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+    const reader = stream.getReader()
+    const chunks: Uint8Array[] = []
+    let cancelled = false
+
+    const decodeAndPlay = async () => {
+      let totalBytes = 0
+      try {
+        while (!cancelled) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value) {
+            chunks.push(value)
+            totalBytes += value.length
+            onChunk?.(totalBytes)
+          }
+        }
+      } catch {
+        // Stream interrupted
+      }
+
+      if (chunks.length === 0 || cancelled) return
+
+      // Concatenate all chunks into a single ArrayBuffer
+      const totalLength = chunks.reduce((acc, c) => acc + c.length, 0)
+      const combined = new Uint8Array(totalLength)
+      let offset = 0
+      for (const chunk of chunks) {
+        combined.set(chunk, offset)
+        offset += chunk.length
+      }
+
+      try {
+        const audioBuffer = await audioCtx.decodeAudioData(combined.buffer)
+        const source = audioCtx.createBufferSource()
+        source.buffer = audioBuffer
+        source.connect(audioCtx.destination)
+        source.start(0)
+      } catch (e) {
+        // Decoding failed — audio data may be incomplete
+      }
+    }
+
+    // Start accumulating and playing
+    decodeAndPlay()
+
+    return () => {
+      cancelled = true
+      reader.cancel().catch(() => {})
+      audioCtx.close().catch(() => {})
+    }
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +363,7 @@ export const feedbackApi = {
     message_id: string
     session_id: string
     agent_id: string
-    rating: 'positive' | 'negative'
+    rating?: 'positive' | 'negative'
     labels?: string[]
     comment?: string
     ideal_response?: string
@@ -225,9 +377,13 @@ export const feedbackApi = {
     agent_id?: string
     rating?: string
     session_id?: string
+    has_correction?: boolean
+    include_messages?: boolean
     limit?: number
     offset?: number
   }) => api.get('/proxy/feedback', { params }).then((r) => r.data),
+
+  delete: (id: string) => api.delete(`/proxy/feedback/${id}`),
 
   summary: (params?: { agent_id?: string }) =>
     api.get('/proxy/feedback/summary', { params }).then((r) => r.data),
@@ -290,6 +446,7 @@ export const guardrailsApi = {
     allowed_topics?: string[]
     profanity_filter?: boolean
     pii_redaction?: boolean
+    pii_pseudonymization?: boolean
     max_response_length?: number
     require_disclaimer?: string
     blocked_message?: string
@@ -300,6 +457,26 @@ export const guardrailsApi = {
 
   delete: (agentId: string) =>
     api.delete(`/proxy/agents/${agentId}/guardrails`),
+
+  // Agent-specific custom guardrails
+  listCustom: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/guardrails/custom`).then((r) => r.data),
+
+  createCustom: (agentId: string, data: { rule: string; category?: string }) =>
+    api.post(`/proxy/agents/${agentId}/guardrails/custom`, data).then((r) => r.data),
+
+  updateCustom: (agentId: string, customId: string, data: { rule?: string; category?: string; is_active?: boolean }) =>
+    api.patch(`/proxy/agents/${agentId}/guardrails/custom/${customId}`, data).then((r) => r.data),
+
+  deleteCustom: (agentId: string, customId: string) =>
+    api.delete(`/proxy/agents/${agentId}/guardrails/custom/${customId}`),
+
+  // Global guardrails change requests
+  requestChange: (data: { guardrail_id: string; proposed_rule: string; reason: string }) =>
+    api.post('/proxy/guardrails/change-requests', data).then((r) => r.data),
+
+  listChangeRequests: () =>
+    api.get('/proxy/guardrails/change-requests').then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -342,8 +519,27 @@ export const documentsApi = {
     form.append('file', file)
     return api.post(`/proxy/agents/${agentId}/documents`, form).then((r) => r.data)
   },
+  createText: (agentId: string, data: { name: string; content: string }) =>
+    api.post(`/proxy/agents/${agentId}/documents/text`, data).then((r) => r.data),
+  updateText: (agentId: string, docId: string, data: { name?: string; content?: string; status?: 'draft' | 'published' }) =>
+    api.put(`/proxy/agents/${agentId}/documents/${docId}`, data).then((r) => r.data),
   delete: (agentId: string, docId: string) =>
     api.delete(`/proxy/agents/${agentId}/documents/${docId}`),
+}
+
+// ---------------------------------------------------------------------------
+// Variables API
+// ---------------------------------------------------------------------------
+
+export const variablesApi = {
+  list: (agentId: string) =>
+    api.get(`/proxy/agents/${agentId}/variables`).then((r) => r.data),
+  create: (agentId: string, data: Record<string, unknown>) =>
+    api.post(`/proxy/agents/${agentId}/variables`, data).then((r) => r.data),
+  update: (agentId: string, varId: string, data: Record<string, unknown>) =>
+    api.put(`/proxy/agents/${agentId}/variables/${varId}`, data).then((r) => r.data),
+  delete: (agentId: string, varId: string) =>
+    api.delete(`/proxy/agents/${agentId}/variables/${varId}`),
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +562,14 @@ export const teamApi = {
 export const billingApi = {
   overview: () => api.get('/billing/overview').then((r) => r.data),
   agents: () => api.get('/billing/agents').then((r) => r.data),
+  createCheckoutSession: (data: { plan: string }) =>
+    api.post('/billing/create-checkout-session', data).then((r) => r.data),
+  createPortalSession: () =>
+    api.post('/billing/portal-session').then((r) => r.data as { portal_url: string }),
+  createAgentSlotSession: () =>
+    api.post('/billing/create-agent-slot-session').then((r) => r.data as { checkout_url: string }),
+  getInvoices: () =>
+    api.get('/billing/invoices').then((r) => r.data as { invoices: any[] }),
 }
 
 // ---------------------------------------------------------------------------

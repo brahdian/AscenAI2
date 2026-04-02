@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json as _json
 import re
-
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -22,24 +21,44 @@ router = APIRouter(prefix="/proxy")
 async def _get_tenant_and_usage(tenant_id: str, db: AsyncSession):
     """Load Tenant + TenantUsage in a single round-trip."""
     from app.models.tenant import Tenant, TenantUsage
-    t_res = await db.execute(select(Tenant).where(Tenant.id == __import__("uuid").UUID(tenant_id)))
-    u_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == __import__("uuid").UUID(tenant_id)))
+    import uuid as _uuid
+    tid = _uuid.UUID(tenant_id)
+    t_res = await db.execute(select(Tenant).where(Tenant.id == tid))
+    u_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tid))
     return t_res.scalar_one_or_none(), u_res.scalar_one_or_none()
 
 
 async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
-    """Raise 429 if tenant is at or above max_agents for their plan."""
-    from app.services.tenant_service import get_plan_limits, check_limit
+    """Raise 402 if tenant is at or above purchased agent slots."""
+    from app.services.tenant_service import get_plan_limits
     tenant, usage = await _get_tenant_and_usage(tenant_id, db)
-    if tenant is None:
+    if tenant is None or usage is None:
         return
-    limits = get_plan_limits(tenant.plan or "professional")
-    current = usage.agent_count if usage else 0
-    if not check_limit(limits["max_agents"], current):
+    
+    purchased_slots = usage.agent_count
+    
+    # Query actual agent count from orchestrator
+    actual_count = 0
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+                headers={"X-Tenant-ID": tenant_id}
+            )
+            if resp.status_code == 200:
+                agents = resp.json()
+                actual_count = len(agents)
+    except Exception as e:
+        logger.warning("agent_count_query_error", error=str(e))
+        # If we can't check, we might want to fail safe or allow?
+        # Given the "upfront payment" requirement, we should probably be strict.
+        pass
+
+    if actual_count >= purchased_slots:
         raise HTTPException(
-            status_code=429,
-            detail=f"Plan limit reached: your {tenant.plan} plan allows up to "
-                   f"{limits['max_agents']} agent(s). Upgrade to add more.",
+            status_code=402,
+            detail=f"No available agent slots. You have {actual_count} agent(s) and {purchased_slots} slot(s). "
+                   f"Please purchase an additional slot in the Billing section."
         )
 
 
@@ -71,8 +90,8 @@ async def _increment_agent_count(tenant_id: str, delta: int, db: AsyncSession) -
         await db.commit()
 
 
-async def _increment_message_count(tenant_id: str, db: AsyncSession) -> None:
-    """Increment current_month_messages on TenantUsage."""
+async def _increment_message_count(tenant_id: str, db: AsyncSession, turn_count: int = 0) -> None:
+    """Increment current_month_messages and optionally chat units on TenantUsage."""
     from app.models.tenant import TenantUsage
     import uuid as _uuid
     tid = _uuid.UUID(tenant_id)
@@ -80,6 +99,10 @@ async def _increment_message_count(tenant_id: str, db: AsyncSession) -> None:
     usage = usage_res.scalar_one_or_none()
     if usage:
         usage.current_month_messages = (usage.current_month_messages or 0) + 1
+        # Chat units: 1 unit per 10 turns. The first turn (turn_count=1) increments it.
+        # subsequent increments at turn 11, 21, etc.
+        if turn_count > 0 and (turn_count % 10 == 1):
+            usage.current_month_chat_units = (usage.current_month_chat_units or 0) + 1
         await db.commit()
 
 
@@ -95,6 +118,7 @@ _SERVICE_MAP = {
     "sessions": settings.AI_ORCHESTRATOR_URL,
     "feedback": settings.AI_ORCHESTRATOR_URL,
     "analytics": settings.AI_ORCHESTRATOR_URL,
+    "templates": settings.AI_ORCHESTRATOR_URL,
     "tools": settings.MCP_SERVER_URL,
     "context": settings.MCP_SERVER_URL,
     "voice": settings.VOICE_PIPELINE_URL,
@@ -111,7 +135,11 @@ def _get_downstream_url(service: str, path: str) -> str:
     base = _SERVICE_MAP.get(service)
     if not base:
         raise HTTPException(status_code=404, detail=f"Unknown service: {service}")
-    return f"{base}/api/v1/{service}{path}"
+    path = path.lstrip("/")
+    if path:
+        return f"{base}/api/v1/{service}/{path}"
+    else:
+        return f"{base}/api/v1/{service}"
 
 
 def _sanitize_chat_body(body: bytes, content_type: str) -> bytes:
@@ -136,7 +164,13 @@ def _sanitize_chat_body(body: bytes, content_type: str) -> bytes:
     return body
 
 
-async def _proxy_request(request: Request, url: str, service: str = "") -> Response:
+async def _proxy_request(
+    request: Request,
+    url: str,
+    path: str,
+    db: AsyncSession,
+    service: str = "",
+):
     """Forward a request to a downstream service and return the response."""
     # Forward auth headers plus tenant context
     _trace_id = getattr(request.state, "trace_id", "")
@@ -164,12 +198,71 @@ async def _proxy_request(request: Request, url: str, service: str = "") -> Respo
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            if "/stream" in url:
+                # Streaming path
+                async def stream_generator():
+                    _turn_count = 0
+                    async with client.stream(
+                        method=request.method,
+                        url=url,
+                        headers=headers,
+                        content=body,
+                        params=dict(request.query_params),
+                    ) as resp:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                            try:
+                                # Safe extraction from the 'done' event payload
+                                _text = chunk.decode("utf-8", errors="ignore")
+                                if '"turn_count":' in _text:
+                                    import re as _re
+                                    _m = _re.search(r'"turn_count":\s*(\d+)', _text)
+                                    if _m:
+                                        _turn_count = int(_m.group(1))
+                            except Exception:
+                                pass
+                    
+                    # Intercept billing increment after stream ends
+                    full_path = f"{service}/{path}".strip("/")
+                    if service == "agents" and request.method == "POST" and _CHAT_SEND.match(full_path):
+                        await _increment_message_count(getattr(request.state, "tenant_id", ""), db, turn_count=_turn_count)
+
+                media = "audio/mpeg" if "/tts/" in url or service == "voice" else "text/event-stream"
+                return StreamingResponse(stream_generator(), media_type=media)
+
             resp = await client.request(
                 method=request.method,
                 url=url,
                 headers=headers,
                 content=body,
                 params=dict(request.query_params),
+            )
+            
+            # Post-request hooks for Non-streaming responses
+            if resp.status_code < 300:
+                tenant_id = getattr(request.state, "tenant_id", "")
+                if service == "agents":
+                    full_path = f"{service}/{path}".strip("/")
+                    # We NO LONGER auto-increment/decrement agent_count here.
+                    # agent_count now represents "Purchased Slots" managed by billing.
+                    if request.method == "POST" and _CHAT_SEND.match(full_path):
+                        _turn_count = 0
+                        if resp.headers.get("Content-Type") == "application/json":
+                            try:
+                                _payload = _json.loads(resp.content)
+                                _turn_count = _payload.get("turn_count", 0)
+                            except Exception:
+                                pass
+                        await _increment_message_count(tenant_id, db, turn_count=_turn_count)
+
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={
+                    k: v
+                    for k, v in resp.headers.items()
+                    if k.lower() not in ("content-encoding", "transfer-encoding", "connection")
+                },
             )
     except httpx.ConnectError as exc:
         logger.error("proxy_connect_error", url=url, error=str(exc))
@@ -178,49 +271,30 @@ async def _proxy_request(request: Request, url: str, service: str = "") -> Respo
         logger.error("proxy_timeout", url=url, error=str(exc))
         raise HTTPException(status_code=504, detail="Downstream service timed out.")
 
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={
-            k: v
-            for k, v in resp.headers.items()
-            if k.lower() not in ("content-encoding", "transfer-encoding", "connection")
-        },
-    )
-
 
 @router.api_route(
     "/{service}/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    response_model=None,
 )
 async def proxy(
     service: str,
     path: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
-) -> Response:
+):
     """Generic reverse proxy with plan-limit enforcement and usage tracking."""
     tenant_id: str = getattr(request.state, "tenant_id", "") or ""
     method = request.method.upper()
+    full_path = f"{service}/{path}".strip("/")
 
     # ── Pre-request plan limit checks ────────────────────────────────────────
     if tenant_id and service == "agents":
-        if method == "POST" and _AGENT_CREATE.match(path.lstrip("/")):
+        if method == "POST" and _AGENT_CREATE.match(full_path):
             await _check_agent_limit(tenant_id, db)
-        elif method == "POST" and _CHAT_SEND.match(path.lstrip("/")):
+        elif method == "POST" and _CHAT_SEND.match(full_path):
             await _check_message_limit(tenant_id, db)
 
     # ── Forward the request ───────────────────────────────────────────────────
     url = _get_downstream_url(service, f"/{path}" if path else "")
-    resp = await _proxy_request(request, url, service=service)
-
-    # ── Post-request usage tracking ───────────────────────────────────────────
-    if tenant_id and service == "agents" and resp.status_code < 300:
-        if method == "POST" and _AGENT_CREATE.match(path.lstrip("/")):
-            await _increment_agent_count(tenant_id, +1, db)
-        elif method == "DELETE" and _AGENT_DELETE.match(path.lstrip("/")):
-            await _increment_agent_count(tenant_id, -1, db)
-        elif method == "POST" and _CHAT_SEND.match(path.lstrip("/")):
-            await _increment_message_count(tenant_id, db)
-
-    return resp
+    return await _proxy_request(request, url, path, db, service=service)

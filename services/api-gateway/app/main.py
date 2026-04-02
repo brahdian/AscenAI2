@@ -21,6 +21,8 @@ from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
 from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
 from app.api.v1 import channels as channels_router
+from app.api.v1 import admin as admin_router
+from app.api.v1 import compliance_audit as compliance_audit_router
 
 logger = structlog.get_logger(__name__)
 
@@ -219,7 +221,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# --- CORS (must be first so preflight requests are handled) ----------------
+# --- Middlewares (Added inside out: last added is outermost in execution) ---
+
+# 1. Rate limiting (Innermost, relies on Auth having run)
+app.add_middleware(RateLimitMiddleware)
+
+# 2. Auth (Protects the router, sets request.state.user for ratelimit)
+app.add_middleware(AuthMiddleware)
+
+# 3. Request logging 
+app.add_middleware(RequestLoggingMiddleware)
+
+# 4. CORS (Must be outer so it catches 401s from Auth and 429s from RateLimit)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -229,16 +242,7 @@ app.add_middleware(
     expose_headers=["X-Trace-ID", "X-Response-Time", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
 
-# --- Request logging --------------------------------------------------------
-app.add_middleware(RequestLoggingMiddleware)
-
-# --- Auth (sets request.state.user / tenant_id) ----------------------------
-app.add_middleware(AuthMiddleware)
-
-# --- Rate limiting (reads tenant_id set by AuthMiddleware) -----------------
-app.add_middleware(RateLimitMiddleware)
-
-# --- W3C traceparent propagation (outermost — wraps everything) -------------
+# 5. W3C traceparent propagation (Outermost — wraps everything)
 app.add_middleware(TracingMiddleware)
 
 # --- Prometheus metrics -----------------------------------------------------
@@ -257,6 +261,8 @@ app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 app.include_router(compliance.router, prefix="/api/v1", tags=["compliance"])
 app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
 app.include_router(channels_router.router, prefix="/api/v1/channels", tags=["channels"])
+app.include_router(admin_router.router, prefix="/api/v1", tags=["admin"])
+app.include_router(compliance_audit_router.router, prefix="/api/v1", tags=["compliance-audit"])
 
 # ── Static assets — widget.js served at /widget/widget.js ─────────────────
 import os as _os

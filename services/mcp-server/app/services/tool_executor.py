@@ -50,9 +50,15 @@ async def _get_builtin_handlers() -> dict:
         handle_google_sheets_append,
     )
     from app.tools.integrations.webhook import handle_custom_webhook
+    from app.tools.integrations.helcim_tool import handle_helcim_process_payment
+    from app.tools.integrations.paypal_tool import handle_paypal_create_order
+    from app.tools.integrations.moneris_tool import handle_moneris_process_payment
+    from app.tools.integrations.square_tool import handle_square_create_payment
+    from app.tools.integrations.mailchimp_tool import handle_mailchimp_add_subscriber
+    from app.tools.integrations.telnyx_tool import handle_telnyx_send_bulk_sms
 
     return {
-        # Built-in demo tools
+        # Demo / Built-in tools
         "pizza_order": handle_pizza_order,
         "order_status": handle_order_status,
         "appointment_book": handle_appointment_book,
@@ -61,18 +67,43 @@ async def _get_builtin_handlers() -> dict:
         "crm_lookup": handle_crm_lookup,
         "crm_update": handle_crm_update,
         "send_sms": handle_send_sms,
-        # Integrations
+        
+        # Google Calendar
+        "calendar_check_availability": handle_google_calendar_check,
+        "calendar_book_appointment": handle_google_calendar_book,
         "google_calendar_check": handle_google_calendar_check,
         "google_calendar_book": handle_google_calendar_book,
+        
+        # Calendly
         "calendly_availability": handle_calendly_availability,
         "calendly_book": handle_calendly_book,
+        "calendly_list_event_types": handle_calendly_availability,
+        
+        # Stripe
         "stripe_payment_link": handle_stripe_payment_link,
         "stripe_check_payment": handle_stripe_check_payment,
+        "stripe_get_customer": handle_stripe_check_payment,
+        
+        # Twilio
         "twilio_send_sms": handle_twilio_send_sms,
+        
+        # Gmail / SMTP
         "gmail_send_email": handle_gmail_send_email,
+        
+        # Google Sheets
         "google_sheets_read": handle_google_sheets_read,
         "google_sheets_append": handle_google_sheets_append,
+        
+        # Webhook
         "custom_webhook": handle_custom_webhook,
+        
+        # Integrations
+        "moneris_process_payment": handle_moneris_process_payment,
+        "square_create_payment": handle_square_create_payment,
+        "helcim_process_payment": handle_helcim_process_payment,
+        "paypal_create_order": handle_paypal_create_order,
+        "mailchimp_add_subscriber": handle_mailchimp_add_subscriber,
+        "telnyx_send_bulk_sms": handle_telnyx_send_bulk_sms,
     }
 
 

@@ -2,7 +2,8 @@
 
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { feedbackApi, agentsApi } from '@/lib/api'
+import { feedbackApi, agentsApi, sessionsApi } from '@/lib/api'
+import Link from 'next/link'
 import {
   ThumbsUp,
   ThumbsDown,
@@ -11,6 +12,7 @@ import {
   Tag,
   MessageSquare,
   TrendingUp,
+  ExternalLink,
 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 
@@ -81,13 +83,12 @@ export default function FeedbackPage() {
   }
 
   function handleExport(format: 'jsonl' | 'csv') {
-    const params = new URLSearchParams({
+    const url = feedbackApi.exportUrl({
       format,
-      ...(agentFilter && { agent_id: agentFilter }),
-      ...(ratingFilter && { rating: ratingFilter }),
+      agent_id: agentFilter || undefined,
+      rating: ratingFilter || undefined,
     })
     // Download via hidden link — HttpOnly auth cookie is sent automatically
-    const url = `/api/v1/proxy/feedback/export?${params}`
     fetch(url, { credentials: 'include' })
       .then((r) => r.blob())
       .then((blob) => {
@@ -102,7 +103,7 @@ export default function FeedbackPage() {
     <div className="p-8">
       <div className="flex items-start justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Feedback & Training</h1>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Feedback</h1>
           <p className="text-gray-500 dark:text-gray-400 mt-1">
             Review user ratings, apply labels, and export training data.
           </p>
@@ -331,7 +332,17 @@ export default function FeedbackPage() {
                       ))}
                     </div>
                     <p className="text-sm text-gray-700 dark:text-gray-300 truncate">
-                      Message: <span className="text-gray-500">{fb.message_id.slice(0, 12)}…</span>
+                      {fb.session_id ? (
+                        <Link
+                          href={`/dashboard/sessions?highlight=${fb.session_id}`}
+                          className="text-violet-600 dark:text-violet-400 hover:underline inline-flex items-center gap-1"
+                        >
+                          Session: <span className="font-mono">{fb.session_id.slice(0, 12)}…</span>
+                          <ExternalLink size={12} />
+                        </Link>
+                      ) : (
+                        <>Message: <span className="text-gray-500">{fb.message_id.slice(0, 12)}…</span></>
+                      )}
                     </p>
                     {fb.comment && (
                       <p className="text-sm text-gray-500 dark:text-gray-400 mt-1 italic">

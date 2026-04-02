@@ -22,6 +22,10 @@ class RegisterRequest(BaseModel):
         default="other",
         description="One of: pizza_shop, clinic, salon, other",
     )
+    plan: str = Field(
+        default="voice_growth",
+        description="Plan: text_growth, voice_growth, voice_business",
+    )
 
 
 class LoginRequest(BaseModel):

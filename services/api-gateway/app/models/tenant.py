@@ -51,6 +51,9 @@ class Tenant(Base):
         String(50), nullable=False, default="professional"
     )  # "professional", "business", "enterprise"
     plan_limits: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    subscription_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Status
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -91,6 +94,21 @@ class Tenant(Base):
         "Webhook", back_populates="tenant", cascade="all, delete-orphan"
     )
 
+    PLAN_DISPLAY_NAMES: dict[str, str] = {
+        "text_growth": "Starter",
+        "voice_growth": "Growth",
+        "voice_business": "Business",
+        "enterprise": "Enterprise",
+        "professional": "Growth",
+        "business": "Business",
+        "starter": "Starter",
+        "growth": "Growth",
+    }
+
+    @property
+    def plan_display_name(self) -> str:
+        return self.PLAN_DISPLAY_NAMES.get(self.plan, self.plan.replace("_", " ").title())
+
     def __repr__(self) -> str:
         return f"<Tenant slug={self.slug} plan={self.plan}>"
 
@@ -119,6 +137,9 @@ class TenantUsage(Base):
         Integer, nullable=False, default=0
     )
     current_month_messages: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    current_month_chat_units: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
     current_month_tokens: Mapped[int] = mapped_column(

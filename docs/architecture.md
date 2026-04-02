@@ -126,9 +126,8 @@ graph TB
   end
 
   subgraph Data
-    PG[("PostgreSQL 16\n(RLS enabled)")]
+    PG[("PostgreSQL 16\n(pgvector + RLS)")]
     RD[("Redis 7")]
-    QD[("Qdrant 1.11\nVector DB")]
   end
 
   FE & WC & CH --> GW
@@ -137,7 +136,6 @@ graph TB
   OR --> LLM
   VP --> OR
   OR & MCP & GW --> PG & RD
-  MCP --> QD
 ```
 
 ### 2.3 Chat Request Flow (Non-Streaming)
@@ -165,7 +163,7 @@ sequenceDiagram
     OR->>RD: Load conversation history (20 turns)
     OR->>OR: Emergency + jailbreak + injection checks
     OR->>OR: ML Moderation (input)
-    OR->>MCP: Hybrid RAG retrieval (BM25 + vector + rerank)
+    OR->>MCP: RAG retrieval (pgvector cosine search)
     OR->>OR: PII anonymize message (Presidio)
     OR->>OR: PromptManager.get_active_prompt() [version + A/B]
     OR->>RD: Check daily token budget
@@ -440,9 +438,8 @@ erDiagram
 | **PII** | Presidio + spaCy | 50+ entity types; reversible pseudonymization |
 | **Logging** | structlog (JSON) | Structured output; processor pipeline |
 | **Metrics** | prometheus-fastapi-instrumentator | Zero-config RED metrics |
-| **Primary DB** | PostgreSQL 16 | ACID; RLS; JSONB; battle-tested |
+| **Primary DB** | PostgreSQL 16 + pgvector | SQL store + Vector similarity search |
 | **Cache** | Redis 7 | Sub-ms latency; atomic ops; TTL |
-| **Vector DB** | Qdrant 1.11 | Purpose-built; payload filter; Rust core |
 | **Containers** | Docker + Compose | Universal reproducibility |
 | **CI/CD** | GitHub Actions | OIDC; matrix builds; no extra infra |
 | **Tracing** | OpenTelemetry (vendor-neutral) | Supports Jaeger/Honeycomb/Tempo |
@@ -527,7 +524,7 @@ graph LR
 | Layer | Coverage | Tools |
 |---|---|---|
 | Unit | Guardrails, PII, playbook conditions, memory | pytest |
-| Integration | DB CRUD, Redis ops, MCP→Qdrant | testcontainers |
+| Integration | DB CRUD, Redis ops, pgvector search | testcontainers |
 | API | All endpoints with real services | httpx.AsyncClient |
 | E2E | Full user journeys | Playwright |
 | Performance | 100 concurrent users | Locust |

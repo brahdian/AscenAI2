@@ -7,7 +7,7 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import toast from 'react-hot-toast'
-import { authApi } from '@/lib/api'
+import { authApi, billingApi } from '@/lib/api'
 import { useAuthStore } from '@/store/auth'
 
 const schema = z.object({
@@ -16,6 +16,7 @@ const schema = z.object({
   password: z.string().min(8, 'Minimum 8 characters'),
   business_name: z.string().min(1, 'Business name required'),
   business_type: z.enum(['pizza_shop', 'clinic', 'salon', 'other']),
+  plan: z.enum(['text_growth', 'voice_growth', 'voice_business']),
 })
 
 type FormData = z.infer<typeof schema>
@@ -31,7 +32,7 @@ export default function RegisterPage() {
     formState: { errors },
   } = useForm<FormData>({
     resolver: zodResolver(schema),
-    defaultValues: { business_type: 'other' },
+    defaultValues: { business_type: 'other', plan: 'voice_growth' },
   })
 
   const onSubmit = async (data: FormData) => {
@@ -39,8 +40,21 @@ export default function RegisterPage() {
     try {
       const res = await authApi.register(data)
       setUser(res.user, res.tenant_id)
-      toast.success('Account created! Welcome to AscenAI.')
-      router.push('/dashboard')
+      toast.success('Account created! Redirecting to checkout...')
+      
+      try {
+        const checkout = await billingApi.createCheckoutSession({ plan: data.plan })
+        if (checkout.checkout_url || checkout.url) {
+          window.location.href = checkout.checkout_url || checkout.url
+        } else {
+          toast.success('Account created!')
+          router.push('/dashboard')
+        }
+      } catch (checkoutErr) {
+        console.error('Checkout error:', checkoutErr)
+        toast.success('Account created!')
+        router.push('/dashboard')
+      }
     } catch (err: any) {
       toast.error(err?.response?.data?.detail || 'Registration failed')
     } finally {
@@ -96,6 +110,57 @@ export default function RegisterPage() {
                 <option value="clinic">Medical Clinic</option>
                 <option value="salon">Salon / Spa</option>
               </select>
+            </div>
+
+            <div>
+              <label className="block text-sm text-gray-300 mb-3">Select plan</label>
+              <div className="space-y-2">
+                <label className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10 cursor-pointer hover:border-violet-500/50 transition-colors">
+                  <div className="flex items-center gap-3">
+                    <input
+                      {...register('plan')}
+                      type="radio"
+                      value="text_growth"
+                      className="w-4 h-4 text-violet-500 bg-white/10 border-white/20"
+                    />
+                    <div>
+                      <span className="text-white font-medium">Starter</span>
+                      <span className="text-gray-400 text-sm ml-2">$49/agent/mo</span>
+                    </div>
+                  </div>
+                </label>
+                <label className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10 cursor-pointer hover:border-violet-500/50 transition-colors">
+                  <div className="flex items-center gap-3">
+                    <input
+                      {...register('plan')}
+                      type="radio"
+                      value="voice_growth"
+                      className="w-4 h-4 text-violet-500 bg-white/10 border-white/20"
+                    />
+                    <div>
+                      <span className="text-white font-medium">Growth</span>
+                      <span className="text-gray-400 text-sm ml-2">$99/agent/mo</span>
+                    </div>
+                  </div>
+                </label>
+                <label className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10 cursor-pointer hover:border-violet-500/50 transition-colors">
+                  <div className="flex items-center gap-3">
+                    <input
+                      {...register('plan')}
+                      type="radio"
+                      value="voice_business"
+                      className="w-4 h-4 text-violet-500 bg-white/10 border-white/20"
+                    />
+                    <div>
+                      <span className="text-white font-medium">Business</span>
+                      <span className="text-gray-400 text-sm ml-2">$199/agent/mo</span>
+                    </div>
+                  </div>
+                </label>
+              </div>
+              {errors.plan && (
+                <p className="text-red-400 text-xs mt-1">{errors.plan.message}</p>
+              )}
             </div>
 
             <button

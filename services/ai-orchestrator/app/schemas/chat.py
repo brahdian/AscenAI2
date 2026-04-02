@@ -67,6 +67,16 @@ class ChatResponse(BaseModel):
         default_factory=list,
         description="Output guardrails applied (e.g. 'pii_redaction', 'length_cap', 'disclaimer_appended')",
     )
+    # Session status
+    session_status: Optional[str] = Field(
+        None, description="Current session status: active, closed, ended, escalated"
+    )
+    minutes_until_expiry: Optional[float] = Field(
+        None, description="Minutes remaining before session auto-closes due to inactivity"
+    )
+    expiry_warning: bool = Field(
+        False, description="True if session is within the warning threshold before expiry"
+    )
 
 
 class StreamChatEvent(BaseModel):
@@ -87,8 +97,11 @@ class AgentCreate(BaseModel):
     voice_enabled: bool = True
     voice_id: Optional[str] = None
     language: str = "en"
+    auto_detect_language: bool = False
+    supported_languages: list[str] = Field(default_factory=list)
     greeting_message: Optional[str] = Field(None, max_length=1000)
     voice_greeting_url: Optional[str] = None
+    voice_system_prompt: Optional[str] = None
     tools: list[str] = Field(default_factory=list)
     knowledge_base_ids: list[str] = Field(default_factory=list)
     llm_config: dict = Field(default_factory=dict)
@@ -104,8 +117,11 @@ class AgentUpdate(BaseModel):
     voice_enabled: Optional[bool] = None
     voice_id: Optional[str] = None
     language: Optional[str] = None
+    auto_detect_language: Optional[bool] = None
+    supported_languages: Optional[list[str]] = None
     greeting_message: Optional[str] = Field(None, max_length=1000)
     voice_greeting_url: Optional[str] = None
+    voice_system_prompt: Optional[str] = None
     tools: Optional[list[str]] = None
     knowledge_base_ids: Optional[list[str]] = None
     llm_config: Optional[dict] = None
@@ -124,8 +140,11 @@ class AgentResponse(BaseModel):
     voice_enabled: bool
     voice_id: Optional[str]
     language: str
+    auto_detect_language: bool
+    supported_languages: list
     greeting_message: Optional[str] = None
     voice_greeting_url: Optional[str] = None
+    voice_system_prompt: Optional[str] = None
     tools: list
     knowledge_base_ids: list
     llm_config: dict
@@ -145,8 +164,10 @@ class SessionResponse(BaseModel):
     metadata: dict
     started_at: Optional[str]
     ended_at: Optional[str]
+    last_activity_at: Optional[str] = None
     updated_at: Optional[str]
     messages: Optional[list[dict]] = None
+    minutes_until_expiry: Optional[float] = None
 
 
 class SessionAnalyticsResponse(BaseModel):
@@ -194,7 +215,7 @@ class FeedbackCreate(BaseModel):
     message_id: str = Field(..., description="UUID of the assistant message being rated")
     session_id: str = Field(..., description="Session the message belongs to")
     agent_id: str = Field(..., description="Agent UUID")
-    rating: str = Field(..., description="positive or negative")
+    rating: Optional[str] = Field(None, description="positive or negative")
     labels: list[str] = Field(default_factory=list, description="Descriptive labels")
     comment: Optional[str] = Field(None, max_length=2000, description="Optional free-text comment")
     ideal_response: Optional[str] = Field(None, max_length=5000, description="What the response should have been")
@@ -212,7 +233,7 @@ class FeedbackResponse(BaseModel):
     session_id: str
     tenant_id: str
     agent_id: str
-    rating: str
+    rating: Optional[str]
     labels: list[str]
     comment: Optional[str]
     ideal_response: Optional[str]
@@ -221,6 +242,8 @@ class FeedbackResponse(BaseModel):
     tool_corrections: list[dict]
     feedback_source: str
     created_at: str
+    agent_response: Optional[str] = None
+    user_message: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +280,7 @@ class PlaybookResponse(BaseModel):
     description: Optional[str]
     intent_triggers: list[str]
     is_default: bool
-    greeting_message: Optional[str]
+    greeting_message: Optional[str] = None
     instructions: Optional[str]
     tone: str
     dos: list[str]
@@ -289,6 +312,7 @@ class DailyAnalytics(BaseModel):
     date: str
     total_sessions: int
     total_messages: int
+    total_chats: int
     total_tokens: int
     estimated_cost_usd: float
     avg_latency_ms: float
@@ -302,6 +326,7 @@ class AgentAnalyticsSummary(BaseModel):
     agent_name: str
     total_sessions: int
     total_messages: int
+    total_chats: int
     total_tokens: int
     estimated_cost_usd: float
     avg_latency_ms: float
@@ -312,6 +337,7 @@ class AnalyticsOverview(BaseModel):
     period_days: int
     total_sessions: int
     total_messages: int
+    total_chats: int
     total_tokens: int
     total_cost_usd: float
     avg_latency_ms: float

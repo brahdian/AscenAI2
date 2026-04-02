@@ -3,9 +3,10 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { tenantApi, complianceApi } from '@/lib/api'
+import { getPlanDisplayName } from '@/lib/plans'
 import toast from 'react-hot-toast'
 import { useEffect, useState } from 'react'
-import { Shield, Trash2 } from 'lucide-react'
+import { Shield, Trash2, Phone, ExternalLink, Copy, CheckCircle } from 'lucide-react'
 
 export default function SettingsPage() {
   const qc = useQueryClient()
@@ -114,7 +115,7 @@ export default function SettingsPage() {
   if (isLoading) return <div className="p-8 animate-pulse">Loading…</div>
 
   return (
-    <div className="p-8 max-w-2xl mx-auto">
+    <div className="p-8 w-full">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Settings</h1>
         <p className="text-gray-500 dark:text-gray-400 mt-1">
@@ -127,8 +128,8 @@ export default function SettingsPage() {
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium text-gray-700 dark:text-gray-300">Current plan</p>
-            <p className="text-xl font-bold text-violet-700 dark:text-violet-300 capitalize">
-              {tenant?.plan}
+            <p className="text-xl font-bold text-violet-700 dark:text-violet-300">
+              {tenant ? getPlanDisplayName(tenant.plan) : ''}
             </p>
           </div>
           <div className="text-right">
@@ -328,6 +329,107 @@ export default function SettingsPage() {
             </a>{' '}
             if you need assistance.
           </p>
+        </div>
+      </div>
+
+      {/* Voice Channels - Twilio Setup Guide */}
+      <div className="mt-8">
+        <div className="flex items-center gap-2 mb-4">
+          <Phone size={18} className="text-blue-500" />
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white">Voice Channels (Twilio)</h2>
+        </div>
+        <p className="text-sm text-gray-500 mb-4">
+          Set up Twilio to enable voice capabilities for your AI agents. This allows customers to call and speak with your AI agents directly.
+        </p>
+
+        <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 mb-6">
+          <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 border-b border-gray-100 dark:border-gray-800 pb-2">
+            What is Twilio and why do I need it?
+          </h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+            Twilio is a cloud communications platform that provides phone numbers and voice call capabilities. 
+            AscenAI uses Twilio to connect incoming phone calls to your AI agents.
+          </p>
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            <strong>You need your own Twilio account</strong> because:
+          </p>
+          <ul className="list-disc list-inside text-sm text-gray-600 dark:text-gray-400 mt-2 space-y-1">
+            <li>Twilio charges per-minute fees for voice calls</li>
+            <li>Phone numbers have monthly costs (typically ~$1-15/month depending on type)</li>
+            <li>You maintain control over your Twilio billing and usage</li>
+          </ul>
+        </div>
+
+        <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 mb-6">
+          <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 border-b border-gray-100 dark:border-gray-800 pb-2">
+            Step-by-Step Setup Guide
+          </h3>
+
+          <div className="space-y-6">
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold">1</span>
+                <h4 className="text-sm font-medium text-gray-900 dark:text-white">Create a Twilio Account</h4>
+              </div>
+              <p className="text-sm text-gray-600 dark:text-gray-400 ml-8">
+                Go to <a href="https://www.twilio.com" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1">
+                  twilio.com <ExternalLink size={12} />
+                </a> and sign up for a free trial account. You'll need to verify your email and phone number.
+              </p>
+            </div>
+
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold">2</span>
+                <h4 className="text-sm font-medium text-gray-900 dark:text-white">Get Your Account SID and Auth Token</h4>
+              </div>
+              <p className="text-sm text-gray-600 dark:text-gray-400 ml-8 mb-2">
+                After logging in to the Twilio Console, find your Account SID (starts with <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">AC</code>) 
+                and Auth Token. These credentials are needed to connect AscenAI to your Twilio account.
+              </p>
+              <div className="ml-8 p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+                <p className="text-xs text-blue-700 dark:text-blue-300">
+                  <strong>Important:</strong> Keep your Auth Token secure! Never share it publicly. You'll need both the Account SID and Auth Token to configure voice in AscenAI.
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold">3</span>
+                <h4 className="text-sm font-medium text-gray-900 dark:text-white">Buy a Phone Number</h4>
+              </div>
+              <p className="text-sm text-gray-600 dark:text-gray-400 ml-8">
+                In the Twilio Console, go to Phone Numbers → Buy a Number. Search for a number in your desired area code/region. 
+                Voice-enabled numbers typically cost $1-15/month. Click "Buy" to purchase.
+              </p>
+            </div>
+
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold">4</span>
+                <h4 className="text-sm font-medium text-gray-900 dark:text-white">Configure in AscenAI</h4>
+              </div>
+              <p className="text-sm text-gray-600 dark:text-gray-400 ml-8">
+                Add your Twilio credentials (Account SID, Auth Token, and Phone Number) in the Channels or Voice settings section. 
+                Once configured, incoming calls to your Twilio number will be routed to your AI agents.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-yellow-50 dark:bg-yellow-900/20 rounded-xl border border-yellow-200 dark:border-yellow-800 p-4">
+          <div className="flex items-start gap-3">
+            <CheckCircle className="w-5 h-5 text-yellow-600 dark:text-yellow-500 mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="text-sm font-medium text-yellow-800 dark:text-yellow-300">Voice Support Add-on Available</p>
+              <p className="text-sm text-yellow-700 dark:text-yellow-400 mt-1">
+                For $15/month, AscenAI provides technical support and configuration assistance for your voice channel setup. 
+                This includes help with Twilio configuration, troubleshooting, and optimizing voice agent flows. 
+                Enable the add-on in the <a href="/billing" className="underline font-medium">Billing page</a>.
+              </p>
+            </div>
+          </div>
         </div>
       </div>
     </div>

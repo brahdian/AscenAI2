@@ -14,41 +14,52 @@ logger = structlog.get_logger(__name__)
 # Plan limits definition — single source of truth, aligned with billing.py pricing.
 # -1 = unlimited.  Keys match Tenant.plan values.
 PLAN_LIMITS: dict[str, dict] = {
-    "professional": {
-        "max_messages_per_month": 5_000,
-        "max_voice_minutes_per_month": 200,
+    "text_growth": {
+        "chats_included": 1_500,
+        "max_voice_minutes_per_month": 0,
         "max_agents": 5,
         "max_api_keys": 5,
         "max_webhooks": 5,
         "max_playbooks_per_agent": 5,
-        "max_rag_documents": 25,
-        "max_team_seats": 3,
+        "max_rag_documents": 50,
+        "max_team_seats": 5,
     },
-    "business": {
-        "max_messages_per_month": 25_000,
-        "max_voice_minutes_per_month": 1_000,
+    "voice_growth": {
+        "chats_included": 3_000,
+        "max_voice_minutes_per_month": 600,
+        "max_agents": 5,
+        "max_api_keys": 5,
+        "max_webhooks": 5,
+        "max_playbooks_per_agent": 5,
+        "max_rag_documents": 50,
+        "max_team_seats": 5,
+    },
+    "voice_business": {
+        "chats_included": 7_500,
+        "max_voice_minutes_per_month": 1_500,
         "max_agents": 20,
         "max_api_keys": 20,
         "max_webhooks": 20,
-        "max_playbooks_per_agent": -1,   # unlimited
+        "max_playbooks_per_agent": 100,
         "max_rag_documents": 200,
-        "max_team_seats": 10,
+        "max_team_seats": 20,
     },
     "enterprise": {
-        "max_messages_per_month": -1,
-        "max_voice_minutes_per_month": -1,
-        "max_agents": -1,
-        "max_api_keys": -1,
-        "max_webhooks": -1,
-        "max_playbooks_per_agent": -1,
-        "max_rag_documents": -1,
-        "max_team_seats": -1,
+        "chats_included": 50_000,
+        "max_voice_minutes_per_month": 10_000,
+        "max_agents": 500,
+        "max_api_keys": 500,
+        "max_webhooks": 500,
+        "max_playbooks_per_agent": 1_000,
+        "max_rag_documents": 10_000,
+        "max_team_seats": 500,
     },
 }
 
-# Legacy plan name aliases (tenants registered before unification)
-PLAN_LIMITS["starter"] = PLAN_LIMITS["professional"]
-PLAN_LIMITS["growth"] = PLAN_LIMITS["business"]
+# Legacy plan name aliases
+PLAN_LIMITS["professional"] = PLAN_LIMITS["voice_growth"]
+PLAN_LIMITS["business"] = PLAN_LIMITS["voice_business"]
+PLAN_LIMITS["starter"] = PLAN_LIMITS["text_growth"]
 
 
 def get_plan_limits(plan: str) -> dict:

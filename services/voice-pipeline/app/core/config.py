@@ -14,7 +14,8 @@ _WEAK_KEYS = frozenset({
 
 class Settings(BaseSettings):
     # STT config
-    STT_PROVIDER: str = "gemini"  # "gemini" | "openai" | "deepgram"
+    # Deepgram Nova-2 is recommended for STT ($0.46/hr). Gemini is fallback.
+    STT_PROVIDER: str = "deepgram"  # "cartesia" | "deepgram" | "gemini" | "openai"
     OPENAI_API_KEY: str = ""
     DEEPGRAM_API_KEY: str = ""
 
@@ -27,8 +28,8 @@ class Settings(BaseSettings):
     GEMINI_STT_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
 
     # TTS config
-    # "cartesia" is the recommended default: cheapest ($0.065/1M chars) + <100ms latency
-    TTS_PROVIDER: str = "cartesia"  # "cartesia" | "google" | "elevenlabs" | "openai"
+    # Cartesia Sonic ($31/1M chars, sub-100ms latency) OR Deepgram Aura 2 ($30/1M chars)
+    TTS_PROVIDER: str = "cartesia"  # "cartesia" | "deepgram" | "google" | "elevenlabs" | "openai"
     CARTESIA_API_KEY: str = ""
     CARTESIA_VOICE_ID: str = "a0e99841-438c-4a64-b679-ae501e7d6091"  # neutral English
     ELEVENLABS_API_KEY: str = ""

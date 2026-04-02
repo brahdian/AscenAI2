@@ -27,9 +27,8 @@ def _tenant_id(request: Request) -> str:
 
 
 def _get_provider(request: Request, db: AsyncSession) -> ContextProvider:
-    qdrant = getattr(request.app.state, "qdrant", None)
     redis = getattr(request.app.state, "redis", None)
-    return ContextProvider(qdrant_client=qdrant, redis_client=redis, db=db)
+    return ContextProvider(redis_client=redis, db=db)
 
 
 @router.post("/retrieve", response_model=MCPContextResult)

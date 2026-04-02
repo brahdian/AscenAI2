@@ -4,7 +4,7 @@ Document Indexer Worker — async background queue for RAG document ingestion.
 Architecture:
   - Documents are uploaded via the /documents endpoint
   - The upload handler pushes a job to the Redis queue ``doc_index_queue``
-  - This worker pulls jobs and processes them (chunking + embedding + Qdrant upsert)
+  - This worker pulls jobs and processes them (chunking + embedding + pgvector upsert)
   - Status is updated in the ``agent_documents`` table
 
 Queue key:    ``doc_index_queue``
@@ -134,12 +134,15 @@ class DocumentIndexer:
                 logger.error("doc_index_dlq", document_id=document_id, error=str(exc))
 
     async def _index_document(self, job: dict) -> None:
-        """Full indexing pipeline: extract text → chunk → embed → upsert to Qdrant."""
+        """Full indexing pipeline: extract text → chunk → generate Gemini embeddings → store in pgvector."""
         document_id = job["document_id"]
-        agent_id = job["agent_id"]
         tenant_id = job["tenant_id"]
         storage_path = job["storage_path"]
         file_type = job.get("file_type", "txt")
+
+        from app.services.llm_client import create_llm_client
+        from app.models.agent import AgentDocumentChunk
+        from sqlalchemy import delete
 
         # 1. Read file content
         text = await self._extract_text(storage_path, file_type)
@@ -150,25 +153,29 @@ class DocumentIndexer:
         chunks = _chunk_text(text, chunk_size=_CHUNK_SIZE, overlap=_CHUNK_OVERLAP)
         logger.info("doc_index_chunks", document_id=document_id, chunks=len(chunks))
 
-        # 3. Index via MCP RAG service (or direct Qdrant if no MCP)
-        if self._mcp:
-            try:
-                result = await self._mcp.execute_tool(
-                    "index_document_chunks",
-                    {
-                        "document_id": document_id,
-                        "agent_id": agent_id,
-                        "tenant_id": tenant_id,
-                        "chunks": chunks,
-                        "file_type": file_type,
-                    },
+        # 3. Generate embeddings and store in pgvector
+        llm_client = create_llm_client()
+        vector_ids: list[str] = []
+        
+        async with self._db_factory() as db:
+            # Clear existing chunks if any (re-processing)
+            await db.execute(delete(AgentDocumentChunk).where(AgentDocumentChunk.doc_id == uuid.UUID(document_id)))
+            
+            for i, chunk_text in enumerate(chunks):
+                embedding = await llm_client.embed(chunk_text)
+                chunk_id = uuid.uuid4()
+                chunk = AgentDocumentChunk(
+                    id=chunk_id,
+                    doc_id=uuid.UUID(document_id),
+                    tenant_id=uuid.UUID(tenant_id),
+                    content=chunk_text,
+                    embedding=embedding,
+                    chunk_index=i
                 )
-                vector_ids = result.get("vector_ids", []) if isinstance(result, dict) else []
-            except Exception as exc:
-                logger.warning("doc_index_mcp_error", error=str(exc))
-                vector_ids = []
-        else:
-            vector_ids = []
+                db.add(chunk)
+                vector_ids.append(str(chunk_id))
+            
+            await db.commit()
 
         # 4. Update document status in DB
         await self._mark_ready(

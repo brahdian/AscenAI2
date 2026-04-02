@@ -4,7 +4,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { documentsApi, agentsApi } from '@/lib/api'
-import { FileText, Upload, Trash2, CheckCircle, Clock, AlertCircle, ChevronRight } from 'lucide-react'
+import { FileText, Upload, Trash2, CheckCircle, Clock, AlertCircle, ChevronRight, Edit2, Plus, X } from 'lucide-react'
+import toast from 'react-hot-toast'
 
 interface Doc {
   id: string
@@ -12,7 +13,8 @@ interface Doc {
   file_type: string
   file_size_bytes: number
   chunk_count: number
-  status: 'processing' | 'ready' | 'failed'
+  status: 'draft' | 'published' | 'processing' | 'ready' | 'failed'
+  content?: string
   error_message?: string
   created_at: string
 }
@@ -25,6 +27,8 @@ const fmtSize = (bytes: number) => {
 
 const StatusBadge = ({ status }: { status: Doc['status'] }) => {
   const map = {
+    draft: { icon: FileText, label: 'Draft', cls: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300' },
+    published: { icon: CheckCircle, label: 'Published', cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' },
     processing: { icon: Clock, label: 'Processing', cls: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' },
     ready: { icon: CheckCircle, label: 'Ready', cls: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' },
     failed: { icon: AlertCircle, label: 'Failed', cls: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' },
@@ -46,6 +50,8 @@ export default function DocumentsPage() {
   const [uploading, setUploading] = useState(false)
   const [drag, setDrag] = useState(false)
   const [error, setError] = useState('')
+  const [showEditor, setShowEditor] = useState(false)
+  const [editingDoc, setEditingDoc] = useState<Doc | null>(null)
 
   const load = useCallback(() => {
     Promise.all([
@@ -92,6 +98,23 @@ export default function DocumentsPage() {
     }
   }
 
+  const saveTextDoc = async (data: { name: string; content: string; status: 'draft' | 'published' }) => {
+    try {
+      if (editingDoc) {
+        await documentsApi.updateText(agentId, editingDoc.id, data)
+        toast.success("Document updated")
+      } else {
+        await documentsApi.createText(agentId, data)
+        toast.success("Document created")
+      }
+      setShowEditor(false)
+      setEditingDoc(null)
+      load()
+    } catch (e: any) {
+      toast.error(e?.response?.data?.detail || "Failed to save document")
+    }
+  }
+
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault()
     setDrag(false)
@@ -100,23 +123,15 @@ export default function DocumentsPage() {
   }
 
   return (
-    <div className="p-8 max-w-3xl mx-auto">
+    <div className="p-8 w-full">
       <div className="mb-6">
-        <nav className="flex items-center gap-1.5 text-sm text-gray-400 mb-4">
-          <Link href="/dashboard" className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">Dashboard</Link>
-          <ChevronRight size={13} />
-          <Link href="/dashboard/agents" className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">Agents</Link>
-          <ChevronRight size={13} />
-          <Link href={`/dashboard/agents/${agentId}`} className="hover:text-gray-600 dark:hover:text-gray-200 transition-colors">{agentName || '…'}</Link>
-          <ChevronRight size={13} />
-          <span className="text-gray-600 dark:text-gray-300">Knowledge Base</span>
-        </nav>
+
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
           <FileText size={24} className="text-violet-500" />
           Knowledge Base
         </h1>
         <p className="text-gray-500 mt-1">
-          Upload documents your agent references when answering questions. Supports PDF, TXT, Markdown, and Word up to 10 MB.
+          Upload documents or author text rules for this agent's knowledge base.
         </p>
       </div>
 
@@ -152,7 +167,25 @@ export default function DocumentsPage() {
             className="hidden"
           />
         </label>
-        <p className="text-xs text-gray-400 mt-2">PDF, TXT, MD, DOCX — max 10 MB</p>
+        
+        <div className="mt-4 flex items-center justify-center gap-3">
+          <div className="h-px bg-gray-200 dark:bg-gray-700 w-16"></div>
+          <span className="text-xs text-gray-400">OR</span>
+          <div className="h-px bg-gray-200 dark:bg-gray-700 w-16"></div>
+        </div>
+        
+        <button
+          onClick={() => {
+            setEditingDoc(null)
+            setShowEditor(true)
+          }}
+          className="mt-4 cursor-pointer inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+        >
+          <Plus size={14} />
+          Author Text Document
+        </button>
+
+        <p className="text-xs text-gray-400 mt-3">PDF, TXT, MD, DOCX — max 10 MB</p>
       </div>
 
       {/* Documents list */}
@@ -191,9 +224,24 @@ export default function DocumentsPage() {
                   <td className="px-6 py-4 text-right text-sm text-gray-500">{fmtSize(d.file_size_bytes)}</td>
                   <td className="px-6 py-4 text-right text-sm text-gray-500">{d.chunk_count}</td>
                   <td className="px-6 py-4 text-right">
-                    <button onClick={() => remove(d.id, d.name)} className="p-1.5 text-gray-400 hover:text-red-500 transition-colors">
-                      <Trash2 size={14} />
-                    </button>
+                    <div className="flex items-center justify-end gap-2">
+                       {/* Allow editing of txt documents created directly (you can determine by content field or extension, here assuming file_type=txt and status allows it) */}
+                      {d.file_type === 'txt' && (d.status === 'draft' || d.status === 'published' || d.status === 'ready') && (
+                        <button
+                          onClick={() => {
+                            setEditingDoc(d)
+                            setShowEditor(true)
+                          }}
+                          className="p-1.5 text-gray-400 hover:text-violet-500 transition-colors"
+                          title="Edit Document"
+                        >
+                          <Edit2 size={14} />
+                        </button>
+                      )}
+                      <button onClick={() => remove(d.id, d.name)} className="p-1.5 text-gray-400 hover:text-red-500 transition-colors">
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -201,6 +249,114 @@ export default function DocumentsPage() {
           </table>
         )}
       </div>
+
+      {showEditor && (
+        <TextDocumentEditor 
+          doc={editingDoc}
+          onSave={saveTextDoc}
+          onClose={() => {
+            setShowEditor(false)
+            setEditingDoc(null)
+          }}
+        />
+      )}
     </div>
   )
 }
+
+function TextDocumentEditor({ 
+  doc, 
+  onSave, 
+  onClose 
+}: { 
+  doc: Doc | null, 
+  onSave: (d: any) => Promise<void>, 
+  onClose: () => void 
+}) {
+  const [name, setName] = useState(doc?.name || '')
+  const [content, setContent] = useState(doc?.content || '')
+  const [status, setStatus] = useState<'draft'|'published'>(doc?.status === 'ready' ? 'published' : ((doc?.status as string) || 'draft') as any)
+
+  const [saving, setSaving] = useState(false)
+
+  const handleSave = async () => {
+    if (!name.trim() || !content.trim()) return
+    setSaving(true)
+    await onSave({ name, content, status })
+    setSaving(false)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex">
+      <div className="flex-1 bg-black/40 backdrop-blur-sm" onClick={onClose} />
+      <div className="w-full max-w-xl bg-white dark:bg-gray-900 shadow-2xl flex flex-col h-full right-0 absolute animation-slide-in">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-800">
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white">
+            {doc ? 'Edit Knowledge String' : 'New Knowledge String'}
+          </h2>
+          <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+              Document Name
+            </label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Return Policy Fall 2026"
+              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+          </div>
+
+          <div className="flex-1 flex flex-col min-h-[300px]">
+            <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+              Content (Text)
+            </label>
+            <textarea
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              className="flex-1 w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none font-mono"
+              placeholder="Enter the textual knowledge facts here. Variables like {company_name} can be used if they exist in global state."
+            />
+          </div>
+          
+          <div>
+            <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+              Lifecycle Status
+            </label>
+            <select
+              value={status}
+              onChange={(e) => setStatus(e.target.value as any)}
+              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+            >
+              <option value="draft">Draft (Excluded from knowledge base)</option>
+              <option value="published">Published (Vectorized and queryable)</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex items-center justify-end gap-3 bg-gray-50 dark:bg-gray-800/50">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-white transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !name.trim() || !content.trim()}
+            className="px-5 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
+          >
+            {saving ? 'Saving...' : 'Save Document'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+

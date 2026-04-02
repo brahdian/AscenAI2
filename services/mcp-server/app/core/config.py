@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # CORS
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+    ALLOWED_METHODS: str = "GET,POST,PUT,DELETE,OPTIONS"
+    ALLOWED_HEADERS: str = "*"
+
     @field_validator("SECRET_KEY")
     @classmethod
     def validate_secret_key(cls, v: str) -> str:
@@ -49,27 +54,10 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Qdrant
-    QDRANT_HOST: str = "localhost"
-    QDRANT_PORT: int = 6333
-    QDRANT_COLLECTION_NAME: str = "knowledge_base"
-    QDRANT_COLLECTION_PREFIX: str = "kb_"
-    QDRANT_VECTOR_SIZE: int = 384  # all-MiniLM-L6-v2 size
-
-    # Tool Execution
-    MAX_TOOL_EXECUTION_TIMEOUT: int = 30
-    MAX_TOOL_TIMEOUT_SECONDS: int = 300   # Hard cap on timeout_override (High fix)
-    RATE_LIMIT_PER_MINUTE: int = 100
-    RATE_LIMIT_WINDOW_SECONDS: int = 60
-
-    # CORS — override in production with explicit origin list
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
-    ALLOWED_METHODS: list[str] = ["*"]
-    ALLOWED_HEADERS: list[str] = ["*"]
-
-    # Embeddings
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSION: int = 1536  # text-embedding-3-small dimension
+    # Embeddings — Google Gemini text-embedding-004 (768-dim)
+    GEMINI_API_KEY: str = ""
+    EMBEDDING_MODEL: str = "text-embedding-004"
+    EMBEDDING_DIMENSION: int = 768
 
     # External Services
     OPENAI_API_KEY: Optional[str] = None

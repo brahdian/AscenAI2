@@ -167,13 +167,14 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = 1000,
         stream: bool = False,
+        session_id: Optional[str] = None,
     ) -> "LLMResponse | AsyncGenerator":
         breaker = _get_breaker(self.provider)
         breaker.before_call()
         _t0 = time.monotonic()
         try:
             result = await asyncio.wait_for(
-                self._dispatch(messages, tools, temperature, max_tokens, stream),
+                self._dispatch(messages, tools, temperature, max_tokens, stream, session_id),
                 timeout=settings.LLM_TIMEOUT_SECONDS,
             )
             breaker.on_success()
@@ -216,9 +217,9 @@ class LLMClient:
             )
             raise
 
-    async def _dispatch(self, messages, tools, temperature, max_tokens, stream):
+    async def _dispatch(self, messages, tools, temperature, max_tokens, stream, session_id):
         if self.provider == "gemini":
-            return await self._gemini_complete(messages, tools, temperature, max_tokens, stream)
+            return await self._gemini_complete(messages, tools, temperature, max_tokens, stream, session_id)
         if self.provider == "vertex":
             return await self._vertex_complete(messages, tools, temperature, max_tokens, stream)
         return await self._openai_complete(messages, tools, temperature, max_tokens, stream)
@@ -234,6 +235,7 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         stream: bool,
+        session_id: Optional[str] = None,
     ) -> "LLMResponse | AsyncGenerator":
         from google import genai
         from google.genai import types
@@ -282,6 +284,8 @@ class LLMClient:
                 )
             gemini_tools = [types.Tool(function_declarations=function_declarations)]
 
+        # Build generation config — implicit caching is automatic on Gemini 2.5+ models
+        # (no explicit client.caches.create needed; Google applies 90% discount automatically)
         config_kwargs: dict = {"max_output_tokens": max_tokens, "temperature": temperature}
         if system_instruction:
             config_kwargs["system_instruction"] = system_instruction
@@ -418,6 +422,7 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         stream: bool,
+        session_id: Optional[str] = None,
     ) -> "LLMResponse | AsyncGenerator":
         from vertexai.generative_models import GenerativeModel, GenerationConfig, Tool, FunctionDeclaration, Schema, Type
         import vertexai
@@ -454,11 +459,6 @@ class LLMClient:
                 )
             vertex_tools = [Tool(function_declarations=declarations)]
 
-        model_kwargs = {}
-        if system_instruction:
-            model_kwargs["system_instruction"] = system_instruction
-        model = GenerativeModel(self.model, **model_kwargs)
-
         from vertexai.generative_models import Content, Part
         history = []
         last_user_message = None
@@ -477,8 +477,10 @@ class LLMClient:
             elif role == "assistant":
                 history.append(Content(role="model", parts=[Part.from_text(content)]))
 
-        if last_user_message is None and chat_messages:
-            last_user_message = chat_messages[-1].get("content", "")
+        model_kwargs = {}
+        if system_instruction:
+            model_kwargs["system_instruction"] = system_instruction
+        model = GenerativeModel(self.model, **model_kwargs)
 
         chat = model.start_chat(history=history)
         send_kwargs: dict = {"generation_config": generation_config}
@@ -536,6 +538,34 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     async def embed(self, text: str) -> list[float]:
+        if self.provider == "gemini":
+            client = self._get_gemini_client()
+            loop = asyncio.get_event_loop()
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: client.models.embed_content(
+                        model=settings.EMBEDDING_MODEL,
+                        contents=text,
+                    ),
+                ),
+                timeout=10.0,
+            )
+            # handle both single string and list responses
+            if hasattr(response, "embeddings") and response.embeddings:
+                return response.embeddings[0].values
+            return response.embedding.values
+
+        if self.provider == "vertex":
+            from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
+            model = TextEmbeddingModel.from_pretrained(settings.EMBEDDING_MODEL)
+            loop = asyncio.get_event_loop()
+            embeddings = await loop.run_in_executor(
+                None,
+                lambda: model.get_embeddings([TextEmbeddingInput(text)])
+            )
+            return embeddings[0].values
+
         if self.provider == "openai":
             client = self._get_openai_client()
             response = await asyncio.wait_for(
@@ -543,18 +573,8 @@ class LLMClient:
                 timeout=10.0,
             )
             return response.data[0].embedding
-        try:
-            from openai import AsyncOpenAI
-            if settings.OPENAI_API_KEY:
-                embed_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-                response = await asyncio.wait_for(
-                    embed_client.embeddings.create(input=text, model=settings.EMBEDDING_MODEL),
-                    timeout=10.0,
-                )
-                return response.data[0].embedding
-        except Exception as exc:
-            logger.warning("embedding_fallback", error=type(exc).__name__)
-        return [0.0] * 1536
+
+        return [0.0] * settings.EMBEDDING_DIMENSION
 
 
 # ---------------------------------------------------------------------------

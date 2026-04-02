@@ -19,7 +19,7 @@ end            — terminal step; emits a final message and marks the session do
 from __future__ import annotations
 
 import re
-from typing import Any, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -275,14 +275,17 @@ class EndStep(PlaybookStep):
 # Discriminated union of all step types
 # ---------------------------------------------------------------------------
 
-AnyStep = Union[
-    LLMStep,
-    DeterministicStep,
-    ToolStep,
-    ConditionStep,
-    WaitInputStep,
-    GotoStep,
-    EndStep,
+AnyStep = Annotated[
+    Union[
+        LLMStep,
+        DeterministicStep,
+        ToolStep,
+        ConditionStep,
+        WaitInputStep,
+        GotoStep,
+        EndStep,
+    ],
+    Field(discriminator="type"),
 ]
 
 
@@ -407,22 +410,10 @@ REFUND_PLAYBOOK = PlaybookDefinition(
     ),
     version="1.0.0",
     trigger_keywords=["refund", "return", "money back", "get my money", "charge back"],
-    initial_step_id="greet",
+    initial_step_id="collect_order_id",
     steps={
-        "greet": DeterministicStep(
-            id="greet",
-            type="deterministic",
-            description="Welcome the customer and explain what we need.",
-            action="set_variable",
-            params={
-                "variable": "greeting_message",
-                "value": (
-                    "Hello! I can help you with a refund request. "
-                    "To get started, I'll need your order ID."
-                ),
-            },
-            next_step_id="collect_order_id",
-        ),
+        # NOTE: Greeting is now handled at agent level (Agent.greeting_message
+        # + Agent.voice_greeting_url), not inside playbook steps.
         "collect_order_id": WaitInputStep(
             id="collect_order_id",
             type="wait_input",
@@ -541,10 +532,11 @@ BOOKING_PLAYBOOK = PlaybookDefinition(
     ),
     version="1.0.0",
     trigger_keywords=["book", "appointment", "schedule", "reserve", "booking"],
-    initial_step_id="greet",
+    initial_step_id="collect_name",
     steps={
-        "greet": WaitInputStep(
-            id="greet",
+        # NOTE: Greeting is now handled at agent level.
+        "collect_name": WaitInputStep(
+            id="collect_name",
             type="wait_input",
             description="Welcome and ask for the customer's name.",
             prompt_to_user=(

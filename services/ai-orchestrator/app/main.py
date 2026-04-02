@@ -77,7 +77,8 @@ from app.api.v1 import internal as internal_router
 from app.api.v1 import replay as replay_router
 from app.api.v1 import evals as evals_router
 from app.api.v1 import prompt_versions as prompt_versions_router
-from app.api.v1 import flows as flows_router
+from app.api.v1 import templates as templates_router
+from app.api.v1 import variables as variables_router
 from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
@@ -96,6 +97,13 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
     logger.info("database_ready")
+    
+    # Seed templates (idempotent, safe on every startup)
+    try:
+        from app.services.seed_templates import seed_templates
+        await seed_templates()
+    except Exception as exc:
+        logger.error("seed_templates_error", error=str(exc))
 
     # Initialize Redis
     redis_client = await init_redis()
@@ -153,12 +161,21 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(indexer.start())
     logger.info("document_indexer_started")
 
+    # Start background session cleanup worker
+    from app.workers.session_cleanup import SessionCleanupWorker
+    session_cleanup = SessionCleanupWorker(db_factory=AsyncSessionLocal)
+    app.state.session_cleanup = session_cleanup
+    asyncio.create_task(session_cleanup.start())
+    logger.info("session_cleanup_worker_started")
+
     app.state.startup_complete = True
     logger.info("ai_orchestrator_started")
     yield
 
     # Shutdown
     logger.info("ai_orchestrator_shutting_down")
+    if hasattr(app.state, "session_cleanup"):
+        app.state.session_cleanup.stop()
     if hasattr(app.state, "document_indexer"):
         app.state.document_indexer.stop()
     await _mcp_client.close()
@@ -200,7 +217,8 @@ app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
 app.include_router(evals_router.router, prefix="/api/v1/agents", tags=["evals"])
 app.include_router(prompt_versions_router.router, prefix="/api/v1/agents", tags=["prompts"])
-app.include_router(flows_router.router, prefix="/api/v1/agents", tags=["flows"])
+app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
+app.include_router(variables_router.router, prefix="/api/v1/agents", tags=["variables"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))
@@ -439,7 +457,23 @@ async def websocket_endpoint(
                         )
                     )
                     session_obj = sess_result.scalar_one_or_none()
+                    if session_obj:
+                        # Check if session is expired
+                        from app.core.config import settings as _ws_settings
+                        _ws_expiry = getattr(_ws_settings, "SESSION_EXPIRY_MINUTES", 30)
+                        if session_obj.is_expired(_ws_expiry):
+                            session_obj.close()
+                            await db.flush()
+                            await websocket.send_json({
+                                "type": "session_expired",
+                                "data": "Your session has expired. Please start a new session.",
+                                "session_id": session_id,
+                                "session_status": "closed",
+                            })
+                            continue
+                        session_obj.touch()
                     if not session_obj:
+                        from datetime import datetime, timezone as _tz
                         session_obj = AgentSession(
                             id=session_id,
                             tenant_id=tenant_uuid,
@@ -447,6 +481,7 @@ async def websocket_endpoint(
                             customer_identifier=customer_identifier,
                             channel="web",
                             status="active",
+                            last_activity_at=datetime.now(_tz.utc),
                         )
                         db.add(session_obj)
                         await db.flush()

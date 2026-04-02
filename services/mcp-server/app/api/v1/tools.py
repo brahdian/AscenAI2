@@ -16,173 +16,474 @@ router = APIRouter(prefix="/tools")
 
 
 # ---------------------------------------------------------------------------
-# Integration catalog — static list of all supported integrations
+# Integration catalog — External services requiring configuration
 # ---------------------------------------------------------------------------
 
-INTEGRATION_CATALOG = [
+INTEGRATION_CATALOG: list[dict[str, Any]] = [
     {
-        "key": "appointment_book",
-        "name": "Book Appointment",
-        "description": "Book an appointment for a customer (built-in)",
-        "category": "booking",
-        "is_builtin": True,
-        "credentials": [],
-    },
-    {
-        "key": "appointment_list",
-        "name": "List Available Slots",
-        "description": "List available appointment time slots (built-in)",
-        "category": "booking",
-        "is_builtin": True,
-        "credentials": [],
-    },
-    {
-        "key": "appointment_cancel",
-        "name": "Cancel Appointment",
-        "description": "Cancel an existing appointment (built-in)",
-        "category": "booking",
-        "is_builtin": True,
-        "credentials": [],
-    },
-    {
-        "key": "crm_lookup",
-        "name": "CRM Lookup",
-        "description": "Look up a customer profile in the CRM (built-in)",
-        "category": "crm",
-        "is_builtin": True,
-        "credentials": [],
-    },
-    {
-        "key": "crm_update",
-        "name": "CRM Update",
-        "description": "Update a customer record in the CRM (built-in)",
-        "category": "crm",
-        "is_builtin": True,
-        "credentials": [],
-    },
-    {
-        "key": "google_calendar_check",
-        "name": "Google Calendar — Check Availability",
-        "description": "Check available slots in a Google Calendar",
+        "id": "google_calendar",
+        "name": "Google Calendar",
+        "description": "Manage calendar events and availability via Google Calendar API.",
         "category": "calendar",
-        "is_builtin": False,
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "access_token": {"type": "string", "description": "OAuth2 Access Token"},
+                "refresh_token": {"type": "string", "description": "OAuth2 Refresh Token (optional)"},
+                "client_id": {"type": "string"},
+                "client_secret": {"type": "string"},
+            },
+            "required": ["access_token"]
+        },
         "credentials": [
-            {"field": "access_token", "label": "Google OAuth Access Token", "type": "password"},
-            {"field": "calendar_id", "label": "Calendar ID (e.g. primary)", "type": "text"},
+            {"field": "client_id", "label": "Client ID", "type": "text"},
+            {"field": "client_secret", "label": "Client Secret", "type": "password"},
+            {"field": "refresh_token", "label": "Refresh Token", "type": "password"},
+            {"field": "access_token", "label": "Access Token", "type": "password"}
         ],
+        "tools": [
+            {
+                "name": "calendar_check_availability",
+                "description": "Check free/busy slots for a given time range.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "time_min": {"type": "string", "format": "date-time"},
+                        "time_max": {"type": "string", "format": "date-time"},
+                        "calendar_id": {"type": "string", "default": "primary"}
+                    },
+                    "required": ["time_min", "time_max"]
+                }
+            },
+            {
+                "name": "calendar_book_appointment",
+                "description": "Book a new event on the calendar.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "start_time": {"type": "string", "format": "date-time"},
+                        "end_time": {"type": "string", "format": "date-time"},
+                        "attendees": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["summary", "start_time", "end_time"]
+                }
+            }
+        ]
     },
     {
-        "key": "google_calendar_book",
-        "name": "Google Calendar — Book Event",
-        "description": "Create an event in Google Calendar",
+        "id": "calendly",
+        "name": "Calendly",
+        "description": "Sync and manage scheduling via Calendly.",
         "category": "calendar",
-        "is_builtin": False,
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Calendly Personal Access Token"}
+            },
+            "required": ["api_key"]
+        },
         "credentials": [
-            {"field": "access_token", "label": "Google OAuth Access Token", "type": "password"},
-            {"field": "calendar_id", "label": "Calendar ID (e.g. primary)", "type": "text"},
+            {"field": "api_key", "label": "API Key", "type": "password"}
         ],
+        "tools": [
+            {
+                "name": "calendly_list_event_types",
+                "description": "List available event types for scheduling.",
+                "input_schema": {"type": "object", "properties": {}}
+            }
+        ]
     },
     {
-        "key": "calendly_availability",
-        "name": "Calendly — Get Availability",
-        "description": "Get available scheduling slots from Calendly",
-        "category": "calendar",
-        "is_builtin": False,
-        "credentials": [
-            {"field": "api_token", "label": "Calendly Personal Access Token", "type": "password"},
-            {"field": "event_type_uuid", "label": "Event Type UUID", "type": "text"},
-        ],
-    },
-    {
-        "key": "calendly_book",
-        "name": "Calendly — Book Appointment",
-        "description": "Schedule an appointment via Calendly",
-        "category": "calendar",
-        "is_builtin": False,
-        "credentials": [
-            {"field": "api_token", "label": "Calendly Personal Access Token", "type": "password"},
-            {"field": "event_type_uuid", "label": "Event Type UUID", "type": "text"},
-        ],
-    },
-    {
-        "key": "stripe_payment_link",
-        "name": "Stripe — Create Payment Link",
-        "description": "Generate a Stripe payment link for a product or amount",
+        "id": "stripe",
+        "name": "Stripe",
+        "description": "Process payments and manage subscriptions.",
         "category": "payments",
-        "is_builtin": False,
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Stripe Secret Key"}
+            },
+            "required": ["api_key"]
+        },
         "credentials": [
-            {"field": "secret_key", "label": "Stripe Secret Key", "type": "password"},
+            {"field": "api_key", "label": "Secret Key", "type": "password"}
         ],
+        "tools": [
+            {
+                "name": "stripe_get_customer",
+                "description": "Retrieve customer details by email.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "email": {"type": "string"}
+                    },
+                    "required": ["email"]
+                }
+            }
+        ]
     },
     {
-        "key": "stripe_check_payment",
-        "name": "Stripe — Check Payment Status",
-        "description": "Check the status of a Stripe payment or invoice",
-        "category": "payments",
-        "is_builtin": False,
-        "credentials": [
-            {"field": "secret_key", "label": "Stripe Secret Key", "type": "password"},
-        ],
-    },
-    {
-        "key": "twilio_send_sms",
-        "name": "Twilio — Send SMS",
-        "description": "Send an SMS message via Twilio",
+        "id": "twilio",
+        "name": "Twilio",
+        "description": "Send and receive SMS messages via Twilio.",
         "category": "messaging",
-        "is_builtin": False,
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "account_sid": {"type": "string"},
+                "auth_token": {"type": "string"},
+                "from_number": {"type": "string"}
+            },
+            "required": ["account_sid", "auth_token", "from_number"]
+        },
         "credentials": [
-            {"field": "account_sid", "label": "Twilio Account SID", "type": "text"},
-            {"field": "auth_token", "label": "Twilio Auth Token", "type": "password"},
-            {"field": "from_number", "label": "From Phone Number (E.164)", "type": "text"},
+            {"field": "account_sid", "label": "Account SID", "type": "text"},
+            {"field": "auth_token", "label": "Auth Token", "type": "password"},
+            {"field": "from_number", "label": "From Number", "type": "text"}
         ],
+        "tools": [
+            {
+                "name": "twilio_send_sms",
+                "description": "Send an SMS message to a phone number.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "string"},
+                        "body": {"type": "string"}
+                    },
+                    "required": ["to", "body"]
+                }
+            }
+        ]
     },
     {
-        "key": "gmail_send_email",
-        "name": "Gmail / SMTP — Send Email",
-        "description": "Send a confirmation or notification email",
+        "id": "gmail",
+        "name": "Gmail / SMTP",
+        "description": "Send confirmation or notification emails.",
         "category": "messaging",
-        "is_builtin": False,
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "smtp_server": {"type": "string", "default": "smtp.gmail.com"},
+                "smtp_port": {"type": "integer", "default": 587},
+                "username": {"type": "string"},
+                "password": {"type": "string", "description": "App Password"}
+            },
+            "required": ["username", "password"]
+        },
         "credentials": [
-            {"field": "smtp_host", "label": "SMTP Host", "type": "text"},
-            {"field": "smtp_port", "label": "SMTP Port (e.g. 587)", "type": "text"},
-            {"field": "smtp_user", "label": "SMTP Username / Email", "type": "text"},
-            {"field": "smtp_password", "label": "SMTP Password or App Password", "type": "password"},
-            {"field": "from_email", "label": "From Email Address", "type": "text"},
+            {"field": "smtp_server", "label": "SMTP Server", "type": "text"},
+            {"field": "smtp_port", "label": "SMTP Port", "type": "text"},
+            {"field": "username", "label": "Username", "type": "text"},
+            {"field": "password", "label": "Password", "type": "password"}
         ],
+        "tools": [
+            {
+                "name": "gmail_send_email",
+                "description": "Send an email via SMTP.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"}
+                    },
+                    "required": ["to", "subject", "body"]
+                }
+            }
+        ]
     },
     {
-        "key": "google_sheets_read",
-        "name": "Google Sheets — Read Rows",
-        "description": "Read rows from a Google Sheet",
+        "id": "google_sheets",
+        "name": "Google Sheets",
+        "description": "Read and write data to Google Sheets.",
         "category": "data",
-        "is_builtin": False,
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string"},
+                "credentials_json": {"type": "string", "description": "Service Account JSON content"}
+            },
+            "required": ["spreadsheet_id"]
+        },
         "credentials": [
-            {"field": "access_token", "label": "Google OAuth Access Token", "type": "password"},
             {"field": "spreadsheet_id", "label": "Spreadsheet ID", "type": "text"},
+            {"field": "credentials_json", "label": "Service Account JSON", "type": "password"}
         ],
+        "tools": [
+            {
+                "name": "google_sheets_read",
+                "description": "Read rows from a spreadsheet range.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "range": {"type": "string", "default": "Sheet1!A1:Z100"}
+                    }
+                }
+            },
+            {
+                "name": "google_sheets_append",
+                "description": "Append a row to the end of a sheet.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "values": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["values"]
+                }
+            }
+        ]
     },
     {
-        "key": "google_sheets_append",
-        "name": "Google Sheets — Append Row",
-        "description": "Append a row to a Google Sheet",
-        "category": "data",
-        "is_builtin": False,
-        "credentials": [
-            {"field": "access_token", "label": "Google OAuth Access Token", "type": "password"},
-            {"field": "spreadsheet_id", "label": "Spreadsheet ID", "type": "text"},
-        ],
-    },
-    {
-        "key": "custom_webhook",
+        "id": "webhook",
         "name": "Custom Webhook",
-        "description": "POST data to any custom HTTP endpoint",
+        "description": "POST data to any custom HTTP endpoint with optional authentication.",
         "category": "custom",
-        "is_builtin": False,
+        "requires_config": True,
+        "allow_multiple": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri"},
+                "method": {"type": "string", "enum": ["POST", "GET", "PUT", "PATCH"], "default": "POST"},
+                "auth_type": {"type": "string", "enum": ["none", "api_key", "bearer", "basic"], "default": "none"},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}}
+            },
+            "required": ["url"]
+        },
         "credentials": [
-            {"field": "url", "label": "Webhook URL", "type": "text"},
-            {"field": "secret", "label": "Bearer Token / Secret (optional)", "type": "password"},
+            {"field": "url", "label": "Endpoint URL", "type": "text"},
+            {"field": "auth_type", "label": "Auth Type", "type": "select", "options": ["none", "api_key", "bearer", "basic"]},
+            {"field": "api_key", "label": "API Key / Token", "type": "password", "condition": {"auth_type": ["api_key", "bearer"]}},
+            {"field": "username", "label": "Username", "type": "text", "condition": {"auth_type": ["basic"]}},
+            {"field": "password", "label": "Password", "type": "password", "condition": {"auth_type": ["basic"]}}
         ],
+        "tools": [
+            {
+                "name": "custom_webhook",
+                "description": "Trigger a custom HTTP request.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "object", "description": "Data to send in the request body"}
+                    }
+                }
+            }
+        ]
     },
+    {
+        "id": "mailchimp",
+        "name": "Mailchimp",
+        "description": "Manage email marketing campaigns and subscribers.",
+        "category": "messaging",
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Mailchimp API Key"},
+                "server_prefix": {"type": "string", "description": "e.g., us19"}
+            },
+            "required": ["api_key", "server_prefix"]
+        },
+        "credentials": [
+            {"field": "api_key", "label": "API Key", "type": "password"},
+            {"field": "server_prefix", "label": "Server Prefix", "type": "text"}
+        ],
+        "tools": [
+            {
+                "name": "mailchimp_add_subscriber",
+                "description": "Add a new subscriber to a specific Mailchimp audience list.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "list_id": {"type": "string"},
+                        "email": {"type": "string"},
+                        "status": {"type": "string", "default": "subscribed"}
+                    },
+                    "required": ["list_id", "email"]
+                }
+            }
+        ]
+    },
+    {
+        "id": "telnyx",
+        "name": "Telnyx",
+        "description": "Send bulk SMS, make calls, and manage numbers via Telnyx.",
+        "category": "messaging",
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": "Telnyx V2 API Key"},
+                "from_number": {"type": "string"}
+            },
+            "required": ["api_key", "from_number"]
+        },
+        "credentials": [
+            {"field": "api_key", "label": "API Key", "type": "password"},
+            {"field": "from_number", "label": "From Number", "type": "text"}
+        ],
+        "tools": [
+            {
+                "name": "telnyx_send_bulk_sms",
+                "description": "Send SMS messages to multiple recipients via Telnyx.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "array", "items": {"type": "string"}},
+                        "text": {"type": "string"}
+                    },
+                    "required": ["to", "text"]
+                }
+            }
+        ]
+    },
+    {
+        "id": "square",
+        "name": "Square",
+        "description": "Process payments, create checkout links, and manage Square orders.",
+        "category": "payments",
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "access_token": {"type": "string", "description": "Square Access Token"},
+                "location_id": {"type": "string", "description": "Square Location ID"},
+                "environment": {"type": "string", "description": "sandbox or production"}
+            },
+            "required": ["access_token", "location_id"]
+        },
+        "credentials": [
+            {"field": "access_token", "label": "Access Token", "type": "password"},
+            {"field": "location_id", "label": "Location ID", "type": "text"},
+            {"field": "environment", "label": "Environment (sandbox/production)", "type": "text"}
+        ],
+        "tools": [
+            {
+                "name": "square_create_payment_link",
+                "description": "Generate a Square payment link for a product or custom amount.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "number"},
+                        "currency": {"type": "string", "default": "CAD"},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["amount"]
+                }
+            }
+        ]
+    },
+    {
+        "id": "moneris",
+        "name": "Moneris",
+        "description": "Process Canadian e-commerce payments securely via Moneris Gateway.",
+        "category": "payments",
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "store_id": {"type": "string", "description": "Moneris Store ID"},
+                "api_token": {"type": "string", "description": "Moneris API Token"},
+                "environment": {"type": "string", "description": "qa or live"}
+            },
+            "required": ["store_id", "api_token"]
+        },
+        "credentials": [
+            {"field": "store_id", "label": "Store ID", "type": "text"},
+            {"field": "api_token", "label": "API Token", "type": "password"},
+            {"field": "environment", "label": "Environment (qa/live)", "type": "text"}
+        ],
+        "tools": [
+            {
+                "name": "moneris_process_purchase",
+                "description": "Process a direct purchase transaction via Moneris.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "string"},
+                        "order_id": {"type": "string"},
+                        "pan": {"type": "string", "description": "Credit Card Number"},
+                        "expdate": {"type": "string", "description": "YYMM"}
+                    },
+                    "required": ["amount", "order_id", "pan", "expdate"]
+                }
+            }
+        ]
+    },
+    {
+        "id": "helcim",
+        "name": "Helcim",
+        "description": "Process Canadian e-commerce payments securely via Helcim.",
+        "category": "payments",
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "description": "Helcim Account ID"},
+                "api_token": {"type": "string", "description": "Helcim API Token"}
+            },
+            "required": ["account_id", "api_token"]
+        },
+        "credentials": [
+            {"field": "account_id", "label": "Account ID", "type": "text"},
+            {"field": "api_token", "label": "API Token", "type": "password"}
+        ],
+        "tools": [
+            {
+                "name": "helcim_process_payment",
+                "description": "Process a direct purchase transaction via Helcim.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "string"},
+                        "card_token": {"type": "string"}
+                    },
+                    "required": ["amount"]
+                }
+            }
+        ]
+    },
+    {
+        "id": "paypal",
+        "name": "PayPal",
+        "description": "Process payments globally via PayPal orders.",
+        "category": "payments",
+        "requires_config": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string", "description": "PayPal Client ID"},
+                "secret": {"type": "string", "description": "PayPal Secret"}
+            },
+            "required": ["client_id", "secret"]
+        },
+        "credentials": [
+            {"field": "client_id", "label": "Client ID", "type": "text"},
+            {"field": "secret", "label": "Secret", "type": "password"}
+        ],
+        "tools": [
+            {
+                "name": "paypal_create_order",
+                "description": "Create a new PayPal order for checkout.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "amount": {"type": "string"},
+                        "currency": {"type": "string", "default": "USD"}
+                    },
+                    "required": ["amount"]
+                }
+            }
+        ]
+    }
 ]
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 import uuid
@@ -45,7 +46,7 @@ class AuthService:
     # Public interface
     # ------------------------------------------------------------------
 
-    async def register(self, request: RegisterRequest, db: AsyncSession) -> TokenResponse:
+    async def register(self, request: RegisterRequest, db: AsyncSession, response=None) -> TokenResponse:
         """Create a new tenant + owner user and return JWT tokens."""
         # Normalize email to lowercase for consistent storage and lookup
         normalized_email = request.email.lower()
@@ -61,7 +62,7 @@ class AuthService:
         # Make slug unique by appending random suffix if needed
         slug = await self._unique_slug(slug, db)
 
-        plan = "professional"
+        plan = request.plan if request.plan in PLAN_LIMITS else "voice_growth"
         tenant = Tenant(
             id=uuid.uuid4(),
             name=request.business_name,
@@ -103,11 +104,16 @@ class AuthService:
         await db.commit()
         await db.refresh(user)
 
+        # 3b. Create Stripe customer
+        stripe_customer_id = await _create_stripe_customer(tenant, user)
+        if stripe_customer_id:
+            tenant.stripe_customer_id = stripe_customer_id
+            await db.commit()
+
         # 4. Generate JWT tokens
         tokens = self._build_token_response(user, tenant)
 
         # 5. Send welcome email (fire-and-forget)
-        import asyncio
         asyncio.create_task(self._send_welcome_email(request.email, request.full_name))
 
         logger.info("user_registered", user_id=str(user.id), tenant_id=str(tenant.id))
@@ -180,7 +186,6 @@ class AuthService:
         Rate-limited to 3 requests per email per hour to prevent abuse.
         """
         import hashlib
-        import asyncio as _asyncio
         from fastapi import HTTPException as _HTTPException
 
         # Rate-limit: max 3 reset requests per email per hour
@@ -472,3 +477,23 @@ class AuthService:
 
 # Singleton instance
 auth_service = AuthService()
+
+
+async def _create_stripe_customer(tenant: Tenant, user: User) -> str | None:
+    """Create Stripe customer and return customer ID."""
+    if not settings.STRIPE_SECRET_KEY:
+        return None
+    
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    
+    try:
+        customer = stripe.Customer.create(
+            email=user.email,
+            name=tenant.name,
+            metadata={"tenant_id": str(tenant.id)},
+        )
+        return customer.id
+    except Exception as e:
+        logger.warning("stripe_customer_creation_failed", error=str(e))
+        return None

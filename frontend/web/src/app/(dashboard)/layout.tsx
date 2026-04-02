@@ -14,7 +14,7 @@ import {
   LogOut,
   BarChart2,
   ThumbsUp,
-  BrainCircuit,
+  CheckCircle,
   Code2,
   Users,
   CreditCard,
@@ -25,8 +25,10 @@ import {
   PhoneCall,
   Mic,
   ChevronLeft,
+  ChevronRight,
   GitBranch,
 } from 'lucide-react'
+import { agentsApi } from '@/lib/api'
 
 const navItems = [
   { href: '/dashboard', icon: LayoutDashboard, label: 'Overview' },
@@ -34,7 +36,7 @@ const navItems = [
   { href: '/dashboard/sessions', icon: MessageSquare, label: 'Chat History' },
   { href: '/dashboard/analytics', icon: BarChart2, label: 'Analytics' },
   { href: '/dashboard/feedback', icon: ThumbsUp, label: 'Feedback' },
-  { href: '/dashboard/learning', icon: BrainCircuit, label: 'Learning' },
+  { href: '/dashboard/learning', icon: CheckCircle, label: 'Corrections' },
   { href: '/dashboard/api-keys', icon: Key, label: 'API Keys' },
   { href: '/dashboard/team', icon: Users, label: 'Team' },
   { href: '/dashboard/billing', icon: CreditCard, label: 'Billing' },
@@ -43,15 +45,40 @@ const navItems = [
 ]
 
 const agentSubNav = [
+  // Agent Configuration
   { slug: '',            icon: Bot,          label: 'Overview' },
+  { slug: 'greeting',    icon: Mic,          label: 'Greeting & Voice' },
   { slug: 'playbooks',   icon: BookOpen,     label: 'Playbooks' },
+  // Knowledge & Tools
   { slug: 'documents',   icon: FileText,     label: 'Documents' },
-  { slug: 'guardrails',  icon: Shield,       label: 'Guardrails' },
   { slug: 'tools',       icon: Wrench,       label: 'Tools' },
+  { slug: 'variables',   icon: Code2,        label: 'Variables' },
+  // Safety & Operations
+  { slug: 'guardrails',  icon: Shield,       label: 'Guardrails' },
   { slug: 'escalation',  icon: PhoneCall,    label: 'Escalation' },
-  { slug: 'greeting',    icon: Mic,          label: 'Greeting & Language' },
-  { slug: 'workflows',   icon: GitBranch,    label: 'Workflows' },
 ]
+
+// Breadcrumb segment labels
+const SEGMENT_LABELS: Record<string, string> = {
+  dashboard: 'Dashboard',
+  agents: 'Agents',
+  playbooks: 'Playbooks',
+  documents: 'Documents',
+  guardrails: 'Guardrails',
+  tools: 'Tools',
+  variables: 'Variables',
+  escalation: 'Escalation',
+  greeting: 'Greeting & Voice',
+  sessions: 'Chat History',
+  analytics: 'Analytics',
+  feedback: 'Feedback',
+  learning: 'Corrections',
+  'api-keys': 'API Keys',
+  team: 'Team',
+  billing: 'Billing',
+  embed: 'Embed & SDK',
+  settings: 'Settings',
+}
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -197,8 +224,55 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
       {/* Main */}
       <main className="flex-1 overflow-auto">
+        <Breadcrumbs pathname={pathname} />
         {children}
       </main>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Breadcrumbs component
+// ---------------------------------------------------------------------------
+function Breadcrumbs({ pathname }: { pathname: string }) {
+  // Don't show breadcrumbs on the root dashboard page or flow builder
+  if (pathname === '/dashboard' || pathname.includes('/workflows/') ) return null
+
+  const segments = pathname.replace(/^\/dashboard\/?/, '').split('/').filter(Boolean)
+  if (segments.length === 0) return null
+
+  const crumbs: { label: string; href: string }[] = [
+    { label: 'Dashboard', href: '/dashboard' },
+  ]
+
+  let path = '/dashboard'
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]
+    path += `/${seg}`
+    // Skip UUID segments that are agent IDs — they'll be resolved by the parent label
+    const isUuid = /^[0-9a-f]{8}-/.test(seg)
+    if (isUuid) {
+      crumbs.push({ label: 'Agent', href: path })
+    } else {
+      const label = SEGMENT_LABELS[seg] || seg.charAt(0).toUpperCase() + seg.slice(1)
+      crumbs.push({ label, href: path })
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-1.5 px-8 pt-4 pb-0 text-xs text-gray-500 dark:text-gray-400">
+      {crumbs.map((crumb, i) => (
+        <span key={crumb.href} className="flex items-center gap-1.5">
+          {i > 0 && <ChevronRight size={12} className="text-gray-400" />}
+          {i < crumbs.length - 1 ? (
+            <Link href={crumb.href} className="hover:text-gray-700 dark:hover:text-gray-200 transition-colors">
+              {crumb.label}
+            </Link>
+          ) : (
+            <span className="text-gray-700 dark:text-gray-200 font-medium">{crumb.label}</span>
+          )}
+        </span>
+      ))}
     </div>
   )
 }

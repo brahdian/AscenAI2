@@ -1,6 +1,7 @@
 from typing import AsyncGenerator
 
 import structlog
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -65,6 +66,22 @@ async def init_db() -> None:
     """Create all tables (dev / testing only — use Alembic in production)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+        # Idempotent migration for missing tenant subscription columns
+        await conn.execute(
+            text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(50);")
+        )
+        await conn.execute(
+            text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_id VARCHAR(255);")
+        )
+
+        # Idempotent migration for missing agent_count column
+        await conn.execute(
+            text("ALTER TABLE tenant_usage ADD COLUMN IF NOT EXISTS agent_count INTEGER DEFAULT 0 NOT NULL;")
+        )
+        await conn.execute(
+            text("ALTER TABLE tenant_usage ADD COLUMN IF NOT EXISTS current_month_chat_units INTEGER DEFAULT 0;")
+        )
     logger.info("database_initialized")
 
 

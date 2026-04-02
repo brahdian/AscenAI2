@@ -31,7 +31,6 @@ def _to_response(pb: AgentPlaybook) -> PlaybookResponse:
         description=pb.description,
         intent_triggers=pb.intent_triggers or [],
         is_default=pb.is_default,
-        greeting_message=pb.greeting_message,
         instructions=pb.instructions,
         tone=pb.tone,
         dos=pb.dos or [],
@@ -106,7 +105,6 @@ async def create_playbook(
         description=body.description,
         intent_triggers=body.intent_triggers,
         is_default=body.is_default,
-        greeting_message=body.greeting_message,
         instructions=body.instructions,
         tone=body.tone,
         dos=body.dos,
@@ -184,7 +182,6 @@ async def update_playbook(
     pb.description = body.description
     pb.intent_triggers = body.intent_triggers
     pb.is_default = body.is_default
-    pb.greeting_message = body.greeting_message
     pb.instructions = body.instructions
     pb.tone = body.tone
     pb.dos = body.dos

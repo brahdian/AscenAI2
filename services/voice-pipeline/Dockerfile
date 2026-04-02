@@ -1,18 +1,3 @@
-FROM python:3.12.9-slim AS builder
-
-WORKDIR /app
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt \
-    && /install/bin/python -m spacy download en_core_web_sm --quiet
-
 FROM python:3.12.9-slim
 
 WORKDIR /app
@@ -24,11 +9,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WORKERS=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+    curl gcc \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system app && adduser --system --ingroup app app
 
-COPY --from=builder /install /usr/local
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m spacy download en_core_web_sm --quiet
+
 COPY --chown=app:app . .
 
 RUN mkdir -p /tmp/audio && chown app:app /tmp/audio

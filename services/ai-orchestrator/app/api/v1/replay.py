@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db
 from app.models.agent import Session as AgentSession
 from app.models.trace import ConversationTrace
 
@@ -47,7 +48,7 @@ async def _verify_session(session_id: str, tenant_id: str, db: AsyncSession) -> 
 async def list_replay_turns(
     session_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """
     List all conversation turns for replay.
@@ -80,7 +81,7 @@ async def get_replay_turn(
     session_id: str,
     turn_index: int,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """
     Full detail for a single conversation turn.
@@ -111,7 +112,7 @@ async def explain_turn(
     session_id: str,
     turn_index: int,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """
     Human-readable explanation of why the agent responded as it did.

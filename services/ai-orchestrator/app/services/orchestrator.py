@@ -11,10 +11,10 @@ from sqlalchemy import select, and_, func
 import json
 
 from app.core.config import settings
-from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, Session as AgentSession, Message, AgentAnalytics
+from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, Session as AgentSession, Message, AgentAnalytics, PlaybookExecution
 from app.schemas.chat import ChatResponse, SourceCitation, StreamChatEvent
 from app.services import pii_service
-from app.services.pii_service import PseudonymizationContext
+from app.services.pii_service import PIIContext
 from app.services.llm_client import LLMClient, LLMResponse, ToolCall
 from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
@@ -163,13 +163,45 @@ class Orchestrator:
         self.db = db
         self.redis = redis_client
         self.intent_detector = IntentDetector()
+        self.session_expiry_minutes = getattr(settings, "SESSION_EXPIRY_MINUTES", 30)
+        self.session_expiry_warning_minutes = getattr(settings, "SESSION_EXPIRY_WARNING_MINUTES", 5)
+
+    def _check_session_expiry(self, session: AgentSession) -> Optional[ChatResponse]:
+        """Check if session is expired. If so, close it and return a ChatResponse. Otherwise return None."""
+        if session.is_expired(self.session_expiry_minutes):
+            session.close()
+            logger.info("session_auto_closed", session_id=session.id, reason="inactivity_timeout")
+            return ChatResponse(
+                session_id=session.id,
+                message="Your session has expired due to inactivity. Please start a new session to continue.",
+                tool_calls_made=[],
+                suggested_actions=["Start new session"],
+                escalate_to_human=False,
+                latency_ms=0,
+                tokens_used=0,
+                session_status="closed",
+            )
+        # Refresh activity timestamp
+        session.touch()
+        return None
+
+    def _get_session_status_info(self, session: AgentSession) -> dict:
+        """Return session status info for inclusion in responses."""
+        minutes_left = session.minutes_until_expiry(self.session_expiry_minutes)
+        is_warning = minutes_left <= self.session_expiry_warning_minutes and minutes_left > 0
+        return {
+            "session_status": session.status,
+            "minutes_until_expiry": round(minutes_left, 1),
+            "expiry_warning": is_warning,
+            "turn_count": session.turn_count,
+        }
 
     # ------------------------------------------------------------------
     # Helpers: playbook + corrections
     # ------------------------------------------------------------------
 
-    async def _load_playbook(self, agent_id) -> Optional[AgentPlaybook]:
-        """Load the active playbook for this agent, if any."""
+    async def _route_active_playbook(self, agent_id, user_message: str) -> Optional[AgentPlaybook]:
+        """Load active playbooks and use the LLM to route intent if > 1."""
         from sqlalchemy import select as sa_select
         result = await self.db.execute(
             sa_select(AgentPlaybook).where(
@@ -177,7 +209,92 @@ class Orchestrator:
                 AgentPlaybook.is_active.is_(True),
             )
         )
+        playbooks = list(result.scalars().all())
+        if not playbooks:
+            return None
+        if len(playbooks) == 1:
+            return playbooks[0]
+
+        system_prompt = (
+            "You are a strict semantic intent router. Analyze the user's message and select the single best playbook ID to handle it. "
+            "Respond ONLY with the exact UUID of the winning playbook. If no playbook is a good match, respond ONLY with the word 'none'.\n\n"
+            "AVAILABLE PLAYBOOKS:\n"
+        )
+        for p in playbooks:
+            system_prompt += f"ID: {p.id}\nName: {p.name}\nDescription: {p.description or 'No description'}\n\n"
+            
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        try:
+            response = await self.llm.complete(messages=messages, max_tokens=50, stream=False)
+            content = response.content.strip()
+            
+            for p in playbooks:
+                if str(p.id) in content:
+                    logger.info("intent_routed", playbook_id=str(p.id), playbook_name=p.name)
+                    return p
+                    
+            logger.info("intent_routed_none", raw_selection=content)
+        except Exception as e:
+            logger.warning("intent_routing_failed", error=str(e))
+            
+        return await self._get_default_playbook(agent_id)
+
+    async def _get_default_playbook(self, agent_id) -> Optional[AgentPlaybook]:
+        """Get or create the default 'General Chat' playbook for handling unmatched messages."""
+        from sqlalchemy import select as sa_select
+        result = await self.db.execute(
+            sa_select(AgentPlaybook).where(
+                AgentPlaybook.agent_id == agent_id,
+                AgentPlaybook.name == "General Chat",
+                AgentPlaybook.is_active.is_(True),
+            )
+        )
+        playbook = result.scalar_one_or_none()
+        
+        if playbook:
+            return playbook
+            
+        result = await self.db.execute(
+            sa_select(AgentPlaybook).where(
+                AgentPlaybook.agent_id == agent_id,
+                AgentPlaybook.is_default.is_(True),
+            )
+        )
         return result.scalar_one_or_none()
+
+    async def _ensure_playbook_execution(self, agent_id, session_id, playbook: Optional[AgentPlaybook]):
+        """Load or create an active PlaybookExecution for the given session and playbook."""
+        if not playbook:
+            return None, {}
+        
+        pb_exec_res = await self.db.execute(
+            select(PlaybookExecution).where(
+                PlaybookExecution.session_id == session_id,
+                PlaybookExecution.playbook_id == str(playbook.id),
+                PlaybookExecution.status == "active"
+            )
+        )
+        playbook_exec = pb_exec_res.scalar_one_or_none()
+        if not playbook_exec:
+            # Find tenant_id from session
+            res = await self.db.execute(select(AgentSession.tenant_id).where(AgentSession.id == session_id))
+            tenant_id = res.scalar() or uuid.uuid4()
+            
+            playbook_exec = PlaybookExecution(
+                session_id=session_id,
+                playbook_id=str(playbook.id),
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                status="active",
+                variables={}
+            )
+            self.db.add(playbook_exec)
+        
+        return playbook_exec, playbook_exec.variables or {}
 
     async def _load_corrections(self, agent_id: str) -> list[dict]:
         """Fetch operator corrections stored in Redis for this agent."""
@@ -208,6 +325,34 @@ class Orchestrator:
         )
         return result.scalar_one_or_none()
 
+    async def _load_variables(self, agent_id: str, playbook_id: Optional[str] = None) -> list:
+        """Load configured AgentVariables for this agent, scoped to a specific playbook."""
+        from app.models.variable import AgentVariable
+        from sqlalchemy import select as sa_select, or_, and_
+        import uuid
+        
+        filters = [AgentVariable.agent_id == uuid.UUID(agent_id)]
+        
+        if playbook_id:
+            # Load global variables OR local variables bound to this playbook
+            filters.append(
+                or_(
+                    AgentVariable.scope == "global",
+                    and_(
+                        AgentVariable.scope == "local",
+                        AgentVariable.playbook_id == uuid.UUID(playbook_id)
+                    )
+                )
+            )
+        else:
+            # Without a playbook context, only load global variables
+            filters.append(AgentVariable.scope == "global")
+
+        result = await self.db.execute(
+            sa_select(AgentVariable).where(*filters)
+        )
+        return list(result.scalars().all())
+
     def _check_input_guardrails(self, user_message: str, guardrails) -> Optional[str]:
         """Return a block reason string if message should be blocked, else None."""
         if not guardrails:
@@ -231,7 +376,7 @@ class Orchestrator:
         self,
         response: str,
         guardrails,
-        pii_ctx: Optional[PseudonymizationContext] = None,
+        pii_ctx: Optional[PIIContext] = None,
         session_id: str = "unknown",
     ) -> tuple[str, list[str]]:
         """Apply output-side guardrails: envelope parse + token restore, redaction, length cap, disclaimer.
@@ -240,17 +385,21 @@ class Orchestrator:
         if not guardrails:
             return response, actions
 
-        # Step 1: Parse structured JSON envelope + restore pseudonymized tokens BEFORE anything else
-        if pii_ctx and not pii_ctx.is_empty():
-            response = pii_service.parse_envelope(response, pii_ctx, session_id)
-            actions.append("pii_pseudonymization_restored")
+        # Step 1: Restore any remaining PII tokens in the response
+        if pii_ctx is not None:
+            parser = pii_service.create_streaming_parser(pii_ctx, session_id)
+            restored = parser.process_chunk(response) + parser.flush()
+            if restored != response:
+                response = restored
+                actions.append("pii_pseudonymization_restored")
 
-        # Step 2: One-way PII redaction on the final output (Presidio-backed, async)
-        if guardrails.pii_redaction:
-            redacted = await pii_service.redact(response)
-            if redacted != response:
-                actions.append("pii_redaction")
-            response = redacted
+        # Step 2: One-way PII redaction is DISABLED when pseudonymization is active
+        # We already restore real values - no need to re-redact them
+        # if guardrails.pii_redaction:
+        #     redacted = await pii_service.redact(response)
+        #     if redacted != response:
+        #         actions.append("pii_redaction")
+        #     response = redacted
 
         if guardrails.max_response_length and len(response) > guardrails.max_response_length:
             response = response[:guardrails.max_response_length].rstrip() + "…"
@@ -282,13 +431,9 @@ class Orchestrator:
         """
         If this is a brand-new session (no messages yet), return the greeting text.
 
-        Priority:
-          1. Playbook greeting_message (operator-customised per flow)
-          2. Agent-level greeting_message (global default)
-          3. None — caller handles silence / generic opener
-
+        Uses agent-level greeting_message exclusively (single source of truth).
         The pre-recorded voice_greeting_url is NOT handled here; it is consumed
-        directly by the voice pipeline to save TTS cost (serve static audio instead).
+        directly by the voice pipeline to save TTS cost (serve static audio).
         """
         from sqlalchemy import select as sa_select, func as sa_func
         count_result = await self.db.execute(
@@ -300,10 +445,7 @@ class Orchestrator:
         if msg_count > 0:
             return None  # Not a new session
 
-        greeting = (
-            (playbook.greeting_message if playbook else None)
-            or getattr(agent, "greeting_message", None)
-        )
+        greeting = getattr(agent, "greeting_message", None)
         if not greeting:
             return None
 
@@ -349,13 +491,18 @@ class Orchestrator:
         tenant_id = str(session.tenant_id)
         session_id = session.id
 
+        # Session auto-close: check expiry before processing
+        expiry_response = self._check_session_expiry(session)
+        if expiry_response:
+            return expiry_response
+
         # TC-C01: Strip role/system injection tokens from user input FIRST
         user_message = self._sanitize_user_message(user_message)
 
         # ── Escalation info-collection state machine ──────────────────────────
         # When the bot is in the middle of collecting name/phone for a callback,
         # every incoming message is handled by the state machine, not the LLM.
-        session_meta = dict(session.metadata or {})
+        session_meta = dict(session.metadata_ or {})
         escalation_state = session_meta.get("_escalation_state")
         if escalation_state:
             return await self._handle_escalation_info_collection(
@@ -429,11 +576,39 @@ class Orchestrator:
             )
 
         # --- Load playbook + corrections ---
-        playbook = await self._load_playbook(agent.id)
+        playbook = await self._route_active_playbook(agent.id, user_message)
+        
+        # --- Handle PlaybookExecution (Local Variable Scope) ---
+        playbook_exec = None
+        local_vars = {}
+        if playbook:
+            from app.models.agent import PlaybookExecution
+            from sqlalchemy import select as sa_select
+            pb_exec_res = await self.db.execute(
+                sa_select(PlaybookExecution).where(
+                    PlaybookExecution.session_id == session.id,
+                    PlaybookExecution.playbook_id == str(playbook.id),
+                    PlaybookExecution.status == "active"
+                )
+            )
+            playbook_exec = pb_exec_res.scalar_one_or_none()
+            if not playbook_exec:
+                playbook_exec = PlaybookExecution(
+                    session_id=session.id,
+                    playbook_id=str(playbook.id),
+                    tenant_id=session.tenant_id,
+                    agent_id=agent.id,
+                    status="active",
+                    variables={}
+                )
+                self.db.add(playbook_exec)
+            local_vars = playbook_exec.variables or {}
+
         corrections = await self._load_corrections(str(agent.id))
         await self._maybe_send_greeting(agent, session, playbook)
 
         guardrails = await self._load_guardrails(agent.id)
+        variables = await self._load_variables(str(agent.id), str(playbook.id) if playbook else None)
 
         # --- Input guardrail check ---
         block_reason = self._check_input_guardrails(user_message, guardrails)
@@ -467,11 +642,11 @@ class Orchestrator:
         summary = await self.memory.get_session_summary(session_id)
 
         # --- PII pseudonymization: anonymize user message before LLM ---
-        pii_ctx: Optional[PseudonymizationContext] = None
+        pii_ctx: Optional[PIIContext] = None
         llm_user_message = user_message  # message sent to LLM (may be anonymized)
-        if guardrails and getattr(guardrails, "pii_pseudonymization", False):
+        if guardrails:
             pii_ctx = await pii_service.load_context(session_id, self.redis)
-            llm_user_message = await pii_service.anonymize_message(user_message, pii_ctx, session_id)
+            llm_user_message = pii_service.redact_pii(user_message, pii_ctx, session_id)
 
         # --- Step 2: Retrieve MCP context ---
         kb_ids = agent.knowledge_base_ids or []
@@ -506,26 +681,33 @@ class Orchestrator:
                 tenant_id, session.customer_identifier
             )
 
+        session_meta = dict(session.metadata_ or {}) if hasattr(session, "metadata_") else {}
+        session_language = session_meta.get("language")
+
+        # Combine global and local variables for the prompt
+        all_variables = {**session_meta.get("variables", {}), **local_vars}
+
         system_prompt = build_system_prompt(
             agent=agent,
             context_items=context_items,
-            business_info={"customer_profile": customer_profile, "intent": intent},
+            business_info={
+                "customer_profile": customer_profile, 
+                "intent": intent,
+                "session_language": session_language
+            },
             playbook=playbook,
             corrections=corrections,
             guardrails=guardrails,
+            variables=variables,
+            session_metadata={**session_meta, "variables": all_variables},
         )
 
         # --- Step 4: Get tool schemas ---
-        tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)
+        tool_schemas = await self._get_agent_tools_schema(agent, playbook, tenant_id)
 
         # --- Build message list for LLM ---
         messages = [{"role": "system", "content": system_prompt}]
 
-        if pii_ctx is not None:
-            messages.append({
-                "role": "system",
-                "content": pii_service.ENVELOPE_SYSTEM_PROMPT,
-            })
 
         if summary:
             messages.append({
@@ -592,7 +774,9 @@ class Orchestrator:
         final_response: Optional[str] = None
         iterations = 0
 
-        enabled_tools = agent.tools or []
+        system_tools = agent.tools or []
+        playbook_tools = playbook.tools or [] if playbook else []
+        enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         while iterations < MAX_TOOL_ITERATIONS:
             # TC-F02: LLM call with hard timeout
@@ -602,6 +786,7 @@ class Orchestrator:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=False,
+                session_id=session_id,
             )
 
             total_tokens += llm_response.usage.total_tokens
@@ -632,7 +817,7 @@ class Orchestrator:
 
                 # De-tokenize tool arguments before execution so real values
                 # reach the booking/CRM APIs — not placeholder tokens.
-                if pii_ctx is not None and not pii_ctx.is_empty():
+                if pii_ctx is not None and pii_ctx.has_mappings():
                     for tc in allowed_calls:
                         if isinstance(tc.arguments, dict):
                             tc.arguments = pii_service.restore_dict(
@@ -660,7 +845,7 @@ class Orchestrator:
                     _re_anon: list = []
                     for _r in tool_results:
                         if isinstance(_r, dict):
-                            _re_anon.append(await pii_service.re_anonymize_dict(_r, pii_ctx, session_id))
+                            _re_anon.append(pii_service.redact_dict(_r, pii_ctx, session_id))
                         else:
                             _re_anon.append(_r)
                     tool_results = _re_anon
@@ -754,7 +939,7 @@ class Orchestrator:
                     tenant_id=session.tenant_id,
                     agent_id=session.agent_id,
                     tool_calls_made=bool(tool_calls_made),
-                    pii_active=bool(pii_ctx and not pii_ctx.is_empty()),
+                    pii_active=bool(pii_ctx and pii_ctx.has_mappings()),
                     guardrail_actions=guardrail_actions if guardrail_actions else None,
                 )
         except Exception:
@@ -810,8 +995,8 @@ class Orchestrator:
             logger.warning("trace_persist_error", error=str(_trace_exc))
 
         # --- Step 8: Persist to memory ---
-        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
-        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": final_response})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": pii_service.redact_for_display(user_message, pii_ctx) if pii_ctx else user_message})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": pii_service.redact_for_display(final_response, pii_ctx) if pii_ctx else final_response})
 
         # --- Context window auto-summarization (at 18 turns) + LTM write ---
         try:
@@ -829,11 +1014,15 @@ class Orchestrator:
             logger.warning("memory_post_turn_error", error=str(_mem_exc))
 
         # --- Persist messages to DB ---
+        # Redact pseudo-values for chat history display
+        user_msg_content = pii_service.redact_for_display(user_message, pii_ctx) if pii_ctx else user_message
+        assistant_msg_content = pii_service.redact_for_display(final_response, pii_ctx) if pii_ctx else final_response
+
         user_msg = Message(
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="user",
-            content=user_message,
+            content=user_msg_content,
             tokens_used=0,
             latency_ms=0,
         )
@@ -841,12 +1030,15 @@ class Orchestrator:
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="assistant",
-            content=final_response,
+            content=assistant_msg_content,
             tool_calls=tool_calls_made if tool_calls_made else None,
             tokens_used=total_tokens,
             latency_ms=latency_ms,
             is_fallback=is_fallback,
+            playbook_name=playbook.name if playbook else None,
+            sources=json.loads(json.dumps([c.dict() for c in source_citations])) if source_citations else [],
         )
+        session.turn_count += 1
         self.db.add(user_msg)
         self.db.add(assistant_msg)
 
@@ -867,6 +1059,8 @@ class Orchestrator:
 
         suggested_actions = self._extract_suggested_actions(final_response, intent)
 
+        session_status_info = self._get_session_status_info(session)
+
         return ChatResponse(
             session_id=session_id,
             message=final_response,
@@ -877,6 +1071,7 @@ class Orchestrator:
             tokens_used=total_tokens,
             sources=source_citations,
             guardrail_actions=guardrail_actions,
+            **session_status_info,
         )
 
     async def stream_response(
@@ -892,6 +1087,27 @@ class Orchestrator:
         tenant_id = str(session.tenant_id)
         session_id = session.id
         start_time = time.monotonic()
+
+        # Session auto-close: check expiry before processing
+        expiry_response = self._check_session_expiry(session)
+        if expiry_response:
+            yield StreamChatEvent(
+                type="text_delta",
+                data=expiry_response.message,
+                session_id=session_id,
+            )
+            yield StreamChatEvent(
+                type="done",
+                data={
+                    "session_id": session_id,
+                    "session_status": "closed",
+                    "latency_ms": 0,
+                    "tokens_used": 0,
+                    "suggested_actions": ["Start new session"],
+                },
+                session_id=session_id,
+            )
+            return
 
         # TC-C01: Strip role/system injection tokens
         user_message = self._sanitize_user_message(user_message)
@@ -947,11 +1163,16 @@ class Orchestrator:
             return
 
         # Load memory and context
-        playbook = await self._load_playbook(agent.id)
+        playbook = await self._route_active_playbook(agent.id, user_message)
+        
+        # --- Handle PlaybookExecution (Local Variable Scope) ---
+        playbook_exec, local_vars = await self._ensure_playbook_execution(agent.id, session.id, playbook)
+
         corrections = await self._load_corrections(str(agent.id))
         await self._maybe_send_greeting(agent, session, playbook)
 
         guardrails = await self._load_guardrails(agent.id)
+        variables = await self._load_variables(str(agent.id), str(playbook.id) if playbook else None)
 
         # --- Input guardrail check ---
         block_reason = self._check_input_guardrails(user_message, guardrails)
@@ -976,7 +1197,8 @@ class Orchestrator:
                 type="done",
                 data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
                       "tool_calls_made": 0, "escalate_to_human": False,
-                      "guardrail_triggered": block_reason},
+                      "guardrail_triggered": block_reason,
+                      "turn_count": session.turn_count},
                 session_id=session_id,
             )
             return
@@ -985,11 +1207,20 @@ class Orchestrator:
         summary = await self.memory.get_session_summary(session_id)
 
         # PII pseudonymization — anonymize user message before LLM (streaming path)
-        stream_pii_ctx: Optional[PseudonymizationContext] = None
+        stream_pii_ctx: Optional[PIIContext] = None
         stream_llm_message = user_message
-        if guardrails and getattr(guardrails, "pii_pseudonymization", False):
+        if guardrails:
+            logger.info("pii_guardrails_loaded", session_id=session_id, has_guardrails=True)
             stream_pii_ctx = await pii_service.load_context(session_id, self.redis)
-            stream_llm_message = await pii_service.anonymize_message(user_message, stream_pii_ctx, session_id)
+            original_msg = user_message
+            stream_llm_message = pii_service.redact_pii(user_message, stream_pii_ctx, session_id)
+            if stream_llm_message != original_msg:
+                logger.info("pii_user_msg_redacted", session_id=session_id,
+                           had_pii=True, tokens=len(stream_pii_ctx.real_to_pseudo))
+            else:
+                logger.info("pii_user_msg_clean", session_id=session_id, had_pii=False)
+        else:
+            logger.warning("pii_no_guardrails", session_id=session_id)
 
         kb_ids = agent.knowledge_base_ids or []
 
@@ -1023,16 +1254,28 @@ class Orchestrator:
                 tenant_id, session.customer_identifier
             )
 
+        session_meta = dict(session.metadata_ or {}) if hasattr(session, "metadata_") else {}
+        session_language = session_meta.get("language")
+
+        # Combine global and local variables for the prompt (Streaming)
+        all_variables = {**session_meta.get("variables", {}), **local_vars}
+
         system_prompt = build_system_prompt(
             agent=agent,
             context_items=context_items,
-            business_info={"customer_profile": customer_profile, "intent": intent},
+            business_info={
+                "customer_profile": customer_profile, 
+                "intent": intent,
+                "session_language": session_language
+            },
             playbook=playbook,
             corrections=corrections,
             guardrails=guardrails,
+            variables=variables,
+            session_metadata={**session_meta, "variables": all_variables},
         )
 
-        tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)
+        tool_schemas = await self._get_agent_tools_schema(agent, playbook, tenant_id)
 
         # Budget check before any LLM call
         if not await self._check_token_budget(tenant_id):
@@ -1045,14 +1288,14 @@ class Orchestrator:
             yield StreamChatEvent(
                 type="done",
                 data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
-                      "tool_calls_made": 0, "escalate_to_human": False},
+                      "tool_calls_made": 0, "escalate_to_human": False,
+                      "turn_count": session.turn_count},
                 session_id=session_id,
             )
             return
 
         messages = [{"role": "system", "content": system_prompt}]
-        if stream_pii_ctx is not None:
-            messages.append({"role": "system", "content": pii_service.ENVELOPE_SYSTEM_PROMPT})
+
         if summary:
             messages.append({"role": "system", "content": f"[Summary]: {summary}"})
         messages.extend(history)
@@ -1066,7 +1309,12 @@ class Orchestrator:
         total_tokens = 0
         full_response_text = ""
 
-        enabled_tools = agent.tools or []
+        system_tools = agent.tools or []
+        playbook_tools = playbook.tools or [] if playbook else []
+        enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
+
+        # --- PII active check ---
+        _pii_active = stream_pii_ctx is not None
 
         # If there are tools, do non-streaming tool loop first, then stream the final answer
         if tool_schemas:
@@ -1080,6 +1328,7 @@ class Orchestrator:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     stream=False,
+                    session_id=session_id,
                 )
                 total_tokens += llm_response.usage.total_tokens
 
@@ -1114,7 +1363,7 @@ class Orchestrator:
                     )
 
                     # De-tokenize args before execution (streaming path)
-                    if stream_pii_ctx is not None and not stream_pii_ctx.is_empty():
+                    if stream_pii_ctx is not None and stream_pii_ctx.has_mappings():
                         for tc in allowed_calls:
                             if isinstance(tc.arguments, dict):
                                 tc.arguments = pii_service.restore_dict(
@@ -1139,7 +1388,7 @@ class Orchestrator:
                         _re_anon_s: list = []
                         for _r in tool_results:
                             if isinstance(_r, dict):
-                                _re_anon_s.append(await pii_service.re_anonymize_dict(_r, stream_pii_ctx, session_id))
+                                _re_anon_s.append(pii_service.redact_dict(_r, stream_pii_ctx, session_id))
                             else:
                                 _re_anon_s.append(_r)
                         tool_results = _re_anon_s
@@ -1192,6 +1441,11 @@ class Orchestrator:
             if receipt:
                 full_response_text = full_response_text.rstrip() + " " + receipt
 
+            # Pseudonymization active: restore tokens BEFORE splitting for streaming
+            if _pii_active and full_response_text:
+                parser = pii_service.create_streaming_parser(stream_pii_ctx, session_id)
+                full_response_text = parser.process_chunk(full_response_text) + parser.flush()
+
             # Stream the final text word by word for a natural feel
             words = full_response_text.split(" ")
             for word in words:
@@ -1203,10 +1457,8 @@ class Orchestrator:
                 await asyncio.sleep(0.01)
         else:
             # No tools — use real streaming with TC-F02 timeout.
-            # When pseudonymization is active, buffer the full response so the JSON
-            # envelope can be parsed and all tokens restored BEFORE anything reaches
-            # the client.  Otherwise stream chunks as they arrive for minimal latency.
-            _pii_active = stream_pii_ctx is not None and not stream_pii_ctx.is_empty()
+            # When pseudonymization is active, we use the StreamingParser
+            # to restore tokens in real-time as chunks arrive.
             try:
                 gen = await asyncio.wait_for(
                     self.llm.complete(
@@ -1215,13 +1467,39 @@ class Orchestrator:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         stream=True,
+                        session_id=session_id,
                     ),
                     timeout=LLM_TIMEOUT_SECONDS,
                 )
+                streaming_parser = pii_service.create_streaming_parser(stream_pii_ctx, session_id) if _pii_active else None
+                
+                # Track raw vs processed for debugging
+                raw_chunks = []
+                
                 async for chunk in gen:
-                    full_response_text += chunk
-                    if not _pii_active:
+                    raw_chunks.append(chunk)
+                    if streaming_parser:
+                        processed_chunk = streaming_parser.process_chunk(chunk)
+                        full_response_text += processed_chunk
+                        yield StreamChatEvent(type="text_delta", data=processed_chunk, session_id=session_id)
+                    else:
+                        full_response_text += chunk
                         yield StreamChatEvent(type="text_delta", data=chunk, session_id=session_id)
+                
+                if streaming_parser:
+                    remaining = streaming_parser.flush()
+                    if remaining:
+                        full_response_text += remaining
+                        yield StreamChatEvent(type="text_delta", data=remaining, session_id=session_id)
+                
+                # Log raw LLM output for debugging PII issues
+                if _pii_active:
+                    raw_output = ''.join(raw_chunks)
+                    logger.info("llm_raw_output", 
+                               session_id=session_id, 
+                               raw_has_brackets='[' in raw_output,
+                               processed_tokens=sum(1 for c in full_response_text if c == '@'),
+                               raw_snippet=raw_output[:500])
             except asyncio.TimeoutError:
                 logger.error("stream_llm_timeout", session_id=session_id)
                 timeout_msg = (
@@ -1231,14 +1509,7 @@ class Orchestrator:
                 if not _pii_active:
                     yield StreamChatEvent(type="text_delta", data=timeout_msg, session_id=session_id)
 
-            # Pseudonymization active: parse envelope, restore tokens, then stream clean text
-            if _pii_active and full_response_text:
-                restored = pii_service.parse_envelope(full_response_text, stream_pii_ctx, session_id)
-                full_response_text = restored  # _apply_output_guardrails will receive clean text
-                for word in restored.split(" "):
-                    yield StreamChatEvent(type="text_delta", data=word + " ", session_id=session_id)
-                    await asyncio.sleep(0.01)
-
+            # PII restoration is now done in real-time above via streaming_parser
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
         full_response_text, stream_guardrail_actions = await self._apply_output_guardrails(
@@ -1265,8 +1536,8 @@ class Orchestrator:
             await self._reset_fallback_counter(session_id)
 
         # Persist to memory and DB
-        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
-        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": full_response_text})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": pii_service.redact_for_display(user_message, stream_pii_ctx) if stream_pii_ctx else user_message})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": pii_service.redact_for_display(full_response_text, stream_pii_ctx) if stream_pii_ctx else full_response_text})
 
         # --- Context window auto-summarization + LTM write (streaming path) ---
         try:
@@ -1283,11 +1554,15 @@ class Orchestrator:
         except Exception as _mem_exc:
             logger.warning("stream_memory_post_turn_error", error=str(_mem_exc))
 
+        # Redact pseudo-values for chat history display
+        user_msg_content = pii_service.redact_for_display(user_message, stream_pii_ctx) if stream_pii_ctx else user_message
+        assistant_msg_content = pii_service.redact_for_display(full_response_text, stream_pii_ctx) if stream_pii_ctx else full_response_text
+
         user_msg = Message(
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="user",
-            content=user_message,
+            content=user_msg_content,
             tokens_used=0,
             latency_ms=0,
         )
@@ -1295,11 +1570,13 @@ class Orchestrator:
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="assistant",
-            content=full_response_text,
+            content=assistant_msg_content,
             tool_calls=tool_calls_made if tool_calls_made else None,
             tokens_used=total_tokens,
             latency_ms=latency_ms,
             is_fallback=is_fallback,
+            playbook_name=playbook.name if playbook else None,
+            sources=json.loads(json.dumps([c.model_dump() for c in stream_source_citations])) if stream_source_citations else [],
         )
         self.db.add(user_msg)
         self.db.add(assistant_msg)
@@ -1334,6 +1611,7 @@ class Orchestrator:
                 "tool_calls_made": len(tool_calls_made),
                 "escalate_to_human": should_escalate,
                 "guardrail_actions": stream_guardrail_actions,
+                "turn_count": session.turn_count,
             },
             session_id=session_id,
         )
@@ -1384,13 +1662,18 @@ class Orchestrator:
         return frustration_count >= 2
 
     async def _get_agent_tools_schema(
-        self, agent: Agent, tenant_id: str
+        self, agent: Agent, playbook: Optional[AgentPlaybook], tenant_id: str
     ) -> list[dict]:
         """
         Retrieve OpenAI-format tool schemas from MCP server for the tools
-        enabled on this agent.
+        enabled on this agent (System-level) AND the current playbook (Playbook-level).
         """
-        enabled_tools = agent.tools or []
+        system_tools = agent.tools or []
+        playbook_tools = playbook.tools or [] if playbook else []
+        
+        # Merge lists and deduplicate while preserving explicit order if possible
+        enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
+        
         if not enabled_tools:
             return []
 
@@ -1398,6 +1681,33 @@ class Orchestrator:
             tenant_id=tenant_id,
             tool_names=enabled_tools,
         )
+        
+        # Inject virtual tools for variable management
+        schemas.append({
+            "name": "set_session_variable",
+            "description": "Store a global variable for the entire session. Use this for data that should persist across playbooks (e.g. user name, preferences).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The name of the variable."},
+                    "value": {"type": "string", "description": "The value to store (stringified)."}
+                },
+                "required": ["name", "value"]
+            }
+        })
+        schemas.append({
+            "name": "set_playbook_variable",
+            "description": "Store a local variable for the current playbook. Use this for transient data needed for the current task (e.g. temporary IDs, flags).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The name of the variable."},
+                    "value": {"type": "string", "description": "The value to store (stringified)."}
+                },
+                "required": ["name", "value"]
+            }
+        })
+        
         return schemas
 
     async def _execute_tool_calls(
@@ -1411,16 +1721,25 @@ class Orchestrator:
         Returns a list of results in the same order as the input tool_calls.
         """
         trace_id = str(uuid.uuid4())
-        tasks = [
-            self.mcp.execute_tool(
-                tenant_id=tenant_id,
-                tool_name=tc.name,
-                parameters=tc.arguments,
-                session_id=session_id,
-                trace_id=f"{trace_id}-{i}",
-            )
-            for i, tc in enumerate(tool_calls)
-        ]
+        tasks = []
+        for i, tc in enumerate(tool_calls):
+            # Intercept virtual tools
+            if tc.name == "set_session_variable":
+                tasks.append(self._handle_set_session_variable(session_id, tc.arguments))
+            elif tc.name == "set_playbook_variable":
+                # We need playbook_id. In process_message it's available.
+                # In _execute_tool_calls we don't have it. 
+                # Let's pass it down or find the active one.
+                tasks.append(self._handle_set_playbook_variable(session_id, tc.arguments))
+            else:
+                tasks.append(self.mcp.execute_tool(
+                    tenant_id=tenant_id,
+                    tool_name=tc.name,
+                    parameters=tc.arguments,
+                    session_id=session_id,
+                    trace_id=f"{trace_id}-{i}",
+                ))
+        
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         processed: list[dict] = []
@@ -1436,6 +1755,36 @@ class Orchestrator:
                 processed.append(result)
 
         return processed
+
+    async def _handle_set_session_variable(self, session_id, arguments: dict) -> dict:
+        """Handler for set_session_variable virtual tool."""
+        res = await self.db.execute(select(AgentSession).where(AgentSession.id == session_id))
+        session = res.scalar_one_or_none()
+        if session:
+            meta = dict(session.metadata_ or {})
+            vars = meta.get("variables", {})
+            vars[arguments.get("name")] = arguments.get("value")
+            meta["variables"] = vars
+            session.metadata_ = meta
+            return {"success": True, "message": f"Global variable '{arguments.get('name')}' set."}
+        return {"success": False, "error": "Session not found."}
+
+    async def _handle_set_playbook_variable(self, session_id, arguments: dict) -> dict:
+        """Handler for set_playbook_variable virtual tool."""
+        # Find the currently active playbook execution for this session
+        res = await self.db.execute(
+            select(PlaybookExecution).where(
+                PlaybookExecution.session_id == session_id,
+                PlaybookExecution.status == "active"
+            ).order_by(PlaybookExecution.updated_at.desc())
+        )
+        pb_exec = res.scalars().first()
+        if pb_exec:
+            vars = dict(pb_exec.variables or {})
+            vars[arguments.get("name")] = arguments.get("value")
+            pb_exec.variables = vars
+            return {"success": True, "message": f"Playbook variable '{arguments.get('name')}' set."}
+        return {"success": False, "error": "No active playbook execution found."}
 
     async def _update_analytics(
         self,

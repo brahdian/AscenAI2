@@ -11,9 +11,8 @@ AI agent platform for small businesses — build, deploy, and manage conversatio
 | **ai-orchestrator** | 8002 | Agent logic, LLM routing, sessions |
 | **voice-pipeline** | 8003 | STT → AI → TTS real-time voice |
 | **frontend** | 3000 | Next.js dashboard |
-| **postgres** | 5432 | Primary database |
+| **postgres** | 5432 | Primary database + Vector store (pgvector) |
 | **redis** | 6379 | Cache, rate limiting, sessions |
-| **qdrant** | 6333 | Vector database (knowledge base) |
 
 ---
 
@@ -114,7 +113,7 @@ docker compose up --build
 ```
 
 This will:
-- Pull Postgres 16, Redis 7, and Qdrant images
+- Pull Postgres 16 (pgvector) and Redis 7 images
 - Build all four Python backend services
 - Build the Next.js frontend
 - Run database initialization from `shared/db/init.sql`
@@ -171,7 +170,7 @@ docker compose logs -f ai-orchestrator
 # Stop all services (keeps data)
 docker compose down
 
-# Stop and wipe all data (postgres, redis, qdrant volumes)
+# Stop and wipe all data (postgres, redis volumes)
 docker compose down -v
 
 # Rebuild a single service after code changes
@@ -246,7 +245,7 @@ If you prefer to run services natively for faster iteration:
 
 ```bash
 # Start only infrastructure
-docker compose up -d postgres redis qdrant
+docker compose up -d postgres redis
 ```
 
 **Backend services:**
@@ -281,7 +280,6 @@ Each service reads `.env` from the repo root. Set `DATABASE_URL`, `REDIS_URL`, a
 # Override for local dev (add to your shell or a local .env.local)
 export DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ascenai
 export REDIS_URL=redis://localhost:6379/0
-export QDRANT_HOST=localhost
 ```
 
 **Frontend:**

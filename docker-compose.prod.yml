@@ -37,13 +37,7 @@ services:
           memory: 512M
           cpus: "0.5"
 
-  qdrant:
-    ports: []
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          cpus: "1.0"
+  # Qdrant removed in favor of pgvector
 
   # -------------------------------------------------------------------------
   # Backend service overrides — multi-worker uvicorn

@@ -1,7 +1,8 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
-from typing import AsyncGenerator
+from sqlalchemy import text
+from typing import AsyncGenerator, Optional
 import structlog
 
 from app.core.config import settings
@@ -36,14 +37,49 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_db(
+    tenant_id: Optional[str] = None,
+) -> AsyncGenerator[AsyncSession, None]:
+    """Yield a DB session, optionally scoped to a tenant via Postgres RLS.
+
+    When *tenant_id* is supplied (non-empty string) the session variable
+    ``app.current_tenant_id`` is SET LOCAL so that every statement in this
+    transaction is filtered by the RLS policies defined in ``init_db``.
+
+    This is the **only** place where the tenant context is injected — never
+    rely on application-level WHERE clauses alone for tenant isolation.
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            if tenant_id:
+                # Use SET LOCAL so the variable is scoped to this transaction
+                # and cannot bleed into a connection-pool reuse.
+                await session.execute(
+                    text("SELECT set_config('app.current_tenant_id', :tid, true)"),
+                    {"tid": str(tenant_id)},
+                )
+            yield session
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            logger.error("database_session_error", error=str(exc))
+            raise
+        finally:
+            await session.close()
+
+
+async def get_db_no_rls() -> AsyncGenerator[AsyncSession, None]:
+    """Yield an unrestricted session for internal background tasks and migrations.
+
+    **Never** expose this via a public API route — it bypasses RLS entirely.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
             await session.commit()
         except Exception as exc:
             await session.rollback()
-            logger.error("database_session_error", error=str(exc))
+            logger.error("database_session_error_no_rls", error=str(exc))
             raise
         finally:
             await session.close()
@@ -80,6 +116,88 @@ async def init_db() -> None:
                 "ADD COLUMN IF NOT EXISTS voice_greeting_url VARCHAR(500)"
             )
         )
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE agents "
+                "ADD COLUMN IF NOT EXISTS auto_detect_language BOOLEAN DEFAULT FALSE"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE agents "
+                "ADD COLUMN IF NOT EXISTS supported_languages JSONB"
+            )
+        )
+        await conn.execute(
+            __import__("sqlalchemy", fromlist=["text"]).text(
+                "ALTER TABLE agents "
+                "ADD COLUMN IF NOT EXISTS voice_system_prompt TEXT"
+            )
+        )
+
+        # AgentGuardrails migrations for content policy schema
+        _t = __import__("sqlalchemy", fromlist=["text"]).text
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_keywords JSONB"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_topics JSONB"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS allowed_topics JSONB"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS profanity_filter BOOLEAN DEFAULT TRUE"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS pii_redaction BOOLEAN DEFAULT FALSE"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS pii_pseudonymization BOOLEAN DEFAULT TRUE"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS max_response_length INTEGER DEFAULT 0"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS require_disclaimer TEXT"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_message TEXT"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS off_topic_message TEXT"))
+        await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS content_filter_level VARCHAR(20) DEFAULT 'medium'"))
+
+        # AgentPlaybook migrations
+        await conn.execute(_t("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS input_schema JSONB"))
+        await conn.execute(_t("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS output_schema JSONB"))
+        await conn.execute(_t("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS tools JSONB"))
+
+        # AgentVariable migrations
+        await conn.execute(_t("ALTER TABLE agent_variables ADD COLUMN IF NOT EXISTS playbook_id UUID"))
+
+        # Session auto-close: last_activity_at column
+        await conn.execute(_t("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ"))
+        await conn.execute(_t("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS turn_count INTEGER DEFAULT 0"))
+        await conn.execute(_t("CREATE INDEX IF NOT EXISTS ix_sessions_last_activity ON sessions (last_activity_at)"))
+
+        # AgentDocument migrations
+        try:
+            await conn.execute(_t("ALTER TABLE agent_documents ALTER COLUMN storage_path DROP NOT NULL"))
+        except Exception as e:
+            logger.warning("failed_to_drop_not_null_storage_path", error=str(e))
+        await conn.execute(_t("ALTER TABLE agent_documents ADD COLUMN IF NOT EXISTS content TEXT"))
+        await conn.execute(_t("ALTER TABLE agent_documents ADD COLUMN IF NOT EXISTS embedding vector(768)"))
+
+        # Register pgvector with asyncpg
+        from pgvector.asyncpg import register_vector
+
+        async def _register(conn):
+            await register_vector(conn)
+
+        # SQLAlchemy 2.0 asyncpg registration pattern
+        await conn.run_sync(lambda sync_conn: _register(sync_conn.connection._connection))
+
+        # AgentDocumentChunk table and HNSW index
+        await conn.execute(_t(
+            "CREATE TABLE IF NOT EXISTS agent_document_chunks ("
+            "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+            "  doc_id UUID NOT NULL REFERENCES agent_documents(id) ON DELETE CASCADE,"
+            "  tenant_id UUID NOT NULL,"
+            "  content TEXT NOT NULL,"
+            "  embedding vector(768) NOT NULL,"
+            "  chunk_index INTEGER NOT NULL"
+            ")"
+        ))
+        await conn.execute(_t("CREATE INDEX IF NOT EXISTS ix_agent_doc_chunks_doc_id ON agent_document_chunks (doc_id)"))
+        await conn.execute(_t("CREATE INDEX IF NOT EXISTS ix_agent_doc_chunks_tenant_id ON agent_document_chunks (tenant_id)"))
+        # HNSW index for cosine similarity performance
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_agent_doc_chunks_embedding_hnsw "
+            "ON agent_document_chunks USING hnsw (embedding vector_cosine_ops)"
+        ))
+
         # Escalation audit trail — DLQ for failed connector attempts
         _t = __import__("sqlalchemy", fromlist=["text"]).text
         await conn.execute(_t(
@@ -111,15 +229,18 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS ix_escalation_status "
             "ON escalation_attempts (status)"
         ))
+        
+        # Message metadata migrations
+        await conn.execute(_t("ALTER TABLE messages ADD COLUMN IF NOT EXISTS playbook_name VARCHAR(255)"))
+        await conn.execute(_t("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sources JSONB"))
+
         # ── PostgreSQL Row-Level Security (RLS) ─────────────────────────────
         # Skip RLS for SQLite (dev/test environment)
         if not _is_sqlite:
             _rls_tables = [
                 "agents", "sessions", "messages", "agent_playbooks",
                 "agent_guardrails", "agent_documents", "agent_analytics",
-                "message_feedback", "conversation_traces", "playbook_executions",
-                "eval_cases", "eval_runs", "eval_scores",
-                "prompt_versions", "prompt_ab_tests",
+                "message_feedback", "conversation_traces", "playbook_executions"
             ]
 
             # Create helper function to read current_tenant_id from session variables
@@ -137,16 +258,16 @@ async def init_db() -> None:
             for _tbl in _rls_tables:
                 # Enable RLS
                 await conn.execute(_t(f"ALTER TABLE {_tbl} ENABLE ROW LEVEL SECURITY"))
-                # Allow table owners (app role) to bypass RLS for internal queries
+                # Force all rows to be filtered — NO IS NULL bypass.
+                # The table owner / superuser role bypasses RLS implicitly via
+                # BYPASSRLS privilege; application workers must always set the
+                # tenant context using get_db(tenant_id=...).
                 await conn.execute(_t(
                     f"DROP POLICY IF EXISTS tenant_isolation ON {_tbl}"
                 ))
                 await conn.execute(_t(f"""
                     CREATE POLICY tenant_isolation ON {_tbl}
-                    USING (
-                        tenant_id = current_tenant_id()
-                        OR current_tenant_id() IS NULL
-                    )
+                    USING (tenant_id = current_tenant_id())
                 """))
 
     logger.info("database_initialized")

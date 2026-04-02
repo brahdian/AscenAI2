@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db
 from app.core.security import get_current_tenant
 from app.models.agent import Agent, AgentGuardrails
 from app.schemas.chat import GuardrailsUpsert, GuardrailsResponse
@@ -31,6 +32,7 @@ def _gr_to_response(gr: AgentGuardrails) -> GuardrailsResponse:
         off_topic_message=gr.off_topic_message,
         content_filter_level=gr.content_filter_level,
         is_active=gr.is_active,
+        pii_pseudonymization=gr.pii_pseudonymization,
         created_at=gr.created_at.isoformat(),
         updated_at=gr.updated_at.isoformat(),
     )
@@ -53,11 +55,11 @@ async def _get_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agent:
 async def get_guardrails(
     agent_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
     tenant=Depends(get_current_tenant),
 ):
     """Get the guardrails config for an agent."""
-    tenant_id = str(tenant.id)
+    tenant_id = str(tenant)
     await _get_agent(agent_id, tenant_id, db)
 
     result = await db.execute(
@@ -74,11 +76,11 @@ async def upsert_guardrails(
     agent_id: str,
     body: GuardrailsUpsert,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
     tenant=Depends(get_current_tenant),
 ):
     """Create or update guardrails for an agent."""
-    tenant_id = str(tenant.id)
+    tenant_id = str(tenant)
     await _get_agent(agent_id, tenant_id, db)
 
     result = await db.execute(
@@ -104,6 +106,7 @@ async def upsert_guardrails(
     gr.off_topic_message = body.off_topic_message
     gr.content_filter_level = body.content_filter_level
     gr.is_active = body.is_active
+    gr.pii_pseudonymization = body.pii_pseudonymization
 
     await db.commit()
     await db.refresh(gr)
@@ -115,11 +118,11 @@ async def upsert_guardrails(
 async def delete_guardrails(
     agent_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
     tenant=Depends(get_current_tenant),
 ):
     """Remove guardrails for an agent."""
-    tenant_id = str(tenant.id)
+    tenant_id = str(tenant)
     await _get_agent(agent_id, tenant_id, db)
 
     result = await db.execute(

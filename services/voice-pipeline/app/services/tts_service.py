@@ -223,25 +223,26 @@ class TTSService:
         self,
         text: str,
         voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091",
-        model_id: str = "sonic-english",
+        model_id: str = "sonic-3",
+        output_format: dict = None,
     ) -> AsyncGenerator[bytes, None]:
         """
         Cartesia Sonic streaming TTS — cheapest real-time option (~$0.065/1M chars).
         First audio byte typically arrives in <100 ms.
-
-        Args:
-            text:     Text to synthesize.
-            voice_id: Cartesia voice UUID. Defaults to a neutral English voice.
-            model_id: "sonic-english" (default) or "sonic-multilingual".
+        Using the latest base multilingual model (sonic-3).
         """
         if not settings.CARTESIA_API_KEY:
-            raise RuntimeError(
-                "CARTESIA_API_KEY is not configured. "
-                "Get one at https://cartesia.ai and set it in the environment."
-            )
+            raise RuntimeError("CARTESIA_API_KEY is not configured.")
 
         if not text.strip():
             return
+
+        if output_format is None:
+            output_format = {
+                "container": "mp3",
+                "encoding": "mp3",
+                "sample_rate": 44100,
+            }
 
         url = "https://api.cartesia.ai/tts/bytes"
         headers = {
@@ -253,11 +254,7 @@ class TTSService:
             "model_id": model_id,
             "transcript": text,
             "voice": {"mode": "id", "id": voice_id},
-            "output_format": {
-                "container": "mp3",
-                "encoding": "mp3",
-                "sample_rate": 44100,
-            },
+            "output_format": output_format,
             "stream": True,
         }
 
@@ -279,6 +276,64 @@ class TTSService:
             logger.info("cartesia_tts_stream_complete", voice_id=voice_id)
         except Exception as exc:
             logger.error("cartesia_tts_stream_error", error=str(exc))
+            raise
+
+    # ------------------------------------------------------------------
+    # Deepgram Aura streaming synthesis
+    # ------------------------------------------------------------------
+
+    async def synthesize_deepgram_stream(
+        self,
+        text: str,
+        voice_id: str = "aura-asteria-en",
+        encoding: str = "mp3",
+        sample_rate: int = 44100,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Deepgram Aura streaming TTS — fastest and cheapest enterprise option (~$30/1M chars).
+        Native support for linear16, mp3, and mulaw (for telephony).
+
+        Args:
+            text:        Text to synthesize.
+            voice_id:    Deepgram voice ID (e.g., aura-asteria-en, aura-luna-en).
+            encoding:    "linear16", "mp3", or "mulaw".
+            sample_rate: 8000, 16000, 24000, 32000, 48000.
+        """
+        if not settings.DEEPGRAM_API_KEY:
+            raise RuntimeError(
+                "DEEPGRAM_API_KEY is not configured for TTS. "
+                "Set it in the environment or .env file."
+            )
+
+        if not text.strip():
+            return
+
+        # Deepgram's API URL requires query params for encoding
+        url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding={encoding}&sample_rate={sample_rate}"
+        headers = {
+            "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {"text": text}
+
+        logger.info(
+            "deepgram_tts_stream_start",
+            chars=len(text),
+            voice_id=voice_id,
+            encoding=encoding,
+        )
+
+        client = self._get_http_client()
+        try:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+
+            logger.info("deepgram_tts_stream_complete", voice_id=voice_id)
+        except Exception as exc:
+            logger.error("deepgram_tts_stream_error", error=str(exc))
             raise
 
     # ------------------------------------------------------------------

@@ -67,7 +67,7 @@ async def register(
     db: AsyncSession = Depends(get_db),
 ):
     """Register a new tenant + owner user and return JWT tokens (+ set cookies)."""
-    tokens = await auth_service.register(request, db)
+    tokens = await auth_service.register(request, db, response)
     _set_auth_cookies(response, tokens)
     return tokens
 

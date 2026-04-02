@@ -30,6 +30,7 @@ class TenantResponse(BaseModel):
     address: dict
     timezone: str
     plan: str
+    plan_display_name: str
     plan_limits: dict
     is_active: bool
 
@@ -41,6 +42,7 @@ class TenantUsageResponse(BaseModel):
     current_month_sessions: int
     current_month_messages: int
     current_month_tokens: int
+    current_month_chat_units: int
     current_month_voice_minutes: float
     total_cost_usd: float
     last_reset_at: str
@@ -81,6 +83,7 @@ async def get_my_tenant(request: Request, db: AsyncSession = Depends(get_db)):
         address=tenant.address,
         timezone=tenant.timezone,
         plan=tenant.plan,
+        plan_display_name=tenant.plan_display_name,
         plan_limits=tenant.plan_limits,
         is_active=tenant.is_active,
     )
@@ -107,6 +110,7 @@ async def update_my_tenant(
         address=tenant.address,
         timezone=tenant.timezone,
         plan=tenant.plan,
+        plan_display_name=tenant.plan_display_name,
         plan_limits=tenant.plan_limits,
         is_active=tenant.is_active,
     )
@@ -124,6 +128,7 @@ async def get_my_usage(request: Request, db: AsyncSession = Depends(get_db)):
         current_month_sessions=usage.current_month_sessions,
         current_month_messages=usage.current_month_messages,
         current_month_tokens=usage.current_month_tokens,
+        current_month_chat_units=usage.current_month_chat_units,
         current_month_voice_minutes=usage.current_month_voice_minutes,
         total_cost_usd=usage.total_cost_usd,
         last_reset_at=usage.last_reset_at.isoformat(),

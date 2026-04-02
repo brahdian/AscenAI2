@@ -50,11 +50,11 @@
 
 | Feature | Status | Detail |
 |---|---|---|
-| Vector DB (Qdrant) | ✅ Full | Per-tenant collections, cosine similarity, payload filter |
+| Vector DB (pgvector) | ✅ Full | Native PostgreSQL similarity search, HNSW index |
 | Chunking + embedding pipeline | ✅ Full | sentence-transformers, async background indexer |
 | Top-K retrieval | ✅ Full | Default top-5 |
-| Hybrid search (BM25 + vector) | 🆕 Full | rank_bm25 + Qdrant dense; RRF fusion (k=60) |
-| Cross-encoder reranking | 🆕 Full | ms-marco-MiniLM-L-6-v2 in ThreadPoolExecutor |
+| Hybrid search (BM25 + vector) | ❌ Missing | Plan to implement pgvector + pg_trgm or inverted index |
+| Cross-encoder reranking | ❌ Missing | Removed with legacy RAG service; to be refactored |
 | Source attribution / citations | ✅ Full | title, excerpt, score, document_id, chunk_id in response |
 | Hallucination guardrails | 🆕 Full | `insufficient_evidence` flag when max reranker score < 0.3; grounding prompt injected |
 | Confidence scoring | 🆕 Full | `0.4*retrieval + 0.4*reranker + 0.2*coverage` |

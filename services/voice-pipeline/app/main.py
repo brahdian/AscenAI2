@@ -130,6 +130,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     redis = await init_redis()
     app.state.redis = redis
 
+    # Pre-synthesise backchannel filler clips to disk so they are ready for realtime use
+    try:
+        from app.services.voice_pipeline import VoicePipeline
+        from app.services.stt_service import STTService
+        from app.services.tts_service import TTSService
+        # Instantiate temporarily just to run the synthesis
+        temp_pipeline = VoicePipeline(
+            stt=STTService(),
+            tts=TTSService(),
+            orchestrator_url="",
+            redis=None
+        )
+        # Note: _presynthesize_backchannels is a fast no-op if files already exist
+        await temp_pipeline._presynthesize_backchannels()
+    except Exception as exc:
+        logger.error("backchannel_presynthesis_failed", error=str(exc))
+
     # Start audio cleanup background task
     cleanup_task = asyncio.create_task(_cleanup_audio_files())
 

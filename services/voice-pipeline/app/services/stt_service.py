@@ -124,23 +124,104 @@ class STTService:
         language: str = "en",
     ) -> AsyncGenerator[PartialTranscript, None]:
         """
-        Streaming transcription using Deepgram Live Streaming API.
+        Streaming transcription using the configured STT provider.
 
-        Opens a persistent WebSocket to Deepgram, forwards audio chunks as they
-        arrive, and yields PartialTranscript objects as Deepgram emits interim
-        and final transcript events.  Falls back to OpenAI Whisper if no
-        Deepgram key is configured.
+        Opens a persistent WebSocket to the STT provider, forwards audio chunks as they
+        arrive, and yields PartialTranscript objects as the provider emits interim
+        and final transcript events. Falls back to OpenAI Whisper if no
+        configured provider key is available.
         """
-        if settings.DEEPGRAM_API_KEY:
+
+        if settings.STT_PROVIDER == "cartesia" and getattr(settings, "CARTESIA_API_KEY", ""):
+            async for partial in self._cartesia_stream(audio_stream, language):
+                yield partial
+        elif settings.STT_PROVIDER == "deepgram" and settings.DEEPGRAM_API_KEY:
             async for partial in self._deepgram_stream(audio_stream, language):
                 yield partial
         else:
             # Fallback: buffer all audio then do single Whisper call
             logger.warning(
-                "deepgram_key_missing_falling_back_to_whisper",
+                "stt_provider_key_missing_falling_back_to_whisper",
             )
             async for partial in self._whisper_buffered_stream(audio_stream, language):
                 yield partial
+
+    async def _cartesia_stream(
+        self,
+        audio_stream: AsyncGenerator[bytes, None],
+        language: str,
+    ) -> AsyncGenerator[PartialTranscript, None]:
+        """
+        Live streaming transcription via Cartesia Ink-Whisper WebSocket API.
+        """
+        import json
+        import websockets  # type: ignore
+
+        api_key = getattr(settings, "CARTESIA_API_KEY", "")
+        url = f"wss://api.cartesia.ai/stt?api_key={api_key}&cartesia_version=2024-06-10"
+
+        result_queue: asyncio.Queue[PartialTranscript | None] = asyncio.Queue()
+
+        async def _send_audio(ws):
+            try:
+                # 1. Send Configuration Handshake
+                config = {
+                    "model": "ink-whisper",
+                    "language": language,
+                    "encoding": "pcm_s16le",
+                    "sample_rate": settings.SAMPLE_RATE
+                }
+                await ws.send(json.dumps(config))
+
+                # 2. Stream Audio Chunks
+                async for chunk in audio_stream:
+                    await ws.send(chunk)
+                
+                # 3. Finalize Stream
+                await ws.send(json.dumps({"type": "finalize"}))
+            except Exception as exc:
+                logger.error("cartesia_send_error", error=str(exc))
+
+        async def _receive_transcripts(ws):
+            try:
+                async for message in ws:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+                    
+                    if msg_type == "transcript":
+                        transcript = data.get("transcript", "").strip()
+                        if transcript:
+                            # We treat it as an interim or final based on what event we get.
+                            # Ink-Whisper websocket payload usually sends continuous transcripts.
+                            await result_queue.put(
+                                PartialTranscript(
+                                    text=transcript,
+                                    is_final=True, # Ink typically emits final text segments
+                                    confidence=1.0,
+                                )
+                            )
+                    elif msg_type == "done":
+                        break
+            except Exception as exc:
+                logger.error("cartesia_receive_error", error=str(exc))
+            finally:
+                await result_queue.put(None)  # sentinel
+
+        try:
+            async with websockets.connect(url) as ws:
+                send_task = asyncio.create_task(_send_audio(ws))
+                recv_task = asyncio.create_task(_receive_transcripts(ws))
+
+                while True:
+                    item = await result_queue.get()
+                    if item is None:
+                        break
+                    yield item
+
+                await asyncio.gather(send_task, recv_task, return_exceptions=True)
+        except Exception as exc:
+            logger.error("cartesia_connection_error", error=str(exc))
+            raise
 
     async def _deepgram_stream(
         self,
@@ -154,9 +235,11 @@ class STTService:
         import json
         import websockets  # type: ignore
 
+        # Use "multi" for automatic language detection when language is "auto"
+        lang_param = "multi" if language == "auto" else language
         url = (
             "wss://api.deepgram.com/v1/listen"
-            f"?language={language}"
+            f"?language={lang_param}"
             "&model=nova-2"
             "&encoding=linear16"
             f"&sample_rate={settings.SAMPLE_RATE}"
@@ -185,12 +268,18 @@ class STTService:
                     if msg_type == "Results":
                         channel = data.get("channel", {})
                         alternatives = channel.get("alternatives", [{}])
+                        detected_language = data.get(" detected_language", "")
                         if alternatives:
                             alt = alternatives[0]
                             transcript = alt.get("transcript", "").strip()
                             is_final = data.get("is_final", False)
                             confidence = alt.get("confidence", 0.0)
                             if transcript:
+                                logger.debug(
+                                    "deepgram_result",
+                                    language=detected_language,
+                                    is_final=is_final,
+                                )
                                 await result_queue.put(
                                     PartialTranscript(
                                         text=transcript,

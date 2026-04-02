@@ -2,18 +2,16 @@
 Inbound channel webhook handlers.
 
 Supported channels:
-  POST /channels/whatsapp/webhook    — Meta Business API (WhatsApp)
-  GET  /channels/whatsapp/webhook    — WhatsApp webhook verification challenge
-  POST /channels/sms/webhook         — Twilio SMS inbound (TwiML)
-  POST /channels/slack/events        — Slack Events API
-  POST /channels/email/inbound       — SendGrid Inbound Parse
+  POST /channels/{tenant_id}/{agent_id}/whatsapp/webhook    — Meta Business API (WhatsApp)
+  GET  /channels/{tenant_id}/{agent_id}/whatsapp/webhook    — WhatsApp webhook verification challenge
+  POST /channels/{tenant_id}/{agent_id}/sms/webhook         — Twilio SMS inbound (TwiML)
+  POST /channels/{tenant_id}/{agent_id}/slack/events        — Slack Events API
+  POST /channels/{tenant_id}/{agent_id}/email/inbound       — SendGrid Inbound Parse
 
-Each handler:
-  1. Validates the channel-specific signature
-  2. Parses the message and extracts (customer_id, text, channel)
-  3. Resolves / creates a canonical customer identity
-  4. Forwards to the AI orchestrator via internal HTTP
-  5. Returns the channel-expected response format
+Tenant and agent IDs are embedded in the URL path so that:
+  1. External providers (Slack, Twilio, Meta) do not need to inject custom headers.
+  2. Each tenant registers their own unique webhook URL.
+  3. Messages are deterministically routed without any header guessing.
 
 Cross-channel identity resolution priority: phone → email → channel_id
 """
@@ -34,7 +32,8 @@ from fastapi.responses import PlainTextResponse
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Settings pulled from environment
+# Settings pulled from environment — these are GLOBAL defaults and can be
+# overridden per-tenant via a future ChannelCredentials DB lookup.
 _WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 _WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 _TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -99,22 +98,22 @@ async def _forward_to_orchestrator(
 # WhatsApp (Meta Business API)
 # ---------------------------------------------------------------------------
 
-@router.get("/whatsapp/webhook")
-async def whatsapp_verify(request: Request):
+@router.get("/{tenant_id}/{agent_id}/whatsapp/webhook")
+async def whatsapp_verify(tenant_id: str, agent_id: str, request: Request):
     """WhatsApp webhook verification challenge."""
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
 
     if mode == "subscribe" and token == _WHATSAPP_VERIFY_TOKEN and _WHATSAPP_VERIFY_TOKEN:
-        logger.info("whatsapp_webhook_verified")
+        logger.info("whatsapp_webhook_verified", tenant_id=tenant_id, agent_id=agent_id)
         return PlainTextResponse(challenge)
 
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
-@router.post("/whatsapp/webhook")
-async def whatsapp_inbound(request: Request):
+@router.post("/{tenant_id}/{agent_id}/whatsapp/webhook")
+async def whatsapp_inbound(tenant_id: str, agent_id: str, request: Request):
     """Handle inbound WhatsApp messages."""
     # Verify Meta signature
     body_bytes = await request.body()
@@ -126,7 +125,7 @@ async def whatsapp_inbound(request: Request):
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(sig_header, expected):
-            logger.warning("whatsapp_signature_invalid")
+            logger.warning("whatsapp_signature_invalid", tenant_id=tenant_id)
             raise HTTPException(status_code=403, detail="Invalid signature")
 
     try:
@@ -139,8 +138,6 @@ async def whatsapp_inbound(request: Request):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             messages = value.get("messages", [])
-            metadata = value.get("metadata", {})
-            phone_number_id = metadata.get("phone_number_id", "")
 
             for msg in messages:
                 msg_id = msg.get("id", "")
@@ -160,28 +157,87 @@ async def whatsapp_inbound(request: Request):
                     "whatsapp_message_received",
                     from_number=from_number,
                     text_length=len(text),
+                    tenant_id=tenant_id,
                 )
 
-                # Resolve tenant / agent from phone_number_id (simplified)
-                tenant_id = request.headers.get("X-Tenant-ID", "")
-                agent_id = request.headers.get("X-Agent-ID", "")
-
-                if tenant_id and agent_id:
-                    session_id = f"wa_{from_number}"
-                    await _forward_to_orchestrator(
-                        agent_id=agent_id,
-                        session_id=session_id,
-                        message=text,
-                        customer_identifier=from_number,
-                        channel="whatsapp",
-                        tenant_id=tenant_id,
-                    )
+                session_id = f"wa_{from_number}"
+                await _forward_to_orchestrator(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    message=text,
+                    customer_identifier=from_number,
+                    channel="whatsapp",
+                    tenant_id=tenant_id,
+                )
 
     return {"status": "ok"}
 
 
+@router.post("/{tenant_id}/{agent_id}/voice/webhook")
+async def twilio_voice_inbound(tenant_id: str, agent_id: str, request: Request):
+    """
+    Handle inbound Twilio Voice call.
+    Returns TwiML instructing Twilio to open a Media Stream WebSocket
+    to the Voice Pipeline service.
+    """
+    form_data = await request.form()
+    params = dict(form_data)
+
+    call_sid = params.get("CallSid", "")
+    if not call_sid:
+        logger.warning("twilio_voice_missing_call_sid", tenant_id=tenant_id)
+        raise HTTPException(status_code=400, detail="Missing CallSid")
+
+    # Optional: Verify Twilio signature if TWILIO_AUTH_TOKEN is set
+    if _TWILIO_AUTH_TOKEN:
+        signature = request.headers.get("X-Twilio-Signature", "")
+        # Twilio signature validates against the full original URL
+        url = str(request.url)
+        if not _validate_twilio_signature(_TWILIO_AUTH_TOKEN, signature, url, params):
+            logger.warning("twilio_voice_signature_invalid", tenant_id=tenant_id)
+            raise HTTPException(status_code=403, detail="Invalid signature")
+
+    logger.info("twilio_voice_call_received", call_sid=call_sid, tenant_id=tenant_id)
+
+    # Generate a short-lived JWT so the voice-pipeline will accept the WebSocket
+    import datetime
+    from jose import jwt as jose_jwt
+    from app.core.config import settings
+
+    token_payload = {
+        "type": "access",
+        "tenant_id": tenant_id,
+        "sub": f"twilio_{call_sid}",
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    }
+    jwt_token = jose_jwt.encode(
+        token_payload,
+        settings.SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM
+    )
+
+    # The external host/port Twilio reached us on (often via ngrok or ingress)
+    # We instruct Twilio to connect back to that same host on the /ws/voice route
+    host_header = request.headers.get("Host") or request.url.hostname
+    protocol = "wss" if ("https" in str(request.url.scheme) or request.headers.get("X-Forwarded-Proto") == "https") else "ws"
+    
+    ws_url = f"{protocol}://{host_header}/ws/voice/{tenant_id}/{call_sid}?token={jwt_token}"
+
+    # Generate TwiML
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{ws_url}">
+      <Parameter name="agentId" value="{agent_id}" />
+      <Parameter name="channel" value="twilio" />
+    </Stream>
+  </Connect>
+</Response>"""
+
+    return Response(content=twiml, media_type="text/xml")
+
 # ---------------------------------------------------------------------------
-# Twilio SMS
+# Slack
 # ---------------------------------------------------------------------------
 
 def _validate_twilio_signature(
@@ -207,8 +263,8 @@ def _validate_twilio_signature(
         return hmac.compare_digest(signature, expected)
 
 
-@router.post("/sms/webhook")
-async def sms_inbound(request: Request):
+@router.post("/{tenant_id}/{agent_id}/sms/webhook")
+async def sms_inbound(tenant_id: str, agent_id: str, request: Request):
     """Handle inbound SMS from Twilio. Returns TwiML."""
     form_data = await request.form()
     params = dict(form_data)
@@ -218,7 +274,7 @@ async def sms_inbound(request: Request):
         sig = request.headers.get("X-Twilio-Signature", "")
         url = str(request.url)
         if not _validate_twilio_signature(_TWILIO_AUTH_TOKEN, sig, url, params):
-            logger.warning("twilio_signature_invalid")
+            logger.warning("twilio_signature_invalid", tenant_id=tenant_id)
             raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     msg_sid = params.get("MessageSid", "")
@@ -237,22 +293,17 @@ async def sms_inbound(request: Request):
             media_type="application/xml",
         )
 
-    logger.info("sms_message_received", from_number=from_number, body_length=len(body))
+    logger.info("sms_message_received", from_number=from_number, body_length=len(body), tenant_id=tenant_id)
 
-    tenant_id = request.headers.get("X-Tenant-ID", "")
-    agent_id = request.headers.get("X-Agent-ID", "")
-
-    response_text = ""
-    if tenant_id and agent_id:
-        session_id = f"sms_{from_number}"
-        response_text = await _forward_to_orchestrator(
-            agent_id=agent_id,
-            session_id=session_id,
-            message=body,
-            customer_identifier=from_number,
-            channel="sms",
-            tenant_id=tenant_id,
-        ) or "Sorry, I'm unable to process your request right now."
+    session_id = f"sms_{from_number}"
+    response_text = await _forward_to_orchestrator(
+        agent_id=agent_id,
+        session_id=session_id,
+        message=body,
+        customer_identifier=from_number,
+        channel="sms",
+        tenant_id=tenant_id,
+    ) or "Sorry, I'm unable to process your request right now."
 
     # Return TwiML response
     escaped = response_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -288,8 +339,8 @@ def _verify_slack_signature(signing_secret: str, body: bytes, headers: dict) -> 
     return hmac.compare_digest(slack_sig, computed)
 
 
-@router.post("/slack/events")
-async def slack_events(request: Request):
+@router.post("/{tenant_id}/{agent_id}/slack/events")
+async def slack_events(tenant_id: str, agent_id: str, request: Request):
     """Handle Slack Events API callbacks (app_mention, message.im)."""
     body_bytes = await request.body()
 
@@ -299,7 +350,7 @@ async def slack_events(request: Request):
             body_bytes,
             dict(request.headers),
         ):
-            logger.warning("slack_signature_invalid")
+            logger.warning("slack_signature_invalid", tenant_id=tenant_id)
             raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
     try:
@@ -337,39 +388,35 @@ async def slack_events(request: Request):
     if not text or not user_id:
         return {"status": "ignored"}
 
-    logger.info("slack_message_received", user_id=user_id, channel_id=channel_id)
+    logger.info("slack_message_received", user_id=user_id, channel_id=channel_id, tenant_id=tenant_id)
 
-    tenant_id = request.headers.get("X-Tenant-ID", "")
-    agent_id = request.headers.get("X-Agent-ID", "")
+    session_id = f"slack_{user_id}_{channel_id}"
+    response_text = await _forward_to_orchestrator(
+        agent_id=agent_id,
+        session_id=session_id,
+        message=text,
+        customer_identifier=user_id,
+        channel="slack",
+        tenant_id=tenant_id,
+    ) or ""
 
-    if tenant_id and agent_id:
-        session_id = f"slack_{user_id}_{channel_id}"
-        response_text = await _forward_to_orchestrator(
-            agent_id=agent_id,
-            session_id=session_id,
-            message=text,
-            customer_identifier=user_id,
-            channel="slack",
-            tenant_id=tenant_id,
-        ) or ""
-
-        # Post response back to Slack
-        if response_text:
-            slack_token = os.getenv("SLACK_BOT_TOKEN", "")
-            if slack_token:
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        await client.post(
-                            "https://slack.com/api/chat.postMessage",
-                            headers={"Authorization": f"Bearer {slack_token}"},
-                            json={
-                                "channel": channel_id,
-                                "text": response_text,
-                                "thread_ts": event.get("thread_ts") or event.get("ts"),
-                            },
-                        )
-                except Exception as exc:
-                    logger.error("slack_reply_error", error=str(exc))
+    # Post response back to Slack
+    if response_text:
+        slack_token = os.getenv("SLACK_BOT_TOKEN", "")
+        if slack_token:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(
+                        "https://slack.com/api/chat.postMessage",
+                        headers={"Authorization": f"Bearer {slack_token}"},
+                        json={
+                            "channel": channel_id,
+                            "text": response_text,
+                            "thread_ts": event.get("thread_ts") or event.get("ts"),
+                        },
+                    )
+            except Exception as exc:
+                logger.error("slack_reply_error", error=str(exc))
 
     return {"status": "ok"}
 
@@ -378,8 +425,8 @@ async def slack_events(request: Request):
 # Email (SendGrid Inbound Parse)
 # ---------------------------------------------------------------------------
 
-@router.post("/email/inbound")
-async def email_inbound(request: Request):
+@router.post("/{tenant_id}/{agent_id}/email/inbound")
+async def email_inbound(tenant_id: str, agent_id: str, request: Request):
     """Handle inbound email via SendGrid Inbound Parse webhook."""
     form_data = await request.form()
 
@@ -403,20 +450,16 @@ async def email_inbound(request: Request):
     if mid_match and _dedup(mid_match.group(1)):
         return {"status": "duplicate"}
 
-    logger.info("email_message_received", from_email=customer_email, subject=subject[:50])
+    logger.info("email_message_received", from_email=customer_email, subject=subject[:50], tenant_id=tenant_id)
 
-    tenant_id = request.headers.get("X-Tenant-ID", "")
-    agent_id = request.headers.get("X-Agent-ID", "")
-
-    if tenant_id and agent_id:
-        session_id = f"email_{customer_email.replace('@', '_at_')}"
-        await _forward_to_orchestrator(
-            agent_id=agent_id,
-            session_id=session_id,
-            message=message[:4000],  # Limit to avoid oversized payloads
-            customer_identifier=customer_email,
-            channel="email",
-            tenant_id=tenant_id,
-        )
+    session_id = f"email_{customer_email.replace('@', '_at_')}"
+    await _forward_to_orchestrator(
+        agent_id=agent_id,
+        session_id=session_id,
+        message=message[:4000],  # Limit to avoid oversized payloads
+        customer_identifier=customer_email,
+        channel="email",
+        tenant_id=tenant_id,
+    )
 
     return {"status": "ok"}

@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db
 from app.models.agent import Agent
 from app.models.prompt import PromptABTest, PromptVersion
 from app.services.prompt_manager import PromptManager
@@ -82,7 +83,7 @@ async def list_prompt_versions(
     agent_id: str,
     request: Request,
     environment: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
     await _verify_agent(agent_id, tenant_id, db)
@@ -104,7 +105,7 @@ async def create_prompt_version(
     agent_id: str,
     body: PromptVersionCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Create a new immutable prompt version (inactive by default)."""
     tenant_id = _tenant_id(request)
@@ -133,7 +134,7 @@ async def get_prompt_version(
     agent_id: str,
     version_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
     await _verify_agent(agent_id, tenant_id, db)
@@ -155,7 +156,7 @@ async def activate_prompt_version(
     agent_id: str,
     version_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Activate a prompt version (deactivates any current active version)."""
     tenant_id = _tenant_id(request)
@@ -182,7 +183,7 @@ async def rollback_prompt_version(
     agent_id: str,
     version_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Rollback to a previous prompt version (semantically identical to activate)."""
     return await activate_prompt_version(
@@ -199,7 +200,7 @@ async def get_prompt_diff(
     version_id: str,
     request: Request,
     compare_to: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """
     Return a unified diff between this version and another.
@@ -232,7 +233,7 @@ async def get_prompt_diff(
 async def list_ab_tests(
     agent_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
     await _verify_agent(agent_id, tenant_id, db)
@@ -251,7 +252,7 @@ async def create_ab_test(
     agent_id: str,
     body: ABTestCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
     agent = await _verify_agent(agent_id, tenant_id, db)
@@ -277,7 +278,7 @@ async def update_ab_test(
     test_id: str,
     body: ABTestUpdate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
     await _verify_agent(agent_id, tenant_id, db)

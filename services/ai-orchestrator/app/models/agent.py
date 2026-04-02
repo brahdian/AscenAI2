@@ -1,12 +1,18 @@
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 from sqlalchemy import (
     String, Boolean, Text, Integer, Float, Date,
     DateTime, ForeignKey, func, Index
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.models.tool import AgentTool
+    from app.models.variable import AgentVariable
 
 from app.core.database import Base
 
@@ -32,9 +38,12 @@ class Agent(Base):
     voice_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     voice_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     language: Mapped[str] = mapped_column(String(10), default="en")
+    auto_detect_language: Mapped[bool] = mapped_column(Boolean, default=False)
+    supported_languages: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
     # Greeting sent at the start of every new session (text + optional pre-recorded audio)
     greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     voice_greeting_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    voice_system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tools: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
     knowledge_base_ids: Mapped[Optional[dict]] = mapped_column(
         JSONB, nullable=True, default=list
@@ -64,6 +73,12 @@ class Agent(Base):
     documents: Mapped[list["AgentDocument"]] = relationship(
         "AgentDocument", back_populates="agent", cascade="all, delete-orphan"
     )
+    tools_rel: Mapped[list["AgentTool"]] = relationship(
+        "AgentTool", back_populates="agent", cascade="all, delete-orphan"
+    )
+    variables: Mapped[list["AgentVariable"]] = relationship(
+        "AgentVariable", back_populates="agent", cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -77,8 +92,11 @@ class Agent(Base):
             "voice_enabled": self.voice_enabled,
             "voice_id": self.voice_id,
             "language": self.language,
+            "auto_detect_language": self.auto_detect_language,
+            "supported_languages": self.supported_languages or [],
             "greeting_message": self.greeting_message,
             "voice_greeting_url": self.voice_greeting_url,
+            "voice_system_prompt": self.voice_system_prompt,
             "tools": self.tools or [],
             "knowledge_base_ids": self.knowledge_base_ids or [],
             "llm_config": self.llm_config or {},
@@ -96,6 +114,7 @@ class Session(Base):
         Index("ix_sessions_agent_id", "agent_id"),
         Index("ix_sessions_customer", "tenant_id", "customer_identifier"),
         Index("ix_sessions_status", "tenant_id", "status"),
+        Index("ix_sessions_last_activity", "last_activity_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -113,14 +132,46 @@ class Session(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    turn_count: Mapped[int] = mapped_column(Integer, default=0)
 
     agent: Mapped["Agent"] = relationship("Agent", back_populates="sessions")
     messages: Mapped[list["Message"]] = relationship(
         "Message", back_populates="session", order_by="Message.created_at"
     )
+
+    def is_expired(self, expiry_minutes: int = 30) -> bool:
+        """Check if the session has expired due to inactivity."""
+        if self.status in ("closed", "ended", "escalated"):
+            return True
+        ref_time = self.last_activity_at or self.updated_at or self.started_at
+        if ref_time is None:
+            return False
+        if ref_time.tzinfo is None:
+            ref_time = ref_time.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - ref_time > timedelta(minutes=expiry_minutes)
+
+    def touch(self) -> None:
+        """Update last_activity_at to now, extending the session expiry."""
+        self.last_activity_at = datetime.now(timezone.utc)
+
+    def close(self) -> None:
+        """Mark the session as closed."""
+        self.status = "closed"
+        self.ended_at = datetime.now(timezone.utc)
+
+    def minutes_until_expiry(self, expiry_minutes: int = 30) -> float:
+        """Return minutes remaining before session expires."""
+        ref_time = self.last_activity_at or self.updated_at or self.started_at
+        if ref_time is None:
+            return float(expiry_minutes)
+        if ref_time.tzinfo is None:
+            ref_time = ref_time.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - ref_time).total_seconds() / 60.0
+        return max(0.0, expiry_minutes - elapsed)
 
     def to_dict(self) -> dict:
         return {
@@ -133,6 +184,7 @@ class Session(Base):
             "metadata": self.metadata_ or {},
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "last_activity_at": self.last_activity_at.isoformat() if self.last_activity_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
@@ -160,6 +212,8 @@ class Message(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     is_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
     guardrail_triggered: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    playbook_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    sources: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -177,6 +231,8 @@ class Message(Base):
             "tool_results": self.tool_results,
             "tokens_used": self.tokens_used,
             "latency_ms": self.latency_ms,
+            "playbook_name": self.playbook_name,
+            "sources": self.sources,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -318,8 +374,9 @@ class AgentPlaybook(Base):
     intent_triggers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Greeting: sent as the first assistant message in a new session
-    greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # NOTE: greeting_message has been moved to Agent level (Agent.greeting_message
+    # + Agent.voice_greeting_url). This field is retained in DB for backward
+    # compatibility but is no longer read by the orchestrator.
 
     # Detailed operator instructions injected into the system prompt
     instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -338,6 +395,13 @@ class AgentPlaybook(Base):
     out_of_scope_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     fallback_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     custom_escalation_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Expected inputs to this playbook and data it outputs (for explicit variable passing)
+    input_schema: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    output_schema: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Playbook-specific tools injected ONLY when this playbook is active (List[str] names)
+    tools: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -359,7 +423,7 @@ class AgentPlaybook(Base):
             "description": self.description,
             "intent_triggers": self.intent_triggers or [],
             "is_default": self.is_default,
-            "greeting_message": self.greeting_message,
+
             "instructions": self.instructions,
             "tone": self.tone,
             "dos": self.dos or [],
@@ -368,6 +432,8 @@ class AgentPlaybook(Base):
             "out_of_scope_response": self.out_of_scope_response,
             "fallback_response": self.fallback_response,
             "custom_escalation_message": self.custom_escalation_message,
+            "input_schema": self.input_schema,
+            "output_schema": self.output_schema,
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -386,15 +452,21 @@ class AgentDocument(Base):
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     file_type: Mapped[str] = mapped_column(String(50), nullable=False)  # pdf, txt, docx, md
     file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
-    storage_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(1000), nullable=True) # Now optional because it can be raw text
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True) # Direct raw text content
+
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(768), nullable=True)
     vector_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-    status: Mapped[str] = mapped_column(String(20), default="processing")  # processing | ready | failed
+    status: Mapped[str] = mapped_column(String(20), default="processing")  # draft | published | processing | ready | failed
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     agent: Mapped["Agent"] = relationship("Agent", back_populates="documents")
+    chunks: Mapped[list["AgentDocumentChunk"]] = relationship(
+        "AgentDocumentChunk", back_populates="document", cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -410,6 +482,22 @@ class AgentDocument(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class AgentDocumentChunk(Base):
+    __tablename__ = "agent_document_chunks"
+    __table_args__ = (
+        Index("ix_agent_doc_chunks_doc_id", "doc_id"),
+        Index("ix_agent_doc_chunks_tenant_id", "tenant_id"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    doc_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agent_documents.id", ondelete="CASCADE"), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    document: Mapped["AgentDocument"] = relationship("AgentDocument", back_populates="chunks")
 
 
 class PlaybookExecution(Base):
@@ -478,7 +566,7 @@ class AgentGuardrails(Base):
     # Output checks
     pii_redaction: Mapped[bool] = mapped_column(Boolean, default=False)
     # Reversible input pseudonymization — anonymize before LLM, restore in response
-    pii_pseudonymization: Mapped[bool] = mapped_column(Boolean, default=False)
+    pii_pseudonymization: Mapped[bool] = mapped_column(Boolean, default=True)
     max_response_length: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
     require_disclaimer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -528,60 +616,7 @@ class AgentGuardrails(Base):
         }
 
 
-class AgentFlow(Base):
-    """
-    Visual state-machine workflow (flow builder) attached to an agent.
-    steps stores the full PlaybookDefinition steps dict; ui_layout stores
-    {step_id: {x, y}} canvas coordinates so the frontend can render the DAG.
-    """
-    __tablename__ = "agent_flows"
-    __table_args__ = (
-        Index("ix_agent_flows_agent_id", "agent_id"),
-        Index("ix_agent_flows_tenant_id", "tenant_id"),
-        Index("ix_agent_flows_active", "agent_id", "is_active"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    agent_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
-    )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, default="Untitled Flow")
-    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    version: Mapped[int] = mapped_column(Integer, default=1)
-    # keywords that trigger this flow (JSONB list[str])
-    trigger_keywords: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-    initial_step_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    # full PlaybookDefinition steps — {step_id: {type, ...}}
-    steps: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    # visual positions — {step_id: {x: int, y: int}}
-    ui_layout: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    def to_dict(self) -> dict:
-        return {
-            "id": str(self.id),
-            "agent_id": str(self.agent_id),
-            "tenant_id": str(self.tenant_id),
-            "name": self.name,
-            "description": self.description,
-            "version": self.version,
-            "trigger_keywords": self.trigger_keywords or [],
-            "initial_step_id": self.initial_step_id,
-            "steps": self.steps or {},
-            "ui_layout": self.ui_layout or {},
-            "is_active": self.is_active,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+# AgentFlow has been deprecated in favor of intent-driven Playbooks.
 
 
 class EscalationAttempt(Base):

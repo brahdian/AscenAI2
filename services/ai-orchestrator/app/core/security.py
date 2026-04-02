@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import AsyncGenerator, Optional, Tuple
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 
 from app.core.config import settings
@@ -35,32 +36,66 @@ def decode_access_token(token: str) -> dict:
         ) from exc
 
 
+from fastapi import Request
+
 async def get_current_tenant(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> str:
-    if not credentials:
+    """
+    Extract tenant_id. 
+    Prioritizes JWT decoding if Bearer token is present.
+    Falls back to X-Tenant-ID header injected by API Gateway.
+    """
+    if credentials:
+        try:
+            payload = decode_access_token(credentials.credentials)
+            tenant_id = payload.get("tenant_id")
+            if tenant_id:
+                return tenant_id
+        except HTTPException:
+            pass # Fall back to header or let it fail below
+
+    tenant_id = request.headers.get("x-tenant-id")
+    if not tenant_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    payload = decode_access_token(credentials.credentials)
-    tenant_id: Optional[str] = payload.get("tenant_id")
-    if not tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing tenant_id claim",
-        )
     return tenant_id
 
 
 async def get_optional_tenant(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Optional[str]:
-    if not credentials:
-        return None
-    try:
-        payload = decode_access_token(credentials.credentials)
-        return payload.get("tenant_id")
-    except HTTPException:
-        return None
+    """Extract optional tenant_id from JWT or X-Tenant-ID header."""
+    if credentials:
+        try:
+            payload = decode_access_token(credentials.credentials)
+            return payload.get("tenant_id")
+        except HTTPException:
+            pass
+    return request.headers.get("x-tenant-id")
+
+
+async def get_tenant_db(
+    tenant_id: str = Depends(get_current_tenant),
+) -> AsyncGenerator[AsyncSession, None]:
+    """Composed dependency: authenticates the request AND yields a tenant-scoped DB session.
+
+    Usage in route handlers::
+
+        @router.get("")
+        async def list_agents(
+            db: AsyncSession = Depends(get_tenant_db),
+            tenant_id: str = Depends(get_current_tenant),
+        ): ...
+
+    The session has ``SET LOCAL app.current_tenant_id = <tenant_id>`` already
+    applied, so all Postgres RLS policies are automatically enforced.
+    """
+    from app.core.database import get_db  # local import to avoid circular deps
+    async for session in get_db(tenant_id=tenant_id):
+        yield session

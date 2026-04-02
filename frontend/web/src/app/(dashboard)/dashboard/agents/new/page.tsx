@@ -2,75 +2,129 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { useForm } from 'react-hook-form'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { z } from 'zod'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi, guardrailsApi } from '@/lib/api'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { agentsApi, templatesApi, billingApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
-import { ArrowLeft, ChevronDown, ChevronUp, Shield } from 'lucide-react'
+import { ArrowLeft, ArrowRight, Bot, Check, Sparkles, Building2, Stethoscope, Scissors } from 'lucide-react'
 
-const schema = z.object({
-  name: z.string().min(1, 'Name required'),
-  description: z.string().optional(),
-  business_type: z.enum(['pizza_shop', 'clinic', 'salon', 'generic']),
-  language: z.string().default('en'),
-  voice_enabled: z.boolean().default(true),
-  system_prompt: z.string().optional(),
-  personality: z.string().optional(),
-})
-
-type FormData = z.infer<typeof schema>
+// Map known icons
+const CATEGORY_ICONS: Record<string, any> = {
+  general: Bot,
+  retail: Building2,
+  medical: Stethoscope,
+  beauty: Scissors,
+}
 
 export default function NewAgentPage() {
   const router = useRouter()
   const qc = useQueryClient()
-  const [showGuardrails, setShowGuardrails] = useState(false)
-  const [blockedKeywords, setBlockedKeywords] = useState('')
-  const [profanityFilter, setProfanityFilter] = useState(true)
-  const [piiRedaction, setPiiRedaction] = useState(false)
-  const [contentFilterLevel, setContentFilterLevel] = useState('medium')
+  
+  const [selectedTemplate, setSelectedTemplate] = useState<any | null>(null)
+  const [step, setStep] = useState<number>(1)
+  
+  // Form State
+  const [agentName, setAgentName] = useState('')
+  const [description, setDescription] = useState('')
+  const [language, setLanguage] = useState('en')
+  const [voiceEnabled, setVoiceEnabled] = useState(true)
+  const [variables, setVariables] = useState<Record<string, any>>({})
 
-  const {
-    register,
-    handleSubmit,
-    formState: { errors },
-  } = useForm<FormData>({
-    resolver: zodResolver(schema),
-    defaultValues: { business_type: 'generic', language: 'en', voice_enabled: true },
+  // Fetch Templates
+  const { data: templates = [], isLoading: loadingTemplates } = useQuery({
+    queryKey: ['templates'],
+    queryFn: templatesApi.list,
   })
 
-  const mutation = useMutation({
-    mutationFn: async (data: FormData) => {
-      const agent = await agentsApi.create(data)
-      // Create default guardrails if any were configured
-      const keywords = blockedKeywords.split(',').map((k) => k.trim()).filter(Boolean)
-      if (keywords.length > 0 || profanityFilter || piiRedaction || contentFilterLevel !== 'medium') {
+  // Fetch current agents and billing to check slots
+  const { data: agents = [], isLoading: loadingAgents } = useQuery({
+    queryKey: ['agents'],
+    queryFn: agentsApi.list,
+  })
+
+  const { data: billing, isLoading: loadingBilling } = useQuery({
+    queryKey: ['billing-overview'],
+    queryFn: billingApi.overview,
+  })
+
+  const purchasedSlots = billing?.agent_count || 0
+  const actualAgentCount = agents.length
+  const hasAvailableSlot = actualAgentCount < purchasedSlots
+
+  // Mutations
+  const purchaseSlotMutation = useMutation({
+    mutationFn: () => billingApi.createAgentSlotSession(),
+    onSuccess: (data) => {
+      if (data.checkout_url) window.location.href = data.checkout_url
+    },
+    onError: () => toast.error('Failed to initiate purchase'),
+  })
+
+  const createMutation = useMutation({
+    mutationFn: async () => {
+      // 1. Create Base Agent
+      const agent = await agentsApi.create({
+        name: agentName,
+        description,
+        business_type: selectedTemplate?.category || 'generic',
+        language,
+        voice_enabled: voiceEnabled,
+      })
+
+      // 2. Instantiate Template if selected
+      if (selectedTemplate && selectedTemplate.versions?.length > 0) {
+        // Use the latest version
+        const latestVersion = selectedTemplate.versions[selectedTemplate.versions.length - 1];
         try {
-          await guardrailsApi.upsert(agent.id, {
-            blocked_keywords: keywords,
-            profanity_filter: profanityFilter,
-            pii_redaction: piiRedaction,
-            content_filter_level: contentFilterLevel,
+          await templatesApi.instantiate(selectedTemplate.id, {
+            agent_id: agent.id,
+            template_version_id: latestVersion.id,
+            variable_values: variables,
+            tool_configs: {}, // Default tool configs
           })
-        } catch {
-          toast.error('Agent created but guardrails failed — configure them on the Guardrails page.')
+        } catch (err) {
+          // Rollback: delete the agent if template instantiation fails
+          console.error('Template instantiation failed, rolling back agent:', err);
+          await agentsApi.delete(agent.id);
+          throw err;
         }
       }
+
       return agent
     },
     onSuccess: (agent) => {
       qc.invalidateQueries({ queryKey: ['agents'] })
-      toast.success('Agent created! Configure your playbooks and settings.')
+      toast.success('Agent created successfully!')
       router.push(`/dashboard/agents/${agent.id}`)
     },
     onError: (err: any) =>
       toast.error(err?.response?.data?.detail || 'Failed to create agent'),
   })
 
+  // Handlers
+  const handleNext = () => setStep(2)
+  const handleBack = () => setStep(1)
+  
+  const handleVariableChange = (key: string, value: any) => {
+    setVariables(prev => ({ ...prev, [key]: value }))
+  }
+
+  // Render Skeleton
+  if (loadingTemplates || loadingAgents || loadingBilling) {
+    return (
+      <div className="p-8 max-w-5xl mx-auto space-y-6 animate-pulse">
+        <div className="h-8 w-48 bg-gray-200 dark:bg-gray-800 rounded"></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {[1,2,3,4,5,6].map(i => (
+            <div key={i} className="h-64 bg-gray-100 dark:bg-gray-800 rounded-xl"></div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className="p-8 max-w-2xl mx-auto">
+    <div className="p-8 max-w-5xl mx-auto">
       <Link
         href="/dashboard/agents"
         className="inline-flex items-center gap-2 text-sm text-gray-500 hover:text-gray-900 dark:hover:text-white mb-6 transition-colors"
@@ -78,174 +132,212 @@ export default function NewAgentPage() {
         <ArrowLeft size={16} /> Back to agents
       </Link>
 
-      <h1 className="text-2xl font-bold text-gray-900 dark:text-white mb-6">
-        Create new agent
-      </h1>
+      {/* Header */}
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
+          <Sparkles className="text-violet-500" size={28} />
+          {step === 1 ? 'Choose a Template' : 'Configure Agent'}
+        </h1>
+        <p className="text-gray-500 mt-2">
+          {step === 1 
+            ? 'Select a prebuilt template to instantly deploy an agent with optimized workflows.' 
+            : `Set up your ${selectedTemplate?.name || 'custom'} agent below.`}
+        </p>
+      </div>
 
-      <form
-        onSubmit={handleSubmit((d) => mutation.mutate(d))}
-        className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 space-y-5"
-      >
-        <div>
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-            Agent name *
-          </label>
-          <input
-            {...register('name')}
-            placeholder="e.g. Pizza Ordering Bot"
-            className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
-          />
-          {errors.name && <p className="text-red-500 text-xs mt-1">{errors.name.message}</p>}
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-            Description
-          </label>
-          <input
-            {...register('description')}
-            placeholder="Optional description"
-            className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
-          />
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-              Business type
-            </label>
-            <select
-              {...register('business_type')}
-              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
-            >
-              <option value="generic">Generic</option>
-              <option value="pizza_shop">Pizza / Restaurant</option>
-              <option value="clinic">Medical Clinic</option>
-              <option value="salon">Salon / Spa</option>
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-              Language
-            </label>
-            <select
-              {...register('language')}
-              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
-            >
-              <option value="en">English</option>
-              <option value="es">Spanish</option>
-              <option value="fr">French</option>
-              <option value="de">German</option>
-              <option value="pt">Portuguese</option>
-            </select>
-          </div>
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-            System prompt
-          </label>
-          <textarea
-            {...register('system_prompt')}
-            rows={4}
-            placeholder="You are a helpful assistant for {business_name}. You help customers with orders and questions..."
-            className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
-          />
-        </div>
-
-        <div className="flex items-center gap-3">
-          <input
-            {...register('voice_enabled')}
-            type="checkbox"
-            id="voice_enabled"
-            className="w-4 h-4 accent-violet-600"
-          />
-          <label htmlFor="voice_enabled" className="text-sm text-gray-700 dark:text-gray-300">
-            Enable voice (STT/TTS)
-          </label>
-        </div>
-
-        {/* Guardrails section */}
-        <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setShowGuardrails(!showGuardrails)}
-            className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 dark:bg-gray-800 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+      {step === 1 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {/* Custom Agent Card */}
+          <div 
+            onClick={() => {
+              setSelectedTemplate(null);
+              setStep(2);
+            }}
+            className="group cursor-pointer relative flex flex-col justify-between p-6 bg-white dark:bg-gray-900 rounded-2xl border-2 border-dashed border-gray-300 dark:border-gray-700 hover:border-violet-500 dark:hover:border-violet-500 transition-colors h-full"
           >
-            <span className="flex items-center gap-2">
-              <Shield size={15} className="text-orange-500" /> Guardrails (optional)
-            </span>
-            {showGuardrails ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-          </button>
-          {showGuardrails && (
-            <div className="p-4 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-                  Blocked keywords
-                  <span className="text-gray-400 font-normal ml-1">(comma-separated)</span>
-                </label>
-                <input
-                  value={blockedKeywords}
-                  onChange={(e) => setBlockedKeywords(e.target.value)}
-                  placeholder="e.g. competitor, refund, lawsuit"
-                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
-                />
+            <div>
+              <div className="w-12 h-12 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center mb-4 group-hover:bg-violet-100 dark:group-hover:bg-violet-900/30 transition-colors">
+                <Bot size={24} className="text-gray-500 dark:text-gray-400 group-hover:text-violet-600 dark:group-hover:text-violet-400" />
               </div>
+              <h3 className="text-lg font-bold text-gray-900 dark:text-white">Start from Scratch</h3>
+              <p className="text-sm text-gray-500 mt-2 leading-relaxed">
+                Build a new agent from the ground up. You will write the system prompt and define schemas manually.
+              </p>
+            </div>
+          </div>
+
+          {/* Template Cards */}
+          {templates.map((tpl: any) => {
+            const Icon = CATEGORY_ICONS[tpl.category] || Bot;
+            return (
+              <div 
+                key={tpl.id}
+                onClick={() => {
+                  setSelectedTemplate(tpl);
+                  
+                  // Initialize default variables
+                  const defaults: Record<string, any> = {};
+                  tpl.variables?.forEach((v: any) => {
+                    if (v.default_value?.value) {
+                      defaults[v.key] = v.default_value.value;
+                    }
+                  });
+                  setVariables(defaults);
+                  setAgentName(`My ${tpl.name}`);
+                  setStep(2);
+                }}
+                className="group cursor-pointer relative flex flex-col justify-between p-6 bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 hover:border-violet-500 hover:shadow-xl hover:shadow-violet-500/10 transition-all h-full"
+              >
+                <div>
+                  <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-500/10 to-blue-500/10 flex items-center justify-center mb-4">
+                    <Icon size={24} className="text-violet-600 dark:text-violet-400" />
+                  </div>
+                  <h3 className="text-lg font-bold text-gray-900 dark:text-white">{tpl.name}</h3>
+                  <p className="text-sm text-gray-500 mt-2 leading-relaxed line-clamp-3">
+                    {tpl.description}
+                  </p>
+                </div>
+                <div className="mt-4 flex items-center gap-2">
+                  <span className="text-xs font-semibold px-2.5 py-1 bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 rounded-full capitalize">
+                    {tpl.category}
+                  </span>
+                  <span className="text-xs font-semibold px-2.5 py-1 bg-violet-50 dark:bg-violet-900/20 text-violet-600 dark:text-violet-400 rounded-full">
+                    {tpl.versions?.[0]?.playbooks?.length || 0} Playbooks
+                  </span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {step === 2 && !hasAvailableSlot && (
+        <div className="mb-6 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl flex items-start gap-3">
+          <Sparkles className="text-amber-600 mt-0.5" size={18} />
+          <div>
+            <h4 className="text-sm font-bold text-amber-900 dark:text-amber-100">Slot Limit Reached</h4>
+            <p className="text-xs text-amber-700 dark:text-amber-300 mt-1">
+              You've used all your {purchasedSlots} purchased agent slots. 
+              To deploy this new agent, you'll need to purchase an additional slot ($99/mo).
+            </p>
+          </div>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div className="max-w-2xl bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm overflow-hidden">
+          <div className="p-6 border-b border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/20">
+            <h2 className="font-semibold text-gray-900 dark:text-white">Basic Settings</h2>
+          </div>
+          <div className="p-6 space-y-6">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                Agent Name *
+              </label>
+              <input
+                value={agentName}
+                onChange={(e) => setAgentName(e.target.value)}
+                placeholder="e.g. Sales Bot"
+                className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+              />
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-                  Content filter level
+                  Language
                 </label>
                 <select
-                  value={contentFilterLevel}
-                  onChange={(e) => setContentFilterLevel(e.target.value)}
-                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value)}
+                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
                 >
-                  <option value="none">None</option>
-                  <option value="low">Low</option>
-                  <option value="medium">Medium (recommended)</option>
-                  <option value="strict">Strict</option>
+                  <option value="en">English</option>
+                  <option value="es">Spanish</option>
+                  <option value="fr">French</option>
                 </select>
               </div>
-              <div className="flex items-center gap-6">
-                <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+              <div className="flex items-end">
+                <label className="flex items-center gap-3 h-[42px] cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={profanityFilter}
-                    onChange={(e) => setProfanityFilter(e.target.checked)}
-                    className="w-4 h-4 accent-violet-600"
+                    checked={voiceEnabled}
+                    onChange={(e) => setVoiceEnabled(e.target.checked)}
+                    className="w-5 h-5 accent-violet-600 rounded"
                   />
-                  Profanity filter
-                </label>
-                <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={piiRedaction}
-                    onChange={(e) => setPiiRedaction(e.target.checked)}
-                    className="w-4 h-4 accent-violet-600"
-                  />
-                  PII redaction
+                  <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    Enable Voice Integration
+                  </span>
                 </label>
               </div>
             </div>
-          )}
-        </div>
+          </div>
 
-        <div className="flex gap-3 pt-2">
-          <button
-            type="submit"
-            disabled={mutation.isPending}
-            className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
-          >
-            {mutation.isPending ? 'Creating…' : 'Create agent'}
-          </button>
-          <Link
-            href="/dashboard/agents"
-            className="px-5 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
-          >
-            Cancel
-          </Link>
+          {selectedTemplate && selectedTemplate.variables?.length > 0 && (
+            <>
+              <div className="p-6 border-y border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/20">
+                <h2 className="font-semibold text-gray-900 dark:text-white">Template Configuration</h2>
+                <p className="text-sm text-gray-500 mt-1">Configure specific settings for this template. You can always edit these later.</p>
+              </div>
+              <div className="p-6 space-y-6">
+                {selectedTemplate.variables.map((vari: any) => (
+                  <div key={vari.id}>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5 flex items-center justify-between">
+                      <span>{vari.label} {vari.is_required && '*'}</span>
+                      <span className="text-xs text-gray-400 font-mono bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{vari.key}</span>
+                    </label>
+                    
+                    {vari.type === 'textarea' || vari.type === 'list' ? (
+                      <textarea
+                        value={variables[vari.key] || ''}
+                        onChange={(e) => handleVariableChange(vari.key, e.target.value)}
+                        className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 min-h-[100px]"
+                        placeholder={`Enter ${vari.label.toLowerCase()}`}
+                      />
+                    ) : (
+                      <input
+                        type={vari.type === 'number' ? 'number' : 'text'}
+                        value={variables[vari.key] || ''}
+                        onChange={(e) => handleVariableChange(vari.key, e.target.value)}
+                        className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500"
+                        placeholder={`Enter ${vari.label.toLowerCase()}`}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {/* Footer Controls */}
+          <div className="p-6 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/20 flex gap-3">
+            <button
+              onClick={handleBack}
+              className="px-5 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-800 transition-colors"
+            >
+              Back
+            </button>
+            <button
+              onClick={() => hasAvailableSlot ? createMutation.mutate() : purchaseSlotMutation.mutate()}
+              disabled={createMutation.isPending || purchaseSlotMutation.isPending || (hasAvailableSlot && !agentName)}
+              className={`flex-1 px-5 py-2.5 rounded-lg text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 transition-opacity flex items-center justify-center gap-2 ${
+                hasAvailableSlot 
+                  ? 'bg-gradient-to-r from-violet-600 to-blue-600' 
+                  : 'bg-gradient-to-r from-amber-500 to-orange-600'
+              }`}
+            >
+              {createMutation.isPending 
+                ? 'Deploying Agent...' 
+                : purchaseSlotMutation.isPending 
+                  ? 'Redirecting to Stripe...' 
+                  : hasAvailableSlot 
+                    ? 'Create & Deploy' 
+                    : `Purchase New Agent Slot ($99/mo)`}
+              {!createMutation.isPending && !purchaseSlotMutation.isPending && <ArrowRight size={16} />}
+            </button>
+          </div>
         </div>
-      </form>
+      )}
     </div>
   )
 }

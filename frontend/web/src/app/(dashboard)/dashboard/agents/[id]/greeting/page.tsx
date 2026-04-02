@@ -57,7 +57,10 @@ export default function GreetingPage() {
 
   // Form state
   const [language, setLanguage] = useState('en')
+  const [autoDetectLanguage, setAutoDetectLanguage] = useState(false)
+  const [supportedLanguages, setSupportedLanguages] = useState<string[]>([])
   const [greetingText, setGreetingText] = useState('')
+  const [voiceSystemPrompt, setVoiceSystemPrompt] = useState('')
 
   // Voice recording state
   const [recordingState, setRecordingState] = useState<RecordingState>('idle')
@@ -82,7 +85,10 @@ export default function GreetingPage() {
   useEffect(() => {
     if (agent) {
       setLanguage(agent.language || 'en')
+      setAutoDetectLanguage(agent.auto_detect_language || false)
+      setSupportedLanguages(agent.supported_languages || [])
       setGreetingText(agent.greeting_message || '')
+      setVoiceSystemPrompt(agent.voice_system_prompt || '')
       if (agent.voice_greeting_url) {
         setAudioUrl(agent.voice_greeting_url)
         setRecordingState('recorded')
@@ -210,7 +216,10 @@ export default function GreetingPage() {
     try {
       await agentsApi.update(id, {
         language,
+        auto_detect_language: autoDetectLanguage,
+        supported_languages: supportedLanguages,
         greeting_message: greetingText || null,
+        voice_system_prompt: voiceSystemPrompt || null,
       })
       qc.invalidateQueries({ queryKey: ['agent', id] })
       toast.success('Greeting settings saved.')
@@ -245,15 +254,9 @@ export default function GreetingPage() {
   const hasPendingUpload = !!audioBlob
 
   return (
-    <div className="p-8 max-w-2xl mx-auto space-y-6">
+    <div className="p-8 w-full space-y-6">
       {/* Header */}
       <div className="flex items-center gap-3">
-        <Link
-          href={`/dashboard/agents/${id}`}
-          className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
-        >
-          <ArrowLeft size={20} className="text-gray-600 dark:text-gray-400" />
-        </Link>
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
             Greeting &amp; Language
@@ -278,7 +281,7 @@ export default function GreetingPage() {
           <h2 className="text-base font-semibold text-gray-900 dark:text-white">Language</h2>
         </div>
         <p className="text-sm text-gray-500">
-          Sets the language for STT recognition and TTS voice synthesis.
+          Sets the default language for STT recognition and TTS voice synthesis.
         </p>
         <select
           value={language}
@@ -291,6 +294,47 @@ export default function GreetingPage() {
             </option>
           ))}
         </select>
+
+        <div className="pt-4 border-t border-gray-100 dark:border-gray-800">
+          <label className="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={autoDetectLanguage}
+              onChange={(e) => setAutoDetectLanguage(e.target.checked)}
+              className="w-4 h-4 text-violet-600 rounded focus:ring-violet-500 border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700"
+            />
+            <span className="text-sm font-medium text-gray-900 dark:text-white">Enable Auto-Detect Language</span>
+          </label>
+          <p className="text-xs text-gray-500 mt-1 ml-7">
+            Automatically detect the user's language based on browser/session headers or initial user message.
+          </p>
+        </div>
+
+        {autoDetectLanguage && (
+          <div className="pl-7 space-y-2">
+            <label className="text-sm font-medium text-gray-700 dark:text-gray-300">Supported Languages</label>
+            <p className="text-xs text-gray-500 mb-2">Select the languages your agent is allowed to speak.</p>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-48 overflow-y-auto p-2 bg-gray-50 dark:bg-gray-800 rounded border border-gray-200 dark:border-gray-700">
+              {LANGUAGES.map((l) => (
+                <label key={l.code} className="flex items-center gap-2 cursor-pointer text-sm">
+                  <input
+                    type="checkbox"
+                    checked={supportedLanguages.includes(l.code)}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setSupportedLanguages([...supportedLanguages, l.code])
+                      } else {
+                        setSupportedLanguages(supportedLanguages.filter((code) => code !== l.code))
+                      }
+                    }}
+                    className="w-3.5 h-3.5 text-violet-600 rounded focus:ring-violet-500 border-gray-300 dark:border-gray-600"
+                  />
+                  <span className="truncate text-gray-700 dark:text-gray-300">{l.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Text greeting */}
@@ -319,8 +363,52 @@ export default function GreetingPage() {
           className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
         >
           <Save size={14} />
-          {isSaving ? 'Saving…' : 'Save Language & Text Greeting'}
+          {isSaving ? 'Saving…' : 'Save Greeting Settings'}
         </button>
+      </div>
+
+      {/* Voice Protocol (System Prompt Extension) */}
+      <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 space-y-4">
+        <div className="flex items-center gap-2 mb-1">
+          <Mic size={18} className="text-violet-600 dark:text-violet-400" />
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white">Voice Protocol</h2>
+        </div>
+        <p className="text-sm text-gray-500">
+          Advanced instructions for how the agent handles voice-specific logic, like language switching and IVR behavior.
+        </p>
+        <div className="relative">
+          <textarea
+            value={voiceSystemPrompt}
+            onChange={(e) => setVoiceSystemPrompt(e.target.value)}
+            rows={8}
+            placeholder="Enter voice-specific system instructions..."
+            className="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-violet-500 focus:border-transparent font-mono"
+          />
+          {!voiceSystemPrompt && (
+            <button
+              onClick={() => setVoiceSystemPrompt(`## IVR & Multi-lingual Protocol
+- **MANDATORY OPENING**: If this is the start of a voice session, you MUST greet the user with:
+  "I'll be responding in English. Let me know if you'd prefer French or another language."
+- **French Support**: If the user asks for French or speaks French, switch your response language to French immediately.
+- **Chinese Support**: If the user speaks Chinese, you must respond in Chinese. You do not need to ask for confirmation.
+- **Language Meta-info**: When you switch languages or detect a new language, ensure your response remains helpful and in-scope.`)}
+              className="mt-2 text-xs text-violet-600 hover:underline flex items-center gap-1"
+            >
+              <Info size={12} />
+              Load Professional IVR Default
+            </button>
+          )}
+        </div>
+        <div className="flex justify-end">
+          <button
+            onClick={saveSettings}
+            disabled={isSaving}
+            className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            <Save size={14} />
+            {isSaving ? 'Saving…' : 'Save Voice Protocol'}
+          </button>
+        </div>
       </div>
 
       {/* Voice recording */}

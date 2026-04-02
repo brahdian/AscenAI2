@@ -47,7 +47,7 @@ export default function ApiKeysPage() {
     (agents as any[])?.find((a: any) => a.id === agentId)?.name ?? agentId
 
   return (
-    <div className="p-8 max-w-3xl mx-auto">
+    <div className="p-8 w-full">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">API Keys</h1>
         <p className="text-gray-500 dark:text-gray-400 mt-1">

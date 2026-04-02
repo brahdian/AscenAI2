@@ -98,6 +98,16 @@ played through a phone or speaker. Follow these voice rules at all times:
   knows when to speak. Silence after TTS playback confuses callers.
 """
 
+DEFAULT_VOICE_PROTOCOL = """\
+## IVR & Multi-lingual Protocol
+- **MANDATORY OPENING**: If this is the start of a voice session, you MUST greet the user with:
+  "Thank you for calling. I can assist you in English or French. To continue in English, please say anything in English. Pour le français, parlez français s'il vous plaît. 对于中文请说中文。For Spanish, please speak in Spanish."
+- **Language Detection**: When user speaks ANY language (French, Chinese, Spanish, German, etc.), respond in THAT language IMMEDIATELY. Do NOT ask for confirmation.
+- **No Confirmation Needed**: NEVER ask "Would you like me to switch to French?" or similar. Just respond naturally in the language the user is speaking.
+- **Auto-Respond**: If user says anything in French → respond in French. If in Chinese → respond in Chinese. No questions asked.
+- **Meta Information**: Always include detected language in response metadata.
+"""
+
 # ---------------------------------------------------------------------------
 # 2. Global Guardrails
 #    These rules are applied in code (orchestrator.py + proxy.py) and ALSO
@@ -383,14 +393,18 @@ def build_voice_system_prompt(
     allowed_topics: str = "our services",
     out_of_scope_response: str = "I can only help with topics related to our service.",
     tone_description: str = "Be warm, concise, and natural.",
+    voice_protocol: str = "",
 ) -> str:
     """
     Return the complete voice-first system prompt with agent-specific fields filled in.
     """
-    return VOICE_AGENT_SYSTEM_PROMPT.format(
+    prompt = VOICE_AGENT_SYSTEM_PROMPT.format(
         agent_name=agent_name,
         business_name=business_name,
         allowed_topics=allowed_topics,
         out_of_scope_response=out_of_scope_response,
         tone_description=tone_description,
     )
+    if voice_protocol:
+        prompt += f"\n\n{voice_protocol}"
+    return prompt

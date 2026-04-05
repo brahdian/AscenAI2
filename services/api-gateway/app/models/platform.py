@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, String, Boolean, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,6 +15,8 @@ class PlatformSetting(Base):
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[dict] = mapped_column(JSONB, nullable=False)
     description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_sensitive: Mapped[bool] = mapped_column(default=False)
+    is_public: Mapped[bool] = mapped_column(default=False)
     supported_languages: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list) # Optional metadata for languages
     
     updated_at: Mapped[datetime] = mapped_column(

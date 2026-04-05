@@ -142,6 +142,12 @@ export const authApi = {
   resendOTP: (data: { email: string }) =>
     api.post('/auth/resend-otp', data).then((r) => r.data),
 
+  forgotPassword: (data: { email: string }) =>
+    api.post('/auth/forgot-password', data).then((r) => r.data),
+
+  resetPassword: (data: { token: string; new_password: string }) =>
+    api.post('/auth/reset-password', data).then((r) => r.data),
+
   subscribe: (data: { email: string; plan: string }) =>
     api.post('/auth/subscribe', data).then((r) => r.data),
 }

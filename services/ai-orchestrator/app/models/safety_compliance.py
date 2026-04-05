@@ -5,10 +5,10 @@ This module adds production-ready safety, compliance, and quality assurance feat
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from sqlalchemy import (
-    String, Boolean, Text, Integer, ForeignKey, func, Index, DateTime, UniqueConstraint
+    String, Boolean, Text, Integer, ForeignKey, func, Index, DateTime, UniqueConstraint, Float, Date
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -225,7 +225,7 @@ class TemplateAnalytics(Base):
     template_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agent_templates.id"), nullable=False
     )
-    date: Mapped[datetime.date] = mapped_column(nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
     
     # Usage metrics
     total_instances: Mapped[int] = mapped_column(Integer, default=0)

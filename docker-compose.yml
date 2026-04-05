@@ -95,7 +95,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       MCP_SERVER_URL: http://mcp-server:8001
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       VOICE_PIPELINE_URL: http://voice-pipeline:8003
@@ -143,7 +143,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     depends_on:
       postgres:
@@ -180,7 +180,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       MCP_SERVER_URL: http://mcp-server:8001
       MCP_WS_URL: ws://mcp-server:8001
     depends_on:
@@ -219,7 +219,7 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       AI_ORCHESTRATOR_WS_URL: ws://ai-orchestrator:8002
     depends_on:

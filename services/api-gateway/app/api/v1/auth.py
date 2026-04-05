@@ -190,9 +190,28 @@ async def login(
     """Authenticate and return JWT tokens (+ set HttpOnly cookies)."""
     await _auth_rate_limit(http_request, "login", limit=10, window=60)  # 10/min per IP
     redis = getattr(http_request.app.state, "redis", None)
-    tokens = await auth_service.login(request, db, redis)
-    _set_auth_cookies(response, tokens, http_request)
-    return tokens
+    from app.services.audit_service import audit_log
+    try:
+        tokens = await auth_service.login(request, db, redis)
+        await audit_log(
+            db, "auth.login_success",
+            request=http_request,
+            actor_email=request.email.lower(),
+            category="auth",
+            details={"email": request.email.lower()},
+        )
+        _set_auth_cookies(response, tokens, http_request)
+        return tokens
+    except Exception:
+        await audit_log(
+            db, "auth.login_failed",
+            request=http_request,
+            actor_email=request.email.lower(),
+            category="auth",
+            status="failure",
+            details={"email": request.email.lower()},
+        )
+        raise
 
 
 @router.post("/subscribe", response_model=SubscribeResponse)

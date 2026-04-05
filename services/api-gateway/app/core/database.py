@@ -72,8 +72,42 @@ async def get_db(tenant_id: str | None = None) -> AsyncGenerator[AsyncSession, N
 
 async def init_db() -> None:
     """Create all tables (dev / testing only — use Alembic in production)."""
+    # Register all models before create_all
+    import app.models.audit_log  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # Audit log table idempotent creation (for existing deployments)
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id UUID,
+                actor_user_id UUID,
+                actor_email VARCHAR(255),
+                actor_role VARCHAR(50),
+                action VARCHAR(100) NOT NULL,
+                category VARCHAR(50) NOT NULL DEFAULT 'general',
+                resource_type VARCHAR(50),
+                resource_id VARCHAR(255),
+                status VARCHAR(20) NOT NULL DEFAULT 'success',
+                details JSONB,
+                ip_address VARCHAR(45),
+                user_agent VARCHAR(500),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_audit_logs_tenant_created ON audit_logs (tenant_id, created_at)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_audit_logs_user_id ON audit_logs (actor_user_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_audit_logs_resource ON audit_logs (resource_type, resource_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_audit_logs_action ON audit_logs (action)"
+        ))
         
         # Idempotent migration for missing tenant subscription columns
         await conn.execute(

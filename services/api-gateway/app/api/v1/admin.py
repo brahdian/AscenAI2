@@ -97,9 +97,14 @@ async def suspend_tenant(
     db: AsyncSession = Depends(get_db),
 ):
     """Suspend a tenant."""
+    from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    return await service.suspend_tenant(tenant_id, body.reason, admin_user_id)
+    result = await service.suspend_tenant(tenant_id, body.reason, admin_user_id)
+    await audit_log(db, "tenant.suspended", request=request, category="admin",
+                    resource_type="tenant", resource_id=tenant_id,
+                    details={"reason": body.reason})
+    return result
 
 
 @router.post("/tenants/{tenant_id}/reactivate")
@@ -109,9 +114,13 @@ async def reactivate_tenant(
     db: AsyncSession = Depends(get_db),
 ):
     """Reactivate a suspended tenant."""
+    from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    return await service.reactivate_tenant(tenant_id, admin_user_id)
+    result = await service.reactivate_tenant(tenant_id, admin_user_id)
+    await audit_log(db, "tenant.reactivated", request=request, category="admin",
+                    resource_type="tenant", resource_id=tenant_id)
+    return result
 
 
 @router.delete("/tenants/{tenant_id}")
@@ -122,9 +131,14 @@ async def delete_tenant(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a tenant (soft or hard delete)."""
+    from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    return await service.delete_tenant(tenant_id, admin_user_id, hard_delete)
+    result = await service.delete_tenant(tenant_id, admin_user_id, hard_delete)
+    await audit_log(db, "tenant.deleted", request=request, category="admin",
+                    resource_type="tenant", resource_id=tenant_id,
+                    details={"hard_delete": hard_delete})
+    return result
 
 
 @router.get("/users")
@@ -153,9 +167,14 @@ async def update_user_role(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a user's role."""
+    from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    return await service.update_user_role(user_id, body.role, admin_user_id)
+    result = await service.update_user_role(user_id, body.role, admin_user_id)
+    await audit_log(db, "user.role_changed", request=request, category="user",
+                    resource_type="user", resource_id=user_id,
+                    details={"new_role": body.role})
+    return result
 
 
 @router.get("/prompts")
@@ -501,3 +520,56 @@ async def update_platform_guardrail(
         raise HTTPException(status_code=500, detail="Failed to update guardrail setting.")
 
     return {"guardrail_id": guardrail_id, "enabled": body.enabled}
+
+
+# ---------------------------------------------------------------------------
+# Audit Logs
+# ---------------------------------------------------------------------------
+
+@router.get("/audit-logs")
+async def list_audit_logs(
+    request: Request,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    tenant_id: Optional[str] = Query(None),
+    actor_user_id: Optional[str] = Query(None),
+    category: Optional[str] = Query(None, pattern="^(auth|user|tenant|agent|billing|admin|data|api_key|general|)$"),
+    action: Optional[str] = Query(None, max_length=100),
+    status: Optional[str] = Query(None, pattern="^(success|failure|)$"),
+    since: Optional[str] = Query(None, description="ISO 8601 datetime"),
+    until: Optional[str] = Query(None, description="ISO 8601 datetime"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrieve paginated audit logs.  Super admins see all tenants; tenant admins
+    see only their own tenant's logs.
+
+    Required by SOC2 CC6.1/CC7.2, GDPR Art.30, HIPAA §164.312(b), PCI-DSS 10.2.
+    """
+    from app.services.audit_service import list_audit_logs as _list
+    from datetime import datetime
+
+    role = getattr(request.state, "role", "")
+    caller_tenant_id = getattr(request.state, "tenant_id", None)
+
+    if role != "super_admin":
+        # Non-super-admin can only see their own tenant
+        if role not in ("tenant_owner", "tenant_admin"):
+            raise HTTPException(status_code=403, detail="Admin access required.")
+        tenant_id = caller_tenant_id
+
+    since_dt = datetime.fromisoformat(since) if since else None
+    until_dt = datetime.fromisoformat(until) if until else None
+
+    return await _list(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id,
+        action_prefix=action,
+        category=category or None,
+        status=status or None,
+        since=since_dt,
+        until=until_dt,
+        page=page,
+        per_page=per_page,
+    )

@@ -21,6 +21,11 @@ export default function AgentsPage() {
   })
 
   const deleteMutation = useMutation({
+    mutationFn: (id: string) => agentsApi.delete(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agents'] })
+      toast.success('Agent removed from directory')
+    },
     onError: (err: any) => {
       const detail = err?.response?.data?.detail
       if (err?.response?.status === 403 && typeof detail === 'string') {

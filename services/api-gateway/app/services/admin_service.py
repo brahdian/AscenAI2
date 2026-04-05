@@ -659,8 +659,8 @@ class AdminService:
             text("""
                 INSERT INTO tenant_usage (tenant_id, current_month_messages, current_month_chat_units, 
                     current_month_sessions, current_month_stt_tokens, current_month_tts_tokens, 
-                    current_month_cost_usd, updated_at)
-                VALUES (:tenant_id, 0, 0, 0, 0, 0, 0.0, NOW())
+                    current_month_cost_usd, agent_count, updated_at)
+                VALUES (:tenant_id, 0, 0, 0, 0, 0, 0.0, 3, NOW())
             """),
             {"tenant_id": tenant_id},
         )

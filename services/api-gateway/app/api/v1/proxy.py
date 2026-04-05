@@ -420,7 +420,7 @@ async def proxy(
 
         # Proxy the delete to the orchestrator, then decrement agent_count
         delete_resp = await _proxy_request(request, url, path, db, service=service)
-        if delete_resp.status_code in (200, 204):
+        if delete_resp.status_code in (200, 204) and sub_id:
             try:
                 await _increment_agent_count(tenant_id, -1, db)
             except Exception as e:

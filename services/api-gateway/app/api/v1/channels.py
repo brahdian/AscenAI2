@@ -122,17 +122,28 @@ async def twilio_pay_webhook(tenant_id: str, agent_id: str, request: Request):
     # ── 0. Validate Twilio Signature ──────────────────────────────────────────
     from app.core.config import settings
     auth_token = settings.TWILIO_AUTH_TOKEN
-    
-    if auth_token:
-        signature = request.headers.get("X-Twilio-Signature", "")
-        # Important: request.url may be internal (http://api-gateway...)
-        # We need to use the publicly reachable URL for signature matching.
-        # Twilio usually sends the absolute URL it was configured with.
-        url = str(request.url)
-        if not _validate_twilio_signature(auth_token, signature, url, params):
-            logger.warning("twilio_pay_signature_invalid", tenant_id=tenant_id)
-            # For hardening, we enforce this.
-            raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    if not auth_token:
+        # Fail-closed: if no Twilio auth token is configured we cannot verify
+        # the request.  Reject in all environments to prevent spoofed webhooks
+        # from triggering payment flows.
+        logger.error("twilio_pay_webhook_auth_token_not_configured", tenant_id=tenant_id)
+        raise HTTPException(status_code=503, detail="Webhook endpoint not configured.")
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    # Build the canonical public URL for signature validation.
+    # request.url uses the internal hostname (http://api-gateway:8000/…).
+    # Twilio signs the URL it was configured with, which is the public URL.
+    public_base = getattr(settings, "PUBLIC_BASE_URL", "").rstrip("/")
+    if public_base:
+        canonical_url = public_base + str(request.url.path)
+        if request.url.query:
+            canonical_url += "?" + request.url.query
+    else:
+        canonical_url = str(request.url)
+    if not _validate_twilio_signature(auth_token, signature, canonical_url, params):
+        logger.warning("twilio_pay_signature_invalid", tenant_id=tenant_id)
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     result = params.get("Result", "")
     payment_card_type = params.get("PaymentCardType", "")
@@ -339,13 +350,21 @@ async def sms_inbound(tenant_id: str, agent_id: str, request: Request):
     form_data = await request.form()
     params = dict(form_data)
 
-    # Validate Twilio signature
-    if _TWILIO_AUTH_TOKEN:
-        sig = request.headers.get("X-Twilio-Signature", "")
-        url = str(request.url)
-        if not _validate_twilio_signature(_TWILIO_AUTH_TOKEN, sig, url, params):
-            logger.warning("twilio_signature_invalid", tenant_id=tenant_id)
-            raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+    # Validate Twilio signature — fail-closed
+    if not _TWILIO_AUTH_TOKEN:
+        logger.error("twilio_sms_webhook_auth_token_not_configured", tenant_id=tenant_id)
+        raise HTTPException(status_code=503, detail="Webhook endpoint not configured.")
+    sig = request.headers.get("X-Twilio-Signature", "")
+    public_base = getattr(settings, "PUBLIC_BASE_URL", "").rstrip("/")
+    if public_base:
+        canonical_url = public_base + str(request.url.path)
+        if request.url.query:
+            canonical_url += "?" + request.url.query
+    else:
+        canonical_url = str(request.url)
+    if not _validate_twilio_signature(_TWILIO_AUTH_TOKEN, sig, canonical_url, params):
+        logger.warning("twilio_signature_invalid", tenant_id=tenant_id)
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     msg_sid = params.get("MessageSid", "")
     if await _dedup(msg_sid):
@@ -495,9 +514,48 @@ async def slack_events(tenant_id: str, agent_id: str, request: Request):
 # Email (SendGrid Inbound Parse)
 # ---------------------------------------------------------------------------
 
+def _verify_sendgrid_signature(signing_key: str, payload: bytes, timestamp: str, signature: str) -> bool:
+    """
+    Verify SendGrid Event Webhook ECDSA signature.
+    https://docs.sendgrid.com/for-developers/tracking-events/getting-started-event-webhook-security-features
+    SendGrid signs: timestamp + payload using ECDSA P-256 + SHA256.
+    """
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            ECDSA,
+            EllipticCurvePublicKey,
+        )
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        import base64
+
+        # SendGrid provides the public key in PEM format in the dashboard
+        pem = f"-----BEGIN PUBLIC KEY-----\n{signing_key}\n-----END PUBLIC KEY-----\n"
+        public_key: EllipticCurvePublicKey = load_pem_public_key(pem.encode())  # type: ignore[assignment]
+        signed_payload = timestamp.encode() + payload
+        sig_bytes = base64.b64decode(signature)
+        public_key.verify(sig_bytes, signed_payload, ECDSA(SHA256()))
+        return True
+    except Exception:
+        return False
+
+
 @router.post("/{tenant_id}/{agent_id}/email/inbound")
 async def email_inbound(tenant_id: str, agent_id: str, request: Request):
     """Handle inbound email via SendGrid Inbound Parse webhook."""
+    # ── SendGrid webhook signature verification ───────────────────────────────
+    sendgrid_key = getattr(settings, "SENDGRID_WEBHOOK_VERIFICATION_KEY", "")
+    if sendgrid_key:
+        raw_body = await request.body()
+        sg_timestamp = request.headers.get("X-Twilio-Email-Event-Webhook-Timestamp", "")
+        sg_signature = request.headers.get("X-Twilio-Email-Event-Webhook-Signature", "")
+        if not sg_timestamp or not sg_signature:
+            logger.warning("sendgrid_inbound_missing_signature_headers", tenant_id=tenant_id)
+            raise HTTPException(status_code=403, detail="Missing SendGrid signature headers.")
+        if not _verify_sendgrid_signature(sendgrid_key, raw_body, sg_timestamp, sg_signature):
+            logger.warning("sendgrid_inbound_signature_invalid", tenant_id=tenant_id)
+            raise HTTPException(status_code=403, detail="Invalid SendGrid signature.")
+
     form_data = await request.form()
 
     from_email = form_data.get("from", "") or form_data.get("sender", "")

@@ -151,8 +151,8 @@ def _validate_tool_url(url: str) -> None:
     except Exception:
         raise SSRFError("Invalid tool URL.")
 
-    if parsed.scheme not in ("http", "https"):
-        raise SSRFError("Tool URL must use HTTP or HTTPS.")
+    if parsed.scheme != "https":
+        raise SSRFError("Tool URL must use HTTPS.")
 
     hostname = (parsed.hostname or "").lower()
     if not hostname:
@@ -162,14 +162,28 @@ def _validate_tool_url(url: str) -> None:
     if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "postgres", "redis", "db", "api-gateway", "ai-orchestrator"):
         raise SSRFError(f"Tool URL must not target internal service: {hostname}")
 
-    # Reject private / link-local / loopback IP ranges
+    # Resolve and validate IPs — includes literal IPs and DNS-resolved domain names.
+    # Resolving the hostname here closes the DNS rebinding window: an attacker cannot
+    # pass validation with a public IP and then swap DNS to a private one mid-flight
+    # (the resolved IP is what we actually validate, not the name).
+    import socket
     try:
-        ip = ipaddress.ip_address(hostname)
-        for net in _PRIVATE_PREFIXES:
-            if ip in net:
-                raise SSRFError("Tool URL must not target a private or reserved IP address.")
-    except ValueError:
-        pass  # hostname is a domain name — allowed for now (could add DNS resolution check for more depth)
+        resolved = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        for _family, _type, _proto, _canonname, sockaddr in resolved:
+            ip_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                for net in _PRIVATE_PREFIXES:
+                    if ip in net:
+                        raise SSRFError(
+                            f"Tool URL resolves to a private or reserved IP address: {ip_str}"
+                        )
+            except ValueError:
+                pass  # malformed addr — skip
+    except SSRFError:
+        raise
+    except OSError as exc:
+        raise SSRFError(f"Tool URL hostname could not be resolved: {exc}") from exc
 
 
 class ToolExecutor:

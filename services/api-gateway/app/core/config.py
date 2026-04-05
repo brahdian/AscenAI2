@@ -86,6 +86,16 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_PHONE_NUMBER: str = ""
 
+    # Public base URL used to construct canonical webhook URLs for Twilio
+    # signature verification.  Must match the URL configured in Twilio console.
+    # Example: https://api.yourdomain.com
+    PUBLIC_BASE_URL: str = ""
+
+    # SendGrid inbound webhook ECDSA public key (from SendGrid dashboard →
+    # Settings → Mail Settings → Event Webhook → Signature Verification).
+    # When set, all inbound parse webhook requests are verified.
+    SENDGRID_WEBHOOK_VERIFICATION_KEY: str = ""
+
     # CORS — override with comma-separated list via ALLOWED_ORIGINS env var in production
     # Example: ALLOWED_ORIGINS="https://app.yourdomain.com,https://admin.yourdomain.com"
     FRONTEND_URL: str = "http://lvh.me:3000"

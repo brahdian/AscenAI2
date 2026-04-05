@@ -58,6 +58,19 @@ _WARNED_CATEGORIES = frozenset({
 })
 
 
+class OutputBlockedError(Exception):
+    """
+    Raised by ModerationService.check_output() when the LLM response contains
+    content with severity "blocked".  Callers must catch this and substitute a
+    safe fallback message — never surface the blocked text to the user.
+    """
+
+    def __init__(self, reason: str, categories: list[str]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.categories = categories
+
+
 @dataclass
 class ModerationResult:
     """Result of a moderation check."""
@@ -107,8 +120,10 @@ class ModerationService:
 
     async def check_output(self, text: str) -> ModerationResult:
         """
-        Check LLM output.  Fail-open: blocked content is logged but not
-        prevented (caller decides whether to substitute a fallback).
+        Check LLM output.  Fail-closed: content with severity "blocked" raises
+        OutputBlockedError so the caller MUST handle it — the flagged text is
+        never returned to the end user.  Lower-severity results (warned, clean)
+        are returned normally.
         """
         result = await self._check(text)
         if result.flagged:
@@ -117,6 +132,11 @@ class ModerationService:
                 severity=result.severity,
                 provider=result.provider,
                 categories=result.categories,
+            )
+        if result.severity == "blocked":
+            raise OutputBlockedError(
+                reason=result.reason or f"Output blocked by moderation ({result.provider})",
+                categories=result.categories or [],
             )
         return result
 

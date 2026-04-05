@@ -10,10 +10,13 @@ Usage:
     # After reading from the DB, before passing to a handler:
     clear = decrypt_sensitive_fields(stored_dict)
 
-The ENCRYPTION_KEY setting must be set in production. If absent, values are stored
-and returned as plaintext (backward-compatible dev mode, logged as a warning at
-startup). Values that were not encrypted (no "gAAAAA" Fernet prefix) are returned
-unchanged, so migration from plaintext → encrypted is zero-downtime.
+ENCRYPTION_KEY **must** be set in production.  If absent, encrypt_value() raises
+EncryptionError rather than storing plaintext — silent plaintext storage is a
+security violation in a production credential store.
+
+Values that are already in plaintext (no "gAAAAA" Fernet prefix) are passed through
+unchanged by decrypt_value() to allow a zero-downtime migration: existing plaintext
+rows are readable but every new write is encrypted.
 """
 from __future__ import annotations
 
@@ -47,6 +50,10 @@ _fernet_instance: Fernet | None = None
 _fernet_loaded: bool = False
 
 
+class EncryptionError(RuntimeError):
+    """Raised when encryption is attempted without a configured key."""
+
+
 def _get_fernet() -> Fernet | None:
     global _fernet_instance, _fernet_loaded
     if _fernet_loaded:
@@ -63,7 +70,7 @@ def _get_fernet() -> Fernet | None:
     if not raw:
         logger.warning(
             "encryption_key_not_set",
-            detail="ENCRYPTION_KEY is not configured — tool credentials stored as plaintext. "
+            detail="ENCRYPTION_KEY is not configured. "
                    "Set a strong key (python -c \"from cryptography.fernet import Fernet; "
                    "print(Fernet.generate_key().decode())\") before going to production.",
         )
@@ -85,28 +92,44 @@ def _get_fernet() -> Fernet | None:
 
 
 def encrypt_value(value: str) -> str:
-    """Encrypt *value* with Fernet. Returns ciphertext (str) or original if no key."""
+    """Encrypt *value* with Fernet.
+
+    Raises EncryptionError if ENCRYPTION_KEY is not configured — plaintext
+    storage of credentials is not permitted.
+    """
     f = _get_fernet()
     if f is None:
-        return value
+        raise EncryptionError(
+            "ENCRYPTION_KEY is not set. Cannot encrypt credential. "
+            "Configure ENCRYPTION_KEY before writing sensitive values to the database."
+        )
     return f.encrypt(value.encode()).decode()
 
 
 def decrypt_value(value: str) -> str:
     """
     Decrypt *value* if it looks like a Fernet token (starts with "gAAAAA").
-    Returns the original string unchanged if it is not encrypted or decryption fails.
+
+    - Plaintext (non-Fernet) values are returned unchanged to support
+      zero-downtime migration from unencrypted to encrypted storage.
+    - If a Fernet-prefixed value cannot be decrypted (wrong key / corrupted
+      token) a ValueError is raised — silent fallback to ciphertext would
+      expose garbage to callers.
     """
     if not value or not value.startswith("gAAAAA"):
+        # Not a Fernet token; return as-is (legacy plaintext or non-sensitive field)
         return value
     f = _get_fernet()
     if f is None:
-        return value
+        raise EncryptionError(
+            "ENCRYPTION_KEY is not set. Cannot decrypt credential. "
+            "Configure ENCRYPTION_KEY to read encrypted values from the database."
+        )
     try:
         return f.decrypt(value.encode()).decode()
-    except (InvalidToken, Exception):
-        logger.warning("credential_decryption_failed", prefix=value[:8])
-        return value
+    except InvalidToken as exc:
+        logger.error("credential_decryption_failed", prefix=value[:8])
+        raise ValueError(f"Failed to decrypt credential (invalid token): {value[:8]}…") from exc
 
 
 def encrypt_sensitive_fields(data: dict[str, Any] | None) -> dict[str, Any] | None:

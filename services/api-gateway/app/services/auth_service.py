@@ -192,14 +192,17 @@ class AuthService:
             raise HTTPException(status_code=500, detail="Redis unavailable for verification.")
         
         stored_otp = await redis.get(f"otp:{normalized_email}")
-        if not stored_otp or stored_otp != otp:
-            raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
-        
+
         # Mark user as verified
         result = await db.execute(select(User).where(User.email == normalized_email))
         user = result.scalar_one_or_none()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found.")
+
+        # Validate OTP *after* the DB lookup so both branches take the same
+        # code path and are not distinguishable by response time.
+        # Return the same generic error whether the email is unknown or the
+        # OTP is wrong — prevents email enumeration via error messages.
+        if not user or not stored_otp or stored_otp != otp:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
         
         user.is_email_verified = True
         

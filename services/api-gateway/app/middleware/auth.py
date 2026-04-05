@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Optional
 
@@ -15,6 +16,19 @@ from app.models.user import APIKey, User
 from app.models.tenant import Tenant
 
 logger = structlog.get_logger(__name__)
+
+# JWT auth cache TTL: 5 minutes.  Balances security (stale sessions noticed
+# quickly) vs DB load (N requests per user only cost 1 DB round-trip per TTL).
+_AUTH_CACHE_TTL = 300
+
+
+async def _get_redis():
+    """Return the shared Redis client, or None if unavailable."""
+    try:
+        from app.core.redis_client import get_redis
+        return await get_redis()
+    except Exception:
+        return None
 
 # Paths that don't require authentication
 PUBLIC_PATHS = {
@@ -108,10 +122,34 @@ class AuthMiddleware(BaseHTTPMiddleware):
             )
             if payload.get("type") != "access":
                 return False
-            
+
             user_id = payload.get("sub")
             tenant_id = payload.get("tenant_id")
+            role = payload.get("role", "viewer")
 
+            if not user_id or not tenant_id:
+                return False
+
+            # ── Redis auth cache ──────────────────────────────────────────────
+            # Skip the two DB queries on every request when the answer is already
+            # cached.  Cache key encodes both user and tenant so a user moved
+            # between tenants is not served a stale entry.
+            cache_key = f"auth:jwt:{user_id}:{tenant_id}"
+            redis = await _get_redis()
+            if redis:
+                try:
+                    cached = await redis.get(cache_key)
+                    if cached:
+                        entry = json.loads(cached)
+                        request.state.user_id = user_id
+                        request.state.tenant_id = tenant_id
+                        request.state.role = entry.get("role", role)
+                        request.state.auth_method = "jwt"
+                        return True
+                except Exception as exc:
+                    logger.warning("auth_cache_read_error", error=str(exc))
+
+            # ── DB verification (cache miss) ──────────────────────────────────
             # Verify that user and tenant still exist in the database.
             # This handles stale sessions after a 'make clean' or record deletion.
             async with AsyncSessionLocal() as db:
@@ -121,7 +159,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 user = user_res.scalar_one_or_none()
                 if not user or not user.is_active:
                     return False
-                
+
                 tenant_res = await db.execute(
                     select(Tenant).where(Tenant.id == uuid.UUID(tenant_id))
                 )
@@ -129,9 +167,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 if not tenant:
                     return False
 
+            # Populate cache so subsequent requests skip the DB queries
+            if redis:
+                try:
+                    await redis.setex(
+                        cache_key,
+                        _AUTH_CACHE_TTL,
+                        json.dumps({"role": role}),
+                    )
+                except Exception as exc:
+                    logger.warning("auth_cache_write_error", error=str(exc))
+
             request.state.user_id = user_id
             request.state.tenant_id = tenant_id
-            request.state.role = payload.get("role", "viewer")
+            request.state.role = role
             request.state.auth_method = "jwt"
             return True
         except (JWTError, ValueError) as exc:

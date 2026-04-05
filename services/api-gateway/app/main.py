@@ -25,6 +25,7 @@ from app.api.v1 import channels as channels_router
 from app.api.v1 import admin as admin_router
 from app.api.v1 import compliance_audit as compliance_audit_router
 from app.api.v1 import playbooks as playbooks_router
+from app.api.v1 import console as console_router
 
 logger = structlog.get_logger(__name__)
 
@@ -268,6 +269,7 @@ app.include_router(channels_router.router, prefix="/api/v1/channels", tags=["cha
 app.include_router(admin_router.router, prefix="/api/v1", tags=["admin"])
 app.include_router(compliance_audit_router.router, prefix="/api/v1", tags=["compliance-audit"])
 app.include_router(playbooks_router.router, prefix="/api/v1", tags=["playbooks"])
+app.include_router(console_router.router, prefix="/api/v1", tags=["console"])
 
 # ── Static assets — widget.js served at /widget/widget.js ─────────────────
 import os as _os

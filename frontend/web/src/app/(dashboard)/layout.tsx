@@ -29,6 +29,7 @@ import {
   GitBranch,
   ShieldCheck,
   Sparkles,
+  Terminal,
 } from 'lucide-react'
 import { agentsApi } from '@/lib/api'
 
@@ -216,6 +217,14 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               </p>
               <p className="text-xs text-gray-500 truncate">{user?.email}</p>
             </div>
+            {/* Console link — discreet, not in main nav */}
+            <Link
+              href="/console"
+              className="p-1.5 text-gray-300 hover:text-gray-600 dark:text-gray-600 dark:hover:text-gray-300 transition-colors"
+              title="Activity Console"
+            >
+              <Terminal size={15} />
+            </Link>
             <button
               onClick={() => {
                 logout()

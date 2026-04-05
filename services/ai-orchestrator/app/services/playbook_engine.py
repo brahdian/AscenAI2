@@ -95,26 +95,44 @@ def _substitute_vars(template: str, variables: dict[str, Any]) -> str:
 
 def _safe_eval(expression: str, variables: dict[str, Any]) -> bool:
     """
-    Evaluate a Python-safe boolean expression against *variables*.
+    Evaluate a boolean expression against *variables* using simpleeval.
 
-    Permitted: comparisons, arithmetic, boolean ops, str/int/float/list builtins.
-    Forbidden: imports, attribute access on non-dict values, __builtins__.
+    simpleeval is a purpose-built restricted evaluator that only permits
+    arithmetic, comparisons, boolean logic, and safe built-ins. It does NOT
+    allow attribute access, subscript chains, imports, or dunder escapes —
+    unlike ``eval()`` with ``__builtins__: {}``, which is NOT a safe sandbox
+    (see CVE-style: str.__class__.__mro__[1].__subclasses__() chain).
 
     Returns False on any evaluation error (fail-closed).
     """
-    safe_builtins = {
-        "int": int, "float": float, "str": str, "bool": bool,
-        "len": len, "abs": abs, "min": min, "max": max,
+    try:
+        from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable, InvalidExpression
+    except ImportError:
+        logger.error(
+            "simpleeval_not_installed",
+            detail="Install simpleeval to enable playbook condition evaluation",
+        )
+        return False
+
+    safe_names = {
+        **variables,
         "True": True, "False": False, "None": None,
     }
-    namespace = {**safe_builtins, **variables}
+    safe_functions = {
+        "int": int, "float": float, "str": str, "bool": bool,
+        "len": len, "abs": abs, "min": min, "max": max,
+    }
     try:
-        result = eval(  # noqa: S307 — expression validated at schema load time
-            compile(expression, "<playbook_condition>", "eval"),
-            {"__builtins__": {}},
-            namespace,
-        )
+        evaluator = EvalWithCompoundTypes(names=safe_names, functions=safe_functions)
+        result = evaluator.eval(expression)
         return bool(result)
+    except (FeatureNotAvailable, InvalidExpression) as exc:
+        logger.warning(
+            "playbook_condition_forbidden_expression",
+            expression=expression,
+            error=str(exc),
+        )
+        return False
     except Exception as exc:
         logger.warning(
             "playbook_condition_eval_error",

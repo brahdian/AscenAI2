@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     AI_ORCHESTRATOR_URL: str = "http://ai-orchestrator:8002"
     VOICE_PIPELINE_URL: str = "http://voice-pipeline:8003"
 
+    # Shared secret for internal service-to-service authentication.
+    # Must match INTERNAL_API_KEY in the ai-orchestrator service.
+    # PRODUCTION: set via env var (e.g. openssl rand -hex 32).
+    INTERNAL_API_KEY: str = ""
+
     # SMTP / email
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587

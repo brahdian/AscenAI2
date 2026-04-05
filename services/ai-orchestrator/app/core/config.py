@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-004"
     EMBEDDING_DIMENSION: int = 768
 
+    # Shared secret for internal service-to-service calls (api-gateway → ai-orchestrator).
+    # Set via INTERNAL_API_KEY env var.  When empty, the internal key check logs a
+    # warning but does NOT block requests (backwards-compatible for local dev).
+    # PRODUCTION: always set a strong random value (e.g. openssl rand -hex 32).
+    INTERNAL_API_KEY: str = ""
+
     SECRET_KEY: str = "change-this-secret-key-in-production"
 
     @field_validator("SECRET_KEY")

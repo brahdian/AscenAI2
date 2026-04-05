@@ -204,10 +204,54 @@ app.add_middleware(
 app.add_middleware(TracingMiddleware)
 
 # Trusted internal headers from API Gateway
+import hmac
 from starlette.middleware.base import BaseHTTPMiddleware
+
+# Paths that carry public (user-facing) JWT auth — skip internal key check.
+_PUBLIC_PREFIX = ("/api/v1/chat", "/api/v1/agents", "/api/v1/sessions",
+                  "/api/v1/templates", "/api/v1/feedback", "/api/v1/analytics",
+                  "/health", "/metrics", "/docs", "/openapi.json", "/redoc",
+                  "/agent-greetings")
+
 class InternalAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Stamps request.state with tenant/user/role from headers that were already
+    validated by the API Gateway.
+
+    SECURITY: Only accept X-Tenant-ID / X-User-ID / X-Role when the caller
+    also presents a valid X-Internal-Key (shared secret between api-gateway
+    and ai-orchestrator).  Without this check any external client that can
+    reach this service (e.g. via misconfigured network policy) could forge
+    an arbitrary tenant identity.
+    """
+
+    _INTERNAL_KEY: str = getattr(settings, "INTERNAL_API_KEY", "")
+
     async def dispatch(self, request: Request, call_next):
-        # Prefer existing state; fall back to headers
+        path = request.url.path
+
+        # Paths that use end-user JWT auth don't send X-Internal-Key — skip check.
+        if path.startswith(_PUBLIC_PREFIX):
+            return await call_next(request)
+
+        # For internal/service-to-service paths, validate the shared key.
+        presented = request.headers.get("X-Internal-Key", "")
+        expected = self._INTERNAL_KEY
+
+        if expected:
+            if not presented or not hmac.compare_digest(presented.encode(), expected.encode()):
+                from fastapi.responses import JSONResponse
+                logger.warning(
+                    "internal_auth_rejected",
+                    path=path,
+                    has_key=bool(presented),
+                )
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid internal credentials."},
+                )
+
+        # Stamp request state with forwarded identity headers (only after key check)
         if not getattr(request.state, "tenant_id", None):
             request.state.tenant_id = request.headers.get("X-Tenant-ID")
         if not getattr(request.state, "user_id", None):

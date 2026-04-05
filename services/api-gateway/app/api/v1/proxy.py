@@ -208,6 +208,10 @@ async def _proxy_request(
         "X-Trace-ID": _trace_id,
         "Content-Type": request.headers.get("Content-Type", "application/json"),
     }
+    # Attach shared internal secret so the ai-orchestrator can verify this
+    # request originated from the trusted api-gateway (CRIT-002 defense).
+    if settings.INTERNAL_API_KEY:
+        headers["X-Internal-Key"] = settings.INTERNAL_API_KEY
     # Propagate W3C traceparent so downstream services continue the same trace
     if _trace_id and _span_id:
         headers["traceparent"] = f"00-{_trace_id}-{_span_id}-01"

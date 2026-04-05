@@ -2,26 +2,57 @@
 Internal API endpoints — not exposed to end-users.
 
 These endpoints are called service-to-service (e.g. api-gateway → ai-orchestrator)
-and must not be reachable from the public internet.  The api-gateway is responsible
-for authentication before forwarding requests here.
+and must not be reachable from the public internet.  Every request must present the
+shared INTERNAL_API_KEY in the X-Internal-Key header; the InternalAuthMiddleware
+already rejects requests that fail this check for non-public paths.
+
+An explicit per-route guard (``_require_internal_key``) is added as defense-in-depth
+so these endpoints remain protected even if middleware configuration changes.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import uuid
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.agent import Message, Session as AgentSession
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/internal")
+
+
+def _require_internal_key(x_internal_key: Optional[str] = Header(default=None)) -> None:
+    """
+    Defense-in-depth guard: verify the shared INTERNAL_API_KEY is present and correct.
+
+    The InternalAuthMiddleware already rejects bad keys at the middleware layer.
+    This per-route check ensures the endpoint remains protected even if the
+    middleware is bypassed (e.g. direct uvicorn access without nginx/middleware).
+    """
+    expected = getattr(settings, "INTERNAL_API_KEY", "")
+    if not expected:
+        # If no key is configured we still accept the request but log a warning.
+        # This preserves backwards-compatibility for deployments that haven't yet
+        # configured INTERNAL_API_KEY (e.g. local dev).
+        logger.warning(
+            "internal_key_not_configured",
+            detail="Set INTERNAL_API_KEY to protect internal endpoints.",
+        )
+        return
+    if not x_internal_key or not hmac.compare_digest(
+        x_internal_key.encode(), expected.encode()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid internal credentials.")
 
 
 class ErasureRequest(BaseModel):
@@ -39,6 +70,7 @@ class ErasureResponse(BaseModel):
 async def erasure(
     body: ErasureRequest,
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(_require_internal_key),
 ) -> ErasureResponse:
     """
     GDPR / PIPEDA right-to-erasure handler.

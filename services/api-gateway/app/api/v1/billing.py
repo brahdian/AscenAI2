@@ -363,7 +363,7 @@ async def billing_agents(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
-                headers={"X-Tenant-ID": tenant_id}
+                headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY}
             )
             resp.raise_for_status()
             actual_agents = resp.json()
@@ -677,7 +677,23 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
         raise HTTPException(status_code=401, detail="Invalid signature.")
 
     event_type = event.get("type", "unknown")
-    logger.info("billing_webhook_received", event_type=event_type)
+    event_id = event.get("id", "")
+    logger.info("billing_webhook_received", event_type=event_type, event_id=event_id)
+
+    # Idempotency guard — skip events already processed (Stripe retries up to 3 days)
+    if event_id:
+        try:
+            redis = getattr(request.app.state, "redis", None)
+            if redis:
+                idempotency_key = f"stripe_event:{event_id}"
+                already_processed = await redis.get(idempotency_key)
+                if already_processed:
+                    logger.info("billing_webhook_duplicate_skipped", event_id=event_id)
+                    return {"received": True}
+                # Mark as processed with 72-hour TTL (covers Stripe's retry window)
+                await redis.setex(idempotency_key, 259_200, "1")
+        except Exception as e:
+            logger.warning("billing_webhook_idempotency_check_failed", error=str(e))
 
     if event_type == "checkout.session.completed":
         session = event.get("data", {}).get("object", {})
@@ -709,7 +725,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     
                     try:
                         async with httpx.AsyncClient() as client:
-                            headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner"}
+                            headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner", "X-Internal-Key": settings.INTERNAL_API_KEY}
                             activate_res = await client.patch(
                                 f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}",
                                 json={
@@ -759,7 +775,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                         logger.info("creating_agent_from_pending_purchase", tenant_id=tenant_id, pending_id=pending_purchase_id)
                         try:
                             async with httpx.AsyncClient() as client:
-                                headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner"}
+                                headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner", "X-Internal-Key": settings.INTERNAL_API_KEY}
                                 create_res = await client.post(
                                     f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/",
                                     json={**pending.config, "is_active": True, "stripe_subscription_id": session.get("subscription")},
@@ -790,6 +806,60 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
 
             except Exception as e:
                 logger.error("billing_webhook_checkout_error", error=str(e), tenant_id=tenant_id)
+
+    elif event_type == "customer.subscription.deleted":
+        # Subscription cancelled externally (non-payment, admin action, or API call).
+        # Deactivate the associated agent and decrement agent_count so the slot is freed.
+        subscription = event.get("data", {}).get("object", {})
+        sub_id = subscription.get("id")
+        metadata = subscription.get("metadata", {})
+        tenant_id = metadata.get("tenant_id")
+
+        if sub_id and tenant_id:
+            try:
+                from app.models.tenant import TenantUsage
+                # Find the agent that holds this subscription
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+                        headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
+                    )
+                    if resp.status_code == 200:
+                        agents = resp.json()
+                        for ag in agents:
+                            if ag.get("stripe_subscription_id") == sub_id:
+                                # Deactivate agent
+                                await client.patch(
+                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{ag['id']}",
+                                    json={"is_active": False, "stripe_subscription_id": None},
+                                    headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
+                                    timeout=10.0,
+                                )
+                                logger.info(
+                                    "agent_deactivated_on_subscription_delete",
+                                    agent_id=ag["id"],
+                                    subscription_id=sub_id,
+                                    tenant_id=tenant_id,
+                                )
+                                break
+
+                # Decrement agent_count
+                t_uuid = _uuid.UUID(tenant_id)
+                usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == t_uuid))
+                usage = usage_res.scalar_one_or_none()
+                if usage and usage.agent_count > 0:
+                    usage.agent_count -= 1
+
+                # Update tenant subscription status
+                result = await db.execute(select(Tenant).where(Tenant.id == t_uuid))
+                tenant = result.scalar_one_or_none()
+                if tenant and tenant.subscription_id == sub_id:
+                    tenant.subscription_status = "cancelled"
+
+                await db.commit()
+                logger.info("subscription_deleted_processed", subscription_id=sub_id, tenant_id=tenant_id)
+            except Exception as e:
+                logger.error("subscription_deleted_webhook_error", error=str(e), subscription_id=sub_id)
 
     elif event_type in ("customer.subscription.created", "customer.subscription.updated"):
         subscription = event.get("data", {}).get("object", {})

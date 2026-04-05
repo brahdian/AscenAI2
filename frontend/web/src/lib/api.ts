@@ -761,4 +761,12 @@ export const adminApi = {
     admin_email: string
     admin_password: string
   }) => api.post('/admin/trial-tenants', data).then((r) => r.data),
+
+  // Tenant usage
+  getTenantsUsage: () => api.get('/admin/tenants/usage').then((r) => r.data),
+
+  // Platform Guardrails
+  listGuardrails: () => api.get('/admin/guardrails').then((r) => r.data),
+  updateGuardrail: (guardrailId: string, enabled: boolean) =>
+    api.patch(`/admin/guardrails/${guardrailId}`, { enabled }).then((r) => r.data),
 }

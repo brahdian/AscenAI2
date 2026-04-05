@@ -278,3 +278,221 @@ async def get_all_tenants_usage(
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
     return await service.get_all_tenants_usage()
+
+
+# ---------------------------------------------------------------------------
+# Platform Guardrails — view and toggle global enforcement rules
+# ---------------------------------------------------------------------------
+
+# The canonical list of platform-level guardrails is defined in code
+# (services/ai-orchestrator/app/guardrails/voice_agent_guardrails.py).
+# Super-admins can DISABLE individual rules (e.g. for debugging) or add
+# extra blocked keywords/topics via PlatformSetting("platform_guardrails").
+# Disabling a guardrail does NOT remove the code — it adds a runtime bypass.
+
+_DEFAULT_GUARDRAILS = [
+    {
+        "id": "GG-01",
+        "name": "Prompt injection strip",
+        "description": "Remove system_prompt / instructions fields forwarded by the client so tenants cannot override the agent's core directives.",
+        "category": "security",
+        "enabled": True,
+        "severity": "critical",
+        "toggleable": False,
+    },
+    {
+        "id": "GG-02",
+        "name": "Role injection sanitization",
+        "description": "Sanitize role-injection tokens (e.g. 'Ignore previous instructions') from user messages before they reach the LLM.",
+        "category": "security",
+        "enabled": True,
+        "severity": "critical",
+        "toggleable": False,
+    },
+    {
+        "id": "GG-03",
+        "name": "Auth from JWT only",
+        "description": "Agent identity and permissions are derived exclusively from the JWT, never from conversation claims.",
+        "category": "security",
+        "enabled": True,
+        "severity": "critical",
+        "toggleable": False,
+    },
+    {
+        "id": "GG-04",
+        "name": "No stack-trace leakage",
+        "description": "Strip stack traces, config values, and internal URLs from LLM responses and error messages.",
+        "category": "privacy",
+        "enabled": True,
+        "severity": "high",
+        "toggleable": False,
+    },
+    {
+        "id": "GG-05",
+        "name": "Emergency keyword intercept",
+        "description": "Immediately return a canned emergency response for health/safety keywords (~0 ms, bypasses LLM).",
+        "category": "safety",
+        "enabled": True,
+        "severity": "critical",
+        "toggleable": False,
+    },
+    {
+        "id": "GG-06",
+        "name": "Anti-impersonation gate",
+        "description": "Agent cannot claim to be a human, licensed professional, or regulatory authority.",
+        "category": "compliance",
+        "enabled": True,
+        "severity": "high",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-07",
+        "name": "Auto-escalate after 3 failures",
+        "description": "Transfer to human after 3 consecutive fallback responses to prevent indefinite loops.",
+        "category": "quality",
+        "enabled": True,
+        "severity": "medium",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-08",
+        "name": "High-risk tool confirmation gate",
+        "description": "Stripe, Twilio SMS, Gmail, and other high-risk tools require an explicit user confirmation step before execution.",
+        "category": "security",
+        "enabled": True,
+        "severity": "high",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-09",
+        "name": "High-risk tool receipt read-back",
+        "description": "After a high-risk tool executes, the agent must read back a confirmation receipt to the user.",
+        "category": "compliance",
+        "enabled": True,
+        "severity": "medium",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-10",
+        "name": "Session-scoped concurrency lock",
+        "description": "Only one utterance is processed at a time per session (asyncio.Lock) to prevent race conditions.",
+        "category": "reliability",
+        "enabled": True,
+        "severity": "high",
+        "toggleable": False,
+    },
+    {
+        "id": "GG-11",
+        "name": "PII pseudonymization",
+        "description": "PII (names, emails, phone, SSN, credit cards) is pseudonymized before reaching the LLM and restored in the response stream.",
+        "category": "privacy",
+        "enabled": True,
+        "severity": "high",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-12",
+        "name": "Output moderation",
+        "description": "LLM responses are scanned for toxic content, hate speech, and medical advice before delivery. Fail-open (logs violation, does not block).",
+        "category": "safety",
+        "enabled": True,
+        "severity": "medium",
+        "toggleable": True,
+    },
+]
+
+
+@router.get("/guardrails")
+async def list_platform_guardrails(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the list of platform-level guardrails with their current enabled status.
+    Overrides are read from PlatformSetting('platform_guardrails').
+    """
+    _require_super_admin(request)
+    overrides: dict = {}
+    try:
+        from app.models.platform import PlatformSetting
+        from sqlalchemy import select as _select
+        result = await db.execute(
+            _select(PlatformSetting).where(PlatformSetting.key == "platform_guardrails")
+        )
+        setting = result.scalar_one_or_none()
+        if setting and setting.value:
+            overrides = setting.value  # {guardrail_id: {enabled: bool, ...}}
+    except Exception as e:
+        logger.warning("guardrails_fetch_failed", error=str(e))
+
+    merged = []
+    for gr in _DEFAULT_GUARDRAILS:
+        override = overrides.get(gr["id"], {})
+        merged.append({**gr, **override})
+
+    return {"guardrails": merged}
+
+
+class GuardrailUpdateRequest(BaseModel):
+    enabled: bool = Field(..., description="Enable or disable this guardrail")
+
+
+@router.patch("/guardrails/{guardrail_id}")
+async def update_platform_guardrail(
+    guardrail_id: str,
+    body: GuardrailUpdateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Toggle a platform guardrail on/off.
+    Only toggleable=True guardrails can be disabled; critical rules are immutable.
+    """
+    admin_user_id = _require_super_admin(request)
+
+    # Validate the guardrail ID and check it's toggleable
+    guardrail = next((g for g in _DEFAULT_GUARDRAILS if g["id"] == guardrail_id), None)
+    if not guardrail:
+        raise HTTPException(status_code=404, detail=f"Guardrail {guardrail_id!r} not found.")
+    if not guardrail["toggleable"] and not body.enabled:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Guardrail {guardrail_id} is a critical non-toggleable rule and cannot be disabled.",
+        )
+
+    try:
+        from app.models.platform import PlatformSetting
+        from sqlalchemy import select as _select
+        result = await db.execute(
+            _select(PlatformSetting).where(PlatformSetting.key == "platform_guardrails")
+        )
+        setting = result.scalar_one_or_none()
+        current: dict = {}
+        if setting and setting.value:
+            current = dict(setting.value)
+        current[guardrail_id] = {"enabled": body.enabled}
+
+        if setting:
+            setting.value = current
+        else:
+            setting = PlatformSetting(
+                key="platform_guardrails",
+                value=current,
+                description="Per-guardrail enable/disable overrides (super_admin only).",
+                is_sensitive=False,
+                is_public=False,
+            )
+            db.add(setting)
+
+        await db.commit()
+        logger.info(
+            "platform_guardrail_updated",
+            guardrail_id=guardrail_id,
+            enabled=body.enabled,
+            admin_user_id=admin_user_id,
+        )
+    except Exception as e:
+        logger.error("guardrail_update_failed", error=str(e), guardrail_id=guardrail_id)
+        raise HTTPException(status_code=500, detail="Failed to update guardrail setting.")
+
+    return {"guardrail_id": guardrail_id, "enabled": body.enabled}

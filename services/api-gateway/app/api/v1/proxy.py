@@ -67,7 +67,7 @@ async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
-                headers={"X-Tenant-ID": tenant_id}
+                headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY}
             )
             if resp.status_code == 200:
                 agents = resp.json()
@@ -150,7 +150,7 @@ _SERVICE_MAP = {
     "voice": settings.VOICE_PIPELINE_URL,
 }
 
-_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+_TIMEOUT = httpx.Timeout(settings.PROXY_TIMEOUT_SECONDS, connect=settings.PROXY_CONNECT_TIMEOUT_SECONDS)
 
 # Fields that clients must never be allowed to inject into downstream requests.
 # Prevents prompt-injection via system_prompt override (TC-E04).
@@ -218,9 +218,11 @@ async def _proxy_request(
 
     body = await request.body()
 
-    _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
-    if len(body) > _MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="Request body too large (max 10 MB).")
+    if len(body) > settings.MAX_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request body too large (max {settings.MAX_BODY_BYTES // (1024 * 1024)} MB).",
+        )
 
     # Strip forbidden fields from chat/stream requests (TC-E04)
     if service == "chat":
@@ -336,7 +338,7 @@ async def proxy(
         actual_count = 0
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get(f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents", headers={"X-Tenant-ID": tenant_id})
+                res = await client.get(f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents", headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY})
                 if res.status_code == 200:
                     actual_count = len(res.json())
         except Exception:
@@ -358,7 +360,8 @@ async def proxy(
                 "X-Tenant-ID": tenant_id,
                 "X-User-ID": getattr(request.state, "user_id", ""),
                 "X-Role": getattr(request.state, "role", ""),
-                "Content-Type": "application/json"
+                "X-Internal-Key": settings.INTERNAL_API_KEY,
+                "Content-Type": "application/json",
             }
             resp = await client.post(url, json=body_dict, headers=headers)
             
@@ -388,26 +391,45 @@ async def proxy(
 
             return Response(content=resp.content, status_code=resp.status_code)
 
-    # CUSTOM HANDLING: Agent Deletion
+    # CUSTOM HANDLING: Agent Deletion — auto-cancel Stripe subscription
     if service == "agents" and method == "DELETE" and _AGENT_DELETE.match(full_path):
-        # 1. Fetch agent from orchestrator to check stripe_subscription_id
+        stripe.api_key = settings.STRIPE_SECRET_KEY
         async with httpx.AsyncClient(timeout=5.0) as client:
-            headers = {"X-Tenant-ID": tenant_id}
-            agent_resp = await client.get(url, headers=headers)
+            agent_resp = await client.get(url, headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY})
             if agent_resp.status_code == 200:
                 agent_info = agent_resp.json()
                 sub_id = agent_info.get("stripe_subscription_id")
                 if sub_id:
-                    # 2. Check Stripe
-                    stripe.api_key = settings.STRIPE_SECRET_KEY
                     try:
                         subscription = stripe.Subscription.retrieve(sub_id)
                         if subscription.status in ("active", "trialing", "past_due"):
-                            raise HTTPException(
-                                status_code=403,
-                                detail="This agent has an active subscription. Please cancel the subscription in the Billing Portal before deleting the agent."
+                            # Auto-cancel immediately — user is explicitly deleting the agent
+                            stripe.Subscription.delete(sub_id)
+                            logger.info(
+                                "agent_subscription_cancelled_on_delete",
+                                agent_id=agent_info.get("id"),
+                                subscription_id=sub_id,
+                                tenant_id=tenant_id,
                             )
-                    except stripe.error.StripeError:
-                        pass # If stripe fails, we'll allow deletion or handle gracefully
+                    except stripe.error.StripeError as e:
+                        logger.error(
+                            "agent_subscription_cancel_failed",
+                            subscription_id=sub_id,
+                            error=str(e),
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Could not cancel the billing subscription for this agent. "
+                                   "Please try again or contact support.",
+                        )
+
+        # Proxy the delete to the orchestrator, then decrement agent_count
+        delete_resp = await _proxy_request(request, url, path, db, service=service)
+        if delete_resp.status_code in (200, 204):
+            try:
+                await _increment_agent_count(tenant_id, -1, db)
+            except Exception as e:
+                logger.warning("agent_count_decrement_failed", error=str(e), tenant_id=tenant_id)
+        return delete_resp
 
     return await _proxy_request(request, url, path, db, service=service)

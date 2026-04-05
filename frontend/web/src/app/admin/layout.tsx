@@ -16,6 +16,7 @@ import {
   Building2,
   BarChart3,
   Home,
+  ShieldAlert,
 } from 'lucide-react'
 
 const ROOT_DOMAIN = process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'localhost:3000'
@@ -64,6 +65,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   ]
 
   const configItems = [
+    { label: 'Platform Guardrails', href: '/admin/guardrails', icon: ShieldAlert },
     { label: 'Billing & Plans', href: '/admin/settings/plans', icon: Zap },
     { label: 'Global Settings', href: '/admin/settings', icon: Settings },
   ]

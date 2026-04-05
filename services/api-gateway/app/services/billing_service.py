@@ -37,10 +37,13 @@ from app.services.tenant_service import get_plan_limits
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Overage rates (per-unit cost beyond included quota)
+# Overage rates — fallback defaults (authoritative values live in PlatformSetting
+# "billing_plans" managed via the admin portal at /admin/settings/plans).
+# These constants are ONLY used when the DB is unreachable or the plan has no
+# overage config. Update them only when first bootstrapping a new environment.
 # ---------------------------------------------------------------------------
 
-_OVERAGE_RATES: dict[str, dict[str, Decimal]] = {
+_DEFAULT_OVERAGE_RATES: dict[str, dict[str, Decimal]] = {
     "text_growth": {
         "per_chat": Decimal("0.002"),
         "per_voice_minute": Decimal("0.10"),
@@ -61,14 +64,60 @@ _OVERAGE_RATES: dict[str, dict[str, Decimal]] = {
         "per_voice_minute": Decimal("0.00"),
         "per_tool_call": Decimal("0.00"),
     },
+    # Legacy aliases
+    "professional": None,  # filled in below
+    "business": None,
+    "starter": None,
 }
+_DEFAULT_OVERAGE_RATES["professional"] = _DEFAULT_OVERAGE_RATES["voice_growth"]
+_DEFAULT_OVERAGE_RATES["business"] = _DEFAULT_OVERAGE_RATES["voice_business"]
+_DEFAULT_OVERAGE_RATES["starter"] = _DEFAULT_OVERAGE_RATES["text_growth"]
 
-# Provide legacy aliases matching PLAN_LIMITS keys
-_OVERAGE_RATES["professional"] = _OVERAGE_RATES["voice_growth"]
-_OVERAGE_RATES["business"] = _OVERAGE_RATES["voice_business"]
-_OVERAGE_RATES["starter"] = _OVERAGE_RATES["text_growth"]
+_SOFT_WARNING_PCT = settings.QUOTA_SOFT_WARNING_PCT  # configurable via env / admin
 
-_SOFT_WARNING_PCT = 80  # warn when usage reaches this %
+
+async def _get_overage_rates(
+    plan: str, db: AsyncSession
+) -> dict[str, Decimal]:
+    """
+    Return per-unit overage rates for *plan*.
+
+    Priority:
+    1. billing_plans PlatformSetting (admin-managed, authoritative)
+    2. _DEFAULT_OVERAGE_RATES fallback (startup bootstrap)
+    """
+    try:
+        from app.models.platform import PlatformSetting
+        from sqlalchemy import select as _sel
+        result = await db.execute(
+            _sel(PlatformSetting).where(PlatformSetting.key == "billing_plans")
+        )
+        setting = result.scalar_one_or_none()
+        if setting and setting.value:
+            # Plan key normalisation: strip prefix e.g. "voice_growth" → check "growth"
+            clean = plan.split("_")[-1] if "_" in plan else plan
+            plan_cfg = setting.value.get(plan) or setting.value.get(clean) or {}
+            if plan_cfg:
+                return {
+                    "per_chat": Decimal(
+                        str(plan_cfg.get("overage_per_chat_equivalent", "0.002"))
+                    ),
+                    "per_voice_minute": Decimal(
+                        str(plan_cfg.get("overage_per_voice_minute", "0.10"))
+                    ),
+                    "per_tool_call": Decimal(
+                        str(plan_cfg.get("overage_per_tool_call", "0.005"))
+                    ),
+                }
+    except Exception as e:
+        logger.warning("overage_rate_db_lookup_failed", plan=plan, error=str(e))
+
+    resolved = _resolve_plan(plan)
+    return (
+        _DEFAULT_OVERAGE_RATES.get(resolved)
+        or _DEFAULT_OVERAGE_RATES.get(plan)
+        or _DEFAULT_OVERAGE_RATES["voice_growth"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +329,7 @@ class BillingService:
         """Calculate overage charges for the current month."""
         canonical = _resolve_plan(plan)
         limits = await get_plan_limits(canonical, self.db)
-        rates = _OVERAGE_RATES.get(canonical, _OVERAGE_RATES["professional"])
+        rates = await _get_overage_rates(canonical, self.db)
         usage = await self.get_usage_summary(tenant_id)
 
         chats_limit = limits.get("chats_included", 0) or 0

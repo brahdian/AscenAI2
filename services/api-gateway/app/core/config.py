@@ -86,16 +86,17 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_PHONE_NUMBER: str = ""
 
-    # CORS
+    # CORS — override with comma-separated list via ALLOWED_ORIGINS env var in production
+    # Example: ALLOWED_ORIGINS="https://app.yourdomain.com,https://admin.yourdomain.com"
     FRONTEND_URL: str = "http://lvh.me:3000"
     ALLOWED_ORIGINS: any = [
-        "http://lvh.me:3000", 
-        "http://admin.lvh.me:3000", 
+        "http://lvh.me:3000",
+        "http://admin.lvh.me:3000",
         "http://app.lvh.me:3000",
-        "http://localhost:3000"
+        "http://localhost:3000",
     ]
     COOKIE_DOMAIN: str | None = ".lvh.me"
-    DYNAMIC_COOKIE_DOMAIN: bool = True  # If true, skips setting domain for 'localhost'
+    DYNAMIC_COOKIE_DOMAIN: bool = True  # Skips cookie domain for 'localhost'
 
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
@@ -103,6 +104,14 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [i.strip() for i in v.split(",")]
         return v
+
+    # Request size & timeout limits — override via env vars for large-file tenants
+    MAX_BODY_BYTES: int = 10 * 1024 * 1024      # 10 MB default
+    PROXY_TIMEOUT_SECONDS: float = 60.0          # Total request timeout
+    PROXY_CONNECT_TIMEOUT_SECONDS: float = 5.0   # Connect-phase timeout
+
+    # Usage quota soft-warning threshold (percent of plan limit)
+    QUOTA_SOFT_WARNING_PCT: int = 80
 
     # Observability
     SENTRY_DSN: str = ""

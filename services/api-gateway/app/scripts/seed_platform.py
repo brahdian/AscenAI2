@@ -148,7 +148,21 @@ async def seed_platform():
             else:
                 print("'billing_plans' is already up to date")
 
-        # 3. Seed System Defaults
+        # 3. Seed Platform Guardrails (initial enabled state — all on)
+        gr_setting_res = await db.execute(select(PlatformSetting).where(PlatformSetting.key == "platform_guardrails"))
+        if not gr_setting_res.scalar_one_or_none():
+            db.add(PlatformSetting(
+                key="platform_guardrails",
+                value={},  # Empty = all defaults apply (all enabled)
+                description="Per-guardrail enable/disable overrides. Managed via /admin/guardrails.",
+                is_sensitive=False,
+                is_public=False,
+            ))
+            print("Seeded 'platform_guardrails'")
+        else:
+            print("'platform_guardrails' already exists")
+
+        # 4. Seed System Defaults
         defaults_setting = await db.execute(select(PlatformSetting).where(PlatformSetting.key == "system_defaults"))
         if not defaults_setting.scalar_one_or_none():
             db.add(PlatformSetting(

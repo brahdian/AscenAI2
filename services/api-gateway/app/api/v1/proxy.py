@@ -229,11 +229,11 @@ async def _proxy_request(
         body = _sanitize_chat_body(body, headers["Content-Type"])
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            if "/stream" in url:
-                # Streaming path
-                async def stream_generator():
-                    _turn_count = 0
+        if "/stream" in url:
+            # Streaming path - create client inside generator to avoid premature closure
+            async def stream_generator():
+                _turn_count = 0
+                async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                     async with client.stream(
                         method=request.method,
                         url=url,
@@ -244,7 +244,6 @@ async def _proxy_request(
                         async for chunk in resp.aiter_bytes():
                             yield chunk
                             try:
-                                # Safe extraction from the 'done' event payload
                                 _text = chunk.decode("utf-8", errors="ignore")
                                 if '"turn_count":' in _text:
                                     import re as _re
@@ -253,13 +252,12 @@ async def _proxy_request(
                                         _turn_count = int(_m.group(1))
                             except Exception:
                                 pass
-                    
-                    # Billing increment is now handled by orchestrator SessionBillingService
-                    pass
+            
+            media = "audio/mpeg" if "/tts/" in url or service == "voice" else "text/event-stream"
+            return StreamingResponse(stream_generator(), media_type=media)
 
-                media = "audio/mpeg" if "/tts/" in url or service == "voice" else "text/event-stream"
-                return StreamingResponse(stream_generator(), media_type=media)
-
+        # Non-streaming path
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.request(
                 method=request.method,
                 url=url,
@@ -273,9 +271,6 @@ async def _proxy_request(
                 tenant_id = getattr(request.state, "tenant_id", "")
                 if service == "agents":
                     full_path = f"{service}/{path}".strip("/")
-                    # We NO LONGER auto-increment/decrement agent_count here.
-                    # agent_count now represents "Purchased Slots" managed by billing.
-                    # Billing increment is now handled by orchestrator SessionBillingService
                     pass
 
             if resp.status_code >= 400:

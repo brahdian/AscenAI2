@@ -82,7 +82,14 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # CORS — override in production with explicit origin list
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    ALLOWED_ORIGINS: any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def validate_allowed_origins(cls, v: any) -> list[str]:
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
 
     # Observability
     SENTRY_DSN: str = ""

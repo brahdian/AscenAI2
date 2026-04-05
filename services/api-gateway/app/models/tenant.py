@@ -107,6 +107,8 @@ class Tenant(Base):
 
     @property
     def plan_display_name(self) -> str:
+        if self.subscription_status != "active":
+            return "Not Subscribed"
         return self.PLAN_DISPLAY_NAMES.get(self.plan, self.plan.replace("_", " ").title())
 
     def __repr__(self) -> str:
@@ -166,3 +168,26 @@ class TenantUsage(Base):
 
     def __repr__(self) -> str:
         return f"<TenantUsage tenant={self.tenant_id} sessions={self.current_month_sessions}>"
+
+
+class PendingAgentPurchase(Base):
+    __tablename__ = "pending_agent_purchases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    config: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PendingAgentPurchase tenant={self.tenant_id} id={self.id}>"

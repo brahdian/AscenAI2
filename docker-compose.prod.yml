@@ -50,6 +50,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
       ENVIRONMENT: production
       DEBUG: "false"
+      COOKIE_DOMAIN: ${DOMAIN}
     deploy:
       resources:
         limits:
@@ -104,6 +105,10 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: https://${DOMAIN}
       NEXT_PUBLIC_WS_URL: wss://${DOMAIN}
+      NEXT_PUBLIC_ROOT_DOMAIN: ${DOMAIN}
+      NEXT_PUBLIC_ADMIN_SUBDOMAIN: admin.${DOMAIN}
+      ADMIN_SUBDOMAIN: admin.${DOMAIN}
+      NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
     deploy:
       resources:
         limits:

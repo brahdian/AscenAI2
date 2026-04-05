@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.user import APIKey, User
+from app.models.tenant import Tenant
 
 logger = structlog.get_logger(__name__)
 
@@ -24,9 +25,14 @@ PUBLIC_PATHS = {
     "/openapi.json",
     "/api/v1/auth/register",
     "/api/v1/auth/login",
+    "/api/v1/auth/verify-email",
+    "/api/v1/auth/resend-otp",
+    "/api/v1/auth/subscribe",
     "/api/v1/auth/refresh",
     "/api/v1/auth/forgot-password",
     "/api/v1/auth/reset-password",
+    "/api/v1/billing/webhook",
+    "/api/v1/playbooks/validate-safety",
 }
 
 
@@ -43,7 +49,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Allow webhook paths (verified by signature in the router)
-        if request.url.path.startswith("/api/v1/webhooks/inbound"):
+        if request.url.path.startswith("/api/v1/webhooks"):
             return await call_next(request)
 
         token: Optional[str] = None
@@ -64,20 +70,29 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if not token:
             from fastapi.responses import JSONResponse
+            logger.info("auth_failed_missing_credentials", path=request.url.path)
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Authentication required."},
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        # Try JWT first, then API key
-        if token.startswith("sk_"):
+        # Try JWT first, then API key (depending on how the token was found)
+        auth_header = request.headers.get("Authorization", "")
+        is_api_key = auth_header.lower().startswith("apikey ") or request.headers.get("X-API-Key") is not None
+
+        if is_api_key:
             ok = await self._authenticate_api_key(request, token)
         else:
-            ok = self._authenticate_jwt(request, token)
+            # Default to JWT for Bearer and Cookies
+            ok = await self._authenticate_jwt(request, token)
+            # Fallback to API key if JWT fails (handles cases where a key is passed without the right prefix)
+            if not ok and not auth_header.lower().startswith("bearer "):
+                ok = await self._authenticate_api_key(request, token)
 
         if not ok:
             from fastapi.responses import JSONResponse
+            logger.warning("auth_failed_invalid_credentials", path=request.url.path)
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or expired credentials."},
@@ -86,20 +101,41 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-    def _authenticate_jwt(self, request: Request, token: str) -> bool:
+    async def _authenticate_jwt(self, request: Request, token: str) -> bool:
         try:
             payload = jwt.decode(
                 token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
             )
             if payload.get("type") != "access":
                 return False
-            request.state.user_id = payload.get("sub")
-            request.state.tenant_id = payload.get("tenant_id")
+            
+            user_id = payload.get("sub")
+            tenant_id = payload.get("tenant_id")
+
+            # Verify that user and tenant still exist in the database.
+            # This handles stale sessions after a 'make clean' or record deletion.
+            async with AsyncSessionLocal() as db:
+                user_res = await db.execute(
+                    select(User).where(User.id == uuid.UUID(user_id))
+                )
+                user = user_res.scalar_one_or_none()
+                if not user or not user.is_active:
+                    return False
+                
+                tenant_res = await db.execute(
+                    select(Tenant).where(Tenant.id == uuid.UUID(tenant_id))
+                )
+                tenant = tenant_res.scalar_one_or_none()
+                if not tenant:
+                    return False
+
+            request.state.user_id = user_id
+            request.state.tenant_id = tenant_id
             request.state.role = payload.get("role", "viewer")
             request.state.auth_method = "jwt"
             return True
-        except JWTError as exc:
-            logger.debug("jwt_validation_failed", error=str(exc))
+        except (JWTError, ValueError) as exc:
+            logger.warning("jwt_decode_failed", error=str(exc))
             return False
 
     async def _authenticate_api_key(self, request: Request, raw_key: str) -> bool:

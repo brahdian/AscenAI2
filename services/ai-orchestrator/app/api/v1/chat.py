@@ -25,12 +25,12 @@ router = APIRouter(prefix="/chat")
 _IDEMPOTENCY_TTL = 300  # 5 minutes
 
 
-async def _check_idempotency(key: str, redis) -> Optional[ChatResponse]:
+async def _check_idempotency(key: str, tenant_id: str, redis) -> Optional[ChatResponse]:
     """Return cached ChatResponse if key was seen recently, else None."""
     if not key or redis is None:
         return None
     try:
-        cached = await redis.get(f"idem:chat:{key}")
+        cached = await redis.get(f"tenant:{tenant_id}:idem:chat:{key}")
         if cached:
             return ChatResponse(**_json.loads(cached))
     except Exception:
@@ -38,12 +38,12 @@ async def _check_idempotency(key: str, redis) -> Optional[ChatResponse]:
     return None
 
 
-async def _store_idempotency(key: str, response: ChatResponse, redis) -> None:
+async def _store_idempotency(key: str, tenant_id: str, response: ChatResponse, redis) -> None:
     """Cache the response under the idempotency key for TTL seconds."""
     if not key or redis is None:
         return
     try:
-        await redis.setex(f"idem:chat:{key}", _IDEMPOTENCY_TTL, _json.dumps(response.model_dump()))
+        await redis.setex(f"tenant:{tenant_id}:idem:chat:{key}", _IDEMPOTENCY_TTL, _json.dumps(response.model_dump()))
     except Exception:
         pass
 
@@ -127,7 +127,7 @@ async def chat(
 
     # Idempotency check — return cached response for duplicate client retries
     if body.idempotency_key:
-        cached = await _check_idempotency(body.idempotency_key, redis_client)
+        cached = await _check_idempotency(body.idempotency_key, tenant_id, redis_client)
         if cached:
             logger.info("chat_idempotent_hit", key=body.idempotency_key, session_id=body.session_id)
             return cached
@@ -166,7 +166,7 @@ async def chat(
 
     # Store for idempotency deduplication
     if body.idempotency_key:
-        await _store_idempotency(body.idempotency_key, response, redis_client)
+        await _store_idempotency(body.idempotency_key, tenant_id, response, redis_client)
 
     return response
 

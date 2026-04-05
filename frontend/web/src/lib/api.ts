@@ -13,7 +13,7 @@
  */
 import axios, { AxiosInstance, AxiosError } from 'axios'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API_URL = typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000') : (process.env.INTERNAL_API_URL || 'http://api-gateway:8000')
 
 // Separate "bare" instance used only for the refresh call so the response
 // interceptor does not trigger recursively.
@@ -35,8 +35,13 @@ function createApiClient(): AxiosInstance {
   const client = axios.create({
     baseURL: `${API_URL}/api/v1`,
     headers: { 'Content-Type': 'application/json' },
-    // Send HttpOnly auth cookies automatically on every request
     withCredentials: true,
+  })
+
+  // The client relies strictly on HttpOnly cookies sent via withCredentials
+  // No explicit Bearer tokens are attached from localStorage
+  client.interceptors.request.use((config) => {
+    return config
   })
 
   // 401 → try a silent token refresh, then retry the original request once
@@ -73,7 +78,6 @@ function createApiClient(): AxiosInstance {
           return client(original)
         } catch (refreshError) {
           _drainQueue(refreshError)
-          // Refresh failed — clear client-side state and send to login
           if (typeof window !== 'undefined') {
             const { useAuthStore } = await import('@/store/auth')
             useAuthStore.getState().logout()
@@ -81,9 +85,23 @@ function createApiClient(): AxiosInstance {
             try { await _refreshClient.post('/auth/logout') } catch { /* ignore */ }
             window.location.href = '/login'
           }
-          return Promise.reject(refreshError)
+          // Return an unresolved promise to freeze the UI state instead of rejecting.
+          // This prevents components from catching the error and displaying false
+          // "failed to load" messages while the browser is redirecting to login.
+          return new Promise(() => {})
         } finally {
           _isRefreshing = false
+        }
+      }
+
+      // Handle 402 Payment Required (e.g. creating an agent without a slot)
+      if (status === 402) {
+        const detail = (error.response?.data as any)?.detail
+        const paymentUrl = detail?.payment_url
+        if (paymentUrl && typeof window !== 'undefined') {
+          // Immediately redirect to Stripe for checkout
+          window.location.href = paymentUrl
+          return new Promise(() => {}) // Freeze UI until redirect
         }
       }
 
@@ -117,6 +135,15 @@ export const authApi = {
   refresh: () => api.post('/auth/refresh').then((r) => r.data),
 
   logout: () => api.post('/auth/logout'),
+
+  verifyEmail: (data: { email: string; otp: string }) =>
+    api.post('/auth/verify-email', data).then((r) => r.data),
+
+  resendOTP: (data: { email: string }) =>
+    api.post('/auth/resend-otp', data).then((r) => r.data),
+
+  subscribe: (data: { email: string; plan: string }) =>
+    api.post('/auth/subscribe', data).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -135,13 +162,15 @@ export const tenantApi = {
 // ---------------------------------------------------------------------------
 
 export const agentsApi = {
-  list: () => api.get('/proxy/agents').then((r) => r.data),
+  list: (params?: { agent_id?: string; status?: string; limit?: number }) =>
+    api.get('/proxy/agents/', { params }).then((r) => r.data),
   get: (id: string) => api.get(`/proxy/agents/${id}`).then((r) => r.data),
   create: (data: Record<string, unknown>) =>
-    api.post('/proxy/agents', data).then((r) => r.data),
+    api.post('/proxy/agents/', data).then((r) => r.data),
   update: (id: string, data: Record<string, unknown>) =>
     api.patch(`/proxy/agents/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/proxy/agents/${id}`),
+  restore: (id: string) => api.post(`/proxy/agents/${id}/restore`).then((r) => r.data),
   test: (id: string, message: string) =>
     api.post(`/proxy/agents/${id}/test`, { message }).then((r) => r.data),
   uploadVoiceGreeting: (id: string, blob: Blob, ext: string) => {
@@ -170,7 +199,7 @@ export const agentsApi = {
 // ---------------------------------------------------------------------------
 
 export const templatesApi = {
-  list: () => api.get('/proxy/templates').then((r) => r.data),
+  list: () => api.get('/proxy/templates/').then((r) => r.data),
   get: (id: string) => api.get(`/proxy/templates/${id}`).then((r) => r.data),
   instantiate: (id: string, data: Record<string, unknown>) =>
     api.post(`/proxy/templates/${id}/instantiate`, data).then((r) => r.data),
@@ -204,6 +233,7 @@ export const chatApi = {
       headers: {
         'Content-Type': 'application/json',
       },
+      credentials: 'include',
       body: JSON.stringify(data),
     })
 
@@ -259,6 +289,7 @@ export const voiceApi = {
     const response = await fetch(`${API_URL}/api/v1/proxy/voice/tts/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ text, voice_id: voiceId || 'alloy' }),
     })
     if (!response.ok) return null
@@ -334,7 +365,7 @@ export const voiceApi = {
 
 export const sessionsApi = {
   list: (params?: { agent_id?: string; status?: string; limit?: number }) =>
-    api.get('/proxy/sessions', { params }).then((r) => r.data),
+    api.get('/proxy/sessions/', { params }).then((r) => r.data),
   get: (id: string, include_messages?: boolean) =>
     api
       .get(`/proxy/sessions/${id}`, {
@@ -371,7 +402,7 @@ export const feedbackApi = {
     feedback_source?: string
     playbook_correction?: { correct_playbook_id: string; correct_playbook_name: string } | null
     tool_corrections?: Array<{ tool_name: string; was_correct: boolean; correct_tool?: string; reason?: string }>
-  }) => api.post('/proxy/feedback', data).then((r) => r.data),
+  }) => api.post('/proxy/feedback/', data).then((r) => r.data),
 
   list: (params?: {
     agent_id?: string
@@ -381,7 +412,7 @@ export const feedbackApi = {
     include_messages?: boolean
     limit?: number
     offset?: number
-  }) => api.get('/proxy/feedback', { params }).then((r) => r.data),
+  }) => api.get('/proxy/feedback/', { params }).then((r) => r.data),
 
   delete: (id: string) => api.delete(`/proxy/feedback/${id}`),
 
@@ -404,7 +435,7 @@ export const feedbackApi = {
 
 export const analyticsApi = {
   overview: (params?: { days?: number; agent_id?: string }) =>
-    api.get('/proxy/analytics/overview', { params }).then((r) => r.data),
+    api.get('/proxy/analytics/overview/', { params }).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +526,8 @@ export const learningApi = {
 export const playbooksApi = {
   list: (agentId: string) =>
     api.get(`/proxy/agents/${agentId}/playbooks`).then((r) => r.data),
+  validateSafety: (text: string) =>
+    api.post('/playbooks/validate-safety', { text }).then((r) => r.data),
   create: (agentId: string, data: Record<string, unknown>) =>
     api.post(`/proxy/agents/${agentId}/playbooks`, data).then((r) => r.data),
   get: (agentId: string, playbookId: string) =>
@@ -561,15 +594,20 @@ export const teamApi = {
 
 export const billingApi = {
   overview: () => api.get('/billing/overview').then((r) => r.data),
+  listPlans: () => api.get('/billing/plans').then((r) => r.data as Record<string, any>),
   agents: () => api.get('/billing/agents').then((r) => r.data),
   createCheckoutSession: (data: { plan: string }) =>
     api.post('/billing/create-checkout-session', data).then((r) => r.data),
   createPortalSession: () =>
     api.post('/billing/portal-session').then((r) => r.data as { portal_url: string }),
-  createAgentSlotSession: () =>
-    api.post('/billing/create-agent-slot-session').then((r) => r.data as { checkout_url: string }),
+  createAgentSlotSession: (agentConfig?: any, returnPath?: string, plan?: string) =>
+    api.post('/billing/create-agent-slot-session', { agent_config: agentConfig, return_path: returnPath, plan }).then((r) => r.data as { checkout_url: string }),
   getInvoices: () =>
     api.get('/billing/invoices').then((r) => r.data as { invoices: any[] }),
+  cancel: () =>
+    api.post('/billing/cancel').then((r) => r.data),
+  toggleVoiceAddon: (enabled: boolean) =>
+    api.post('/billing/voice-addon', { enabled }).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -652,4 +690,75 @@ export const embedApi = {
     npmInstall: `npm install @ascenai/sdk`,
     sdkUsage: `import { AscenAIClient } from '@ascenai/sdk';\n\nconst client = new AscenAIClient({\n  apiKey: '${apiKey}',\n  apiUrl: '${apiUrl}',\n  agentId: '${agentId}',\n});\n\nconst response = await client.chat('Hello!');\nconsole.log(response.message);`,
   }),
+}
+
+// ---------------------------------------------------------------------------
+// Platform Settings (Admin)
+// ---------------------------------------------------------------------------
+
+export const platformSettingsApi = {
+  list: () => api.get('/admin/settings').then((r) => r.data),
+  update: (key: string, value: any) =>
+    api.put(`/admin/settings/${key}`, { value }).then((r) => r.data),
+}
+
+// ---------------------------------------------------------------------------
+// Admin API
+// ---------------------------------------------------------------------------
+
+export const adminApi = {
+  // Tenants
+  listTenants: (params?: { page?: number; per_page?: number; status?: string }) =>
+    api.get('/admin/tenants', { params }).then((r) => r.data),
+
+  getTenant: (tenantId: string) =>
+    api.get(`/admin/tenants/${tenantId}`).then((r) => r.data),
+
+  suspendTenant: (tenantId: string, reason: string) =>
+    api.post(`/admin/tenants/${tenantId}/suspend`, { reason }).then((r) => r.data),
+
+  reactivateTenant: (tenantId: string) =>
+    api.post(`/admin/tenants/${tenantId}/reactivate`).then((r) => r.data),
+
+  deleteTenant: (tenantId: string, hard_delete?: boolean) =>
+    api.delete(`/admin/tenants/${tenantId}`, { params: { hard_delete: hard_delete ?? false } }).then((r) => r.data),
+
+  // Users
+  listUsers: (params?: { tenant_id?: string; page?: number; per_page?: number }) =>
+    api.get('/admin/users', { params }).then((r) => r.data),
+
+  updateUserRole: (userId: string, role: string) =>
+    api.put(`/admin/users/${userId}/role`, { role }).then((r) => r.data),
+
+  // Prompts
+  getPrompts: (agentId?: string) =>
+    api.get('/admin/prompts', { params: agentId ? { agent_id: agentId } : undefined }).then((r) => r.data),
+
+  updatePrompt: (agentId: string, systemPrompt: string) =>
+    api.put(`/admin/prompts/${agentId}`, { system_prompt: systemPrompt }).then((r) => r.data),
+
+  // Traces
+  getTraces: (params?: { session_id?: string; tenant_id?: string; limit?: number }) =>
+    api.get('/admin/traces', { params }).then((r) => r.data),
+
+  // Metrics
+  getMetrics: () => api.get('/admin/metrics').then((r) => r.data),
+
+  // Roles
+  listRoles: () => api.get('/admin/roles').then((r) => r.data),
+
+  // Settings
+  getSettings: () => api.get('/admin/settings').then((r) => r.data),
+
+  updateSetting: (key: string, value: any) =>
+    api.put(`/admin/settings/${key}`, { value }).then((r) => r.data),
+
+  // Trial tenant creation (bypasses payment)
+  createTrialTenant: (data: {
+    name: string
+    business_name: string
+    plan: string
+    admin_email: string
+    admin_password: string
+  }) => api.post('/admin/trial-tenants', data).then((r) => r.data),
 }

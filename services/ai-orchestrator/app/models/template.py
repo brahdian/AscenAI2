@@ -9,6 +9,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
+# Import safety and compliance models
+from app.models.safety_compliance import (
+    TemplateCompliance,
+    TemplateGuardrail,
+    TemplateEmergencyProtocol,
+    TemplateQualityEvaluation,
+    TemplateAnalytics,
+    TemplateMarketplace,
+)
+
 
 class AgentTemplate(Base):
     __tablename__ = "agent_templates"

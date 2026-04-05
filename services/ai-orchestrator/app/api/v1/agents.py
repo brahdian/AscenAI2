@@ -23,7 +23,11 @@ from app.schemas.chat import (
     ChatResponse,
     ConnectorTestResult,
 )
-from app.guardrails.voice_agent_guardrails import DEFAULT_VOICE_PROTOCOL
+from app.guardrails.voice_agent_guardrails import (
+    get_dynamic_voice_protocol,
+    generate_multilingual_greeting,
+    generate_multilingual_fallback,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -62,7 +66,14 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-def _agent_to_response(agent: Agent) -> AgentResponse:
+async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
+    supported_langs = getattr(agent, 'supported_languages', None) or []
+    
+    # Generate dynamic components from platform settings
+    computed_greeting = await generate_multilingual_greeting(db, supported_langs)
+    computed_protocol = await get_dynamic_voice_protocol(db, supported_langs)
+    computed_fallback = await generate_multilingual_fallback(db, supported_langs)
+
     return AgentResponse(
         id=str(agent.id),
         tenant_id=str(agent.tenant_id),
@@ -75,15 +86,20 @@ def _agent_to_response(agent: Agent) -> AgentResponse:
         voice_id=agent.voice_id,
         language=agent.language,
         auto_detect_language=getattr(agent, 'auto_detect_language', False),
-        supported_languages=getattr(agent, 'supported_languages', None) or [],
+        supported_languages=supported_langs,
         greeting_message=agent.greeting_message,
         voice_greeting_url=agent.voice_greeting_url,
         voice_system_prompt=agent.voice_system_prompt,
+        computed_greeting=computed_greeting,
+        computed_protocol=computed_protocol,
+        computed_fallback=computed_fallback,
         tools=agent.tools or [],
         knowledge_base_ids=agent.knowledge_base_ids or [],
         llm_config=agent.llm_config or {},
         escalation_config=agent.escalation_config or {},
         is_active=agent.is_active,
+        stripe_subscription_id=agent.stripe_subscription_id,
+        deleted_at=agent.deleted_at.isoformat() if agent.deleted_at else None,
         created_at=agent.created_at.isoformat() if agent.created_at else None,
         updated_at=agent.updated_at.isoformat() if agent.updated_at else None,
     )
@@ -114,8 +130,8 @@ async def create_agent(
         llm_config=body.llm_config,
         escalation_config=body.escalation_config,
         greeting_message=f"Hi! I'm {body.name}. How can I help you today?",
-        voice_system_prompt=body.voice_system_prompt or DEFAULT_VOICE_PROTOCOL,
-        is_active=True,
+        voice_system_prompt=body.voice_system_prompt,
+        is_active=body.is_active if body.is_active is not None else True,
     )
     db.add(agent)
 
@@ -151,21 +167,31 @@ async def create_agent(
     await db.commit()
     await db.refresh(agent)
     logger.info("agent_created", agent_id=str(agent.id), tenant_id=tenant_id)
-    return _agent_to_response(agent)
+    return await _agent_to_response(agent, db)
 
 
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(
+    status: str = "active",  # active, archived, all
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
-    """List all agents for the tenant."""
-    result = await db.execute(
-        select(Agent)
-        .where(Agent.tenant_id == uuid.UUID(tenant_id), Agent.is_active.is_(True))
-        .order_by(Agent.created_at.desc())
-    )
-    return [_agent_to_response(a) for a in result.scalars().all()]
+    """
+    List agents for the tenant.
+    - status=active (default): is_active=True
+    - status=archived: is_active=False AND deleted_at IS NOT NULL
+    - status=all: everything
+    """
+    query = select(Agent).where(Agent.tenant_id == uuid.UUID(tenant_id))
+    
+    if status == "active":
+        query = query.where(Agent.is_active.is_(True))
+    elif status == "archived":
+        query = query.where(Agent.is_active.is_(False), Agent.deleted_at.is_not(None))
+    
+    result = await db.execute(query.order_by(Agent.created_at.desc()))
+    agents = result.scalars().all()
+    return [await _agent_to_response(a, db) for a in agents]
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)
@@ -185,7 +211,7 @@ async def get_agent(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
-    return _agent_to_response(agent)
+    return await _agent_to_response(agent, db)
 
 
 @router.patch("/{agent_id}", response_model=AgentResponse)
@@ -214,7 +240,7 @@ async def update_agent(
 
     await db.commit()
     await db.refresh(agent)
-    return _agent_to_response(agent)
+    return await _agent_to_response(agent, db)
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -235,9 +261,32 @@ async def delete_agent(
         raise HTTPException(status_code=404, detail="Agent not found.")
     
     agent.is_active = False
-    # Also deactivate associated guardrails and playbooks if needed?
-    # Usually is_active on Agent is enough to hide it.
+    agent.deleted_at = datetime.now(timezone.utc)
     await db.commit()
+
+
+@router.post("/{agent_id}/restore", response_model=AgentResponse)
+async def restore_agent(
+    agent_id: str,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """Restore an archived agent."""
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    
+    agent.is_active = True
+    agent.deleted_at = None
+    await db.commit()
+    await db.refresh(agent)
+    return await _agent_to_response(agent, db)
 
 
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

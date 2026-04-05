@@ -14,12 +14,50 @@ import {
   CheckCircle,
   AlertCircle,
   Clock,
-  ChevronRight,
+  ChevronLeft,
+  ArrowUp,
+  ArrowDown,
+  X,
+  Loader2,
   TrendingUp,
   Sparkles,
   Phone,
+  ChevronRight,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+
+const PLANS = {
+  starter: {
+    display_name: "Starter",
+    price_per_agent: 49.00,
+    chat_equivalents_included: 20_000,
+    voice_minutes_included: 0,
+    voice_enabled: false,
+  },
+  voice_growth: {
+    display_name: "Growth",
+    price_per_agent: 99.00,
+    chat_equivalents_included: 80_000,
+    voice_minutes_included: 1500,
+    voice_enabled: true,
+  },
+  voice_business: {
+    display_name: "Business",
+    price_per_agent: 199.00,
+    chat_equivalents_included: 170_000,
+    voice_minutes_included: 3500,
+    voice_enabled: true,
+  },
+  enterprise: {
+    display_name: "Enterprise",
+    price_per_agent: null,
+    chat_equivalents_included: null,
+    voice_minutes_included: null,
+    voice_enabled: true,
+  },
+}
+
+const PLAN_ORDER = ['starter', 'voice_growth', 'voice_business', 'enterprise']
 
 interface BillingOverview {
   plan: string
@@ -58,6 +96,7 @@ interface AgentBilling {
   agent_name: string
   sessions: number
   messages: number
+  chats?: number
   tokens: number
   voice_minutes: number
   base_cost: number
@@ -81,6 +120,8 @@ export default function BillingPage() {
   const [invoices, setInvoices] = useState<Invoice[]>([])
   const [loading, setLoading] = useState(true)
   const [portalLoading, setPortalLoading] = useState(false)
+  const [selectedAgentId, setSelectedAgentId] = useState<string>('')
+  const [changingPlan, setChangingPlan] = useState(false)
 
   useEffect(() => {
     Promise.all([
@@ -92,6 +133,9 @@ export default function BillingPage() {
         setOverview(ov)
         setAgents(ag)
         setInvoices(inv)
+        if (ag.length > 0 && !selectedAgentId) {
+          setSelectedAgentId(ag[0].agent_id || '')
+        }
       })
       .catch((err) => {
         console.error('Failed to load billing data:', err)
@@ -117,6 +161,23 @@ export default function BillingPage() {
     }
   }
 
+  const currentPlanKey = overview?.plan || 'starter'
+  const currentPlanIndex = PLAN_ORDER.indexOf(currentPlanKey)
+  const isFreeTier = currentPlanKey === 'none'
+
+  const handleUpgrade = async (newPlan: string) => {
+    setChangingPlan(true)
+    try {
+      const data = await billingApi.createCheckoutSession({ plan: newPlan })
+      if (data.checkout_url) {
+        window.location.href = data.checkout_url
+      }
+    } catch (err) {
+      toast.error('Failed to start plan change')
+      setChangingPlan(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="p-8 flex items-center justify-center min-h-[400px]">
@@ -134,6 +195,7 @@ export default function BillingPage() {
   const formatDate = (ts: number) => new Date(ts * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 
   const isOverage = (overview?.estimated_bill.overage || 0) > 0
+  const isSubscribed = overview?.plan && overview.plan !== 'none' && (overview.subscription_status === 'active' || overview.subscription_status === 'trialing')
 
   return (
     <div className="p-8 w-full max-w-6xl mx-auto">
@@ -205,90 +267,170 @@ export default function BillingPage() {
               <div className="mt-8 pt-6 border-t border-white/10 flex items-center justify-between">
                 <div className="flex gap-6">
                   <div>
-                    <p className="text-xs text-violet-200 mb-0.5">Active Agents</p>
+                    <p className="text-xs text-violet-200 mb-0.5">Active Agent Slots</p>
                     <p className="text-lg font-bold">{overview?.agent_count || 0}</p>
                   </div>
-                  <div>
-                    <p className="text-xs text-violet-200 mb-0.5">Base Fee</p>
-                    <p className="text-lg font-bold">{fmt(overview?.estimated_bill.base || 0)}</p>
-                  </div>
-                  {isOverage && (
-                    <div>
-                      <p className="text-xs text-violet-200 mb-0.5">Overage</p>
-                      <p className="text-lg font-bold text-amber-300">{fmt(overview?.estimated_bill.overage || 0)}</p>
-                    </div>
+                  {isSubscribed && (
+                    <>
+                      <div>
+                        <p className="text-xs text-violet-200 mb-0.5">Base Fee</p>
+                        <p className="text-lg font-bold">{fmt(overview?.estimated_bill.base || 0)}</p>
+                      </div>
+                      {isOverage && (
+                        <div>
+                          <p className="text-xs text-violet-200 mb-0.5">Overage</p>
+                          <p className="text-lg font-bold text-amber-300">{fmt(overview?.estimated_bill.overage || 0)}</p>
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
                 <button
-                  onClick={() => window.open('https://ascenai.com/pricing', '_blank')}
+                  onClick={handleManageBilling}
                   className="px-4 py-2 bg-white text-violet-600 rounded-xl text-sm font-bold hover:bg-violet-50 transition-colors shadow-sm"
                 >
-                  Change Plan
+                  {isSubscribed ? 'Change Plan' : 'Choose Plan'}
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Plan Progress */}
-          <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
-            <h2 className="text-base font-bold text-gray-900 dark:text-white mb-6 flex items-center gap-2">
-              <Zap size={18} className="text-violet-500" />
-              Resource Utilization
-            </h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              {[
-                { 
-                  label: 'Chat Equivalents', 
-                  used: overview?.usage.chats || 0, 
-                  limit: overview?.limits.chat_messages, 
-                  pct: overview?.usage.messages_pct,
-                  desc: 'Calculated as 10 regular messages per chat unit'
-                },
-                { 
-                  label: 'Voice Minutes', 
-                  used: overview?.usage.voice_minutes || 0, 
-                  limit: overview?.limits.voice_minutes, 
-                  pct: overview?.usage.voice_pct,
-                  desc: 'Total duration of all AI-user voice calls'
-                },
-              ].map(({ label, used, limit, pct, desc }) => (
-                <div key={label} className="space-y-3">
-                  <div className="flex justify-between items-end">
-                    <div>
-                      <p className="text-sm font-bold text-gray-900 dark:text-white">{label}</p>
-                      <p className="text-[10px] text-gray-500 mt-0.5">{desc}</p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-sm font-mono font-bold text-gray-900 dark:text-white">
-                        {fmtNum(Math.round(used))} <span className="text-gray-400 font-normal">/ {fmtLimit(limit)}</span>
-                      </p>
-                    </div>
-                  </div>
-                  <div className="h-2.5 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                      className={`h-full transition-all duration-700 ease-out rounded-full ${
-                        (pct || 0) > 100 ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]' : 
-                        (pct || 0) > 85 ? 'bg-amber-500' : 
-                        'bg-violet-600'
-                      }`}
-                      style={{ width: `${Math.min(pct || 0, 100)}%` }}
-                    />
-                  </div>
-                  <div className="flex justify-between text-[10px]">
-                    <span className={ (pct || 0) > 100 ? 'text-red-500 font-bold' : 'text-gray-400' }>
-                      { (pct || 0) > 100 ? 'Overage Applied' : `${Math.round(pct || 0)}% of limit used` }
+          {/* Plan Progress - Only show if subscribed */}
+          {isSubscribed && (
+            <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-base font-bold text-gray-900 dark:text-white flex items-center gap-2">
+                  <Zap size={18} className="text-violet-500" />
+                  Resource Utilization
+                </h2>
+                
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      const idx = agents.findIndex(a => a.agent_id === selectedAgentId);
+                      const prev = idx > 0 ? agents[idx - 1] : agents[agents.length - 1];
+                      if (prev) setSelectedAgentId(prev.agent_id || '');
+                    }}
+                    className="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 hover:text-violet-600 transition-colors"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <div className="flex items-center gap-2 bg-gray-50 dark:bg-gray-800 p-1 rounded-xl border border-gray-100 dark:border-gray-700 overflow-hidden">
+                    <span className="px-3 py-1 text-[10px] font-black text-violet-600 dark:text-violet-400 uppercase tracking-widest whitespace-nowrap">
+                      {agents.find(a => a.agent_id === selectedAgentId)?.agent_name || 'Select Agent'}
                     </span>
-                    {(pct || 0) > 85 && (
-                      <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400 font-medium">
-                        <AlertCircle size={10} />
-                        Approaching limit
-                      </span>
-                    )}
+                  </div>
+                  <button
+                    onClick={() => {
+                      const idx = agents.findIndex(a => a.agent_id === selectedAgentId);
+                      const next = idx < agents.length - 1 ? agents[idx + 1] : agents[0];
+                      if (next) setSelectedAgentId(next.agent_id || '');
+                    }}
+                    className="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 hover:text-violet-600 transition-colors"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                {[
+                  { 
+                    label: 'Chat Equivalents', 
+                    used: overview?.usage.chats || 0, 
+                    limit: overview?.limits.chat_messages, 
+                    pct: overview?.usage.messages_pct,
+                    desc: 'Calculated as 10 regular messages per chat unit'
+                  },
+                  { 
+                    label: 'Voice Minutes', 
+                    used: overview?.usage.voice_minutes || 0, 
+                    limit: overview?.limits.voice_minutes, 
+                    pct: overview?.usage.voice_pct,
+                    desc: 'Total duration of all AI-user voice calls'
+                  },
+                ].map(({ label, used, limit, pct, desc }) => {
+                  // Determine display values based on selected agent
+                  let displayUsed = used
+                  let displayPct = pct
+
+                  if (selectedAgentId !== 'total') {
+                    const agent = agents.find(a => a.agent_id === selectedAgentId)
+                    if (agent) {
+                      if (label === 'Chat Equivalents') {
+                        // Assuming 1 chat unit per session floor or messages? 
+                        // The backend 'billing_agents' returns 'chats'
+                        // interface AgentBilling has chats? wait let me check
+                        displayUsed = (agent as any).chats || (agent.messages / 10)
+                        displayPct = limit ? (displayUsed / limit) * 100 : 0
+                      } else {
+                        displayUsed = agent.voice_minutes
+                        displayPct = limit ? (displayUsed / limit) * 100 : 0
+                      }
+                    }
+                  }
+
+                  return (
+                    <div key={label} className="space-y-3">
+                      <div className="flex justify-between items-end">
+                        <div>
+                          <p className="text-sm font-bold text-gray-900 dark:text-white">{label}</p>
+                          <p className="text-[10px] text-gray-500 mt-0.5">{desc}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-sm font-mono font-bold text-gray-900 dark:text-white">
+                            {fmtNum(Math.round(displayUsed))} <span className="text-gray-400 font-normal">/ {fmtLimit(limit)}</span>
+                          </p>
+                        </div>
+                      </div>
+                      <div className="h-2.5 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full transition-all duration-700 ease-out rounded-full ${
+                            (displayPct || 0) > 100 ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]' : 
+                            (displayPct || 0) > 85 ? 'bg-amber-500' : 
+                            'bg-violet-600'
+                          }`}
+                          style={{ width: `${Math.min(displayPct || 0, 100)}%` }}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[10px]">
+                        <span className={ (displayPct || 0) > 100 ? 'text-red-500 font-bold' : 'text-gray-400' }>
+                          { (displayPct || 0) > 100 ? 'Overage Applied' : `${Math.round(displayPct || 0)}% of limit used` }
+                        </span>
+                        {(displayPct || 0) > 85 && (
+                          <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400 font-medium">
+                            <AlertCircle size={10} />
+                            Approaching limit
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Per-Agent Upgrade Button */}
+              <div className="mt-8 pt-6 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-violet-100 dark:bg-violet-900/30 flex items-center justify-center text-violet-600">
+                    <Sparkles size={16} />
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-gray-900 dark:text-white">Upgrade this Agent</p>
+                    <p className="text-[10px] text-gray-500">Increase limits for {agents.find(a => a.agent_id === selectedAgentId)?.agent_name}</p>
                   </div>
                 </div>
-              ))}
+                <button
+                  onClick={() => {
+                    const el = document.getElementById('plans-section');
+                    el?.scrollIntoView({ behavior: 'smooth' });
+                  }}
+                  className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-violet-600/20"
+                >
+                  View Plans
+                </button>
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         {/* Right Column: Invoices & Stats */}
@@ -347,88 +489,175 @@ export default function BillingPage() {
         </div>
       </div>
 
-      {/* Usage breakdown cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-        {[
-          { icon: Sparkles, label: 'Sessions', value: fmtNum(overview?.usage.sessions || 0), desc: 'Total conversations', color: 'bg-blue-50 text-blue-600 dark:bg-blue-900/20' },
-          { icon: MessageSquare, label: 'Chats', value: fmtNum(overview?.usage.chats || 0), desc: 'Inbound + Outbound', color: 'bg-violet-50 text-violet-600 dark:bg-violet-900/20' },
-          { icon: Phone, label: 'Voice Minutes', value: `${(overview?.usage.voice_minutes || 0).toFixed(1)}m`, desc: 'AI-user calls', color: 'bg-orange-50 text-orange-600 dark:bg-orange-900/20' },
-        ].map(({ icon: Icon, label, value, desc, color }) => (
-          <div key={label} className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-5 group hover:shadow-md transition-shadow">
-            <div className={`w-10 h-10 rounded-xl ${color} flex items-center justify-center mb-4 group-hover:scale-110 transition-transform`}>
-              <Icon size={20} />
+      {/* Usage breakdown cards - Only show if subscribed */}
+      {isSubscribed && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+          {[
+            { icon: Sparkles, label: 'Sessions', value: fmtNum(overview?.usage.sessions || 0), desc: 'Total conversations', color: 'bg-blue-50 text-blue-600 dark:bg-blue-900/20' },
+            { icon: MessageSquare, label: 'Chats', value: fmtNum(overview?.usage.chats || 0), desc: 'Inbound + Outbound', color: 'bg-violet-50 text-violet-600 dark:bg-violet-900/20' },
+            { icon: Phone, label: 'Voice Minutes', value: `${(overview?.usage.voice_minutes || 0).toFixed(1)}m`, desc: 'AI-user calls', color: 'bg-orange-50 text-orange-600 dark:bg-orange-900/20' },
+          ].map(({ icon: Icon, label, value, desc, color }) => (
+            <div key={label} className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-5 group hover:shadow-md transition-shadow">
+              <div className={`w-10 h-10 rounded-xl ${color} flex items-center justify-center mb-4 group-hover:scale-110 transition-transform`}>
+                <Icon size={20} />
+              </div>
+              <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">{label}</p>
+              <p className="text-2xl font-black text-gray-900 dark:text-white leading-none">{value}</p>
+              <p className="text-[10px] text-gray-400 mt-2">{desc}</p>
             </div>
-            <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">{label}</p>
-            <p className="text-2xl font-black text-gray-900 dark:text-white leading-none">{value}</p>
-            <p className="text-[10px] text-gray-400 mt-2">{desc}</p>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
 
       {/* Per-agent breakdown table */}
-      <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 overflow-hidden shadow-sm">
-        <div className="px-6 py-5 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
-          <h2 className="text-base font-bold text-gray-900 dark:text-white">Active Agent Usage</h2>
-          <span className="text-xs text-gray-400 bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded-lg">
-            Billing for {overview?.billing_period.start} — {overview?.billing_period.end}
-          </span>
-        </div>
-        
-        {agents.length === 0 ? (
-          <div className="py-20 flex flex-col items-center justify-center text-gray-400">
-            <Bot size={48} strokeWidth={1} className="mb-3 opacity-20" />
-            <p className="text-sm italic">No agents recorded usage in this window.</p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-gray-50/50 dark:bg-gray-800/30">
-                  <th className="pl-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest">Agent Persona</th>
-                  <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Messages</th>
-                  <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Voice Minutes</th>
-                  <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Base Cost</th>
-                  <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Overage</th>
-                  <th className="pr-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Total Contribution</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                {agents.map((a, i) => (
-                  <tr key={a.agent_id ?? i} className="hover:bg-violet-50/20 dark:hover:bg-violet-900/5 transition-colors group">
-                    <td className="pl-6 py-4">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-gray-100 to-gray-200 dark:from-gray-800 dark:to-gray-700 flex items-center justify-center text-gray-400 group-hover:from-violet-500 group-hover:to-indigo-500 group-hover:text-white transition-all">
-                          <Bot size={20} />
-                        </div>
-                        <div>
-                          <p className="text-sm font-bold text-gray-900 dark:text-white">{a.agent_name}</p>
-                          <p className="text-[10px] text-gray-400">ID: {a.agent_id?.slice(0,8)}...</p>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{fmtNum(a.messages)}</td>
-                    <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{a.voice_minutes.toFixed(1)}</td>
-                    <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400 font-medium">{fmt(a.base_cost)}</td>
-                    <td className="px-4 py-4 text-right text-sm font-mono text-amber-600 dark:text-amber-400 font-medium">{a.overage > 0 ? fmt(a.overage) : '—'}</td>
-                    <td className="pr-6 py-4 text-right">
-                      <p className="text-sm font-black text-gray-900 dark:text-white">{fmt(a.total_cost)}</p>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr className="bg-gray-50/50 dark:bg-gray-800/30">
-                  <td colSpan={5} className="pl-6 py-5 text-right text-xs font-bold text-gray-500">Statement Total</td>
-                  <td className="pr-6 py-5 text-right">
-                    <span className="text-lg font-black text-violet-600 dark:text-violet-400">
-                      {fmt(overview?.estimated_bill.total || 0)}
-                    </span>
-                  </td>
-                </tr>
-              </tfoot>
-            </table>
+        {isSubscribed && (
+          <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 overflow-hidden shadow-sm">
+            <div className="px-6 py-5 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
+              <h2 className="text-base font-bold text-gray-900 dark:text-white">Active Agent Usage</h2>
+              <span className="text-xs text-gray-400 bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded-lg">
+                Billing for {overview?.billing_period.start} — {overview?.billing_period.end}
+              </span>
+            </div>
+            
+            {agents.length === 0 ? (
+              <div className="py-20 flex flex-col items-center justify-center text-gray-400">
+                <Bot size={48} strokeWidth={1} className="mb-3 opacity-20" />
+                <p className="text-sm italic">No agents recorded usage in this window.</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-gray-50/50 dark:bg-gray-800/30">
+                      <th className="pl-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest">Agent Persona</th>
+                      <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Messages</th>
+                      <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Voice Minutes</th>
+                      <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Base Cost</th>
+                      <th className="px-4 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Overage</th>
+                      <th className="pr-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Total Contribution</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                    {agents.map((a, i) => (
+                      <tr key={a.agent_id ?? i} className="hover:bg-violet-50/20 dark:hover:bg-violet-900/5 transition-colors group">
+                        <td className="pl-6 py-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-gray-100 to-gray-200 dark:from-gray-800 dark:to-gray-700 flex items-center justify-center text-gray-400 group-hover:from-violet-500 group-hover:to-indigo-500 group-hover:text-white transition-all">
+                              <Bot size={20} />
+                            </div>
+                            <div>
+                              <p className="text-sm font-bold text-gray-900 dark:text-white">{a.agent_name}</p>
+                              <p className="text-[10px] text-gray-400">ID: {a.agent_id?.slice(0,8)}...</p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{fmtNum(a.messages)}</td>
+                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{a.voice_minutes.toFixed(1)}</td>
+                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400 font-medium">{fmt(a.base_cost)}</td>
+                        <td className="px-4 py-4 text-right text-sm font-mono text-amber-600 dark:text-amber-400 font-medium">{a.overage > 0 ? fmt(a.overage) : '—'}</td>
+                        <td className="pr-6 py-4 text-right">
+                          <p className="text-sm font-black text-gray-900 dark:text-white">{fmt(a.total_cost)}</p>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr className="bg-gray-50/50 dark:bg-gray-800/30">
+                      <td colSpan={5} className="pl-6 py-5 text-right text-xs font-bold text-gray-500">Statement Total</td>
+                      <td className="pr-6 py-5 text-right">
+                        <span className="text-lg font-black text-violet-600 dark:text-violet-400">
+                          {fmt(overview?.estimated_bill.total || 0)}
+                        </span>
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            )}
           </div>
         )}
+
+      {/* Available Plans - Upgrade/Downgrade */}
+      <div id="plans-section" className="mt-8 bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-8 shadow-sm">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white">Available Plans</h2>
+            <p className="text-sm text-gray-500 mt-1">Scale your AI operations with predictable, per-agent pricing</p>
+          </div>
+          <Zap size={24} className="text-amber-500 opacity-20" />
+        </div>
+        
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+          {Object.entries(PLANS).map(([key, plan]) => {
+            const isCurrentPlan = key === currentPlanKey
+            const planIndex = PLAN_ORDER.indexOf(key)
+            const isUpgrade = !isFreeTier && planIndex > currentPlanIndex
+            const isDowngrade = !isFreeTier && planIndex < currentPlanIndex && !isFreeTier
+
+            return (
+              <div
+                key={key}
+                className={`relative group p-6 rounded-2xl border-2 transition-all duration-300 ${isCurrentPlan
+                  ? 'border-violet-500 bg-violet-50/30 dark:bg-violet-900/10 shadow-lg shadow-violet-500/5'
+                  : 'border-gray-100 dark:border-gray-800 hover:border-violet-200 dark:hover:border-violet-800 bg-white dark:bg-gray-900'
+                  }`}
+              >
+                {isCurrentPlan && (
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 bg-violet-600 text-white text-[10px] font-black uppercase tracking-widest rounded-full shadow-lg">
+                    Current Plan
+                  </div>
+                )}
+                
+                <h3 className="font-bold text-gray-900 dark:text-white text-lg mb-1">{plan.display_name}</h3>
+                <div className="mb-4">
+                  <p className="text-3xl font-black text-gray-900 dark:text-white">
+                    {plan.price_per_agent ? `$${plan.price_per_agent}` : 'Custom'}
+                  </p>
+                  {plan.price_per_agent && <p className="text-[10px] font-bold text-gray-400 uppercase tracking-tighter">Per Active Agent / Month</p>}
+                </div>
+
+                <div className="space-y-3 mb-8">
+                  <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+                    <MessageSquare size={14} className="text-violet-500" />
+                    <span>{plan.chat_equivalents_included ? `${(plan.chat_equivalents_included / 1000).toFixed(1)}K Units` : 'Custom Units'}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+                    <Mic size={14} className="text-violet-500" />
+                    <span>{plan.voice_minutes_included ? `${plan.voice_minutes_included}m Voice` : plan.voice_minutes_included === 0 ? 'No Voice' : 'Custom Voice'}</span>
+                  </div>
+                </div>
+
+                {isCurrentPlan ? (
+                  <button
+                    disabled
+                    className="w-full py-3 text-sm font-bold text-violet-600 bg-violet-100 dark:bg-violet-900/30 rounded-xl flex items-center justify-center gap-2"
+                  >
+                    <CheckCircle size={16} />
+                    Current
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleUpgrade(key)}
+                    disabled={changingPlan}
+                    className={`w-full py-3 text-sm font-bold rounded-xl transition-all flex items-center justify-center gap-2 ${
+                      isUpgrade 
+                        ? 'bg-violet-600 text-white hover:bg-violet-700 shadow-lg shadow-violet-600/20' 
+                        : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-700'
+                    }`}
+                  >
+                    {changingPlan ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        {isUpgrade ? 'Upgrade' : (isDowngrade ? 'Downgrade' : 'Talk to Sales')}
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
       </div>
 
       {/* Helpful alerts */}

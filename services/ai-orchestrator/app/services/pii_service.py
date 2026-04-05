@@ -36,7 +36,7 @@ async def warmup() -> None:
     logger.info("pii_service_ready", method="pseudo_values")
 
 
-async def redact(text: str) -> str:
+def redact(text: str) -> str:
     """One-way PII redaction for output guardrail. Replaces PII with [TYPE] labels."""
     if not text:
         return text
@@ -87,14 +87,12 @@ class PIIContext:
         return len(self.real_to_pseudo) > 0
     
     def _generate_pseudo(self, pii_type: str, value: str) -> str:
-        """Generate a pseudo-value that looks natural."""
-        hash_id = hashlib.md5(value.encode()).hexdigest()[:6]
+        """Generate a pseudo-value that looks natural and is non-collidable."""
+        hash_id = uuid.uuid4().hex[:8]
 
         if pii_type == 'EMAIL':
-            # Natural email format: user_x7k2m@ascenai.private
             return f"user_{hash_id}@{PII_PSEUDO_DOMAIN}"
         elif pii_type == 'PHONE':
-            # Natural phone format: +1-555-XXXX
             return f"+1-555-{hash_id[:4]}"
         elif pii_type == 'CREDIT_CARD':
             return f"4000-{hash_id[:4]}-{hash_id[4:8]}-0001"
@@ -167,7 +165,7 @@ def redact_pii(text: str, ctx: PIIContext, session_id: str = "") -> str:
             real_value = match.group(0)
             pseudo = ctx.get_pseudo(ptype, real_value)
             logger.info("pii_replaced", session_id=session_id, pii_type=ptype,
-                       pseudo=pseudo, real_preview=real_value[:20])
+                       pseudo=pseudo)
             return pseudo
 
         before = result
@@ -301,23 +299,30 @@ class StreamingParser:
         if not self.ctx.has_mappings():
             return chunk
         
-        # Add chunk to buffer
         self.buffer += chunk
         
-        # Try to find and replace pseudo-values in buffer
+        last_replacement_end = None
+        
         for pseudo, real in self.ctx.pseudo_to_real.items():
-            if pseudo in self.buffer:
-                self.buffer = self.buffer.replace(pseudo, real)
-                logger.info("pii_stream_restored", session_id=self.session_id, 
+            idx = self.buffer.find(pseudo)
+            if idx != -1:
+                self.buffer = self.buffer.replace(pseudo, real, 1)
+                last_replacement_end = idx + len(real)
+                logger.info("pii_stream_restored", session_id=self.session_id,
                            pseudo_len=len(pseudo), real_len=len(real))
         
-        # If buffer is shorter than max pseudo length, don't emit yet
-        # (might be start of a pseudo-value)
-        if len(self.buffer) <= self.max_pseudo_len:
+        if len(self.buffer) <= self.max_pseudo_len and last_replacement_end is None:
             return ""
         
-        # Emit safe portion, keep potential partial match in buffer
-        # The safe portion is everything except the last max_pseudo_len chars
+        if last_replacement_end is not None:
+            output = self.buffer[:last_replacement_end]
+            self.buffer = self.buffer[last_replacement_end:]
+            return output
+        
+        suffix = self.buffer[len(self.buffer) - self.max_pseudo_len:]
+        if len(suffix) >= 16 and "@" in suffix and suffix in self.ctx.pseudo_to_real:
+            return ""
+        
         safe_end = len(self.buffer) - self.max_pseudo_len
         output = self.buffer[:safe_end]
         self.buffer = self.buffer[safe_end:]

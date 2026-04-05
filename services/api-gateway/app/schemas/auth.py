@@ -28,6 +28,42 @@ class RegisterRequest(BaseModel):
     )
 
 
+class RegisterResponse(BaseModel):
+    message: str = "Verification code sent. Complete email verification and payment to activate your account."
+    email: str
+    requires_verification: bool = True
+    requires_payment: bool = True
+    payment_url: str | None = None
+
+
+class VerifyEmailResponse(BaseModel):
+    message: str
+    email: str
+    tenant_id: str
+    requires_payment: bool = True
+    payment_url: str | None = None
+
+
+class SubscribeRequest(BaseModel):
+    email: EmailStr
+    plan: str = Field(default="voice_growth")
+
+
+class SubscribeResponse(BaseModel):
+    payment_url: str
+    session_id: str
+    plan: str
+
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6)
+
+
+class ResendOTPRequest(BaseModel):
+    email: EmailStr
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str

@@ -24,6 +24,9 @@ interface CatalogEntry {
   category: string
   is_builtin: boolean
   allow_multiple?: boolean
+  voice_capable?: boolean
+  pci_compliant?: boolean
+  channel_support?: string[]
   credentials: {
     field: string
     label: string
@@ -643,6 +646,16 @@ export default function AgentToolsPage() {
                         <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${CATEGORY_COLORS[category] || CATEGORY_COLORS.custom}`}>
                           {CATEGORY_LABELS[category] || category}
                         </span>
+                        {entry.channel_support && entry.channel_support.length > 0 && !entry.channel_support.includes('voice') && (
+                          <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-orange-50 text-orange-700 dark:bg-orange-900/20 dark:text-orange-300">
+                            Chat Only
+                          </span>
+                        )}
+                        {category === 'payments' && entry.pci_compliant === false && (
+                          <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300" title="Not PCI-DSS compliant">
+                            PCI Warning
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-gray-500 mt-0.5">{entry.description}</p>
                     </div>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json as _json
 import re
 import httpx
+import stripe
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.services.billing_service import create_agent_checkout_session
 
 logger = structlog.get_logger(__name__)
 
@@ -29,14 +31,36 @@ async def _get_tenant_and_usage(tenant_id: str, db: AsyncSession):
 
 
 async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
-    """Raise 402 if tenant is at or above purchased agent slots."""
+    """Raise 402 if tenant is not subscribed, or is at/above purchased agent slots."""
     from app.services.tenant_service import get_plan_limits
+    from app.services.auth_service import auth_service as _auth_service
     tenant, usage = await _get_tenant_and_usage(tenant_id, db)
     if tenant is None or usage is None:
         return
-    
+
+    # Gate 1: tenant has no paid subscription or 0 slots
+    if tenant.subscription_status != "active" or usage.agent_count == 0:
+        payment_url = None
+        try:
+            # Generate a checkout session for the user to purchase their first agent slot
+            sub_resp = await _auth_service.create_subscription(
+                tenant.email or "", tenant.plan or "voice_growth", db, None
+            )
+            payment_url = sub_resp.payment_url
+        except Exception as e:
+            logger.warning("agent_create_payment_url_failed", error=str(e))
+
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": "A paid subscription is required to deploy an AI agent.",
+                "payment_url": payment_url,
+            },
+        )
+
+    # Gate 2: Check if they are at their agent limit
     purchased_slots = usage.agent_count
-    
+
     # Query actual agent count from orchestrator
     actual_count = 0
     try:
@@ -50,8 +74,6 @@ async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
                 actual_count = len(agents)
     except Exception as e:
         logger.warning("agent_count_query_error", error=str(e))
-        # If we can't check, we might want to fail safe or allow?
-        # Given the "upfront payment" requirement, we should probably be strict.
         pass
 
     if actual_count >= purchased_slots:
@@ -68,9 +90,9 @@ async def _check_message_limit(tenant_id: str, db: AsyncSession) -> None:
     tenant, usage = await _get_tenant_and_usage(tenant_id, db)
     if tenant is None:
         return
-    limits = get_plan_limits(tenant.plan or "professional")
+    limits = await get_plan_limits(tenant.plan or "professional", db)
     current = usage.current_month_messages if usage else 0
-    if not check_limit(limits["max_messages_per_month"], current):
+    if not check_limit(limits.get("max_messages_per_month", 0), current):
         raise HTTPException(
             status_code=429,
             detail=f"Monthly message limit reached ({limits['max_messages_per_month']} messages "
@@ -99,6 +121,10 @@ async def _increment_message_count(tenant_id: str, db: AsyncSession, turn_count:
     usage = usage_res.scalar_one_or_none()
     if usage:
         usage.current_month_messages = (usage.current_month_messages or 0) + 1
+        # Sessions: increment on the first turn
+        if turn_count == 1:
+            usage.current_month_sessions = (usage.current_month_sessions or 0) + 1
+        
         # Chat units: 1 unit per 10 turns. The first turn (turn_count=1) increments it.
         # subsequent increments at turn 11, 21, etc.
         if turn_count > 0 and (turn_count % 10 == 1):
@@ -222,10 +248,8 @@ async def _proxy_request(
                             except Exception:
                                 pass
                     
-                    # Intercept billing increment after stream ends
-                    full_path = f"{service}/{path}".strip("/")
-                    if service == "agents" and request.method == "POST" and _CHAT_SEND.match(full_path):
-                        await _increment_message_count(getattr(request.state, "tenant_id", ""), db, turn_count=_turn_count)
+                    # Billing increment is now handled by orchestrator SessionBillingService
+                    pass
 
                 media = "audio/mpeg" if "/tts/" in url or service == "voice" else "text/event-stream"
                 return StreamingResponse(stream_generator(), media_type=media)
@@ -245,16 +269,16 @@ async def _proxy_request(
                     full_path = f"{service}/{path}".strip("/")
                     # We NO LONGER auto-increment/decrement agent_count here.
                     # agent_count now represents "Purchased Slots" managed by billing.
-                    if request.method == "POST" and _CHAT_SEND.match(full_path):
-                        _turn_count = 0
-                        if resp.headers.get("Content-Type") == "application/json":
-                            try:
-                                _payload = _json.loads(resp.content)
-                                _turn_count = _payload.get("turn_count", 0)
-                            except Exception:
-                                pass
-                        await _increment_message_count(tenant_id, db, turn_count=_turn_count)
+                    # Billing increment is now handled by orchestrator SessionBillingService
+                    pass
 
+            if resp.status_code >= 400:
+                logger.warning(
+                    "proxy_downstream_error",
+                    service=service,
+                    status_code=resp.status_code,
+                    path=path,
+                )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -285,16 +309,101 @@ async def proxy(
 ):
     """Generic reverse proxy with plan-limit enforcement and usage tracking."""
     tenant_id: str = getattr(request.state, "tenant_id", "") or ""
+    if not tenant_id and request.url.path not in PUBLIC_PATHS:
+        logger.warning("proxy_auth_failed_no_tenant", path=request.url.path)
+        raise HTTPException(status_code=401, detail="Authentication required for proxy requests.")
+    
     method = request.method.upper()
     full_path = f"{service}/{path}".strip("/")
 
     # ── Pre-request plan limit checks ────────────────────────────────────────
     if tenant_id and service == "agents":
-        if method == "POST" and _AGENT_CREATE.match(full_path):
-            await _check_agent_limit(tenant_id, db)
-        elif method == "POST" and _CHAT_SEND.match(full_path):
+        if method == "POST" and _CHAT_SEND.match(full_path):
             await _check_message_limit(tenant_id, db)
 
     # ── Forward the request ───────────────────────────────────────────────────
     url = _get_downstream_url(service, f"/{path}" if path else "")
+
+    # CUSTOM HANDLING: Agent Creation (Draft-First Flow)
+    if service == "agents" and method == "POST" and _AGENT_CREATE.match(full_path):
+        tenant, usage = await _get_tenant_and_usage(tenant_id, db)
+        
+        purchased_slots = usage.agent_count if usage else 0
+        actual_count = 0
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents", headers={"X-Tenant-ID": tenant_id})
+                if res.status_code == 200:
+                    actual_count = len(res.json())
+        except Exception:
+            pass
+            
+        has_slot = False
+        if tenant and tenant.subscription_status == "active" and (actual_count < purchased_slots):
+            has_slot = True
+            
+        try:
+            body_dict = await request.json()
+        except Exception:
+            body_dict = {}
+            
+        body_dict["is_active"] = has_slot
+        
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            headers = {
+                "X-Tenant-ID": tenant_id,
+                "X-User-ID": getattr(request.state, "user_id", ""),
+                "X-Role": getattr(request.state, "role", ""),
+                "Content-Type": "application/json"
+            }
+            resp = await client.post(url, json=body_dict, headers=headers)
+            
+            if resp.status_code == 201:
+                if has_slot:
+                    return Response(content=resp.content, status_code=201)
+                
+                # Create draft and redirect to Stripe
+                agent_data = resp.json()
+                agent_id = agent_data.get("id")
+                try:
+                    requested_plan = body_dict.get("plan")
+                    payment_url = await create_agent_checkout_session(tenant_id, agent_id, db, requested_plan=requested_plan)
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "message": "AI Agent drafted successfully. Payment required for activation.",
+                            "agent_id": agent_id,
+                            "payment_url": payment_url,
+                        }
+                    )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error("agent_payment_url_failed", error=str(e), agent_id=agent_id)
+                    return Response(content=resp.content, status_code=201)
+
+            return Response(content=resp.content, status_code=resp.status_code)
+
+    # CUSTOM HANDLING: Agent Deletion
+    if service == "agents" and method == "DELETE" and _AGENT_DELETE.match(full_path):
+        # 1. Fetch agent from orchestrator to check stripe_subscription_id
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            headers = {"X-Tenant-ID": tenant_id}
+            agent_resp = await client.get(url, headers=headers)
+            if agent_resp.status_code == 200:
+                agent_info = agent_resp.json()
+                sub_id = agent_info.get("stripe_subscription_id")
+                if sub_id:
+                    # 2. Check Stripe
+                    stripe.api_key = settings.STRIPE_SECRET_KEY
+                    try:
+                        subscription = stripe.Subscription.retrieve(sub_id)
+                        if subscription.status in ("active", "trialing", "past_due"):
+                            raise HTTPException(
+                                status_code=403,
+                                detail="This agent has an active subscription. Please cancel the subscription in the Billing Portal before deleting the agent."
+                            )
+                    except stripe.error.StripeError:
+                        pass # If stripe fails, we'll allow deletion or handle gracefully
+
     return await _proxy_request(request, url, path, db, service=service)

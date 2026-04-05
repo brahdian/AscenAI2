@@ -27,6 +27,7 @@ import {
   ChevronLeft,
   ChevronRight,
   GitBranch,
+  ShieldCheck,
 } from 'lucide-react'
 import { agentsApi } from '@/lib/api'
 
@@ -176,24 +177,28 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               </div>
             </>
           ) : (
-            navItems.map((item) => {
-              const active = pathname === item.href || (item.href !== '/dashboard' && pathname.startsWith(item.href))
-              return (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                    active
-                      ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
-                      : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
-                  }`}
-                >
-                  <item.icon size={18} />
-                  {item.label}
-                </Link>
-              )
-            })
+            <>
+              {navItems.map((item) => {
+                const active = pathname === item.href || (item.href !== '/dashboard' && pathname.startsWith(item.href))
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                      active
+                        ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
+                        : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
+                    }`}
+                  >
+                    <item.icon size={18} />
+                    {item.label}
+                  </Link>
+                )
+              })}
+            </>
           )}
+
+
         </nav>
 
         {/* User */}

@@ -1,7 +1,7 @@
 'use client'
 
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -17,8 +17,10 @@ const schema = z.object({
 
 type FormData = z.infer<typeof schema>
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const redirect = searchParams.get('redirect')
   const { setUser } = useAuthStore()
   const [loading, setLoading] = useState(false)
 
@@ -32,11 +34,50 @@ export default function LoginPage() {
     setLoading(true)
     try {
       const res = await authApi.login(data)
+      console.log('[LOGIN] Response:', {
+        hasUser: !!res.user,
+        hasToken: !!res.access_token,
+        tenantId: res.tenant_id,
+        tokenLength: res.access_token?.length,
+      })
+      
+      // Clear old cached session store to avoid hydration mismatches
+      localStorage.removeItem('ascenai-auth')
       setUser(res.user, res.tenant_id)
+      
+      console.log('[LOGIN] Successful login, HttpOnly cookies set.')
+      
       toast.success('Welcome back!')
-      router.push('/dashboard')
+      
+      const hostname = typeof window !== 'undefined' ? window.location.hostname : ''
+      const isAdminPortal = hostname === (process.env.NEXT_PUBLIC_ADMIN_SUBDOMAIN?.split(':')[0] || 'admin.lvh.me')
+      
+      if (redirect) {
+        router.push(redirect)
+      } else if (isAdminPortal) {
+        router.push('/settings')
+      } else {
+        router.push('/dashboard')
+      }
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || 'Login failed')
+      console.error('[LOGIN] Error:', {
+        status: err?.response?.status,
+        detail: err?.response?.data?.detail,
+        action: err?.response?.headers?.['x-action'],
+        message: err?.message,
+      })
+      const detail = err?.response?.data?.detail
+      const action = err?.response?.headers?.['x-action']
+      
+      if (action === 'verify_email' || detail?.includes('verify') || detail?.includes('Email not verified')) {
+        toast.error('Please verify your email first. Check your inbox for the verification code.')
+        router.push('/verify-email')
+      } else if (detail?.includes('inactive') || detail?.includes('Subscription required')) {
+        toast.error('Account is not active. Please complete payment to activate your account.')
+        router.push('/pricing')
+      } else {
+        toast.error(detail || 'Login failed')
+      }
     } finally {
       setLoading(false)
     }
@@ -45,7 +86,6 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#0f0728] via-[#1a1040] to-[#0c1e4a] px-4">
       <div className="w-full max-w-md">
-        {/* Logo */}
         <div className="text-center mb-8">
           <Link href="/" className="inline-flex items-center gap-2">
             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-blue-500 flex items-center justify-center text-white font-bold">
@@ -56,7 +96,6 @@ export default function LoginPage() {
           <p className="text-gray-400 mt-3">Sign in to your account</p>
         </div>
 
-        {/* Card */}
         <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-8 backdrop-blur-sm">
           <form onSubmit={handleSubmit(onSubmit)} className="space-y-5">
             <div>
@@ -97,11 +136,23 @@ export default function LoginPage() {
           <p className="text-center text-gray-400 text-sm mt-6">
             No account?{' '}
             <Link href="/register" className="text-violet-400 hover:text-violet-300 transition-colors">
-              Create one free
+              Sign up
             </Link>
           </p>
         </div>
       </div>
     </div>
+  )
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#0f0728] via-[#1a1040] to-[#0c1e4a] px-4">
+        <div className="text-white">Loading...</div>
+      </div>
+    }>
+      <LoginForm />
+    </Suspense>
   )
 }

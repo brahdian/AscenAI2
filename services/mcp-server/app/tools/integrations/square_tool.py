@@ -1,4 +1,5 @@
 import httpx
+import uuid
 from typing import Any
 
 async def handle_square_create_payment(parameters: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -21,8 +22,12 @@ async def handle_square_create_payment(parameters: dict[str, Any], config: dict[
         "Square-Version": "2023-12-13"
     }
     
+    idempotency_key = parameters.get("idempotency_key")
+    if not idempotency_key:
+        idempotency_key = uuid.uuid4().hex
+
     payload = {
-        "idempotency_key": parameters.get("idempotency_key", "default-key"),
+        "idempotency_key": idempotency_key,
         "amount_money": {
             "amount": int(amount * 100), # Square expects cents
             "currency": currency

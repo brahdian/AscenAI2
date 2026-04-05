@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { tenantApi, agentsApi, sessionsApi } from '@/lib/api'
 import { getPlanDisplayName } from '@/lib/plans'
 import { useAuthStore } from '@/store/auth'
-import { Bot, MessageSquare, Zap, TrendingUp } from 'lucide-react'
+import { Bot, MessageSquare, Zap, TrendingUp, AlertCircle } from 'lucide-react'
 
 function StatCard({
   icon: Icon,
@@ -38,17 +38,17 @@ export default function DashboardPage() {
 
   const { data: usage } = useQuery({
     queryKey: ['usage'],
-    queryFn: tenantApi.getUsage,
+    queryFn: () => tenantApi.getUsage(),
   })
 
   const { data: agents } = useQuery({
     queryKey: ['agents'],
-    queryFn: agentsApi.list,
+    queryFn: () => agentsApi.list(),
   })
 
   const { data: tenant } = useQuery({
     queryKey: ['tenant'],
-    queryFn: tenantApi.getMe,
+    queryFn: () => tenantApi.getMe(),
   })
 
   return (
@@ -62,14 +62,6 @@ export default function DashboardPage() {
           Here&apos;s an overview of your AI agents this month.
         </p>
       </div>
-
-      {/* Plan badge */}
-      {tenant && (
-        <div className="mb-6 inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-50 dark:bg-violet-900/20 border border-violet-100 dark:border-violet-800 text-violet-700 dark:text-violet-300 text-sm font-medium">
-          <Zap size={14} />
-          {getPlanDisplayName(tenant.plan)} Plan
-        </div>
-      )}
 
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
@@ -97,7 +89,7 @@ export default function DashboardPage() {
         <StatCard
           icon={TrendingUp}
           label="Active agents"
-          value={agents?.length ?? '—'}
+          value={Array.isArray(agents) ? agents.length : 0}
           sub="Manage assistants"
           color="bg-emerald-500"
         />

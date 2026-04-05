@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -14,8 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog import get_logger
 
 from app.core.database import get_db
-from app.models.user import Webhook
+from app.models.user import User, Webhook
 from app.schemas.auth import WebhookCreateRequest, WebhookCreatedResponse, WebhookResponse, WebhookUpdateRequest
+from app.services.auth_service import auth_service
+from app.services.auth_service import auth_service
 
 logger = get_logger(__name__)
 
@@ -215,127 +218,20 @@ async def delete_webhook(
     await db.commit()
 
 
-@router.post("/stripe", status_code=200)
-async def stripe_webhook(request: Request, raw_body: bytes, db: AsyncSession = Depends(get_db)):
+# Redundant stripe_webhook removed — use /api/v1/billing/webhook instead.
+
+
+async def _send_welcome_email_async(email: str, full_name: str) -> None:
+    """Send a welcome email after payment activation."""
+    from app.core.config import settings
+    from app.services.email_service import send_email
+
+    html_body = f"""
+    <html><body>
+    <h1>Welcome to AscenAI, {full_name}!</h1>
+    <p>Your account is now active. Get started at <a href="{settings.FRONTEND_URL}">{settings.FRONTEND_URL}</a></p>
+    </body></html>
     """
-    Handle Stripe webhook events.
-    Stripe will send events like: customer.subscription.created, invoice.paid, etc.
-    """
-    body = raw_body
+    await send_email(email, "Welcome to AscenAI!", html_body)
 
-    logger.info("stripe_webhook_received",
-                headers=dict(request.headers),
-                content_length=len(body))
 
-    try:
-        event = json.loads(body)
-    except json.JSONDecodeError:
-        logger.warning("stripe_webhook_invalid_json")
-        return {"error": "Invalid JSON"}
-
-    event_type = event.get("type", "unknown")
-    logger.info("stripe_webhook_event", event_type=event_type)
-
-    from app.models.tenant import Tenant
-
-    if event_type == "customer.subscription.created":
-        subscription = event.get("data", {}).get("object", {})
-        metadata = subscription.get("metadata", {})
-        tenant_id = metadata.get("tenant_id")
-        plan = metadata.get("plan")
-
-        if tenant_id and plan:
-            try:
-                tenant_uuid = uuid.UUID(tenant_id)
-                result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    tenant.plan = plan
-                    tenant.subscription_status = "active"
-                    tenant.subscription_id = subscription.get("id")
-                    from app.services.tenant_service import PLAN_LIMITS
-                    tenant.plan_limits = PLAN_LIMITS.get(plan, PLAN_LIMITS.get("voice_growth"))
-                    await db.commit()
-                    logger.info("tenant_plan_updated", tenant_id=tenant_id, plan=plan, sub_id=tenant.subscription_id)
-            except Exception as e:
-                logger.error("stripe_subscription_created_error", error=str(e), tenant_id=tenant_id)
-
-    elif event_type == "customer.subscription.updated":
-        subscription = event.get("data", {}).get("object", {})
-        metadata = subscription.get("metadata", {})
-        tenant_id = metadata.get("tenant_id")
-        plan = metadata.get("plan")
-        status = subscription.get("status")
-
-        if tenant_id:
-            try:
-                tenant_uuid = uuid.UUID(tenant_id)
-                result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    tenant.subscription_id = subscription.get("id")
-                    if plan:
-                        tenant.plan = plan
-                        from app.services.tenant_service import PLAN_LIMITS
-                        tenant.plan_limits = PLAN_LIMITS.get(plan, PLAN_LIMITS.get("voice_growth"))
-                    if status:
-                        tenant.subscription_status = status
-                    await db.commit()
-                    logger.info("tenant_subscription_updated", tenant_id=tenant_id, plan=plan, status=status)
-            except Exception as e:
-                logger.error("stripe_subscription_updated_error", error=str(e), tenant_id=tenant_id)
-
-    elif event_type == "customer.subscription.deleted":
-        subscription = event.get("data", {}).get("object", {})
-        metadata = subscription.get("metadata", {})
-        tenant_id = metadata.get("tenant_id")
-
-        if tenant_id:
-            try:
-                tenant_uuid = uuid.UUID(tenant_id)
-                result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    tenant.plan = "starter"
-                    tenant.subscription_status = "cancelled"
-                    from app.services.tenant_service import PLAN_LIMITS
-                    tenant.plan_limits = PLAN_LIMITS.get("starter")
-                    await db.commit()
-                    logger.info("tenant_subscription_cancelled", tenant_id=tenant_id)
-            except Exception as e:
-                logger.error("stripe_subscription_deleted_error", error=str(e), tenant_id=tenant_id)
-
-    elif event_type == "invoice.paid":
-        invoice = event.get("data", {}).get("object", {})
-        customer_id = invoice.get("customer")
-        subscription_id = invoice.get("subscription")
-
-        if customer_id:
-            try:
-                result = await db.execute(select(Tenant).where(Tenant.stripe_customer_id == customer_id))
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    tenant.subscription_status = "active"
-                    if subscription_id:
-                        tenant.subscription_id = subscription_id
-                    await db.commit()
-                    logger.info("tenant_invoice_paid", tenant_id=str(tenant.id), customer_id=customer_id)
-            except Exception as e:
-                logger.error("stripe_invoice_paid_error", error=str(e), customer_id=customer_id)
-
-    elif event_type == "invoice.payment_failed":
-        invoice = event.get("data", {}).get("object", {})
-        customer_id = invoice.get("customer")
-
-        if customer_id:
-            try:
-                result = await db.execute(select(Tenant).where(Tenant.stripe_customer_id == customer_id))
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    tenant.subscription_status = "past_due"
-                    await db.commit()
-                    logger.info("tenant_invoice_payment_failed", tenant_id=str(tenant.id), customer_id=customer_id)
-            except Exception as e:
-                logger.error("stripe_invoice_payment_failed_error", error=str(e), customer_id=customer_id)
-
-    return {"received": True}

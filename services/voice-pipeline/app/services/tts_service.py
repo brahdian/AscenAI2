@@ -126,6 +126,9 @@ class TTSService:
         if not text.strip():
             return
 
+        # VULN-031 FIX: Strip SSML-like tags to prevent injection into TTS engine
+        text = self._sanitize_tts_input(text)
+
         voice = self._resolve_voice(voice_id)
         client = self._get_openai_client()
 
@@ -148,6 +151,20 @@ class TTSService:
             logger.error("tts_stream_error", error=str(exc))
             raise
 
+    @staticmethod
+    def _sanitize_tts_input(text: str) -> str:
+        """Strip SSML-like tags and suspicious patterns from TTS input."""
+        import re
+        # Remove XML/SSML-like tags
+        text = re.sub(r'<[^>]+>', '', text)
+        # Remove SSML prosody/pitch/rate attributes
+        text = re.sub(r'(prosody|pitch|rate|volume|emphasis)\s*=', '', text, flags=re.IGNORECASE)
+        # Remove javascript: and data: URIs
+        text = re.sub(r'(javascript|data|vbscript):', '[blocked]', text, flags=re.IGNORECASE)
+        return text
+
+    # ------------------------------------------------------------------
+    # ElevenLabs streaming synthesis
     # ------------------------------------------------------------------
     # ElevenLabs streaming synthesis
     # ------------------------------------------------------------------

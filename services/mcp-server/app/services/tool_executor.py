@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import uuid
 from typing import Any, Optional
@@ -6,6 +7,8 @@ from typing import Any, Optional
 import httpx
 import jsonschema
 import structlog
+import ipaddress
+import urllib.parse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -56,6 +59,7 @@ async def _get_builtin_handlers() -> dict:
     from app.tools.integrations.square_tool import handle_square_create_payment
     from app.tools.integrations.mailchimp_tool import handle_mailchimp_add_subscriber
     from app.tools.integrations.telnyx_tool import handle_telnyx_send_bulk_sms
+    from app.tools.builtin.twilio_pay import handle_twilio_pay
 
     return {
         # Demo / Built-in tools
@@ -104,6 +108,7 @@ async def _get_builtin_handlers() -> dict:
         "paypal_create_order": handle_paypal_create_order,
         "mailchimp_add_subscriber": handle_mailchimp_add_subscriber,
         "telnyx_send_bulk_sms": handle_telnyx_send_bulk_sms,
+        "twilio_pay_initiate": handle_twilio_pay,
     }
 
 
@@ -117,6 +122,54 @@ class RateLimitError(Exception):
 
 class ToolNotFoundError(Exception):
     """Raised when the requested tool does not exist."""
+
+
+class SSRFError(Exception):
+    """Raised when a tool URL targets a private or internal address."""
+
+
+_PRIVATE_PREFIXES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _validate_tool_url(url: str) -> None:
+    """
+    Reject URLs that target localhost, private/internal IPs, or use non-HTTPS
+    schemes. Prevents SSRF via tool execution.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        raise SSRFError("Invalid tool URL.")
+
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFError("Tool URL must use HTTP or HTTPS.")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise SSRFError("Tool URL must include a hostname.")
+
+    # Block common internal hostnames
+    if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "postgres", "redis", "db", "api-gateway", "ai-orchestrator"):
+        raise SSRFError(f"Tool URL must not target internal service: {hostname}")
+
+    # Reject private / link-local / loopback IP ranges
+    try:
+        ip = ipaddress.ip_address(hostname)
+        for net in _PRIVATE_PREFIXES:
+            if ip in net:
+                raise SSRFError("Tool URL must not target a private or reserved IP address.")
+    except ValueError:
+        pass  # hostname is a domain name — allowed for now (could add DNS resolution check for more depth)
 
 
 class ToolExecutor:
@@ -280,6 +333,13 @@ class ToolExecutor:
 
     async def _execute_http_tool(self, tool: Tool, parameters: dict) -> dict:
         """Execute an HTTP-based tool by posting parameters to its endpoint."""
+        # ── 0. SSRF Guard ──────────────────────────────────────────────────
+        try:
+            _validate_tool_url(tool.endpoint_url)
+        except SSRFError as exc:
+            logger.warning("tool_ssrf_blocked", tool_name=tool.name, url=tool.endpoint_url)
+            raise ValueError(f"SSRF Protection: {str(exc)}")
+
         headers = await self.auth_manager.resolve_tool_auth(tool)
         headers.setdefault("Content-Type", "application/json")
 
@@ -333,7 +393,7 @@ class ToolExecutor:
         now = time.time()
         window = 60  # 1 minute
         window_start = now - window
-        key = f"tool_rate:{tenant_id}:{tool_name}"
+        key = f"tenant:{tenant_id}:tool_rate:{tool_name}"
         member = str(now)
 
         pipe = self.redis.pipeline()
@@ -360,6 +420,27 @@ class ToolExecutor:
         Raises ValidationError with a descriptive message on failure.
         Empty/None schemas pass through without validation.
         """
+        # Size guard: reject oversized parameter payloads
+        _MAX_PARAM_BYTES = getattr(settings, "MAX_TOOL_PARAM_BYTES", 32_768)
+        param_size = len(json.dumps(parameters).encode("utf-8")) if parameters else 0
+        if param_size > _MAX_PARAM_BYTES:
+            raise ValidationError(
+                f"Parameter payload too large: {param_size} bytes (max {_MAX_PARAM_BYTES})"
+            )
+
+        # Depth guard: reject deeply nested structures
+        def _check_depth(obj, max_depth=5, current=0):
+            if current > max_depth:
+                raise ValidationError(f"Parameter nesting exceeds max depth of {max_depth}")
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    _check_depth(v, max_depth, current + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _check_depth(item, max_depth, current + 1)
+
+        _check_depth(parameters)
+
         if not schema:
             return
 

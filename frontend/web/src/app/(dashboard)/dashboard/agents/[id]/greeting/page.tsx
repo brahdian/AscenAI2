@@ -230,6 +230,54 @@ export default function GreetingPage() {
     }
   }
 
+  // ── Opening Preview ────────────────────────────────────────────────────────
+
+  const generateOpeningPreview = () => {
+    const langs = supportedLanguages.length > 0 ? supportedLanguages : [language]
+
+    // Map codes to human names (covers all in LANGUAGES constant)
+    const getLangName = (code: string) => {
+      const match = LANGUAGES.find(l => l.code === code)
+      if (match) return match.label.split(' (')[0] // 'French (Canada)' -> 'French'
+      
+      // Fallback: strip region (fr-CA -> fr) and try again
+      const baseCode = code.split('-')[0]
+      const baseMatch = LANGUAGES.find(l => l.code === baseCode)
+      if (baseMatch) return baseMatch.label.split(' (')[0]
+      
+      return code // Last resort
+    }
+
+    const phrases: Record<string, string> = {
+      en: 'For English, please continue.',
+      fr: 'Pour le français, parlez français s\'il vous plaît.',
+      zh: '对于中文请直接用中文交流。',
+      es: 'Para español, por favor hable en español.',
+      de: 'Für Deutsch sprechen Sie bitte Deutsch.',
+      it: 'Per l\'italiano, per favore parla in italiano.',
+      pt: 'Para português, por favor fale em português.',
+      ja: '日本語での対応をご希望の場合は、そのまま日本語でお話しください。',
+      ko: '한국어로 말씀하시려면 한국어로 계속해 주세요.',
+    }
+
+    const getPhrase = (code: string) => {
+      if (phrases[code]) return phrases[code]
+      const baseCode = code.split('-')[0]
+      return phrases[baseCode] || ''
+    }
+
+    const names = langs.map(l => getLangName(l))
+    let assistStr = ''
+    if (names.length === 1) assistStr = `I can assist you in ${names[0]}.`
+    else if (names.length === 2) assistStr = `I can assist you in ${names[0]} or ${names[1]}.`
+    else assistStr = `I can assist you in ${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}.`
+
+    const audibleLangs = langs.slice(0, 3)
+    const audiblePhrases = audibleLangs.map(l => getPhrase(l)).filter(Boolean)
+
+    return `Thank you for calling. ${assistStr} ${audiblePhrases.join(' ')}`
+  }
+
   // ── Recording timer label ─────────────────────────────────────────────────
 
   const timerLabel = `${Math.floor(recordingSeconds / 60)
@@ -335,6 +383,20 @@ export default function GreetingPage() {
             </div>
           </div>
         )}
+
+        {/* Dynamic Opening Preview */}
+        <div className="mt-4 p-4 bg-violet-50 dark:bg-violet-900/10 border border-violet-100 dark:border-violet-800/50 rounded-xl">
+          <div className="flex items-center gap-2 mb-2">
+            <Volume2 size={14} className="text-violet-600 dark:text-violet-400" />
+            <span className="text-xs font-bold text-violet-700 dark:text-violet-300 uppercase tracking-wider">Audible Opening Preview</span>
+          </div>
+          <p className="text-sm text-gray-700 dark:text-gray-300 italic font-medium leading-relaxed">
+            "{generateOpeningPreview()}"
+          </p>
+          <p className="text-[10px] text-gray-400 mt-2">
+            * This is the exact phrase your agent will speak at the start of a voice call.
+          </p>
+        </div>
       </div>
 
       {/* Text greeting */}
@@ -386,12 +448,12 @@ export default function GreetingPage() {
           />
           {!voiceSystemPrompt && (
             <button
-              onClick={() => setVoiceSystemPrompt(`## IVR & Multi-lingual Protocol
-- **MANDATORY OPENING**: If this is the start of a voice session, you MUST greet the user with:
-  "I'll be responding in English. Let me know if you'd prefer French or another language."
-- **French Support**: If the user asks for French or speaks French, switch your response language to French immediately.
-- **Chinese Support**: If the user speaks Chinese, you must respond in Chinese. You do not need to ask for confirmation.
-- **Language Meta-info**: When you switch languages or detect a new language, ensure your response remains helpful and in-scope.`)}
+              onClick={() => setVoiceSystemPrompt(`## Multi-lingual & IVR Operational Protocol
+- **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
+  "${generateOpeningPreview()}"
+- **DYNAMIC LANGUAGE ADAPTATION**: You are globally configured to handle multiple languages.
+- **PROTOCOL**: Upon detecting ANY supported language, pivot your response language immediately to match the user without requesting procedural confirmation (e.g., avoid "Would you like to speak French?").
+- **CONTEXTUAL METADATA**: Ensure your response metadata accurately identifies the current communication language.`)}
               className="mt-2 text-xs text-violet-600 hover:underline flex items-center gap-1"
             >
               <Info size={12} />

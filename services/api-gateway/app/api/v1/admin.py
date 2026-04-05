@@ -18,14 +18,14 @@ Endpoints:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.services.admin_service import AdminService, has_permission, ROLES
+from app.services.admin_service import AdminService, get_all_roles
 
 router = APIRouter(prefix="/admin")
 
@@ -208,6 +208,73 @@ async def get_platform_metrics(
 
 
 @router.get("/roles")
-async def list_roles():
+async def list_roles(db: AsyncSession = Depends(get_db)):
     """List available roles and their permissions."""
-    return {"roles": ROLES}
+    roles = await get_all_roles(db)
+    return {"roles": roles}
+
+
+@router.get("/settings")
+async def get_platform_settings(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all platform settings (super_admin only)."""
+    _require_super_admin(request)
+    service = _get_admin_service(request, db)
+    return await service.get_platform_settings()
+
+
+class SettingUpdateRequest(BaseModel):
+    value: Any = Field(..., description="New setting value (JSON serializable)")
+
+
+@router.put("/settings/{key}")
+async def update_platform_setting(
+    key: str,
+    body: SettingUpdateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a platform setting (super_admin only)."""
+    admin_user_id = _require_super_admin(request)
+    service = _get_admin_service(request, db)
+    return await service.update_platform_setting(key, body.value, admin_user_id)
+
+
+class TrialTenantCreateRequest(BaseModel):
+    name: str = Field(..., description="Tenant name (slug)")
+    business_name: str = Field(..., description="Business display name")
+    plan: str = Field(default="starter", description="Plan tier")
+    admin_email: str = Field(..., description="Admin user email")
+    admin_password: str = Field(..., description="Admin user password")
+
+
+@router.post("/trial-tenants")
+async def create_trial_tenant(
+    body: TrialTenantCreateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a trial tenant with admin user (bypasses Stripe/payment)."""
+    admin_user_id = _require_super_admin(request)
+    service = _get_admin_service(request, db)
+    return await service.create_trial_tenant(
+        name=body.name,
+        business_name=body.business_name,
+        plan=body.plan,
+        admin_email=body.admin_email,
+        admin_password=body.admin_password,
+        created_by=admin_user_id,
+    )
+
+
+@router.get("/tenants/usage")
+async def get_all_tenants_usage(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get usage stats for all tenants (LLM, STT, TTS tokens)."""
+    admin_user_id = _require_super_admin(request)
+    service = _get_admin_service(request, db)
+    return await service.get_all_tenants_usage()

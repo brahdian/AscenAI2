@@ -106,6 +106,7 @@ class AgentCreate(BaseModel):
     knowledge_base_ids: list[str] = Field(default_factory=list)
     llm_config: dict = Field(default_factory=dict)
     escalation_config: dict = Field(default_factory=dict)
+    is_active: Optional[bool] = None
 
 
 class AgentUpdate(BaseModel):
@@ -145,11 +146,16 @@ class AgentResponse(BaseModel):
     greeting_message: Optional[str] = None
     voice_greeting_url: Optional[str] = None
     voice_system_prompt: Optional[str] = None
+    computed_greeting: Optional[str] = None  # Dynamically generated based on supported_languages
+    computed_protocol: Optional[str] = None  # Dynamically generated protocol instructions
+    computed_fallback: Optional[str] = None  # Dynamically generated "I didn't catch that" prompt
     tools: list
     knowledge_base_ids: list
     llm_config: dict
     escalation_config: dict
     is_active: bool
+    stripe_subscription_id: Optional[str] = None
+    deleted_at: Optional[str] = None
     created_at: Optional[str]
     updated_at: Optional[str]
 
@@ -312,13 +318,14 @@ class DailyAnalytics(BaseModel):
     date: str
     total_sessions: int
     total_messages: int
-    total_chats: int
+    total_chats: int  # This will now contain the pre-calculated total_chat_units
     total_tokens: int
     estimated_cost_usd: float
     avg_latency_ms: float
     tool_executions: int
     escalations: int
     successful_completions: int
+    total_voice_minutes: float = 0.0
 
 
 class AgentAnalyticsSummary(BaseModel):
@@ -330,6 +337,7 @@ class AgentAnalyticsSummary(BaseModel):
     total_tokens: int
     estimated_cost_usd: float
     avg_latency_ms: float
+    total_voice_minutes: float = 0.0
     positive_feedback_pct: Optional[float]
 
 

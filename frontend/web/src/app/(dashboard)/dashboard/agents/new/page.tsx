@@ -1,7 +1,7 @@
 'use client'
 
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { agentsApi, templatesApi, billingApi } from '@/lib/api'
 import toast from 'react-hot-toast'
@@ -18,8 +18,20 @@ const CATEGORY_ICONS: Record<string, any> = {
 
 export default function NewAgentPage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const success = searchParams.get('success') === 'true'
   const qc = useQueryClient()
-  
+
+  useEffect(() => {
+    if (success) {
+      toast.success('Payment successful! Deploying your agent...')
+      // Redirect to agents list to see the new agent appear
+      setTimeout(() => {
+        router.push('/dashboard/agents')
+      }, 2000)
+    }
+  }, [success, router])
+
   const [selectedTemplate, setSelectedTemplate] = useState<any | null>(null)
   const [step, setStep] = useState<number>(1)
   
@@ -29,6 +41,7 @@ export default function NewAgentPage() {
   const [language, setLanguage] = useState('en')
   const [voiceEnabled, setVoiceEnabled] = useState(true)
   const [variables, setVariables] = useState<Record<string, any>>({})
+  const [selectedPlan, setSelectedPlan] = useState<'starter' | 'growth' | 'business'>('growth')
 
   // Fetch Templates
   const { data: templates = [], isLoading: loadingTemplates } = useQuery({
@@ -39,12 +52,12 @@ export default function NewAgentPage() {
   // Fetch current agents and billing to check slots
   const { data: agents = [], isLoading: loadingAgents } = useQuery({
     queryKey: ['agents'],
-    queryFn: agentsApi.list,
+    queryFn: () => agentsApi.list({}),
   })
 
   const { data: billing, isLoading: loadingBilling } = useQuery({
     queryKey: ['billing-overview'],
-    queryFn: billingApi.overview,
+    queryFn: () => billingApi.overview(),
   })
 
   const purchasedSlots = billing?.agent_count || 0
@@ -52,23 +65,16 @@ export default function NewAgentPage() {
   const hasAvailableSlot = actualAgentCount < purchasedSlots
 
   // Mutations
-  const purchaseSlotMutation = useMutation({
-    mutationFn: () => billingApi.createAgentSlotSession(),
-    onSuccess: (data) => {
-      if (data.checkout_url) window.location.href = data.checkout_url
-    },
-    onError: () => toast.error('Failed to initiate purchase'),
-  })
-
   const createMutation = useMutation({
     mutationFn: async () => {
-      // 1. Create Base Agent
+      // 1. Create Base Agent (Draft-First)
       const agent = await agentsApi.create({
         name: agentName,
         description,
         business_type: selectedTemplate?.category || 'generic',
         language,
         voice_enabled: voiceEnabled,
+        plan: selectedPlan, // Pass requested plan for potential upgrade checkout
       })
 
       // 2. Instantiate Template if selected
@@ -94,11 +100,23 @@ export default function NewAgentPage() {
     },
     onSuccess: (agent) => {
       qc.invalidateQueries({ queryKey: ['agents'] })
-      toast.success('Agent created successfully!')
+      toast.success('Agent deployed successfully!')
       router.push(`/dashboard/agents/${agent.id}`)
     },
-    onError: (err: any) =>
-      toast.error(err?.response?.data?.detail || 'Failed to create agent'),
+    onError: (err: any) => {
+      // Handle Payment Redirect (Draft saved successfully but needs activation)
+      if (err?.response?.status === 402 && err?.response?.data?.detail?.payment_url) {
+        toast.loading('Redirecting to Stripe for payment...', { duration: 2000 })
+        setTimeout(() => {
+          window.location.href = err.response.data.detail.payment_url
+        }, 1000)
+        return
+      }
+      
+      const detail = err?.response?.data?.detail
+      const msg = typeof detail === 'string' ? detail : detail?.message || 'Failed to create agent'
+      toast.error(msg)
+    },
   })
 
   // Handlers
@@ -218,14 +236,47 @@ export default function NewAgentPage() {
             <h4 className="text-sm font-bold text-amber-900 dark:text-amber-100">Slot Limit Reached</h4>
             <p className="text-xs text-amber-700 dark:text-amber-300 mt-1">
               You've used all your {purchasedSlots} purchased agent slots. 
-              To deploy this new agent, you'll need to purchase an additional slot ($99/mo).
+              To deploy this new agent, you'll need to purchase an additional slot.
             </p>
           </div>
         </div>
       )}
 
       {step === 2 && (
-        <div className="max-w-2xl bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm overflow-hidden">
+        <div className="max-w-2xl bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm overflow-hidden mb-8">
+          {!hasAvailableSlot && (
+            <div className="p-6 border-b border-gray-100 dark:border-gray-800 bg-amber-50/10 dark:bg-amber-900/10">
+              <label className="block text-sm font-bold text-gray-900 dark:text-white mb-4">
+                Select a Plan for this Slot
+              </label>
+              <div className="grid grid-cols-3 gap-3">
+                {[
+                  { id: 'starter', name: 'Starter', price: 39 },
+                  { id: 'growth', name: 'Growth', price: 99 },
+                  { id: 'business', name: 'Business', price: 199 },
+                ].map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => setSelectedPlan(p.id as any)}
+                    className={`p-3 rounded-xl border-2 text-left transition-all ${
+                      selectedPlan === p.id 
+                        ? 'border-violet-600 bg-violet-50 dark:bg-violet-900/20' 
+                        : 'border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 hover:border-gray-300'
+                    }`}
+                  >
+                    <div className={`text-[10px] font-bold uppercase tracking-wider ${selectedPlan === p.id ? 'text-violet-600' : 'text-gray-400'}`}>
+                      {p.name}
+                    </div>
+                    <div className="text-lg font-bold text-gray-900 dark:text-white mt-1">
+                      ${p.price}
+                    </div>
+                    <div className="text-[10px] text-gray-500 mt-0.5">/ month</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="p-6 border-b border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/20">
             <h2 className="font-semibold text-gray-900 dark:text-white">Basic Settings</h2>
           </div>
@@ -318,8 +369,8 @@ export default function NewAgentPage() {
               Back
             </button>
             <button
-              onClick={() => hasAvailableSlot ? createMutation.mutate() : purchaseSlotMutation.mutate()}
-              disabled={createMutation.isPending || purchaseSlotMutation.isPending || (hasAvailableSlot && !agentName)}
+              onClick={() => createMutation.mutate()}
+              disabled={createMutation.isPending || !agentName || (!hasAvailableSlot && !selectedPlan)}
               className={`flex-1 px-5 py-2.5 rounded-lg text-white text-sm font-medium hover:opacity-90 disabled:opacity-50 transition-opacity flex items-center justify-center gap-2 ${
                 hasAvailableSlot 
                   ? 'bg-gradient-to-r from-violet-600 to-blue-600' 
@@ -327,13 +378,11 @@ export default function NewAgentPage() {
               }`}
             >
               {createMutation.isPending 
-                ? 'Deploying Agent...' 
-                : purchaseSlotMutation.isPending 
-                  ? 'Redirecting to Stripe...' 
-                  : hasAvailableSlot 
-                    ? 'Create & Deploy' 
-                    : `Purchase New Agent Slot ($99/mo)`}
-              {!createMutation.isPending && !purchaseSlotMutation.isPending && <ArrowRight size={16} />}
+                ? (hasAvailableSlot ? 'Deploying Agent...' : 'Saving Draft & Redirecting...')
+                : hasAvailableSlot 
+                  ? 'Create & Deploy' 
+                  : `Purchase & Deploy Slot`}
+              {!createMutation.isPending && <ArrowRight size={16} />}
             </button>
           </div>
         </div>

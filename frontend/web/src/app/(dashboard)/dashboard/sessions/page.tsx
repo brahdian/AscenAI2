@@ -4,7 +4,6 @@ import { useState, useRef, useEffect } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { sessionsApi, agentsApi, feedbackApi, playbooksApi } from '@/lib/api'
-import { maskSensitivePII } from '@/lib/pii-mask'
 import Link from 'next/link'
 import {
   MessageSquare,
@@ -168,7 +167,7 @@ function FeedbackModal({
 
         {/* Message preview */}
         <p className="text-sm text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 rounded-lg p-3 mb-5 line-clamp-3">
-          {maskSensitivePII(message.content)}
+          {message.content}
         </p>
 
         {/* ── Rating ─────────────────────────────────────────────────────── */}
@@ -397,7 +396,7 @@ function MessageBubble({
               ? 'bg-blue-500 text-white rounded-tr-sm'
               : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white rounded-tl-sm'
           }`}>
-            {maskSensitivePII(message.content)}
+            {message.content}
             
             {/* Metadata enrichment: Playbook, Tools, Rerieval */}
             {(message.playbook_name || message.tool_calls || (message.sources && message.sources.length > 0)) && (

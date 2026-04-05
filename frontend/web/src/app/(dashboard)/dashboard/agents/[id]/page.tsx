@@ -285,6 +285,7 @@ export default function AgentDetailPage() {
 
   useEffect(() => {
     if (agent) {
+      const voiceConfig = agent.voice_config || {}
       setFormData({
         name: agent.name || '',
         description: agent.description || '',
@@ -294,6 +295,11 @@ export default function AgentDetailPage() {
         system_prompt: agent.system_prompt || '',
         greeting_message: agent.greeting_message || '',
         voice_enabled: agent.voice_enabled ?? true,
+        voice_config: {
+          twilio_phone_number: voiceConfig.twilio_phone_number || '',
+          twilio_account_sid: voiceConfig.twilio_account_sid || '',
+          twilio_auth_token: voiceConfig.twilio_auth_token || '',
+        },
       })
     }
   }, [agent])
@@ -715,6 +721,50 @@ export default function AgentDetailPage() {
               Enable voice (STT/TTS)
             </label>
           </div>
+
+          {!!formData.voice_enabled && (
+            <div className="space-y-4 p-4 rounded-lg bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700">
+              <div>
+                <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Voice Configuration</h3>
+                <p className="text-xs text-gray-400 mb-3">Configure your Twilio phone number for inbound voice calls. Callers dialing this number will reach this agent.</p>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1.5">
+                  Twilio Phone Number
+                </label>
+                <input
+                  value={((formData.voice_config as any)?.twilio_phone_number) || ''}
+                  onChange={(e) => setFormData((p) => ({ ...p, voice_config: { ...(p.voice_config as any || {}), twilio_phone_number: e.target.value } }))}
+                  placeholder="+18001234567"
+                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1.5">
+                  Twilio Account SID
+                </label>
+                <input
+                  type="password"
+                  value={((formData.voice_config as any)?.twilio_account_sid) || ''}
+                  onChange={(e) => setFormData((p) => ({ ...p, voice_config: { ...(p.voice_config as any || {}), twilio_account_sid: e.target.value } }))}
+                  placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1.5">
+                  Twilio Auth Token
+                </label>
+                <input
+                  type="password"
+                  value={((formData.voice_config as any)?.twilio_auth_token) || ''}
+                  onChange={(e) => setFormData((p) => ({ ...p, voice_config: { ...(p.voice_config as any || {}), twilio_auth_token: e.target.value } }))}
+                  placeholder="Your Twilio Auth Token"
+                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+                />
+              </div>
+            </div>
+          )}
 
           <div className="pt-2">
             <button

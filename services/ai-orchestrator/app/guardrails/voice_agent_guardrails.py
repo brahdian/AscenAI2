@@ -96,17 +96,121 @@ played through a phone or speaker. Follow these voice rules at all times:
 - {tone_description}
 - End every response with a single clear question or next-step prompt so the user
   knows when to speak. Silence after TTS playback confuses callers.
+
+## Payment Result Handling
+- When you receive a message beginning with [PAYMENT_RESULT], this is a system
+  notification from the payment processor — NOT something the user said.
+- On SUCCESSFUL payment: Thank the customer warmly. Confirm the key details
+  (card type, last 4 digits if provided). Complete any pending action (booking,
+  order, etc.) automatically. Offer to send a receipt or confirmation by SMS.
+  Do NOT read out raw transaction SIDs. Use the confirmation code instead.
+- On FAILED payment: Apologise briefly and empathetically. Do NOT say "error code".
+  Offer clear next steps (try a different card, or call back). Keep it calm and
+  solution-focused.
+- After handling a [PAYMENT_RESULT], ask "Is there anything else I can help you
+  with today?" to keep the conversation open.
 """
 
-DEFAULT_VOICE_PROTOCOL = """\
-## IVR & Multi-lingual Protocol
-- **MANDATORY OPENING**: If this is the start of a voice session, you MUST greet the user with:
-  "Thank you for calling. I can assist you in English or French. To continue in English, please say anything in English. Pour le français, parlez français s'il vous plaît. 对于中文请说中文。For Spanish, please speak in Spanish."
-- **Language Detection**: When user speaks ANY language (French, Chinese, Spanish, German, etc.), respond in THAT language IMMEDIATELY. Do NOT ask for confirmation.
-- **No Confirmation Needed**: NEVER ask "Would you like me to switch to French?" or similar. Just respond naturally in the language the user is speaking.
-- **Auto-Respond**: If user says anything in French → respond in French. If in Chinese → respond in Chinese. No questions asked.
-- **Meta Information**: Always include detected language in response metadata.
+# Mapping of ISO 639-1 codes to their respective "please speak in [language]" phrases.
+from app.services.settings_service import SettingsService
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def generate_multilingual_greeting(
+    db: AsyncSession, 
+    supported_languages: list[str] | None = None
+) -> str:
+    """
+    Generate the audible MANDATORY OPENING string based on selected languages and platform settings.
+    """
+    # 1. Fetch maps from Platform Settings (with cache)
+    greeting_map = await SettingsService.get_setting(db, "language_greeting_map", {})
+    
+    langs = supported_languages or ["en"]
+    if not isinstance(langs, list):
+        langs = ["en"]
+    
+    # 2. Filter out languages we don't have phrases for
+    active_langs = [l for l in langs if l in greeting_map]
+    if not active_langs:
+        active_langs = ["en"]
+
+    lang_names_map = {
+        "en": "English", "fr": "French", "zh": "Chinese", "es": "Spanish",
+        "de": "German", "it": "Italian", "pt": "Portuguese",
+    }
+    
+    names = [lang_names_map.get(l, l) for l in active_langs]
+    if len(names) == 1:
+        assist_str = f"I can assist you in {names[0]}."
+    elif len(names) == 2:
+        assist_str = f"I can assist you in {names[0]} or {names[1]}."
+    else:
+        assist_str = f"I can assist you in {', '.join(names[:-1])}, and {names[-1]}."
+
+    greeting = f"Thank you for calling. {assist_str} "
+    
+    # audible limit (Capped at 3)
+    audible_langs = active_langs[:3]
+    phrases = [greeting_map[l] for l in audible_langs if l in greeting_map]
+    greeting += " ".join(phrases)
+    
+    return greeting
+
+# Mapping for "I didn't catch that" fallback phrases.
+LANGUAGE_FALLBACK_MAP = {
+    "en": "Sorry, I didn't quite catch that. Could you say that again?",
+    "fr": "Désolé, je n'ai pas bien compris. Pourriez-vous répéter?",
+    "zh": "对不起，我没听清。请再说一遍。",
+    "es": "Lo siento, no he entendido bien. ¿Podría repetir?",
+    "de": "Entschuldigung, das habe ich nicht verstanden. Könnten Sie das bitte wiederholen?",
+    "it": "Scusa, non ho capito bene. Potresti ripetere?",
+    "pt": "Desculpe, não entendi bem. Você poderia repetir?",
+}
+
+async def generate_multilingual_fallback(
+    db: AsyncSession, 
+    supported_languages: list[str] | None = None
+) -> str:
+    """
+    Generate the multilingual "I didn't catch that" message based on selected languages and platform settings.
+    """
+    fallback_map = await SettingsService.get_setting(db, "language_fallback_map", {})
+    
+    langs = supported_languages or ["en"]
+    if not isinstance(langs, list):
+        langs = ["en"]
+    
+    active_langs = [l for l in langs if l in fallback_map]
+    if not active_langs:
+        active_langs = ["en"]
+
+    phrases = [fallback_map[l] for l in active_langs if l in fallback_map]
+    return " ".join(phrases)
+
+async def get_dynamic_voice_protocol(
+    db: AsyncSession, 
+    supported_languages: list[str] | None = None
+) -> str:
+    """Return the IVR & Multi-lingual Protocol block using dynamic templates from Platform Settings."""
+    opening = await generate_multilingual_greeting(db, supported_languages)
+    all_langs = ", ".join(supported_languages) if supported_languages else "English"
+    
+    # Fetch template from settings
+    protocol_setting = await SettingsService.get_setting(db, "voice_protocol_template", {})
+    template = protocol_setting.get("template")
+    
+    if not template:
+        # Fallback to hardcoded if not in DB
+        template = """\
+## Multi-lingual & IVR Operational Protocol
+- **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
+  "{opening}"
+- **DYNAMIC LANGUAGE ADAPTATION**: You are globally configured to handle the following languages: {all_langs}.
+- **PROTOCOL**: Upon detecting ANY of the supported languages, pivot your response language immediately to match the user without requesting procedural confirmation (e.g., avoid "Would you like to speak French?").
+- **CONTEXTUAL METADATA**: Ensure the `language` field in your response metadata accurately identifies the communication language used in the current turn.
 """
+    
+    return template.format(opening=opening, all_langs=all_langs)
 
 # ---------------------------------------------------------------------------
 # 2. Global Guardrails
@@ -394,6 +498,7 @@ def build_voice_system_prompt(
     out_of_scope_response: str = "I can only help with topics related to our service.",
     tone_description: str = "Be warm, concise, and natural.",
     voice_protocol: str = "",
+    supported_languages: list[str] | None = None,
 ) -> str:
     """
     Return the complete voice-first system prompt with agent-specific fields filled in.
@@ -405,6 +510,9 @@ def build_voice_system_prompt(
         out_of_scope_response=out_of_scope_response,
         tone_description=tone_description,
     )
-    if voice_protocol:
-        prompt += f"\n\n{voice_protocol}"
+    
+    # Use dynamic protocol if no custom one is provided
+    protocol = voice_protocol or get_dynamic_voice_protocol(supported_languages)
+    prompt += f"\n\n{protocol}"
+    
     return prompt

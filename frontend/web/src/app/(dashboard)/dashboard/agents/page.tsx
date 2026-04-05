@@ -12,20 +12,32 @@ export default function AgentsPage() {
   const [testingId, setTestingId] = useState<string | null>(null)
   const [testMsg, setTestMsg] = useState('')
   const [testResult, setTestResult] = useState<string | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
 
   const { data: agents, isLoading } = useQuery({
-    queryKey: ['agents'],
-    queryFn: agentsApi.list,
+    queryKey: ['agents', showArchived],
+    queryFn: () => agentsApi.list({ status: showArchived ? 'all' : 'active' }),
     staleTime: 30000, // 30s stability
   })
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => agentsApi.delete(id),
+    onError: (err: any) => {
+      const detail = err?.response?.data?.detail
+      if (err?.response?.status === 403 && typeof detail === 'string') {
+        toast.error(detail, { duration: 6000 })
+      } else {
+        toast.error('Failed to remove agent')
+      }
+    },
+  })
+
+  const restoreMutation = useMutation({
+    mutationFn: (id: string) => agentsApi.restore(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agents'] })
-      toast.success('Agent removed')
+      toast.success('Agent restored')
     },
-    onError: () => toast.error('Failed to remove agent'),
+    onError: () => toast.error('Failed to restore agent'),
   })
 
   const handleDelete = (agent: any) => {
@@ -70,13 +82,30 @@ export default function AgentsPage() {
             Manage your AI agents and their configurations.
           </p>
         </div>
-        <Link
-          href="/dashboard/agents/new"
-          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white text-sm font-medium hover:opacity-90 transition-opacity"
-        >
-          <Plus size={16} />
-          New agent
-        </Link>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 mr-4 bg-gray-100 dark:bg-gray-800 p-1.5 rounded-lg border border-gray-200 dark:border-gray-700">
+            <span className="text-xs font-medium text-gray-500 px-2 py-1">View</span>
+            <button
+              onClick={() => setShowArchived(false)}
+              className={`px-3 py-1 rounded-md text-xs font-bold transition-all ${!showArchived ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm ring-1 ring-gray-200 dark:ring-gray-600' : 'text-gray-400 hover:text-gray-900'}`}
+            >
+              Active
+            </button>
+            <button
+              onClick={() => setShowArchived(true)}
+              className={`px-3 py-1 rounded-md text-xs font-bold transition-all ${showArchived ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm ring-1 ring-gray-200 dark:ring-gray-600' : 'text-gray-400 hover:text-gray-900'}`}
+            >
+              All
+            </button>
+          </div>
+          <Link
+            href="/dashboard/agents/new"
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white text-sm font-medium hover:opacity-90 transition-opacity"
+          >
+            <Plus size={16} />
+            New agent
+          </Link>
+        </div>
       </div>
 
       {isLoading ? (
@@ -113,10 +142,25 @@ export default function AgentsPage() {
                     <Bot size={20} className="text-violet-600 dark:text-violet-400" />
                   </div>
                   <div>
-                    <h3 className="font-semibold text-gray-900 dark:text-white">
-                      {agent.name}
-                    </h3>
-                    <p className="text-xs text-gray-500 mt-0.5">
+                    <div className="flex items-center gap-2">
+                      <h3 className={`font-semibold transition-opacity ${!agent.is_active ? 'text-gray-500 opacity-60' : 'text-gray-900 dark:text-white'}`}>
+                        {agent.name}
+                      </h3>
+                      {agent.deleted_at ? (
+                        <span className="px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 text-[10px] font-bold uppercase tracking-wider border border-red-200 dark:border-red-800">
+                          Archived
+                        </span>
+                      ) : agent.stripe_subscription_id ? (
+                        <span className="px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 text-[10px] font-bold uppercase tracking-wider border border-green-200 dark:border-green-800">
+                          Paid
+                        </span>
+                      ) : !agent.is_active ? (
+                        <span className="px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 text-[10px] font-bold uppercase tracking-wider border border-amber-200 dark:border-amber-800">
+                          Payment Required
+                        </span>
+                      ) : null}
+                    </div>
+                    <p className={`text-xs mt-0.5 transition-opacity ${!agent.is_active ? 'text-gray-400 opacity-50' : 'text-gray-500'}`}>
                       {agent.business_type} • {agent.language}
                       {agent.voice_enabled ? (
                         <span className="ml-2 inline-flex items-center gap-1 text-green-600">
@@ -131,47 +175,63 @@ export default function AgentsPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => {
-                      setTestingId(testingId === agent.id ? null : agent.id)
-                      setTestResult(null)
-                      setTestMsg('')
-                    }}
-                    className="p-2 text-gray-400 hover:text-violet-600 transition-colors"
-                    title="Test agent"
-                  >
-                    <TestTube size={16} />
-                  </button>
-                  <Link
-                    href={`/dashboard/agents/${agent.id}/playbooks`}
-                    className="p-2 text-gray-400 hover:text-violet-600 transition-colors"
-                    title="Edit Playbook"
-                  >
-                    <BookOpen size={16} />
-                  </Link>
-                  <Link
-                    href={`/dashboard/agents/${agent.id}/guardrails`}
-                    className="p-2 text-gray-400 hover:text-orange-500 transition-colors"
-                    title="Edit Guardrails"
-                  >
-                    <Shield size={16} />
-                  </Link>
-                  <Link
-                    href={`/dashboard/agents/${agent.id}`}
-                    className="p-2 text-gray-400 hover:text-blue-600 transition-colors"
-                    title="Edit agent"
-                  >
-                    <Edit2 size={16} />
-                  </Link>
-                  <div className="flex items-center gap-1">
+                  {agent.deleted_at ? (
                     <button
-                      onClick={() => handleDelete(agent)}
-                      className="p-2 text-gray-400 hover:text-red-500 transition-colors"
-                      title="Delete agent"
+                      onClick={() => restoreMutation.mutate(agent.id)}
+                      disabled={restoreMutation.isPending}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 text-xs font-bold hover:bg-emerald-100 dark:hover:bg-emerald-900/30 transition-colors border border-emerald-200 dark:border-emerald-800"
                     >
-                      <Trash2 size={16} />
+                      Restore Agent
                     </button>
-                  </div>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => {
+                          if (!agent.is_active) {
+                            toast.error('Agent must be activated before testing.')
+                            return
+                          }
+                          setTestingId(testingId === agent.id ? null : agent.id)
+                          setTestResult(null)
+                          setTestMsg('')
+                        }}
+                        className={`p-2 transition-colors ${!agent.is_active ? 'text-gray-300 cursor-not-allowed' : 'text-gray-400 hover:text-violet-600'}`}
+                        title={agent.is_active ? "Test agent" : "Activation Required"}
+                      >
+                        <TestTube size={16} />
+                      </button>
+                      <Link
+                        href={`/dashboard/agents/${agent.id}/playbooks`}
+                        className="p-2 text-gray-400 hover:text-violet-600 transition-colors border border-transparent"
+                        title="Edit Playbook"
+                      >
+                        <BookOpen size={16} />
+                      </Link>
+                      <Link
+                        href={`/dashboard/agents/${agent.id}/guardrails`}
+                        className="p-2 text-gray-400 hover:text-orange-500 transition-colors"
+                        title="Edit Guardrails"
+                      >
+                        <Shield size={16} />
+                      </Link>
+                      <Link
+                        href={`/dashboard/agents/${agent.id}`}
+                        className="p-2 text-gray-400 hover:text-blue-600 transition-colors"
+                        title="Edit agent"
+                      >
+                        <Edit2 size={16} />
+                      </Link>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => handleDelete(agent)}
+                          className="p-2 text-gray-400 hover:text-red-500 transition-colors"
+                          title="Delete agent"
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
 

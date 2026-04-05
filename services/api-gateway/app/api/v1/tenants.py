@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -17,6 +17,7 @@ class TenantUpdateRequest(BaseModel):
     phone: str | None = None
     address: dict | None = None
     timezone: str | None = None
+    metadata_: dict | None = Field(None, alias="metadata")
 
 
 class TenantResponse(BaseModel):
@@ -32,9 +33,10 @@ class TenantResponse(BaseModel):
     plan: str
     plan_display_name: str
     plan_limits: dict
+    metadata_: dict = Field(default_factory=dict, alias="metadata")
     is_active: bool
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "populate_by_name": True}
 
 
 class TenantUsageResponse(BaseModel):
@@ -82,12 +84,12 @@ async def get_my_tenant(request: Request, db: AsyncSession = Depends(get_db)):
         phone=tenant.phone,
         address=tenant.address,
         timezone=tenant.timezone,
-        plan=tenant.plan,
-        plan_display_name=tenant.plan_display_name,
-        plan_limits=tenant.plan_limits,
+        plan=tenant.plan or "",
+        plan_display_name=tenant.plan_display_name or "",
+        plan_limits=tenant.plan_limits or {},
+        metadata_=tenant.metadata_ or {},
         is_active=tenant.is_active,
     )
-
 
 @router.patch("/me", response_model=TenantResponse)
 async def update_my_tenant(
@@ -97,7 +99,7 @@ async def update_my_tenant(
 ):
     """Update current tenant details (owner/admin only)."""
     tenant_id = _require_owner_or_admin(request)
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    updates = body.model_dump(exclude_unset=True, by_alias=False)
     tenant = await tenant_service.update_tenant(tenant_id, updates, db)
     return TenantResponse(
         id=str(tenant.id),
@@ -112,6 +114,7 @@ async def update_my_tenant(
         plan=tenant.plan,
         plan_display_name=tenant.plan_display_name,
         plan_limits=tenant.plan_limits,
+        metadata_=tenant.metadata_,
         is_active=tenant.is_active,
     )
 

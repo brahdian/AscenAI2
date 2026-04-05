@@ -34,12 +34,8 @@ target_metadata = Base.metadata
 # ---------------------------------------------------------------------------
 def _get_url() -> str:
     from app.core.config import settings
-    # Alembic uses sync SQLAlchemy — swap asyncpg driver for psycopg2
-    return settings.DATABASE_URL.replace(
-        "postgresql+asyncpg://", "postgresql+psycopg2://"
-    ).replace(
-        "postgresql+asyncio://", "postgresql+psycopg2://"
-    )
+    # Return the raw async URL for run_async_migrations
+    return settings.DATABASE_URL
 
 
 # ---------------------------------------------------------------------------

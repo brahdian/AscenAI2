@@ -26,8 +26,12 @@ from typing import Optional
 
 import httpx
 import structlog
-from fastapi import APIRouter, Form, HTTPException, Request, Response
+from xml.sax.saxutils import escape
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -36,28 +40,36 @@ router = APIRouter()
 # overridden per-tenant via a future ChannelCredentials DB lookup.
 _WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 _WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
-_TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+from app.core.config import settings
+_TWILIO_AUTH_TOKEN = settings.TWILIO_AUTH_TOKEN
 _SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 _SENDGRID_WEBHOOK_KEY = os.getenv("SENDGRID_WEBHOOK_KEY", "")
 _ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://ai-orchestrator:8000")
 _ORCHESTRATOR_INTERNAL_KEY = os.getenv("ORCHESTRATOR_INTERNAL_KEY", "")
+_MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://mcp-server:8001")
 
 # Dedup cache TTL (seconds) — prevents duplicate webhook deliveries
-_DEDUP_SEEN: dict[str, float] = {}
+# SECURITY: Uses Redis SETNX for constant-time O(1) dedup instead of an in-memory
+# dict that could be exhausted by an attacker sending many unique IDs (Slowloris).
 _DEDUP_TTL = 300
 
 
-def _dedup(message_id: str) -> bool:
-    """Return True if this message_id was seen recently (duplicate)."""
-    now = time.monotonic()
-    # Evict stale entries
-    stale = [k for k, v in _DEDUP_SEEN.items() if now - v > _DEDUP_TTL]
-    for k in stale:
-        del _DEDUP_SEEN[k]
-    if message_id in _DEDUP_SEEN:
-        return True
-    _DEDUP_SEEN[message_id] = now
-    return False
+async def _dedup(message_id: str) -> bool:
+    """Return True if this message_id was seen recently (duplicate).
+
+    Uses Redis SETNX to atomically check-and-set in O(1) time.
+    Falls back to in-memory allow (not raise) if Redis is unavailable.
+    """
+    try:
+        from app.core.redis_client import get_redis
+        redis = await get_redis()
+        key = f"webhook_dedup:{message_id}"
+        # SETNX: set only if not exists. Returns 1 (new) or 0 (duplicate).
+        is_new = await redis.set(key, "1", ex=_DEDUP_TTL, nx=True)
+        return not bool(is_new)  # True = duplicate (already existed)
+    except Exception:
+        # If Redis is down, allow the message through rather than dropping
+        return False
 
 
 async def _forward_to_orchestrator(
@@ -95,150 +107,208 @@ async def _forward_to_orchestrator(
 
 
 # ---------------------------------------------------------------------------
-# WhatsApp (Meta Business API)
+# Twilio Pay Webhook
 # ---------------------------------------------------------------------------
 
-@router.get("/{tenant_id}/{agent_id}/whatsapp/webhook")
-async def whatsapp_verify(tenant_id: str, agent_id: str, request: Request):
-    """WhatsApp webhook verification challenge."""
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-
-    if mode == "subscribe" and token == _WHATSAPP_VERIFY_TOKEN and _WHATSAPP_VERIFY_TOKEN:
-        logger.info("whatsapp_webhook_verified", tenant_id=tenant_id, agent_id=agent_id)
-        return PlainTextResponse(challenge)
-
-    raise HTTPException(status_code=403, detail="Verification failed")
-
-
-@router.post("/{tenant_id}/{agent_id}/whatsapp/webhook")
-async def whatsapp_inbound(tenant_id: str, agent_id: str, request: Request):
-    """Handle inbound WhatsApp messages."""
-    # Verify Meta signature
-    body_bytes = await request.body()
-    if _WHATSAPP_APP_SECRET:
-        sig_header = request.headers.get("X-Hub-Signature-256", "")
-        expected = "sha256=" + hmac.new(
-            _WHATSAPP_APP_SECRET.encode(),
-            body_bytes,
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(sig_header, expected):
-            logger.warning("whatsapp_signature_invalid", tenant_id=tenant_id)
-            raise HTTPException(status_code=403, detail="Invalid signature")
-
-    try:
-        payload = json.loads(body_bytes)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # Parse the Meta webhook structure
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            value = change.get("value", {})
-            messages = value.get("messages", [])
-
-            for msg in messages:
-                msg_id = msg.get("id", "")
-                if _dedup(msg_id):
-                    continue
-
-                msg_type = msg.get("type", "")
-                if msg_type != "text":
-                    continue  # Only handle text for now
-
-                from_number = msg.get("from", "")
-                text = msg.get("text", {}).get("body", "")
-                if not text or not from_number:
-                    continue
-
-                logger.info(
-                    "whatsapp_message_received",
-                    from_number=from_number,
-                    text_length=len(text),
-                    tenant_id=tenant_id,
-                )
-
-                session_id = f"wa_{from_number}"
-                await _forward_to_orchestrator(
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    message=text,
-                    customer_identifier=from_number,
-                    channel="whatsapp",
-                    tenant_id=tenant_id,
-                )
-
-    return {"status": "ok"}
-
-
-@router.post("/{tenant_id}/{agent_id}/voice/webhook")
-async def twilio_voice_inbound(tenant_id: str, agent_id: str, request: Request):
+@router.post("/{tenant_id}/{agent_id}/voice/pay-webhook")
+async def twilio_pay_webhook(tenant_id: str, agent_id: str, request: Request):
     """
-    Handle inbound Twilio Voice call.
-    Returns TwiML instructing Twilio to open a Media Stream WebSocket
-    to the Voice Pipeline service.
+    Handle Twilio Pay completion callback.
+    Verified by X-Twilio-Signature to prevent forgery.
     """
     form_data = await request.form()
     params = dict(form_data)
 
-    call_sid = params.get("CallSid", "")
-    if not call_sid:
-        logger.warning("twilio_voice_missing_call_sid", tenant_id=tenant_id)
-        raise HTTPException(status_code=400, detail="Missing CallSid")
-
-    # Optional: Verify Twilio signature if TWILIO_AUTH_TOKEN is set
-    if _TWILIO_AUTH_TOKEN:
-        signature = request.headers.get("X-Twilio-Signature", "")
-        # Twilio signature validates against the full original URL
-        url = str(request.url)
-        if not _validate_twilio_signature(_TWILIO_AUTH_TOKEN, signature, url, params):
-            logger.warning("twilio_voice_signature_invalid", tenant_id=tenant_id)
-            raise HTTPException(status_code=403, detail="Invalid signature")
-
-    logger.info("twilio_voice_call_received", call_sid=call_sid, tenant_id=tenant_id)
-
-    # Generate a short-lived JWT so the voice-pipeline will accept the WebSocket
-    import datetime
-    from jose import jwt as jose_jwt
+    # ── 0. Validate Twilio Signature ──────────────────────────────────────────
     from app.core.config import settings
+    auth_token = settings.TWILIO_AUTH_TOKEN
+    
+    if auth_token:
+        signature = request.headers.get("X-Twilio-Signature", "")
+        # Important: request.url may be internal (http://api-gateway...)
+        # We need to use the publicly reachable URL for signature matching.
+        # Twilio usually sends the absolute URL it was configured with.
+        url = str(request.url)
+        if not _validate_twilio_signature(auth_token, signature, url, params):
+            logger.warning("twilio_pay_signature_invalid", tenant_id=tenant_id)
+            # For hardening, we enforce this.
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    token_payload = {
-        "type": "access",
-        "tenant_id": tenant_id,
-        "sub": f"twilio_{call_sid}",
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=2)
-    }
-    jwt_token = jose_jwt.encode(
-        token_payload,
-        settings.SECRET_KEY,
-        algorithm=settings.JWT_ALGORITHM
+    result = params.get("Result", "")
+    payment_card_type = params.get("PaymentCardType", "")
+    payment_card_last4 = params.get("PaymentCardLast4", "")
+    transaction_sid = params.get("TransactionSid", "")
+    payment_confirmation_code = params.get("PaymentConfirmationCode", "")
+    error_code = params.get("ErrorCode", "")
+    error_description = params.get("ErrorDescription", "")
+
+    payment_token = params.get("PaymentToken", "")
+    if not payment_token:
+        logger.warning("twilio_pay_webhook_missing_token", tenant_id=tenant_id)
+        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Payment session not found. Please try again later.</Say><Hangup/></Response>'
+        return Response(content=twiml, media_type="text/xml")
+
+    logger.info(
+        "twilio_pay_webhook_received",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        payment_token=payment_token,
+        result=result,
+        card_type=payment_card_type,
+        last4=payment_card_last4,
+        transaction_sid=transaction_sid,
     )
 
-    # The external host/port Twilio reached us on (often via ngrok or ingress)
-    # We instruct Twilio to connect back to that same host on the /ws/voice route
-    host_header = request.headers.get("Host") or request.url.hostname
-    protocol = "wss" if ("https" in str(request.url.scheme) or request.headers.get("X-Forwarded-Proto") == "https") else "ws"
-    
-    ws_url = f"{protocol}://{host_header}/ws/voice/{tenant_id}/{call_sid}?token={jwt_token}"
+    # ── 1. Read original session context from Redis ────────────────────────────
+    # The twilio_pay_initiate tool stores session data under this key.
+    session_id: str | None = None
+    customer_identifier: str = tenant_id
+    original_session: dict = {}
 
-    # Generate TwiML
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="{ws_url}">
-      <Parameter name="agentId" value="{agent_id}" />
-      <Parameter name="channel" value="twilio" />
-    </Stream>
-  </Connect>
-</Response>"""
+    try:
+        from app.core.redis_client import get_redis
+
+        redis = await get_redis()
+
+        session_raw = await redis.get(f"payment_session:{payment_token}")
+        if session_raw:
+            original_session = json.loads(session_raw)
+            session_id = original_session.get("session_id")
+            # Use the customer phone/identifier stored at initiation time
+            customer_identifier = original_session.get("customer_identifier", tenant_id)
+
+            # ── SECURITY: IDOR guard — verify the stored session belongs to this tenant
+            stored_tenant = original_session.get("tenant_id", "")
+            if stored_tenant and stored_tenant != tenant_id:
+                logger.warning(
+                    "twilio_pay_idor_attempt",
+                    url_tenant_id=tenant_id,
+                    stored_tenant_id=stored_tenant,
+                    payment_token=payment_token,
+                )
+                raise HTTPException(status_code=403, detail="Payment session does not belong to this tenant")
+
+        # ── 2. Persist the payment result for audit / downstream tooling ───────
+        payment_result = {
+            "result": result,
+            "card_type": payment_card_type,
+            "last4": payment_card_last4,
+            "transaction_sid": transaction_sid,
+            "confirmation_code": payment_confirmation_code,
+            "error_code": error_code,
+            "error_description": error_description,
+            "timestamp": time.time(),
+        }
+
+        if original_session:
+            original_session["status"] = "success" if result == "Success" else "failed"
+            original_session["result_data"] = payment_result
+            await redis.set(
+                f"payment_session:{payment_token}",
+                json.dumps(original_session),
+                ex=3600,  # keep result for 1 hr for receipts / lookup
+            )
+
+        # Separate result key so other services can poll without re-parsing
+        await redis.set(
+            f"payment_result:{payment_token}",
+            json.dumps(payment_result),
+            ex=3600,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "twilio_pay_webhook_redis_error",
+            payment_token=payment_token,
+            error=str(exc),
+        )
+
+    # ── 3. Build system message describing the payment outcome ─────────────────
+    # This is injected into the AI conversation so the agent can respond
+    # naturally without us hardcoding a canned message.
+    if result == "Success":
+        system_msg = (
+            f"[PAYMENT_RESULT] The customer's payment was successfully processed via Twilio Pay. "
+            f"Details — Card: {payment_card_type or 'Unknown'} ending in {payment_card_last4 or 'N/A'}, "
+            f"Transaction SID: {transaction_sid or 'N/A'}, "
+            f"Confirmation code: {payment_confirmation_code or transaction_sid or 'N/A'}. "
+            f"Please acknowledge the successful payment warmly, thank the customer, "
+            f"complete any remaining steps (e.g., confirm any booking, offer to send a receipt via SMS), "
+            f"and ask if there is anything else you can help with."
+        )
+    else:
+        error_detail = error_description or error_code or "an unexpected error occurred"
+        system_msg = (
+            f"[PAYMENT_RESULT] The customer's payment attempt failed. "
+            f"Error code: {error_code or 'N/A'} — {error_description or 'No further details'}. "
+            f"Please tell the customer their payment was not successful in an empathetic, helpful tone. "
+            f"Offer to try again with a different card or suggest they call back. "
+            f"Do not disclose the raw error code to the customer."
+        )
+
+    # ── 4. Re-inject into the AI session ──────────────────────────────────────
+    ai_response_text: str | None = None
+
+    if session_id:
+        logger.info(
+            "twilio_pay_webhook_reinject",
+            session_id=session_id,
+            result=result,
+            agent_id=agent_id,
+        )
+        try:
+            ai_response_text = await _forward_to_orchestrator(
+                agent_id=agent_id,
+                session_id=session_id,
+                message=system_msg,
+                customer_identifier=customer_identifier,
+                channel="voice",
+                tenant_id=tenant_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "twilio_pay_webhook_orchestrator_error",
+                session_id=session_id,
+                payment_token=payment_token,
+                error=str(exc),
+            )
+    else:
+        logger.warning(
+            "twilio_pay_webhook_no_session",
+            payment_token=payment_token,
+            note="session_id not found in Redis — using generic fallback response",
+        )
+
+    # ── 5. Fallback TTS if orchestrator is unavailable ────────────────────────
+    if not ai_response_text:
+        if result == "Success":
+            card_info = f"your {payment_card_type} card ending in {payment_card_last4}" if payment_card_last4 else "your card"
+            conf = payment_confirmation_code or transaction_sid or "N/A"
+            ai_response_text = (
+                f"Thank you! Your payment was processed successfully using {card_info}. "
+                f"Your confirmation number is {conf}. "
+                f"Is there anything else I can help you with?"
+            )
+        else:
+            error_detail = error_description or "an unexpected error"
+            ai_response_text = (
+                f"I'm sorry, your payment could not be processed. {error_detail}. "
+                f"You're welcome to try again with a different card, or contact us directly and we'll be happy to assist."
+            )
+
+    # ── 6. Return TwiML ───────────────────────────────────────────────────────
+    escaped = escape(ai_response_text)
+
+    if result == "Success":
+        # On success: say the response and leave the call open
+        # (Twilio will hang up when the caller disconnects or the AI says goodbye)
+        twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Say>{escaped}</Say></Response>'
+    else:
+        # On failure: say the response then hang up
+        twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Say>{escaped}</Say><Hangup/></Response>'
 
     return Response(content=twiml, media_type="text/xml")
 
-# ---------------------------------------------------------------------------
-# Slack
-# ---------------------------------------------------------------------------
 
 def _validate_twilio_signature(
     auth_token: str,
@@ -278,7 +348,7 @@ async def sms_inbound(tenant_id: str, agent_id: str, request: Request):
             raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     msg_sid = params.get("MessageSid", "")
-    if _dedup(msg_sid):
+    if await _dedup(msg_sid):
         return PlainTextResponse(
             '<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
             media_type="application/xml",
@@ -306,7 +376,7 @@ async def sms_inbound(tenant_id: str, agent_id: str, request: Request):
     ) or "Sorry, I'm unable to process your request right now."
 
     # Return TwiML response
-    escaped = response_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    escaped = escape(response_text)
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         f"<Response><Message>{escaped}</Message></Response>"
@@ -374,7 +444,7 @@ async def slack_events(tenant_id: str, agent_id: str, request: Request):
         return {"status": "ignored"}
 
     event_id = payload.get("event_id", "")
-    if event_id and _dedup(event_id):
+    if event_id and await _dedup(event_id):
         return {"status": "duplicate"}
 
     user_id = event.get("user", "")
@@ -447,7 +517,7 @@ async def email_inbound(tenant_id: str, agent_id: str, request: Request):
     # Dedup by message-id header
     msg_id = form_data.get("headers", "")
     mid_match = re.search(r"Message-ID:\s*<([^>]+)>", msg_id, re.IGNORECASE)
-    if mid_match and _dedup(mid_match.group(1)):
+    if mid_match and await _dedup(mid_match.group(1)):
         return {"status": "duplicate"}
 
     logger.info("email_message_received", from_email=customer_email, subject=subject[:50], tenant_id=tenant_id)

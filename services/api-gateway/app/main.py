@@ -17,12 +17,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.database import close_db, init_db
+from app.core.scheduler import start_scheduler
 from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
 from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
 from app.api.v1 import channels as channels_router
 from app.api.v1 import admin as admin_router
 from app.api.v1 import compliance_audit as compliance_audit_router
+from app.api.v1 import playbooks as playbooks_router
 
 logger = structlog.get_logger(__name__)
 
@@ -197,6 +199,8 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis_client  # expose for password reset and other routes
     logger.info("redis_connected", url=settings.REDIS_URL)
 
+    start_scheduler(app)
+
     app.state.startup_complete = True
     logger.info("api_gateway_started")
 
@@ -263,6 +267,7 @@ app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
 app.include_router(channels_router.router, prefix="/api/v1/channels", tags=["channels"])
 app.include_router(admin_router.router, prefix="/api/v1", tags=["admin"])
 app.include_router(compliance_audit_router.router, prefix="/api/v1", tags=["compliance-audit"])
+app.include_router(playbooks_router.router, prefix="/api/v1", tags=["playbooks"])
 
 # ── Static assets — widget.js served at /widget/widget.js ─────────────────
 import os as _os

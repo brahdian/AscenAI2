@@ -17,7 +17,7 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/team")
 
 _VALID_ROLES = {"owner", "admin", "developer", "viewer"}
-_MANAGEMENT_ROLES = {"owner", "admin"}
+_MANAGEMENT_ROLES = {"owner", "admin", "super_admin"}
 
 
 class InviteRequest(BaseModel):

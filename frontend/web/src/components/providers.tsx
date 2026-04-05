@@ -2,9 +2,13 @@
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Toaster } from 'react-hot-toast'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { useAuthStore } from '@/store/auth'
 
 export function Providers({ children }: { children: React.ReactNode }) {
+  const syncAuth = useAuthStore((state) => state.syncAuth)
+  const isHydrated = useAuthStore((state) => state._hasHydrated)
+
   const [queryClient] = useState(
     () =>
       new QueryClient({
@@ -16,6 +20,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
         },
       })
   )
+
+  useEffect(() => {
+    if (isHydrated) {
+      syncAuth()
+    }
+  }, [isHydrated, syncAuth])
 
   return (
     <QueryClientProvider client={queryClient}>

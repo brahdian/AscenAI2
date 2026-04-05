@@ -18,21 +18,13 @@ interface AuthState {
   setUser: (user: UserInfo, tenantId: string) => void
   markAuthenticated: () => void
   logout: () => void
+  syncAuth: () => Promise<void>
   setHasHydrated: (v: boolean) => void
 }
 
-/**
- * Auth state store — tokens are NOT stored here or in localStorage.
- * They live exclusively in HttpOnly cookies (set by the API server) so they are
- * invisible to JavaScript and immune to XSS token theft.
- *
- * Persisted to localStorage: user profile + isAuthenticated flag only.
- * The flag is a UI hint; the server is the authority (a stale flag just
- * causes an extra 401 that the interceptor handles gracefully).
- */
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       user: null,
       tenantId: null,
       isAuthenticated: false,
@@ -40,7 +32,11 @@ export const useAuthStore = create<AuthState>()(
 
       setHasHydrated: (v) => set({ _hasHydrated: v }),
 
-      setUser: (user, tenantId) => set({ user, tenantId, isAuthenticated: true }),
+      setUser: (user, tenantId) => set({
+        user,
+        tenantId,
+        isAuthenticated: true,
+      }),
 
       markAuthenticated: () => set({ isAuthenticated: true }),
 
@@ -50,6 +46,28 @@ export const useAuthStore = create<AuthState>()(
           tenantId: null,
           isAuthenticated: false,
         }),
+
+      syncAuth: async () => {
+        const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+        try {
+          const axios = (await import('axios')).default
+          const { data } = await axios.get(`${API_URL}/api/v1/auth/me`, {
+            withCredentials: true,
+          })
+          if (data.user) {
+            set({
+              user: data.user,
+              tenantId: data.tenant_id,
+              isAuthenticated: true,
+            })
+          }
+        } catch (error) {
+          const axios = (await import('axios')).default
+          if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
+            set({ user: null, tenantId: null, isAuthenticated: false })
+          }
+        }
+      },
     }),
     {
       name: 'ascenai-auth',

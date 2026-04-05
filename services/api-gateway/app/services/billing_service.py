@@ -28,7 +28,11 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.tenant_service import PLAN_LIMITS
+import uuid
+import stripe
+from app.core.config import settings
+from app.models.tenant import Tenant
+from app.services.tenant_service import get_plan_limits
 
 logger = structlog.get_logger(__name__)
 
@@ -211,7 +215,7 @@ class BillingService:
         Returns usage percentages, warnings (soft), and blocked flag (hard).
         """
         canonical = _resolve_plan(plan)
-        limits = PLAN_LIMITS.get(canonical, PLAN_LIMITS["professional"])
+        limits = await get_plan_limits(canonical, self.db)
         usage = await self.get_usage_summary(tenant_id)
 
         chats_limit = limits.get("chats_included", 0) or 0
@@ -275,7 +279,7 @@ class BillingService:
     ) -> dict[str, Any]:
         """Calculate overage charges for the current month."""
         canonical = _resolve_plan(plan)
-        limits = PLAN_LIMITS.get(canonical, PLAN_LIMITS["professional"])
+        limits = await get_plan_limits(canonical, self.db)
         rates = _OVERAGE_RATES.get(canonical, _OVERAGE_RATES["professional"])
         usage = await self.get_usage_summary(tenant_id)
 
@@ -467,3 +471,90 @@ async def get_db_usage_summary(tenant_id: str, db: AsyncSession) -> dict[str, An
         "voice_minutes": float(row.current_month_voice_minutes or 0),
         "agent_count": row.agent_count or 0,
     }
+
+# ---------------------------------------------------------------------------
+# Checkout Sessions
+# ---------------------------------------------------------------------------
+
+async def create_agent_checkout_session(
+    tenant_id: str,
+    agent_id: str,
+    db: AsyncSession,
+    requested_plan: str = None,
+    return_path: str = "/dashboard/agents",
+) -> str:
+    """
+    Create a Stripe checkout session for a specific agent.
+    Forces monthly subscription mode.
+    """
+    import uuid as _uuid
+    from fastapi import HTTPException
+    tenant_uuid = _uuid.UUID(tenant_id)
+    
+    # 1. Load Tenant
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+    tenant = tenant_result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # 2. Get Pricing (Default to $99/agent if not found)
+    from app.api.v1.billing import _get_plan
+    target_plan = requested_plan or tenant.plan or "growth"
+    plan_data = await _get_plan(target_plan, db)
+    price = plan_data.get("price_per_agent") or 99.00
+
+    # 3. Stripe Setup
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    
+    # Self-healing customer ID
+    if not tenant.stripe_customer_id:
+        from app.models.user import User
+        user_res = await db.execute(select(User).where(User.tenant_id == tenant.id, User.role == "owner"))
+        owner = user_res.scalar_one_or_none()
+        if owner:
+            from app.services.auth_service import _create_stripe_customer
+            stripe_customer_id = await _create_stripe_customer(tenant, owner)
+            if stripe_customer_id:
+                tenant.stripe_customer_id = stripe_customer_id
+                await db.commit()
+
+    try:
+        kwargs = {
+            "payment_method_types": ["card"],
+            "line_items": [
+                {
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": int(price * 100),
+                        "recurring": {"interval": "month"},
+                        "product_data": {
+                            "name": "AI Agent Subscription",
+                            "description": f"Standard {plan_data.get('display_name', 'Professional')} AI Agent",
+                        },
+                    },
+                    "quantity": 1,
+                }
+            ],
+            "mode": "subscription",
+            "success_url": f"{settings.FRONTEND_URL}{return_path}?success=true&agent_id={agent_id}",
+            "cancel_url": f"{settings.FRONTEND_URL}{return_path}?cancelled=true",
+            "metadata": {
+                "tenant_id": str(tenant.id),
+                "agent_id": agent_id,
+                "plan": target_plan,
+                "action": "activate_agent",
+            },
+        }
+        if tenant.stripe_customer_id:
+            kwargs["customer"] = tenant.stripe_customer_id
+        else:
+            kwargs["customer_email"] = tenant.email
+
+        checkout_session = stripe.checkout.Session.create(**kwargs)
+        return checkout_session.url
+    except stripe.error.StripeError as e:
+        logger.error("stripe_agent_checkout_error", error=str(e), tenant_id=tenant_id, agent_id=agent_id)
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+    except Exception as e:
+        logger.error("unexpected_agent_checkout_error", error=str(e), tenant_id=tenant_id, agent_id=agent_id)
+        raise HTTPException(status_code=500, detail="An error occurred while initiating purchase.")

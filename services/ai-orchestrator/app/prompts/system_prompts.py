@@ -18,6 +18,40 @@ TONE_DESCRIPTIONS = {
     "empathetic": "You are empathetic and patient. Acknowledge the customer's feelings before responding.",
 }
 
+# Mapping of ISO codes to natural language names for prompting
+LANG_NAMES = {
+    "en": "English",
+    "en-US": "English",
+    "en-GB": "English",
+    "en-CA": "English",
+    "fr": "French",
+    "fr-CA": "French",
+    "es": "Spanish",
+    "es-MX": "Spanish",
+    "es-ES": "Spanish",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "pt-BR": "Portuguese",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ru": "Russian",
+    "pl": "Polish",
+    "nl": "Dutch",
+    "tr": "Turkish",
+    "vi": "Vietnamese",
+    "hi": "Hindi",
+    "ar": "Arabic",
+}
+
+def get_natural_lang(code: str) -> str:
+    if not code: return "English"
+    if code in LANG_NAMES: return LANG_NAMES[code]
+    base = code.split("-")[0].lower()
+    return LANG_NAMES.get(base, code)
+
+
 def expand_playbook_references(
     text: str,
     variables: list["AgentVariable"] = None,
@@ -123,6 +157,7 @@ def build_system_prompt(
             out_of_scope_response=out_of_scope,
             tone_description=tone_desc,
             voice_protocol=getattr(agent, "voice_system_prompt", "") or "",
+            supported_languages=getattr(agent, "supported_languages", None) or [],
         ))
     else:
         parts.append(f"You are {agent_name}, an AI assistant for a {business_type} business.")
@@ -137,17 +172,30 @@ def build_system_prompt(
         parts.append(f"\n{expanded_prompt}")
 
     session_lang = business_info.get("session_language")
-    if getattr(agent, "auto_detect_language", False) and session_lang:
-        lang_str = session_lang
-    else:
-        lang_str = agent.language or "en"
-
-    lang_instruction = f"\nAlways respond in language: {lang_str}."
+    auto_detect = getattr(agent, "auto_detect_language", False)
     
-    supported_langs = getattr(agent, "supported_languages", None)
-    if getattr(agent, "auto_detect_language", False) and supported_langs:
-        langs_joined = ", ".join(supported_langs)
-        lang_instruction += f"\nIf the user speaks a language not in [{langs_joined}], politely inform them you only support [{langs_joined}]."
+    if auto_detect and session_lang:
+        lang_str = get_natural_lang(session_lang)
+    else:
+        lang_str = get_natural_lang(agent.language or "en")
+
+    if auto_detect:
+        supported_langs = getattr(agent, "supported_languages", None) or []
+        supported_names = [get_natural_lang(l) for l in supported_langs]
+        if not supported_names:
+            supported_names = [lang_str]
+        
+        langs_joined = ", ".join(list(dict.fromkeys(supported_names)))
+        lang_instruction = (
+            f"\n## Language Protocol\n"
+            f"- You are configured to support: {langs_joined}.\n"
+            f"- The current session language is detected as: {lang_str}.\n"
+            f"- If the user speaks any of the supported languages ({langs_joined}), you MUST pivot and respond in that language immediately.\n"
+            f"- If the user speaks a language NOT in this list, politely inform them you only support {langs_joined}."
+        )
+    else:
+        lang_instruction = f"\nAlways respond in language: {lang_str}."
+    
     parts.append(lang_instruction)
 
     if playbook:

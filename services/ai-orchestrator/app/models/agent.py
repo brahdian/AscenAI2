@@ -44,6 +44,9 @@ class Agent(Base):
     greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     voice_greeting_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     voice_system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_config: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True, default=dict
+    )
     tools: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
     knowledge_base_ids: Mapped[Optional[dict]] = mapped_column(
         JSONB, nullable=True, default=list
@@ -53,6 +56,8 @@ class Agent(Base):
         JSONB, nullable=True, default=dict
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -97,6 +102,7 @@ class Agent(Base):
             "greeting_message": self.greeting_message,
             "voice_greeting_url": self.voice_greeting_url,
             "voice_system_prompt": self.voice_system_prompt,
+            "voice_config": self.voice_config or {},
             "tools": self.tools or [],
             "knowledge_base_ids": self.knowledge_base_ids or [],
             "llm_config": self.llm_config or {},
@@ -260,6 +266,8 @@ class AgentAnalytics(Base):
     tool_executions: Mapped[int] = mapped_column(Integer, default=0)
     escalations: Mapped[int] = mapped_column(Integer, default=0)
     successful_completions: Mapped[int] = mapped_column(Integer, default=0)
+    total_chat_units: Mapped[int] = mapped_column(Integer, default=0)
+    total_voice_minutes: Mapped[float] = mapped_column(Float, default=0.0)
 
     agent: Mapped["Agent"] = relationship("Agent", back_populates="analytics")
 
@@ -277,6 +285,8 @@ class AgentAnalytics(Base):
             "tool_executions": self.tool_executions,
             "escalations": self.escalations,
             "successful_completions": self.successful_completions,
+            "total_chat_units": self.total_chat_units,
+            "total_voice_minutes": self.total_voice_minutes,
         }
 
 

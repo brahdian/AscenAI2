@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -19,10 +20,14 @@ from app.schemas.auth import (
     APIKeyCreatedResponse,
     LoginRequest,
     RegisterRequest,
+    RegisterResponse,
+    SubscribeResponse,
     TokenResponse,
     UserInfo,
+    VerifyEmailResponse,
 )
-from app.services.tenant_service import PLAN_LIMITS
+from app.services.email_service import send_email
+from app.services.tenant_service import get_all_plan_limits, get_plan_limits
 
 logger = structlog.get_logger(__name__)
 
@@ -46,63 +51,112 @@ class AuthService:
     # Public interface
     # ------------------------------------------------------------------
 
-    async def register(self, request: RegisterRequest, db: AsyncSession, response=None) -> TokenResponse:
+    async def register(self, request: RegisterRequest, db: AsyncSession, redis=None) -> RegisterResponse:
         """Create a new tenant + owner user and return JWT tokens."""
         # Normalize email to lowercase for consistent storage and lookup
         normalized_email = request.email.lower()
 
-        # 1. Check email uniqueness
-        existing = await db.execute(select(User).where(User.email == normalized_email))
-        if existing.scalar_one_or_none():
+        # 1. Handle idempotency for unverified users
+        existing_user_res = await db.execute(select(User).where(User.email == normalized_email))
+        user = existing_user_res.scalar_one_or_none()
+
+        if user:
             from fastapi import HTTPException
-            raise HTTPException(status_code=409, detail="Email already registered.")
+            
+            tenant_res = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
+            tenant = tenant_res.scalar_one_or_none()
+            if not tenant:
+                raise HTTPException(status_code=500, detail="Account inconsistency: user exists without tenant.")
+            if user.is_email_verified:
+                if tenant.is_active:
+                    raise HTTPException(status_code=409, detail="Email already registered and active.")
+                
+                # ONBOARDING RECOVERY: User verified email but didn't pay.
+                # Update their info in case they chose a different plan/business name on retry
+                user.hashed_password = self.hash_password(request.password)
+                user.full_name = request.full_name
+                tenant.name = request.business_name
+                tenant.business_name = request.business_name
+                tenant.business_type = request.business_type
+                limits = await get_all_plan_limits(db)
+                tenant.plan = request.plan if request.plan in limits else "voice_growth"
+                tenant.plan_limits = await get_plan_limits(tenant.plan, db)
+                await db.commit()
 
-        # 2. Create tenant with default settings
-        slug = self._generate_slug(request.business_name)
-        # Make slug unique by appending random suffix if needed
-        slug = await self._unique_slug(slug, db)
+                payment_url = None
+                try:
+                    sub_resp = await self.create_subscription(normalized_email, tenant.plan, db, redis)
+                    payment_url = sub_resp.payment_url
+                except Exception as exc:
+                    logger.error("failed_to_generate_recovery_payment_link", email=normalized_email, error=str(exc))
 
-        plan = request.plan if request.plan in PLAN_LIMITS else "voice_growth"
-        tenant = Tenant(
-            id=uuid.uuid4(),
-            name=request.business_name,
-            slug=slug,
-            business_type=request.business_type,
-            business_name=request.business_name,
-            email=normalized_email,
-            phone="",
-            address={},
-            timezone="UTC",
-            plan=plan,
-            plan_limits=PLAN_LIMITS[plan],
-            is_active=True,
-            metadata_={},
-        )
-        db.add(tenant)
-        await db.flush()  # get tenant.id
+                logger.info("registration_recovery_verified_unpaid", user_id=str(user.id), email=normalized_email)
+                
+                return RegisterResponse(
+                    message="Email already verified. Complete payment to activate your account." if payment_url else "Email already verified.",
+                    email=normalized_email,
+                    requires_verification=False,
+                    requires_payment=True,
+                    payment_url=payment_url,
+                )
+            # Re-use existing tenant/user for unverified accounts
+            # Update data to reflect latest registration attempt
+            user.hashed_password = self.hash_password(request.password)
+            user.full_name = request.full_name
+            user.created_at = _utcnow() # Reset for cleanup task
 
-        # 2b. Create usage row
-        usage = TenantUsage(
-            id=uuid.uuid4(),
-            tenant_id=tenant.id,
-            last_reset_at=_utcnow(),
-        )
-        db.add(usage)
+            tenant.name = request.business_name
+            tenant.business_name = request.business_name
+            tenant.business_type = request.business_type
+            limits = await get_all_plan_limits(db)
+            tenant.plan = request.plan if request.plan in limits else "voice_growth"
+            tenant.plan_limits = await get_plan_limits(tenant.plan, db)
+            tenant.created_at = _utcnow()
 
-        # 3. Create user (owner role)
-        user = User(
-            id=uuid.uuid4(),
-            tenant_id=tenant.id,
-            email=normalized_email,
-            hashed_password=self.hash_password(request.password),
-            full_name=request.full_name,
-            role="owner",
-            is_active=True,
-            is_email_verified=False,
-        )
-        db.add(user)
+            logger.info("registration_retry_unverified_account", user_id=str(user.id), email=normalized_email)
+        else:
+            # 2. Create new tenant
+            slug = await self._unique_slug(self._generate_slug(request.business_name), db)
+            limits = await get_all_plan_limits(db)
+            plan = request.plan if request.plan in limits else "voice_growth"
+            tenant = Tenant(
+                id=uuid.uuid4(),
+                name=request.business_name,
+                slug=slug,
+                business_type=request.business_type,
+                business_name=request.business_name,
+                email=normalized_email,
+                phone="",
+                address={},
+                timezone="UTC",
+                plan=plan,
+                plan_limits=await get_plan_limits(plan, db),
+                is_active=False,
+                metadata_={},
+            )
+            db.add(tenant)
+            await db.flush()
+
+            # 2b. Create usage row
+            usage = TenantUsage(id=uuid.uuid4(), tenant_id=tenant.id, last_reset_at=_utcnow())
+            db.add(usage)
+
+            # 3. Create user (owner role)
+            user = User(
+                id=uuid.uuid4(),
+                tenant_id=tenant.id,
+                email=normalized_email,
+                hashed_password=self.hash_password(request.password),
+                full_name=request.full_name,
+                role="owner",
+                is_active=True,
+                is_email_verified=False,
+            )
+            db.add(user)
+
         await db.commit()
         await db.refresh(user)
+        await db.refresh(tenant)
 
         # 3b. Create Stripe customer
         stripe_customer_id = await _create_stripe_customer(tenant, user)
@@ -110,16 +164,163 @@ class AuthService:
             tenant.stripe_customer_id = stripe_customer_id
             await db.commit()
 
-        # 4. Generate JWT tokens
-        tokens = self._build_token_response(user, tenant)
+        # 4. Generate OTP
+        otp = self._generate_otp()
+        if redis:
+            await redis.setex(f"otp:{normalized_email}", 600, otp) # 10 minute TTL
 
-        # 5. Send welcome email (fire-and-forget)
-        asyncio.create_task(self._send_welcome_email(request.email, request.full_name))
+        # 5. Store pending activation in Redis (30-min TTL)
+        if redis:
+            await redis.setex(
+                f"pending_activation:{normalized_email}",
+                1800,
+                json.dumps({"tenant_id": str(tenant.id), "user_id": str(user.id), "plan": tenant.plan}),
+            )
 
-        logger.info("user_registered", user_id=str(user.id), tenant_id=str(tenant.id))
-        return tokens
+        # 6. Send OTP email (fire-and-forget)
+        asyncio.create_task(self._send_otp_email(request.email, request.full_name, otp))
 
-    async def login(self, request: LoginRequest, db: AsyncSession) -> TokenResponse:
+        logger.info("user_registered_pending_verification", user_id=str(user.id), tenant_id=str(tenant.id))
+        return RegisterResponse(email=normalized_email, requires_payment=True)
+
+    async def verify_email(self, email: str, otp: str, db: AsyncSession, redis=None) -> VerifyEmailResponse:
+        """Validate OTP and verify user email. Returns payment-required response."""
+        from fastapi import HTTPException
+        normalized_email = email.lower()
+        
+        if not redis:
+            raise HTTPException(status_code=500, detail="Redis unavailable for verification.")
+        
+        stored_otp = await redis.get(f"otp:{normalized_email}")
+        if not stored_otp or stored_otp != otp:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+        
+        # Mark user as verified
+        result = await db.execute(select(User).where(User.email == normalized_email))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        
+        user.is_email_verified = True
+        
+        # Get tenant and activate it (allows login)
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
+        tenant = tenant_result.scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found.")
+        
+        tenant.is_active = True
+        await db.commit()
+        await redis.delete(f"otp:{normalized_email}")
+        
+        logger.info("email_verified", user_id=str(user.id))
+
+        # Automatically create checkout session if not already paid
+        payment_url = None
+        # Check if the tenant has a valid subscription
+        if tenant.subscription_status != "active":
+            try:
+                sub_resp = await self.create_subscription(normalized_email, tenant.plan, db, redis)
+                payment_url = sub_resp.payment_url
+                # Cleanup pending activation as we are moving to payment
+                if redis:
+                    await redis.delete(f"pending_activation:{normalized_email}")
+            except Exception as exc:
+                logger.error("failed_to_generate_payment_link", email=normalized_email, error=str(exc))
+
+        return VerifyEmailResponse(
+            message="Email verified. Complete payment to activate your account." if payment_url else "Email verified.",
+            email=normalized_email,
+            tenant_id=str(tenant.id),
+            requires_payment=not tenant.is_active,
+            payment_url=payment_url,
+        )
+
+    async def create_subscription(self, email: str, plan: str, db: AsyncSession, redis=None) -> SubscribeResponse:
+        """Create Stripe Checkout session for the given plan."""
+        from fastapi import HTTPException
+        normalized_email = email.lower()
+
+        result = await db.execute(select(User).where(User.email == normalized_email))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
+        tenant = tenant_result.scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found.")
+
+        if tenant.is_active:
+            raise HTTPException(status_code=400, detail="Account is already active.")
+
+        limits = await get_all_plan_limits(db)
+        if plan not in limits:
+            raise HTTPException(status_code=400, detail=f"Unknown plan: {plan}")
+
+        if not settings.STRIPE_SECRET_KEY:
+            raise HTTPException(status_code=500, detail="Stripe is not configured.")
+
+        import stripe
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+
+        price_id = await _get_stripe_price_id_for_plan(plan)
+
+        success_url = f"{settings.FRONTEND_URL}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
+        cancel_url = f"{settings.FRONTEND_URL}/payment/cancel"
+
+        checkout_session = stripe.checkout.Session.create(
+            customer=tenant.stripe_customer_id,
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            mode="subscription",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "tenant_id": str(tenant.id),
+                "user_id": str(user.id),
+                "email": normalized_email,
+                "plan": plan,
+            },
+        )
+
+        if redis:
+            await redis.setex(
+                f"stripe_session:{checkout_session.id}",
+                1800,
+                json.dumps({"tenant_id": str(tenant.id), "email": normalized_email, "plan": plan}),
+            )
+
+        logger.info("stripe_checkout_created", session_id=checkout_session.id, email=normalized_email)
+        return SubscribeResponse(
+            payment_url=checkout_session.url,
+            session_id=checkout_session.id,
+            plan=plan,
+        )
+
+    async def resend_otp(self, email: str, db: AsyncSession, redis=None) -> None:
+        """Generate and resend a new OTP."""
+        from fastapi import HTTPException
+        normalized_email = email.lower()
+        
+        if not redis:
+            return
+            
+        # Check if user exists and is not verified
+        result = await db.execute(select(User).where(User.email == normalized_email))
+        user = result.scalar_one_or_none()
+        
+        if user and user.is_email_verified:
+            raise HTTPException(status_code=400, detail="Email is already verified. Please log in.")
+        if not user:
+            return # Silent success to prevent email enumeration
+            
+        otp = self._generate_otp()
+        await redis.setex(f"otp:{normalized_email}", 600, otp)
+        asyncio.create_task(self._send_otp_email(user.email, user.full_name, otp))
+        logger.info("otp_resent", email=normalized_email)
+
+    async def login(self, request: LoginRequest, db: AsyncSession, redis=None) -> TokenResponse:
         """Authenticate user and return JWT tokens."""
         result = await db.execute(select(User).where(User.email == request.email.lower()))
         user: User | None = result.scalar_one_or_none()
@@ -135,13 +336,20 @@ class AuthService:
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account is deactivated.")
 
+        if not user.is_email_verified:
+            raise HTTPException(
+                status_code=403, 
+                detail="Email not verified. Please verify your email to log in.",
+                headers={"X-Action": "verify_email"}
+            )
+
         # Get tenant
         tenant_result = await db.execute(
             select(Tenant).where(Tenant.id == user.tenant_id)
         )
         tenant: Tenant | None = tenant_result.scalar_one_or_none()
-        if not tenant or not tenant.is_active:
-            raise HTTPException(status_code=403, detail="Tenant account is inactive.")
+        if not tenant:
+            raise HTTPException(status_code=403, detail="Tenant account not found.")
 
         # Update last_login_at
         user.last_login_at = _utcnow()
@@ -354,9 +562,108 @@ class AuthService:
     def verify_password(self, password: str, hashed: str) -> bool:
         return pwd_context.verify(password, hashed)
 
+    async def cleanup_pending_accounts(self, db: AsyncSession, redis=None) -> int:
+        """
+        Remove inactive tenants/users that were created but never completed payment.
+        
+        A pending account is eligible for cleanup if:
+        - tenant.is_active is False
+        - tenant.created_at is older than 30 minutes
+        - No Stripe checkout session is still active in Redis for this tenant
+        
+        Returns the number of cleaned-up accounts.
+        """
+        from sqlalchemy import text, delete
+        
+        cutoff = _utcnow() - timedelta(minutes=30)
+        
+        # Find all inactive tenants older than 30 minutes
+        result = await db.execute(
+            select(Tenant).where(
+                Tenant.is_active.is_(False),
+                Tenant.created_at <= cutoff,
+            )
+        )
+        pending_tenants = result.scalars().all()
+        
+        cleaned = 0
+        for tenant in pending_tenants:
+            # Check if there's still an active Stripe session for this tenant
+            if redis:
+                # Look for any stripe_session:* keys that reference this tenant
+                try:
+                    keys = await redis.keys("stripe_session:*")
+                    has_active_session = False
+                    for key in keys:
+                        raw = await redis.get(key)
+                        if raw:
+                            session_data = json.loads(raw)
+                            if session_data.get("tenant_id") == str(tenant.id):
+                                has_active_session = True
+                                break
+                    
+                    if has_active_session:
+                        continue  # Skip — still has active payment session
+                except Exception as exc:
+                    logger.warning("cleanup_redis_check_failed", tenant_id=str(tenant.id), error=str(exc))
+            
+            # Look up the user for this tenant
+            user_result = await db.execute(select(User).where(User.tenant_id == tenant.id))
+            user = user_result.scalar_one_or_none()
+            
+            # Delete usage record
+            await db.execute(delete(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
+            
+            # Delete user if exists
+            if user:
+                await db.execute(delete(User).where(User.id == user.id))
+            
+            # Delete tenant (cascade will handle related records)
+            await db.execute(delete(Tenant).where(Tenant.id == tenant.id))
+            
+            # Clean up Redis keys
+            if redis:
+                await redis.delete(f"pending_activation:{tenant.email}")
+                await redis.delete(f"otp:{tenant.email}")
+            
+            cleaned += 1
+            logger.info("pending_account_cleaned", tenant_id=str(tenant.id), email=tenant.email)
+        
+        if cleaned > 0:
+            await db.commit()
+            logger.info("cleanup_completed", cleaned_count=cleaned)
+        
+        return cleaned
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _generate_otp() -> str:
+        """Generate a cryptographically strong 6-digit numeric OTP."""
+        return "".join([str(secrets.randbelow(10)) for _ in range(6)])
+
+    @staticmethod
+    async def _send_otp_email(email: str, full_name: str, otp: str) -> None:
+        """Send a verification OTP email (async, best-effort)."""
+        html_body = f"""
+        <html><body>
+        <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+            <h2 style="color: #4f46e5;">Verify your email</h2>
+            <p>Hi {full_name},</p>
+            <p>Please enter the following 6-digit code to complete your registration:</p>
+            <div style="font-size: 32px; font-weight: bold; letter-spacing: 5px; padding: 20px 0; color: #1f2937; text-align: center;">
+                {otp}
+            </div>
+            <p style="color: #6b7280; font-size: 14px;">This code will expire in 10 minutes. If you did not sign up for AscenAI, please ignore this email.</p>
+            <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #9ca3af;">&copy; 2026 AscenAI. All rights reserved.</p>
+        </div>
+        </body></html>
+        """
+        subject = f"{otp} is your AscenAI verification code"
+        await send_email(email, subject, html_body)
 
     def _build_token_response(self, user: User, tenant: Tenant) -> TokenResponse:
         token_data = {
@@ -401,86 +708,32 @@ class AuthService:
 
     @staticmethod
     async def _send_reset_email(email: str, full_name: str, reset_url: str) -> None:
-        """Send a password-reset email via SMTP (async, best-effort)."""
-        if not settings.SMTP_HOST:
-            logger.info("smtp_not_configured_skipping_reset_email", email=email)
-            return
-        try:
-            import aiosmtplib
-            from email.mime.multipart import MIMEMultipart
-            from email.mime.text import MIMEText
-
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = "Reset your AscenAI password"
-            msg["From"] = settings.FROM_EMAIL
-            msg["To"] = email
-
-            html_body = f"""
-            <html><body>
-            <p>Hi {full_name},</p>
-            <p>Click the link below to reset your password. This link expires in 1 hour.</p>
-            <p><a href="{reset_url}">Reset Password</a></p>
-            <p>If you did not request a password reset, ignore this email.</p>
-            </body></html>
-            """
-            msg.attach(MIMEText(html_body, "html"))
-
-            await aiosmtplib.send(
-                msg,
-                hostname=settings.SMTP_HOST,
-                port=settings.SMTP_PORT,
-                username=settings.SMTP_USER or None,
-                password=settings.SMTP_PASSWORD or None,
-                start_tls=True,
-            )
-            logger.info("reset_email_sent", email=email)
-        except Exception as exc:
-            logger.warning("reset_email_failed", email=email, error=str(exc))
+        """Send a password-reset email (async, best-effort)."""
+        html_body = f"""
+        <html><body>
+        <p>Hi {full_name},</p>
+        <p>Click the link below to reset your password. This link expires in 1 hour.</p>
+        <p><a href="{reset_url}">Reset Password</a></p>
+        <p>If you did not request a password reset, ignore this email.</p>
+        </body></html>
+        """
+        await send_email(email, "Reset your AscenAI password", html_body)
 
     @staticmethod
     async def _send_welcome_email(email: str, full_name: str) -> None:
-        """Send a welcome email via SMTP (async, best-effort)."""
-        if not settings.SMTP_HOST:
-            logger.info("smtp_not_configured_skipping_welcome_email", email=email)
-            return
-        try:
-            import aiosmtplib
-            from email.mime.multipart import MIMEMultipart
-            from email.mime.text import MIMEText
-
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = "Welcome to AscenAI!"
-            msg["From"] = settings.FROM_EMAIL
-            msg["To"] = email
-
-            html_body = f"""
-            <html><body>
-            <h1>Welcome to AscenAI, {full_name}!</h1>
-            <p>Your account has been created. You're on the <strong>Professional</strong> plan.</p>
-            <p>Get started at <a href="{settings.FRONTEND_URL}">{settings.FRONTEND_URL}</a></p>
-            </body></html>
-            """
-            msg.attach(MIMEText(html_body, "html"))
-
-            await aiosmtplib.send(
-                msg,
-                hostname=settings.SMTP_HOST,
-                port=settings.SMTP_PORT,
-                username=settings.SMTP_USER or None,
-                password=settings.SMTP_PASSWORD or None,
-                start_tls=True,
-            )
-            logger.info("welcome_email_sent", email=email)
-        except Exception as exc:
-            logger.warning("welcome_email_failed", email=email, error=str(exc))
-
-
-# Singleton instance
-auth_service = AuthService()
+        """Send a welcome email (async, best-effort)."""
+        html_body = f"""
+        <html><body>
+        <h1>Welcome to AscenAI, {full_name}!</h1>
+        <p>Your account has been created. You're on the <strong>Professional</strong> plan.</p>
+        <p>Get started at <a href="{settings.FRONTEND_URL}">{settings.FRONTEND_URL}</a></p>
+        </body></html>
+        """
+        await send_email(email, "Welcome to AscenAI!", html_body)
 
 
 async def _create_stripe_customer(tenant: Tenant, user: User) -> str | None:
-    """Create Stripe customer and return customer ID."""
+    """Create a Stripe customer and return the customer ID, or None if Stripe is not configured."""
     if not settings.STRIPE_SECRET_KEY:
         return None
     
@@ -497,3 +750,56 @@ async def _create_stripe_customer(tenant: Tenant, user: User) -> str | None:
     except Exception as e:
         logger.warning("stripe_customer_creation_failed", error=str(e))
         return None
+
+
+# Singleton instance
+auth_service = AuthService()
+
+
+async def _get_stripe_price_id_for_plan(plan: str) -> str:
+    """Look up or create a Stripe Price ID for the given plan."""
+    from app.core.config import settings
+
+    # 1. First, try reading from environment variables
+    if plan == "text_growth" and settings.STRIPE_TEXT_GROWTH_PRICE_ID:
+        return settings.STRIPE_TEXT_GROWTH_PRICE_ID
+    if plan == "voice_growth" and settings.STRIPE_VOICE_GROWTH_PRICE_ID:
+        return settings.STRIPE_VOICE_GROWTH_PRICE_ID
+    if plan == "voice_business" and settings.STRIPE_VOICE_BUSINESS_PRICE_ID:
+        return settings.STRIPE_VOICE_BUSINESS_PRICE_ID
+
+    # 2. Fallback to lookup_key search if env var is missing
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+
+    price_lookup_key = f"ascenai_{plan}"
+
+    try:
+        prices = stripe.Price.list(lookup_keys=[price_lookup_key], limit=1)
+        if prices.data:
+            return prices.data[0].id
+    except Exception as e:
+        logger.warning("stripe_price_lookup_failed", plan=plan, error=str(e))
+    try:
+        # 3. If lookup fails, dynamically create the Product and Price
+        logger.info("stripe_price_not_found_creating", plan=plan)
+        
+        product_name = f"AscenAI {plan.replace('_', ' ').title()}"
+        product = stripe.Product.create(name=product_name)
+        
+        # Default amounts based on plan heuristics (in cents)
+        amount = 9900  # $99 defaults
+        if "business" in plan:
+            amount = 29900 # $299
+
+        price = stripe.Price.create(
+            unit_amount=amount,
+            currency="usd",
+            recurring={"interval": "month"},
+            product=product.id,
+            lookup_key=price_lookup_key,
+        )
+        return price.id
+    except Exception as e2:
+        logger.error("stripe_dynamic_creation_failed", plan=plan, error=str(e2))
+        raise Exception(f"No Stripe price configured for plan '{plan}' and auto-creation failed: {str(e2)}")

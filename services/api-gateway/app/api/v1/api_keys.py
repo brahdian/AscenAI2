@@ -46,7 +46,7 @@ async def create_api_key(
     from app.services.tenant_service import get_plan_limits, check_limit
     t_res = await db.execute(select(Tenant).where(Tenant.id == uuid.UUID(tenant_id)))
     tenant = t_res.scalar_one_or_none()
-    limits = get_plan_limits(tenant.plan if tenant else "professional")
+    limits = await get_plan_limits(tenant.plan if tenant else "professional", db)
     existing_count_res = await db.execute(
         select(APIKey).where(APIKey.tenant_id == uuid.UUID(tenant_id), APIKey.is_active.is_(True))
     )

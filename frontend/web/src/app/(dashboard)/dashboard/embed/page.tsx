@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { agentsApi, apiKeysApi, feedbackApi } from '@/lib/api'
 import { Code2, Copy, Check, Globe, Package, Terminal, MessageSquare, Eye, RefreshCw, Send, X, ThumbsUp, ThumbsDown, PenLine } from 'lucide-react'
 
-interface Agent { id: string; name: string }
+interface Agent { id: string; name: string; greeting_message?: string }
 interface APIKey { id: string; name: string; key_prefix: string; key?: string }
 
 interface PreviewMessage {
@@ -55,9 +55,24 @@ export default function EmbedPage() {
     previewEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [previewMessages])
 
+  // Show greeting immediately when agent is selected / changed
+  useEffect(() => {
+    if (agentId) {
+      const greeting = agents.find((a) => a.id === agentId)?.greeting_message || 'Hi! How can I help you today?'
+      setPreviewMessages([{ role: 'assistant', content: greeting }])
+      setPreviewSessionId(null)
+      setPreviewInput('')
+      setPreviewOpen(true)
+    } else {
+      setPreviewMessages([])
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId])
+
   const resetPreview = () => {
     setPreviewKey(k => k + 1)
-    setPreviewMessages([])
+    const greeting = selectedAgent?.greeting_message || 'Hi! How can I help you today?'
+    setPreviewMessages([{ role: 'assistant', content: greeting }])
     setPreviewInput('')
     setPreviewLoading(false)
     setPreviewStreaming(false)
@@ -425,7 +440,14 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
                 </div>
 
                 {/* Interactive chat widget */}
-                {previewOpen ? (
+                {!agentId ? (
+                  <div className="flex items-center justify-center h-full">
+                    <div className="text-center text-gray-400 dark:text-gray-500">
+                      <MessageSquare size={48} className="mx-auto mb-3 opacity-50" />
+                      <p className="text-sm">Select an agent above to preview the chat widget</p>
+                    </div>
+                  </div>
+                ) : previewOpen ? (
                   <div className="absolute bottom-16 right-4 w-80 rounded-2xl overflow-hidden shadow-2xl border border-gray-100 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col" style={{ height: '340px' }}>
                     {/* Header */}
                     <div className="flex items-center justify-between px-4 py-3 flex-shrink-0" style={{ background: '#7c3aed' }}>
@@ -446,16 +468,6 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
                     </div>
                     {/* Messages */}
                     <div className="flex-1 overflow-y-auto p-3 space-y-2 bg-gray-50 dark:bg-gray-900">
-                      {previewMessages.length === 0 && (
-                        <div className="flex gap-2 items-end">
-                          <div className="w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center" style={{ background: '#7c3aed' }}>
-                            <MessageSquare size={10} className="text-white" />
-                          </div>
-                          <div className="bg-white dark:bg-gray-800 rounded-2xl rounded-bl-sm px-3 py-2 text-xs text-gray-700 dark:text-gray-200 shadow-sm max-w-[75%]">
-                            Hi! How can I help you today?
-                          </div>
-                        </div>
-                      )}
                       {previewMessages.map((msg, i) => (
                         <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start gap-2 items-end'}`}>
                           {msg.role === 'assistant' && (
@@ -524,7 +536,7 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
                 )}
 
                 {/* Bubble (always visible when panel is open) */}
-                {previewOpen && (
+                {agentId && previewOpen && (
                   <div className="absolute bottom-4 right-4 w-12 h-12 rounded-full flex items-center justify-center shadow-lg" style={{ background: '#7c3aed' }}>
                     <MessageSquare size={20} className="text-white" />
                   </div>

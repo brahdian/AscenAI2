@@ -1,9 +1,12 @@
 """Built-in SMS sending tool handler."""
 from __future__ import annotations
 
+import re
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+_E164_PATTERN = re.compile(r"^\+[1-9]\d{1,14}$")
 
 SMS_SEND_SCHEMA = {
     "type": "object",
@@ -20,9 +23,15 @@ async def handle_send_sms(parameters: dict, tenant_config: dict) -> dict:
     to = parameters.get("to", "")
     message = parameters.get("message", "")
 
-    account_sid = tenant_config.get("TWILIO_ACCOUNT_SID")
-    auth_token = tenant_config.get("TWILIO_AUTH_TOKEN")
-    from_number = tenant_config.get("TWILIO_FROM_NUMBER")
+    if not to or not message:
+        return {"success": False, "error": "Missing required parameters: to, message"}
+
+    if not _E164_PATTERN.match(to):
+        return {"success": False, "error": f"Invalid phone number format. Must be E.164 (e.g. +14155551234). Got: {to}"}
+
+    account_sid = tenant_config.get("twilio_account_sid") or tenant_config.get("TWILIO_ACCOUNT_SID")
+    auth_token = tenant_config.get("twilio_auth_token") or tenant_config.get("TWILIO_AUTH_TOKEN")
+    from_number = tenant_config.get("twilio_phone_number") or tenant_config.get("TWILIO_FROM_NUMBER")
 
     if not all([account_sid, auth_token, from_number]):
         # Dev mode — log and return success

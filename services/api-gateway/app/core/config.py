@@ -58,17 +58,46 @@ class Settings(BaseSettings):
     # SMTP / email
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
+    SMTP_TLS: bool = True
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
     FROM_EMAIL: str = "noreply@ascenai.com"
 
+    # SendGrid / email provider
+    SENDGRID_API_KEY: str = ""
+    EMAIL_PROVIDER: str = "smtp"  # "smtp" | "sendgrid"
+
     # Stripe
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    
+    # Stripe Price IDs
+    STRIPE_TEXT_GROWTH_PRICE_ID: str = ""
+    STRIPE_VOICE_GROWTH_PRICE_ID: str = ""
+    STRIPE_VOICE_BUSINESS_PRICE_ID: str = ""
+
+    # Twilio
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_PHONE_NUMBER: str = ""
 
     # CORS
-    FRONTEND_URL: str = "http://localhost:3000"
-    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:3001"]
+    FRONTEND_URL: str = "http://lvh.me:3000"
+    ALLOWED_ORIGINS: any = [
+        "http://lvh.me:3000", 
+        "http://admin.lvh.me:3000", 
+        "http://app.lvh.me:3000",
+        "http://localhost:3000"
+    ]
+    COOKIE_DOMAIN: str | None = ".lvh.me"
+    DYNAMIC_COOKIE_DOMAIN: bool = True  # If true, skips setting domain for 'localhost'
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def validate_allowed_origins(cls, v: any) -> list[str]:
+        if isinstance(v, str):
+            return [i.strip() for i in v.split(",")]
+        return v
 
     # Observability
     SENTRY_DSN: str = ""

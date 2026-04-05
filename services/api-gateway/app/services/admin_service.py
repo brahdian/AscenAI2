@@ -5,6 +5,7 @@ Provides:
 - Tenant management (list, create, suspend, delete)
 - User management with role-based access control
 - System prompt management (global + per-agent)
+- Platform settings management (global greeting phrases, etc.)
 - Audit logging for all admin actions
 - Observability APIs (traces, metrics, logs)
 
@@ -32,7 +33,8 @@ logger = structlog.get_logger(__name__)
 # RBAC Definitions
 # ---------------------------------------------------------------------------
 
-ROLES = {
+# Fallback roles if DB is empty or during initial startup
+DEFAULT_ROLES = {
     "super_admin": {
         "level": 100,
         "permissions": [
@@ -45,6 +47,7 @@ ROLES = {
             "traces:read", "metrics:read", "logs:read",
             "billing:read", "billing:write",
             "compliance:read", "compliance:write",
+            "settings:read", "settings:write",
         ],
     },
     "tenant_owner": {
@@ -87,16 +90,47 @@ ROLES = {
     },
 }
 
+# Cache for dynamic roles
+_ROLES_CACHE: Dict[str, Any] = {}
+_LAST_ROLES_FETCH: Optional[datetime] = None
+_CACHE_TTL = 300  # 5 minutes
 
-def has_permission(role: str, permission: str) -> bool:
+
+async def get_all_roles(db: AsyncSession) -> Dict[str, Any]:
+    """Fetch roles from DB (with caching)."""
+    global _ROLES_CACHE, _LAST_ROLES_FETCH
+    
+    now = datetime.now(timezone.utc)
+    if _ROLES_CACHE and _LAST_ROLES_FETCH and (now - _LAST_ROLES_FETCH).total_seconds() < _CACHE_TTL:
+        return _ROLES_CACHE
+
+    try:
+        from app.models.platform import PlatformSetting
+        result = await db.execute(
+            select(PlatformSetting).where(PlatformSetting.key == "rbac_roles")
+        )
+        setting = result.scalar_one_or_none()
+        if setting and setting.value:
+            _ROLES_CACHE = setting.value
+            _LAST_ROLES_FETCH = now
+            return _ROLES_CACHE
+    except Exception as e:
+        logger.warning("failed_to_fetch_roles_from_db", error=str(e))
+    
+    return DEFAULT_ROLES
+
+
+async def has_permission(role: str, permission: str, db: AsyncSession) -> bool:
     """Check if a role has a specific permission."""
-    role_config = ROLES.get(role, {})
+    roles = await get_all_roles(db)
+    role_config = roles.get(role, {})
     return permission in role_config.get("permissions", [])
 
 
-def get_role_level(role: str) -> int:
+async def get_role_level(role: str, db: AsyncSession) -> int:
     """Get the numeric level of a role."""
-    return ROLES.get(role, {}).get("level", 0)
+    roles = await get_all_roles(db)
+    return roles.get(role, {}).get("level", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +424,8 @@ class AdminService:
         admin_user_id: str,
     ) -> Dict[str, Any]:
         """Update a user's role."""
-        if new_role not in ROLES:
+        roles = await get_all_roles(self.db)
+        if new_role not in roles:
             return {"error": f"Invalid role: {new_role}"}
 
         await self.db.execute(
@@ -524,3 +559,144 @@ class AdminService:
             "messages_today": messages_today,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    async def get_platform_settings(self) -> List[Dict[str, Any]]:
+        """Get all platform settings."""
+        result = await self.db.execute(text("SELECT key, value, description, updated_at FROM platform_settings ORDER BY key ASC"))
+        return [dict(row._mapping) for row in result.fetchall()]
+
+    async def update_platform_setting(
+        self,
+        key: str,
+        value: Any,
+        admin_user_id: str,
+    ) -> Dict[str, Any]:
+        """Update a platform setting."""
+        # Check if exists
+        result = await self.db.execute(
+            text("SELECT key FROM platform_settings WHERE key = :key"),
+            {"key": key}
+        )
+        if not result.fetchone():
+            return {"error": f"Setting '{key}' not found"}
+
+        import json
+        json_value = json.dumps(value) if not isinstance(value, str) else value
+
+        await self.db.execute(
+            text("UPDATE platform_settings SET value = CAST(:value AS JSONB), updated_at = NOW() WHERE key = :key"),
+            {"value": json_value, "key": key}
+        )
+        await self.db.commit()
+
+        await self.audit.log_action(
+            user_id=admin_user_id,
+            tenant_id="",
+            action="platform_setting_update",
+            resource_type="platform_setting",
+            resource_id=key,
+            details={"key": key}
+        )
+
+        logger.info("platform_setting_updated", key=key)
+        
+        # Invalidate cache if roles were updated
+        if key == "rbac_roles":
+            global _ROLES_CACHE, _LAST_ROLES_FETCH
+            _ROLES_CACHE = {}
+            _LAST_ROLES_FETCH = None
+            
+        return {"status": "updated", "key": key}
+
+    async def create_trial_tenant(
+        self,
+        name: str,
+        business_name: str,
+        plan: str,
+        admin_email: str,
+        admin_password: str,
+        created_by: str,
+    ) -> Dict[str, Any]:
+        """Create a trial tenant with admin user (bypasses Stripe/payment)."""
+        import hashlib
+        import json
+        
+        tenant_id = str(uuid.uuid4())
+        user_id = str(uuid.uuid4())
+        
+        # Create tenant
+        await self.db.execute(
+            text("""
+                INSERT INTO tenants (id, name, business_name, plan, status, created_at, updated_at)
+                VALUES (:id, :name, :business_name, :plan, 'active', NOW(), NOW())
+            """),
+            {
+                "id": tenant_id,
+                "name": name,
+                "business_name": business_name,
+                "plan": plan,
+            },
+        )
+        
+        # Create tenant usage record
+        await self.db.execute(
+            text("""
+                INSERT INTO tenant_usage (tenant_id, current_month_messages, current_month_chat_units, 
+                    current_month_sessions, current_month_stt_tokens, current_month_tts_tokens, 
+                    current_month_cost_usd, updated_at)
+                VALUES (:tenant_id, 0, 0, 0, 0, 0, 0.0, NOW())
+            """),
+            {"tenant_id": tenant_id},
+        )
+        
+        # Create admin user
+        password_hash = hashlib.sha256(admin_password.encode()).hexdigest()
+        await self.db.execute(
+            text("""
+                INSERT INTO users (id, email, name, password_hash, role, tenant_id, is_active, created_at, updated_at)
+                VALUES (:id, :email, :name, :password_hash, 'tenant_owner', :tenant_id, true, NOW(), NOW())
+            """),
+            {
+                "id": user_id,
+                "email": admin_email,
+                "name": admin_email.split("@")[0],
+                "password_hash": password_hash,
+                "tenant_id": tenant_id,
+            },
+        )
+        
+        await self.db.commit()
+        
+        await self.audit.log_action(
+            user_id=created_by,
+            tenant_id=tenant_id,
+            action="trial_tenant_created",
+            resource_type="tenant",
+            resource_id=tenant_id,
+            details={"name": name, "business_name": business_name, "plan": plan},
+        )
+        
+        logger.info("trial_tenant_created", tenant_id=tenant_id, name=name)
+        return {"id": tenant_id, "name": name, "business_name": business_name, "plan": plan, "status": "active"}
+
+    async def get_all_tenants_usage(self) -> Dict[str, Any]:
+        """Get usage stats for all tenants."""
+        result = await self.db.execute(
+            text("""
+                SELECT 
+                    t.id as tenant_id,
+                    t.business_name as tenant_name,
+                    COALESCE(tu.current_month_messages, 0) as current_month_messages,
+                    COALESCE(tu.current_month_chat_units, 0) as current_month_chat_units,
+                    COALESCE(tu.current_month_sessions, 0) as current_month_sessions,
+                    COALESCE(tu.current_month_stt_tokens, 0) as current_month_stt_tokens,
+                    COALESCE(tu.current_month_tts_tokens, 0) as current_month_tts_tokens,
+                    COALESCE(tu.current_month_cost_usd, 0.0) as current_month_cost_usd
+                FROM tenants t
+                LEFT JOIN tenant_usage tu ON t.id = tu.tenant_id
+                WHERE t.status != 'deleted'
+                ORDER BY current_month_cost_usd DESC
+            """)
+        )
+        tenants = [dict(row._mapping) for row in result.fetchall()]
+        return {"tenants": tenants}

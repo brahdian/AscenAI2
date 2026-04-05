@@ -133,6 +133,13 @@ class SessionState:
     # Barge-in cancels the TTS task, but the *next* utterance must wait for the
     # lock to be released before starting a new pipeline pass.
     utterance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # VULN-032 FIX: Rate limiting on utterance processing
+    utterance_timestamps: list[float] = field(default_factory=list)
+    # VULN-032 FIX: Rate limiting on utterance processing
+    utterance_timestamps: list[float] = field(default_factory=list)
+
+    # Per-session agent configuration (persisted after first fetch)
+    agent_config: Optional[dict] = None
 
     # Backchannel state -------------------------------------------------------
     # Monotonic time when the user started their current voiced segment.
@@ -397,6 +404,19 @@ class VoicePipeline:
         while the previous utterance is still in the STT/orchestrator phase,
         the new utterance waits until the lock is released rather than racing.
         """
+        # VULN-032 FIX: Rate limit utterances per session (max 20 per minute)
+        now = time.monotonic()
+        state.utterance_timestamps = [t for t in state.utterance_timestamps if now - t < 60.0]
+        if len(state.utterance_timestamps) >= 20:
+            logger.warning("utterance_rate_limited", session_id=state.session_id, count=len(state.utterance_timestamps))
+            await self._tts_and_send(
+                "You're speaking too quickly. Please wait a moment before continuing.",
+                websocket, state,
+            )
+            state.is_listening = True
+            return
+        state.utterance_timestamps.append(now)
+
         # Non-blocking try: if another utterance is already being processed,
         # drop this one (the user barged in before the previous was done).
         if state.utterance_lock.locked():
@@ -451,9 +471,10 @@ class VoicePipeline:
                     },
                 )
                 state.is_listening = True
+                fallback_msg = (state.agent_config or {}).get("computed_fallback") or "Sorry, I didn't quite catch that. Could you say that again?"
                 tts_task = asyncio.create_task(
                     self._tts_and_send(
-                        "Sorry, I didn't quite catch that. Could you say that again?",
+                        fallback_msg,
                         websocket,
                         state,
                     )
@@ -756,9 +777,11 @@ class VoicePipeline:
             if resp.status_code != 200:
                 return
             agent_data = resp.json()
+            state.agent_config = agent_data
 
             voice_greeting_url: str = agent_data.get("voice_greeting_url") or ""
             greeting_text: str = agent_data.get("greeting_message") or ""
+            computed_greeting: str = agent_data.get("computed_greeting") or ""
 
             if voice_greeting_url:
                 # Resolve relative URL against orchestrator base
@@ -782,14 +805,16 @@ class VoicePipeline:
                     state.is_speaking = False
                 await self._send_json(websocket, {"type": "greeting_complete"})
 
-            elif greeting_text:
+            elif greeting_text or computed_greeting:
+                text_to_speak = greeting_text or computed_greeting
                 logger.info(
                     "synthesising_greeting",
                     session_id=state.session_id,
+                    use_computed=not bool(greeting_text)
                 )
                 state.is_speaking = True
                 try:
-                    await self._tts_and_send(greeting_text, websocket, state)
+                    await self._tts_and_send(text_to_speak, websocket, state)
                 finally:
                     state.is_speaking = False
                 await self._send_json(websocket, {"type": "greeting_complete"})

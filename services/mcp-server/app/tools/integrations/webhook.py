@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import socket
 import urllib.parse
 
 import httpx
@@ -20,7 +21,11 @@ _PRIVATE_PREFIXES = [
 
 
 def _validate_webhook_url(url: str) -> str | None:
-    """Return an error message string if the URL is unsafe, else None."""
+    """Return an error message string if the URL is unsafe, else None.
+    
+    Defends against DNS rebinding by resolving the hostname and checking
+    the resolved IP against private/reserved ranges.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
     except Exception:
@@ -42,7 +47,15 @@ def _validate_webhook_url(url: str) -> str | None:
             if ip in net:
                 return "Webhook URL must not target a private or reserved IP address."
     except ValueError:
-        pass  # domain name — allowed
+        try:
+            resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for family, _, _, _, sockaddr in resolved:
+                ip = ipaddress.ip_address(sockaddr[0])
+                for net in _PRIVATE_PREFIXES:
+                    if ip in net:
+                        return "Webhook URL must not target a private or reserved IP address."
+        except socket.gaierror:
+            return "Could not resolve webhook URL hostname."
 
     return None
 

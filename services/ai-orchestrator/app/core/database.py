@@ -176,8 +176,11 @@ async def init_db() -> None:
         async def _register(conn):
             await register_vector(conn)
 
-        # SQLAlchemy 2.0 asyncpg registration pattern
-        await conn.run_sync(lambda sync_conn: _register(sync_conn.connection._connection))
+        # Get the raw asyncpg connection from the SQLAlchemy connection
+        raw_conn = await conn.get_raw_connection()
+        dbapi_conn = raw_conn.dbapi_connection
+        # dbapi_conn is AsyncAdapt_asyncpg_connection, _connection is the actual asyncpg.Connection
+        await _register(dbapi_conn._connection)
 
         # AgentDocumentChunk table and HNSW index
         await conn.execute(_t(

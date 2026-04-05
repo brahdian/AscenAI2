@@ -200,8 +200,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# W3C traceparent propagation — must be outermost after CORS
+# W3C traceparent propagation
 app.add_middleware(TracingMiddleware)
+
+# Trusted internal headers from API Gateway
+from starlette.middleware.base import BaseHTTPMiddleware
+class InternalAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Prefer existing state; fall back to headers
+        if not getattr(request.state, "tenant_id", None):
+            request.state.tenant_id = request.headers.get("X-Tenant-ID")
+        if not getattr(request.state, "user_id", None):
+            request.state.user_id = request.headers.get("X-User-ID")
+        if not getattr(request.state, "role", None):
+            request.state.role = request.headers.get("X-Role")
+        return await call_next(request)
+
+app.add_middleware(InternalAuthMiddleware)
 
 # Include routers
 app.include_router(chat_router.router, prefix="/api/v1", tags=["chat"])

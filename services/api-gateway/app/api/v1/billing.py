@@ -22,13 +22,26 @@ router = APIRouter(prefix="/billing")
 class CheckoutSessionRequest(BaseModel):
     plan: str = Field(..., description="Plan: text_growth, voice_growth, voice_business")
 
+
+class AgentSlotSessionRequest(BaseModel):
+    agent_config: dict | None = Field(None, description="Optional agent configuration for auto-creation after success")
+    return_path: str | None = Field(None, description="Optional return path (e.g., /dashboard/agents/new)")
+
 # ---------------------------------------------------------------------------
 # Plan definitions — update here when pricing changes
 # ---------------------------------------------------------------------------
 
-PLANS: dict[str, dict] = {
+# ---------------------------------------------------------------------------
+# Fallback plans if DB is empty
+# ---------------------------------------------------------------------------
+
+DEFAULT_PLANS: dict[str, dict] = {
     "starter": {
         "display_name": "Starter",
+        "description": "For growing businesses with higher conversation volume.",
+        "badge": "Entry Level",
+        "color": "border-white/10",
+        "highlight": False,
         "price_per_agent": 49.00,
         "chat_equivalents_included": 20_000,
         "base_chat_equivalents": 20_000,
@@ -43,6 +56,10 @@ PLANS: dict[str, dict] = {
     },
     "growth": {
         "display_name": "Growth",
+        "description": "For growing businesses needing voice capability.",
+        "badge": "Most Popular",
+        "color": "border-violet-500/50",
+        "highlight": True,
         "price_per_agent": 99.00,
         "chat_equivalents_included": 80_000,
         "base_chat_equivalents": 20_000,
@@ -57,6 +74,10 @@ PLANS: dict[str, dict] = {
     },
     "business": {
         "display_name": "Business",
+        "description": "For high-volume businesses with heavy voice usage.",
+        "badge": "Power User",
+        "color": "border-white/10",
+        "highlight": False,
         "price_per_agent": 199.00,
         "chat_equivalents_included": 170_000,
         "base_chat_equivalents": 20_000,
@@ -71,6 +92,10 @@ PLANS: dict[str, dict] = {
     },
     "enterprise": {
         "display_name": "Enterprise",
+        "description": "For high-volume businesses with custom requirements.",
+        "badge": "Contact Sales",
+        "color": "border-white/10",
+        "highlight": False,
         "price_per_agent": None,
         "chat_equivalents_included": None,
         "base_chat_equivalents": None,
@@ -78,20 +103,41 @@ PLANS: dict[str, dict] = {
         "playbooks_per_agent": None,
         "rag_documents": None,
         "team_seats": None,
-        "overage_per_chat_equivalent": 0.00,
-        "overage_per_voice_minute": 0.00,
+        "overage_per_chat_equivalent": 0.0,
+        "overage_per_voice_minute": 0.0,
         "voice_enabled": True,
         "model": "chat_equivalent",
     },
 }
 
-DEFAULT_PLAN = "growth"
+
+async def get_platform_plans(db: AsyncSession) -> dict[str, dict]:
+    """Fetch plans from platform_settings."""
+    try:
+        from app.models.platform import PlatformSetting
+        result = await db.execute(
+            select(PlatformSetting).where(PlatformSetting.key == "billing_plans")
+        )
+        setting = result.scalar_one_or_none()
+        if setting and setting.value:
+            # Merge with defaults to ensure all keys exist for robust UI
+            merged = {}
+            for key, default_data in DEFAULT_PLANS.items():
+                if key in setting.value:
+                    merged[key] = {**default_data, **setting.value[key]}
+                else:
+                    merged[key] = default_data
+            return merged
+    except Exception as e:
+        logger.warning("failed_to_fetch_billing_plans", error=str(e))
+    return DEFAULT_PLANS
 
 
-def _get_plan(plan_key: str) -> dict:
+async def _get_plan(plan_key: str, db: AsyncSession) -> dict:
+    plans = await get_platform_plans(db)
     # Handle DB keys like "voice_growth" by stripping prefix
     clean_key = plan_key.split("_")[-1] if "_" in plan_key else plan_key
-    return PLANS.get(clean_key, PLANS.get(plan_key, PLANS[DEFAULT_PLAN]))
+    return plans.get(clean_key, plans.get(plan_key, plans.get("growth", {})))
 
 
 def _require_tenant(request: Request) -> str:
@@ -101,12 +147,12 @@ def _require_tenant(request: Request) -> str:
     return tenant_id
 
 
-def _billing_period() -> tuple[str, str]:
+def _billing_period() -> tuple[date, date]:
     today = date.today()
     start = date(today.year, today.month, 1)
     last_day = calendar.monthrange(today.year, today.month)[1]
     end = date(today.year, today.month, last_day)
-    return start.isoformat(), end.isoformat()
+    return start, end
 
 
 def _calc_overage(plan: dict, chats: int, voice_minutes: float) -> float:
@@ -131,11 +177,12 @@ def _calc_overage(plan: dict, chats: int, voice_minutes: float) -> float:
 
 
 @router.get("/plans")
-async def list_plans() -> dict:
+async def list_plans(db: AsyncSession = Depends(get_db)) -> dict:
     """Return all available plan definitions (used by the frontend pricing page)."""
+    plans = await get_platform_plans(db)
     return {
         key: {k: v for k, v in plan.items()}
-        for key, plan in PLANS.items()
+        for key, plan in plans.items()
     }
 
 
@@ -152,9 +199,24 @@ async def billing_overview(
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
     
-    # Use tenant.plan or fallback to growth
-    plan_key = (tenant.plan if tenant else DEFAULT_PLAN) or DEFAULT_PLAN
-    plan = _get_plan(plan_key)
+    # Use tenant.plan or fallback to none
+    plan_key = tenant.plan if (tenant and tenant.plan) else "none"
+    plan_display_name = "Not Subscribed"
+    
+    if plan_key != "none":
+        plan = await _get_plan(plan_key, db)
+        plan_display_name = tenant.plan_display_name if tenant and tenant.plan_display_name else plan["display_name"]
+    else:
+        # Dummy plan with zero limits/pricing
+        plan = {
+            "display_name": "Not Subscribed",
+            "price_per_agent": 0.0,
+            "chat_equivalents_included": 0,
+            "voice_minutes_included": 0,
+            "team_seats": 1,
+            "overage_per_chat_equivalent": 0.0,
+            "overage_per_voice_minute": 0.0,
+        }
 
     usage_result = await db.execute(
         select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
@@ -178,7 +240,16 @@ async def billing_overview(
 
     price_per_agent = plan["price_per_agent"] or 0
     base_cost = round(agent_count * price_per_agent, 2)
-    overage = _calc_overage(plan, chats, voice_minutes)
+    
+    # Accurate overage calculation for UI
+    chat_equivalents = chats + int(voice_minutes * 100)
+    included_chat_equivalents = plan["chat_equivalents_included"] or 0
+    chat_overage_units = max(0, chat_equivalents - included_chat_equivalents)
+    chat_overage_cost = round(chat_overage_units * plan["overage_per_chat_equivalent"], 2)
+    
+    # For now, voice overage is included in the chat equivalent overage in this model,
+    # but we'll provide the fields for UI compatibility.
+    voice_overage_cost = 0.0 
     
     # Fetch period from Stripe if available, else month-end
     billing_start, billing_end = _billing_period()
@@ -215,9 +286,9 @@ async def billing_overview(
         "price_per_agent": price_per_agent,
         "agent_count": agent_count,
         "limits": {
-            "chat_messages": plan["chat_equivalents_included"],
-            "voice_minutes": plan["voice_minutes_included"],
-            "team_seats": plan["team_seats"],
+            "chat_messages": plan["chat_equivalents_included"] if sub_status == "active" else 0,
+            "voice_minutes": plan["voice_minutes_included"] if sub_status == "active" else 0,
+            "team_seats": plan["team_seats"] if sub_status == "active" else 0,
         },
         "usage": {
             "sessions": sessions,
@@ -225,13 +296,17 @@ async def billing_overview(
             "chats": chats,
             "tokens": tokens,
             "voice_minutes": round(voice_minutes, 2),
-            "messages_pct": round(chats / (plan["chat_equivalents_included"] or 1) * 100, 1) if plan["chat_equivalents_included"] else 0.0,
+            "messages_pct": round(chat_equivalents / (plan["chat_equivalents_included"] or 1) * 100, 1) if plan["chat_equivalents_included"] else 0.0,
             "voice_pct": round(voice_minutes / (plan["voice_minutes_included"] or 1) * 100, 1) if plan["voice_minutes_included"] else 0.0,
+            "chat_overage": chat_overage_units,
+            "voice_overage": 0.0,
         },
         "estimated_bill": {
             "base": base_cost,
-            "overage": overage,
-            "total": round(base_cost + overage, 2),
+            "chat_overage": chat_overage_cost,
+            "voice_overage": voice_overage_cost,
+            "overage": chat_overage_cost + voice_overage_cost,
+            "total": round(base_cost + chat_overage_cost + voice_overage_cost, 2),
         },
         "billing_period": {
             "start": billing_start,
@@ -253,15 +328,35 @@ async def billing_agents(
 
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
-    plan_key = (tenant.plan if tenant else DEFAULT_PLAN) or DEFAULT_PLAN
-    plan = _get_plan(plan_key)
+    plan_key = tenant.plan if (tenant and tenant.plan) else "growth"
+    plan = await _get_plan(plan_key, db)
     price_per_agent = plan["price_per_agent"] or 0
 
     try:
-        usage_result = await db.execute(
+        from app.models.tenant import Tenant, TenantUsage
+        # Actually, since orchestrator and gateway might have different model structures, let's use raw SQL for speed and safety.
+        from sqlalchemy import text
+        
+        # Get start/end of current month
+        start_date, _ = _billing_period()
+        
+        usage_query = text("""
+            SELECT agent_id, 
+                   SUM(total_sessions) as sessions, 
+                   SUM(total_messages) as messages, 
+                   SUM(total_chat_units) as chats,
+                   SUM(total_voice_minutes) as voice_minutes
+            FROM agent_analytics
+            WHERE tenant_id = :tenant_id AND date >= :start_date
+            GROUP BY agent_id
+        """)
+        usage_res = await db.execute(usage_query, {"tenant_id": tenant_uuid, "start_date": start_date})
+        usage_map = {str(r.agent_id): r for r in usage_res.all()}
+
+        usage_row_result = await db.execute(
             select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
         )
-        usage_row = usage_result.scalar_one_or_none()
+        usage_row = usage_row_result.scalar_one_or_none()
         purchased_slots = usage_row.agent_count if usage_row else 0
 
         # Fetch actual agents from orchestrator
@@ -278,24 +373,28 @@ async def billing_agents(
         if purchased_slots == 0 and tenant and sub_status == "active":
             purchased_slots = 1
 
-        total_sessions = (usage_row.current_month_sessions or 0) if usage_row else 0
-        total_chats = (usage_row.current_month_chat_units or 0) if usage_row else 0
-        total_voice = float(usage_row.current_month_voice_minutes or 0) if usage_row else 0.0
-
         # We display the actual agents first, then empty slots
         results = []
         for agent in actual_agents:
-            # We don't have per-agent usage in the aggregate usage_row,
-            # so we'll show 0 or N/A for now, or just focus on the name accuracy.
-            # In a real system, we'd query per-agent analytics.
+            a_usage = usage_map.get(agent["id"])
+            sessions = int(a_usage.sessions) if a_usage else 0
+            messages = int(a_usage.messages) if a_usage else 0
+            chats = int(a_usage.chats) if a_usage else 0
+            voice_minutes = float(a_usage.voice_minutes) if a_usage else 0.0
+            
+            # Simple overage logic per agent for display (pro-rata estimated)
+            # Actually, overage is usually calculated at tenant level, but we can show "contribution"
             results.append({
                 "agent_id": agent["id"],
                 "agent_name": agent["name"],
-                "sessions": 0, # Placeholder until per-agent analytics are added
-                "messages": 0,
-                "voice_minutes": 0.0,
+                "sessions": sessions,
+                "messages": messages,
+                "chats": chats,
+                "tokens": 0,
+                "voice_minutes": round(voice_minutes, 2),
                 "base_cost": price_per_agent,
                 "status": "active" if agent.get("is_active") else "inactive",
+                "overage": 0.0, # Tenant-level usually, but can be split if needed
                 "total_cost": price_per_agent,
             })
 
@@ -315,14 +414,21 @@ async def billing_agents(
         return results
     except Exception as exc:
         logger.warning("billing_agents_error", error=str(exc))
-        # Fallback to basic purchased slots if orchestrator is down
+        # Fallback if orchestrator or analytics query fails
+        try:
+            # Try to at least get purchased slots for a fallback list
+            usage_row_result = await db.execute(
+                select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
+            )
+            usage_row = usage_row_result.scalar_one_or_none()
+            purchased_slots = usage_row.agent_count if usage_row else 1
+        except Exception:
+            purchased_slots = 1
+
         return [
-            {"agent_id": None, "agent_name": f"Agent Slot {i+1}", "base_cost": price_per_agent}
-            for i in range(usage_row.agent_count if usage_row else 1)
+            {"agent_id": None, "agent_name": f"Agent Slot {i+1}", "base_cost": price_per_agent, "status": "available"}
+            for i in range(purchased_slots)
         ]
-    except Exception as exc:
-        logger.warning("billing_agents_error", error=str(exc))
-        return []
 
 
 @router.post("/create-checkout-session")
@@ -343,7 +449,7 @@ async def create_checkout_session(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    plan_data = _get_plan(plan)
+    plan_data = await _get_plan(plan, db)
     price = plan_data.get("price_per_agent")
     if not price:
         raise HTTPException(status_code=400, detail="Invalid plan or price not available")
@@ -385,28 +491,59 @@ async def create_checkout_session(
 @router.post("/create-agent-slot-session")
 async def create_agent_slot_session(
     request: Request,
+    payload: AgentSlotSessionRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Create Stripe checkout session for a single new agent slot."""
     tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
+    
+    agent_config = payload.agent_config if payload else None
+    return_path = payload.return_path if payload else "/dashboard/billing"
 
-    from app.models.tenant import Tenant
+    from app.models.tenant import Tenant, PendingAgentPurchase
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    plan_data = _get_plan(tenant.plan or DEFAULT_PLAN)
+    # If agent_config is provided, create a pending purchase record
+    pending_id = None
+    if agent_config:
+        pending = PendingAgentPurchase(
+            tenant_id=tenant_uuid,
+            config=agent_config
+        )
+        db.add(pending)
+        await db.commit()
+        await db.refresh(pending)
+        pending_id = str(pending.id)
+
+    plan_data = await _get_plan(tenant.plan or "growth", db)
     price = plan_data.get("price_per_agent") or 99.00
+
+    # Self-healing: if stripe_customer_id is missing, try to create one now.
+    if not tenant.stripe_customer_id:
+        logger.info("stripe_customer_id_missing_attempting_creation", tenant_id=str(tenant.id))
+        from app.models.user import User
+        user_res = await db.execute(select(User).where(User.tenant_id == tenant.id, User.role == "owner"))
+        owner = user_res.scalar_one_or_none()
+        if owner:
+            from app.services.auth_service import _create_stripe_customer
+            stripe_customer_id = await _create_stripe_customer(tenant, owner)
+            if stripe_customer_id:
+                tenant.stripe_customer_id = stripe_customer_id
+                await db.commit()
+                logger.info("stripe_customer_id_created_on_the_fly", tenant_id=str(tenant.id), customer_id=stripe_customer_id)
 
     import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
     try:
-        checkout_session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[
+        # If still no customer ID, we'll let Stripe create one or omit it (Session creation might fail without customer in some modes, but mode="subscription" usually allows it if price is valid)
+        kwargs = {
+            "payment_method_types": ["card"],
+            "line_items": [
                 {
                     "price_data": {
                         "currency": "usd",
@@ -420,19 +557,29 @@ async def create_agent_slot_session(
                     "quantity": 1,
                 }
             ],
-            mode="subscription",
-            success_url=f"{settings.FRONTEND_URL}/dashboard/billing?success=true",
-            cancel_url=f"{settings.FRONTEND_URL}/dashboard/billing?cancelled=true",
-            customer=tenant.stripe_customer_id,
-            metadata={
+            "mode": "subscription",
+            "success_url": f"{settings.FRONTEND_URL}{return_path}?success=true",
+            "cancel_url": f"{settings.FRONTEND_URL}{return_path}?cancelled=true",
+            "metadata": {
                 "tenant_id": str(tenant.id),
                 "action": "add_agent_slot",
+                "pending_agent_purchase_id": pending_id or "",
             },
-        )
+        }
+        if tenant.stripe_customer_id:
+            kwargs["customer"] = tenant.stripe_customer_id
+        else:
+            # If we don't have a customer, we MUST provide customer_email to at least link it later
+            kwargs["customer_email"] = tenant.email
+
+        checkout_session = stripe.checkout.Session.create(**kwargs)
         return {"checkout_url": checkout_session.url}
     except stripe.error.StripeError as e:
-        logger.warning("stripe_slot_checkout_error", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to create checkout session")
+        logger.error("stripe_slot_checkout_error", error=str(e), tenant_id=str(tenant.id))
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+    except Exception as e:
+        logger.error("unexpected_slot_checkout_error", error=str(e), tenant_id=str(tenant.id))
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while initiating purchase.")
 
 
 @router.post("/portal-session")
@@ -499,3 +646,207 @@ async def list_invoices(
             for inv in invoices.data
         ]
     }
+
+
+@router.post("/webhook", status_code=200, include_in_schema=False)
+async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Handle Stripe webhook events at /api/v1/billing/webhook.
+    Activates tenant accounts on successful payment.
+    """
+    import uuid as _uuid
+    from app.models.tenant import Tenant
+    from app.services.tenant_service import get_plan_limits
+
+    body = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing Stripe signature header.")
+
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+
+    try:
+        event = stripe.Webhook.construct_event(
+            body, sig_header, settings.STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload.")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=401, detail="Invalid signature.")
+
+    event_type = event.get("type", "unknown")
+    logger.info("billing_webhook_received", event_type=event_type)
+
+    if event_type == "checkout.session.completed":
+        session = event.get("data", {}).get("object", {})
+        metadata = session.get("metadata", {})
+        tenant_id = metadata.get("tenant_id")
+        plan = metadata.get("plan")
+
+        if tenant_id:
+            try:
+                from app.models.tenant import TenantUsage
+                result = await db.execute(select(Tenant).where(Tenant.id == _uuid.UUID(tenant_id)))
+                tenant = result.scalar_one_or_none()
+                if tenant:
+                    # ALWAYS activate subscription on payment success
+                    tenant.subscription_status = "active"
+                    tenant.subscription_id = session.get("subscription") or session.get("id")
+                    if plan:
+                        tenant.plan = plan
+                        tenant.plan_limits = await get_plan_limits(plan, db)
+                    
+                    await db.commit()
+                    logger.info("tenant_subscription_activated", tenant_id=tenant_id, plan=plan)
+
+                # FLOW 1: Activate specific agent if metadata contains agent_id
+                agent_id = metadata.get("agent_id")
+                if agent_id:
+                    logger.info("activating_agent_from_webhook", tenant_id=tenant_id, agent_id=agent_id)
+                    subscription_id = session.get("subscription")
+                    
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner"}
+                            activate_res = await client.patch(
+                                f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}",
+                                json={
+                                    "is_active": True,
+                                    "stripe_subscription_id": subscription_id
+                                },
+                                headers=headers,
+                                timeout=10.0
+                            )
+                            if activate_res.status_code == 200:
+                                logger.info("agent_activated_successfully", agent_id=agent_id)
+                                
+                                # UI Alignment: Increment agent_count in TenantUsage
+                                usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
+                                usage = usage_res.scalar_one_or_none()
+                                if usage:
+                                    usage.agent_count += 1
+                                    await db.commit()
+                            else:
+                                logger.error("agent_activation_failed_upstream", agent_id=agent_id, status=activate_res.status_code)
+                                # Failsafe: Agent missing or errored -> Issue refund/cancel to prevent unauthorized charge
+                                if subscription_id:
+                                    try:
+                                        stripe.Subscription.delete(subscription_id)
+                                        logger.info("stripe_subscription_cancelled_failsafe", subscription_id=subscription_id)
+                                    except Exception as sub_e:
+                                        logger.error("stripe_subscription_cancel_failed", error=str(sub_e))
+                                        
+                                payment_intent = session.get("payment_intent")
+                                if payment_intent:
+                                    try:
+                                        stripe.Refund.create(payment_intent=payment_intent)
+                                        logger.info("stripe_payment_refunded_failsafe", payment_intent=payment_intent)
+                                    except Exception as ref_e:
+                                        logger.error("stripe_refund_failed", error=str(ref_e))
+
+                    except Exception as e:
+                        logger.error("agent_activation_request_error", error=str(e), agent_id=agent_id)
+
+                # FLOW 2: LEGACY/FALLBACK Auto-create agent from config
+                pending_purchase_id = metadata.get("pending_agent_purchase_id")
+                if pending_purchase_id:
+                    from app.models.tenant import PendingAgentPurchase
+                    pending_res = await db.execute(select(PendingAgentPurchase).where(PendingAgentPurchase.id == _uuid.UUID(pending_purchase_id)))
+                    pending = pending_res.scalar_one_or_none()
+                    if pending:
+                        logger.info("creating_agent_from_pending_purchase", tenant_id=tenant_id, pending_id=pending_purchase_id)
+                        try:
+                            async with httpx.AsyncClient() as client:
+                                headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner"}
+                                create_res = await client.post(
+                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/",
+                                    json={**pending.config, "is_active": True, "stripe_subscription_id": session.get("subscription")},
+                                    headers=headers,
+                                    timeout=10.0
+                                )
+                                if create_res.status_code in (200, 201):
+                                    await db.delete(pending)
+                                    # Sync agent_count
+                                    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
+                                    usage = usage_res.scalar_one_or_none()
+                                    if usage:
+                                        usage.agent_count += 1
+                                    await db.commit()
+                                    logger.info("pending_agent_created_and_cleaned_up", tenant_id=tenant_id)
+                        except Exception as e:
+                            logger.error("pending_agent_creation_error", error=str(e))
+
+                # FLOW 3: Generic Slot Increment
+                if metadata.get("action") == "add_agent_slot":
+                    logger.info("adding_generic_agent_slot", tenant_id=tenant_id)
+                    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
+                    usage = usage_res.scalar_one_or_none()
+                    if usage:
+                        usage.agent_count += 1
+                        await db.commit()
+                        logger.info("generic_slot_added_successfully", tenant_id=tenant_id)
+
+            except Exception as e:
+                logger.error("billing_webhook_checkout_error", error=str(e), tenant_id=tenant_id)
+
+    elif event_type in ("customer.subscription.created", "customer.subscription.updated"):
+        subscription = event.get("data", {}).get("object", {})
+        metadata = subscription.get("metadata", {})
+        tenant_id = metadata.get("tenant_id")
+        plan = metadata.get("plan")
+        status = subscription.get("status")
+        quantity = subscription.get("quantity") or 1
+
+        if tenant_id:
+            try:
+                from app.models.tenant import TenantUsage
+                result = await db.execute(select(Tenant).where(Tenant.id == _uuid.UUID(tenant_id)))
+                tenant = result.scalar_one_or_none()
+                if tenant:
+                    tenant.subscription_id = subscription.get("id")
+                    tenant.subscription_status = status or "active"
+                    if status == "active":
+                        tenant.is_active = True
+                        if plan:
+                            tenant.plan = plan
+                            tenant.plan_limits = await get_plan_limits(plan, db)
+                        
+                        # Sync agent slots with subscription quantity
+                        usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
+                        usage = usage_res.scalar_one_or_none()
+                        if usage and usage.agent_count < quantity:
+                            usage.agent_count = quantity
+                            
+                    await db.commit()
+                    logger.info("billing_webhook_subscription_updated", tenant_id=tenant_id, status=status)
+            except Exception as e:
+                logger.error("billing_webhook_subscription_error", error=str(e), tenant_id=tenant_id)
+
+    elif event_type == "invoice.paid":
+        invoice = event.get("data", {}).get("object", {})
+        customer_id = invoice.get("customer")
+        if customer_id:
+            try:
+                from app.models.tenant import TenantUsage
+                result = await db.execute(select(Tenant).where(Tenant.stripe_customer_id == customer_id))
+                tenant = result.scalar_one_or_none()
+                if tenant:
+                    tenant.is_active = True
+                    tenant.subscription_status = "active"
+                    if invoice.get("subscription"):
+                        tenant.subscription_id = invoice["subscription"]
+                    
+                    # Ensure at least 1 slot is granted on paid invoice if currently 0
+                    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
+                    usage = usage_res.scalar_one_or_none()
+                    if usage and usage.agent_count == 0:
+                        usage.agent_count = 1
+                        
+                    await db.commit()
+                    logger.info("billing_webhook_invoice_paid", customer_id=customer_id)
+            except Exception as e:
+                logger.error("billing_webhook_invoice_paid_error", error=str(e), customer_id=customer_id)
+
+    return {"received": True}

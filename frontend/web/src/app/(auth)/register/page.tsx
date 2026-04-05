@@ -7,8 +7,7 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import toast from 'react-hot-toast'
-import { authApi, billingApi } from '@/lib/api'
-import { useAuthStore } from '@/store/auth'
+import { authApi } from '@/lib/api'
 
 const schema = z.object({
   full_name: z.string().min(1, 'Full name required'),
@@ -16,15 +15,17 @@ const schema = z.object({
   password: z.string().min(8, 'Minimum 8 characters'),
   business_name: z.string().min(1, 'Business name required'),
   business_type: z.enum(['pizza_shop', 'clinic', 'salon', 'other']),
-  plan: z.enum(['text_growth', 'voice_growth', 'voice_business']),
 })
 
 type FormData = z.infer<typeof schema>
 
 export default function RegisterPage() {
   const router = useRouter()
-  const { setUser } = useAuthStore()
   const [loading, setLoading] = useState(false)
+  const [step, setStep] = useState<'register' | 'verify'>('register')
+  const [registeredEmail, setRegisteredEmail] = useState('')
+  const [otp, setOtp] = useState('')
+  const [verifying, setVerifying] = useState(false)
 
   const {
     register,
@@ -32,33 +33,45 @@ export default function RegisterPage() {
     formState: { errors },
   } = useForm<FormData>({
     resolver: zodResolver(schema),
-    defaultValues: { business_type: 'other', plan: 'voice_growth' },
+    defaultValues: { business_type: 'other' },
   })
 
   const onSubmit = async (data: FormData) => {
     setLoading(true)
     try {
-      const res = await authApi.register(data)
-      setUser(res.user, res.tenant_id)
-      toast.success('Account created! Redirecting to checkout...')
-      
-      try {
-        const checkout = await billingApi.createCheckoutSession({ plan: data.plan })
-        if (checkout.checkout_url || checkout.url) {
-          window.location.href = checkout.checkout_url || checkout.url
-        } else {
-          toast.success('Account created!')
-          router.push('/dashboard')
-        }
-      } catch (checkoutErr) {
-        console.error('Checkout error:', checkoutErr)
-        toast.success('Account created!')
-        router.push('/dashboard')
-      }
+      await authApi.register(data)
+      setRegisteredEmail(data.email)
+      setStep('verify')
+      toast.success('Verification code sent to your email!')
     } catch (err: any) {
       toast.error(err?.response?.data?.detail || 'Registration failed')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleVerify = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (otp.length !== 6) return
+    
+    setVerifying(true)
+    try {
+      await authApi.verifyEmail({ email: registeredEmail, otp })
+      toast.success('Email verified! Redirecting to dashboard...')
+      router.push('/dashboard')
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || 'Verification failed')
+    } finally {
+      setVerifying(false)
+    }
+  }
+
+  const handleResend = async () => {
+    try {
+      await authApi.resendOTP({ email: registeredEmail })
+      toast.success('New code sent!')
+    } catch (err) {
+      toast.error('Failed to resend code')
     }
   }
 
@@ -72,112 +85,110 @@ export default function RegisterPage() {
             </div>
             <span className="text-2xl font-bold text-white">AscenAI</span>
           </Link>
-          <p className="text-gray-400 mt-3">From $99/agent/month · no setup fees</p>
+          <p className="text-gray-400 mt-3">Advanced Agentic AI platform for business</p>
         </div>
 
         <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-8 backdrop-blur-sm">
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
-            {[
-              { name: 'full_name', label: 'Full name', type: 'text', placeholder: 'Alex Johnson' },
-              { name: 'email', label: 'Work email', type: 'email', placeholder: 'alex@business.com' },
-              { name: 'password', label: 'Password', type: 'password', placeholder: '8+ characters' },
-              { name: 'business_name', label: 'Business name', type: 'text', placeholder: "Joe's Pizza" },
-            ].map((f) => (
-              <div key={f.name}>
-                <label className="block text-sm text-gray-300 mb-1.5">{f.label}</label>
-                <input
-                  {...register(f.name as keyof FormData)}
-                  type={f.type}
-                  placeholder={f.placeholder}
-                  className="w-full px-4 py-3 rounded-lg bg-white/5 border border-white/10 text-white placeholder-gray-500 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors"
-                />
-                {errors[f.name as keyof FormData] && (
-                  <p className="text-red-400 text-xs mt-1">
-                    {errors[f.name as keyof FormData]?.message}
-                  </p>
-                )}
-              </div>
-            ))}
+          {step === 'register' ? (
+            <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+              {[
+                { name: 'full_name', label: 'Full name', type: 'text', placeholder: 'Alex Johnson' },
+                { name: 'email', label: 'Work email', type: 'email', placeholder: 'alex@business.com' },
+                { name: 'password', label: 'Password', type: 'password', placeholder: '8+ characters' },
+                { name: 'business_name', label: 'Business name', type: 'text', placeholder: "Joe's Pizza" },
+              ].map((f) => (
+                <div key={f.name}>
+                  <label className="block text-sm text-gray-300 mb-1.5">{f.label}</label>
+                  <input
+                    {...register(f.name as keyof FormData)}
+                    type={f.type}
+                    placeholder={f.placeholder}
+                    className="w-full px-4 py-3 rounded-lg bg-white/5 border border-white/10 text-white placeholder-gray-500 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors"
+                  />
+                  {errors[f.name as keyof FormData] && (
+                    <p className="text-red-400 text-xs mt-1">
+                      {errors[f.name as keyof FormData]?.message}
+                    </p>
+                  )}
+                </div>
+              ))}
 
-            <div>
-              <label className="block text-sm text-gray-300 mb-1.5">Business type</label>
-              <select
-                {...register('business_type')}
-                className="w-full px-4 py-3 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors"
+              <div>
+                <label className="block text-sm text-gray-300 mb-1.5">Business type</label>
+                <select
+                  {...register('business_type')}
+                  className="w-full px-4 py-3 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors"
+                >
+                  <option value="other">Other</option>
+                  <option value="pizza_shop">Pizza / Restaurant</option>
+                  <option value="clinic">Medical Clinic</option>
+                  <option value="salon">Salon / Spa</option>
+                </select>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full py-3 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed mt-2"
               >
-                <option value="other">Other</option>
-                <option value="pizza_shop">Pizza / Restaurant</option>
-                <option value="clinic">Medical Clinic</option>
-                <option value="salon">Salon / Spa</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-sm text-gray-300 mb-3">Select plan</label>
-              <div className="space-y-2">
-                <label className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10 cursor-pointer hover:border-violet-500/50 transition-colors">
-                  <div className="flex items-center gap-3">
-                    <input
-                      {...register('plan')}
-                      type="radio"
-                      value="text_growth"
-                      className="w-4 h-4 text-violet-500 bg-white/10 border-white/20"
-                    />
-                    <div>
-                      <span className="text-white font-medium">Starter</span>
-                      <span className="text-gray-400 text-sm ml-2">$49/agent/mo</span>
-                    </div>
-                  </div>
-                </label>
-                <label className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10 cursor-pointer hover:border-violet-500/50 transition-colors">
-                  <div className="flex items-center gap-3">
-                    <input
-                      {...register('plan')}
-                      type="radio"
-                      value="voice_growth"
-                      className="w-4 h-4 text-violet-500 bg-white/10 border-white/20"
-                    />
-                    <div>
-                      <span className="text-white font-medium">Growth</span>
-                      <span className="text-gray-400 text-sm ml-2">$99/agent/mo</span>
-                    </div>
-                  </div>
-                </label>
-                <label className="flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10 cursor-pointer hover:border-violet-500/50 transition-colors">
-                  <div className="flex items-center gap-3">
-                    <input
-                      {...register('plan')}
-                      type="radio"
-                      value="voice_business"
-                      className="w-4 h-4 text-violet-500 bg-white/10 border-white/20"
-                    />
-                    <div>
-                      <span className="text-white font-medium">Business</span>
-                      <span className="text-gray-400 text-sm ml-2">$199/agent/mo</span>
-                    </div>
-                  </div>
-                </label>
+                {loading ? 'Creating account…' : 'Create account'}
+              </button>
+            </form>
+          ) : (
+            <div className="space-y-6">
+              <div className="text-center">
+                <p className="text-gray-300">We've sent a 6-digit code to</p>
+                <p className="text-white font-medium">{registeredEmail}</p>
               </div>
-              {errors.plan && (
-                <p className="text-red-400 text-xs mt-1">{errors.plan.message}</p>
-              )}
+
+              <form onSubmit={handleVerify} className="space-y-4">
+                <div>
+                  <input
+                    type="text"
+                    maxLength={6}
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
+                    placeholder="000000"
+                    className="w-full text-center text-3xl tracking-[1em] py-4 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 transition-colors font-mono"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={verifying || otp.length !== 6}
+                  className="w-full py-3 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {verifying ? 'Verifying…' : 'Verify email'}
+                </button>
+              </form>
+
+              <div className="text-center space-y-2">
+                <p className="text-sm text-gray-400">Didn't receive the code?</p>
+                <button
+                  onClick={handleResend}
+                  className="text-white text-sm hover:text-violet-400 transition-colors font-medium"
+                >
+                  Resend code
+                </button>
+              </div>
+
+              <button
+                onClick={() => setStep('register')}
+                className="w-full text-gray-500 text-sm hover:text-gray-400 transition-colors"
+              >
+                ← Back to registration
+              </button>
             </div>
+          )}
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full py-3 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white font-semibold hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed mt-2"
-            >
-              {loading ? 'Creating account…' : 'Create account'}
-            </button>
-          </form>
-
-          <p className="text-center text-gray-400 text-sm mt-6">
-            Already have an account?{' '}
-            <Link href="/login" className="text-violet-400 hover:text-violet-300 transition-colors">
-              Sign in
-            </Link>
-          </p>
+          <div className="mt-8 pt-6 border-t border-white/10">
+            <p className="text-center text-gray-400 text-sm">
+              Already have an account?{' '}
+              <Link href="/login" className="text-violet-400 hover:text-violet-300 transition-colors">
+                Sign in
+              </Link>
+            </p>
+          </div>
         </div>
       </div>
     </div>

@@ -1,585 +1,562 @@
-# AscenAI2 — Production Architecture Documentation
+# Architecture Overview
 
-> Version: 2.0 | Branch: `claude/ai-agent-mcp-platform-dpseU`
+**Version:** 2.0.0 | **Last Updated:** 2026-04-02
 
----
-
-## 1. Application Overview
-
-### 1.1 Purpose
-
-AscenAI2 is a **production-grade, multi-tenant AI Agent Platform** enabling businesses to deploy intelligent conversational agents across text and voice channels. It provides agent creation, knowledge base management, tool integration, guardrails, PII protection, compliance controls, billing, and analytics — all within a strict multi-tenant security boundary.
-
-### 1.2 Target Users
-
-| User Type | Core Needs |
-|---|---|
-| Business Operators | Agent builder, analytics dashboard, billing management |
-| Developers | REST API, WebSocket, API keys, embed widget, webhooks |
-| End Customers | Low-latency chat and voice responses |
-| Platform Admins | Compliance controls, tenant management |
-
-### 1.3 Functional Requirements
-
-| ID | Requirement |
-|---|---|
-| FR-01 | Multi-turn text chat with streaming and session memory |
-| FR-02 | Voice channel (STT → LLM → TTS) with sub-200ms target |
-| FR-03 | Tool calling via MCP server (HTTP tools + built-in integrations) |
-| FR-04 | RAG with hybrid search, reranking, and source citations |
-| FR-05 | Guardrails: blocked keywords, profanity, PII, jailbreak, emergency, toxicity |
-| FR-06 | PII pseudonymization (reversible, per-session, Presidio-backed) |
-| FR-07 | Declarative playbook flows (state machine execution) |
-| FR-08 | Per-tenant token budget and plan-based limits |
-| FR-09 | GDPR erasure, prompt versioning, A/B testing |
-| FR-10 | Full conversation trace logging and replay |
-
-### 1.4 Non-Functional Requirements
-
-| ID | Requirement | Target |
-|---|---|---|
-| NFR-01 | Chat API P99 first-token latency | < 1.5 s |
-| NFR-02 | Voice end-to-end latency | < 200 ms |
-| NFR-03 | Availability | 99.9% monthly |
-| NFR-04 | Horizontal scaling | Linear to 10× base |
-| NFR-05 | GDPR erasure SLA | 30 days |
-| NFR-06 | Zero cross-tenant data leakage | Enforced at DB + app layers |
+This document provides a comprehensive overview of the AscenAI2 system architecture, including service topology, data flows, database schema, and infrastructure components.
 
 ---
 
-## 2. System Architecture
+## Table of Contents
 
-### 2.1 System Context
+1. [System Architecture Diagram](#1-system-architecture-diagram)
+2. [Service Overview](#2-service-overview)
+3. [Data Flow: Text Chat](#3-data-flow-text-chat)
+4. [Data Flow: Voice](#4-data-flow-voice)
+5. [Database Schema](#5-database-schema)
+6. [Redis Usage](#6-redis-usage)
+7. [Stripe Integration](#7-stripe-integration)
+8. [Security Architecture](#8-security-architecture)
 
-```mermaid
-C4Context
-  title AscenAI2 System Context
-  Person(op, "Business Operator", "Configures agents via dashboard")
-  Person(dev, "Developer", "Integrates via REST/WebSocket")
-  Person(cust, "End Customer", "Chats with AI agents")
+---
 
-  System_Boundary(p, "AscenAI2 Platform") {
-    System(platform, "AscenAI2", "Multi-tenant AI Agent Platform")
-  }
+## 1. System Architecture Diagram
 
-  System_Ext(gemini, "Google Gemini", "LLM + STT")
-  System_Ext(openai, "OpenAI", "LLM / Whisper / TTS")
-  System_Ext(cartesia, "Cartesia", "TTS <100ms")
-  System_Ext(stripe, "Stripe", "Payments")
-  System_Ext(twilio, "Twilio", "SMS")
-  System_Ext(sentry, "Sentry", "Errors")
-  System_Ext(otel, "OpenTelemetry", "Tracing")
-
-  Rel(op, platform, "HTTPS Dashboard")
-  Rel(dev, platform, "REST API / WebSocket")
-  Rel(cust, platform, "Chat widget / Voice")
-  Rel(platform, gemini, "LLM inference + STT")
-  Rel(platform, openai, "Fallback LLM / Whisper")
-  Rel(platform, cartesia, "TTS synthesis")
-  Rel(platform, stripe, "Billing")
-  Rel(platform, twilio, "SMS / WhatsApp")
-  Rel(platform, sentry, "Error reporting")
-  Rel(platform, otel, "Distributed traces")
 ```
+                        ┌─────────────────────────────────────────────────┐
+                        │                  CLIENTS                        │
+                        │  Browser (Next.js)  │  Twilio (Voice)  │  SDK  │
+                        └────────┬────────────┴────────┬───────────┴─────┘
+                                 │                     │
+                          HTTP/WS│                     │SIP/RTP
+                                 │                     │
+                    ┌────────────▼─────────────────────▼────────────┐
+                    │              NGINX (Production)               │
+                    │         TLS Termination + Reverse Proxy       │
+                    └────────────┬─────────────────────┬────────────┘
+                                 │                     │
+                    ┌────────────▼─────────────────────▼────────────┐
+                    │              API GATEWAY (:8000)              │
+                    │  ┌─────────┐ ┌──────────┐ ┌───────────────┐  │
+                    │  │  Auth   │ │   Rate   │ │  Plan/Limit   │  │
+                    │  │  (JWT)  │ │  Limit   │ │  Enforcement  │  │
+                    │  └─────────┘ └──────────┘ └───────────────┘  │
+                    │  ┌─────────────────────────────────────────┐  │
+                    │  │         Reverse Proxy Router            │  │
+                    │  │  /agents/*   → AI Orchestrator (:8002)  │  │
+                    │  │  /tools/*    → MCP Server (:8001)       │  │
+                    │  │  /voice/*    → Voice Pipeline (:8003)   │  │
+                    │  └─────────────────────────────────────────┘  │
+                    └──────┬──────────────┬──────────────┬──────────┘
+                           │              │              │
+              ┌────────────▼────┐  ┌──────▼──────┐  ┌───▼──────────────┐
+              │  AI ORCHESTRATOR│  │  MCP SERVER │  │  VOICE PIPELINE  │
+              │     (:8002)     │  │  (:8001)    │  │     (:8003)      │
+              │                 │  │             │  │                  │
+              │ ┌─────────────┐ │  │ ┌─────────┐ │  │ ┌──────────────┐ │
+              │ │ Orchestrator│ │  │ │  Tool   │ │  │ │ STT Service  │ │
+              │ │ PII Service │ │  │ │ Registry│ │  │ │ TTS Service  │ │
+              │ │ Memory Mgr  │ │  │ │ Executor│ │  │ │ Voice Guard  │ │
+              │ │ Playbook    │ │  │ │ Context │ │  │ │ Barge-in     │ │
+              │ │ LLM Client  │ │  │ │ Provider│ │  │ │ VAD Engine   │ │
+              │ │ Sem. Cache  │ │  │ │ Auth Mgr│ │  │ └──────┬───────┘ │
+              │ │ Moderation  │ │  │ └─────────┘ │  │        │         │
+              │ │ Model Router│ │  └──────┬──────┘  │        │         │
+              │ └──────┬──────┘ │         │         │        │         │
+              │        │        │         │         │        │         │
+              │   ┌────▼────┐   │    ┌────▼────┐    │   ┌────▼────┐    │
+              │   │ LLM API  │   │    │External │    │   │ AI Orch │    │
+              │   │(Gemini/  │   │    │ APIs    │    │   │ (:8002) │    │
+              │   │ OpenAI)  │   │    │(Stripe, │    │   └─────────┘    │
+              │   └─────────┘   │    │ GCal,   │    └──────────────────┘
+              └─────────────────┘    │ Twilio) │
+                                     └─────────┘
 
-### 2.2 Component Architecture
-
-```mermaid
-graph TB
-  subgraph Clients
-    FE["Next.js Dashboard :3000"]
-    WC["Web Chat Widget"]
-    CH["WhatsApp / SMS / Slack / Email"]
-  end
-
-  subgraph GW["API Gateway :8000"]
-    AUTH["JWT + API Key Auth"]
-    RL["Rate Limiter (Redis)"]
-    PROX["Reverse Proxy + Plan Enforcer"]
-    CHAN["Channel Webhooks"]
-  end
-
-  subgraph OR["AI Orchestrator :8002"]
-    ORCH["Orchestrator Engine"]
-    PB["Playbook Engine"]
-    LLM["LLM Client (Gemini/OpenAI/Vertex)"]
-    MR["Model Router"]
-    MEM["Memory Manager"]
-    PII["PII Service (Presidio)"]
-    GRD["Guardrails + Moderation"]
-    TL["Trace Logger"]
-    SC["Semantic Cache"]
-    PM["Prompt Manager"]
-    EV["Eval Service"]
-  end
-
-  subgraph MCP["MCP Server :8001"]
-    TR["Tool Registry"]
-    TE["Tool Executor"]
-    RAG["RAG Service (Hybrid)"]
-    DI["Document Indexer"]
-  end
-
-  subgraph VP["Voice Pipeline :8003"]
-    STT["STT (Gemini/Deepgram)"]
-    TTS["TTS (Cartesia/ElevenLabs)"]
-  end
-
-  subgraph Data
-    PG[("PostgreSQL 16\n(pgvector + RLS)")]
-    RD[("Redis 7")]
-  end
-
-  FE & WC & CH --> GW
-  GW --> OR & MCP
-  OR --> MCP
-  OR --> LLM
-  VP --> OR
-  OR & MCP & GW --> PG & RD
-```
-
-### 2.3 Chat Request Flow (Non-Streaming)
-
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant GW as API Gateway
-  participant OR as Orchestrator
-  participant SC as Semantic Cache
-  participant MCP as MCP Server
-  participant LLM as LLM Provider
-  participant DB as PostgreSQL
-  participant RD as Redis
-
-  C->>GW: POST /api/v1/chat {message}
-  GW->>GW: Auth + rate limit check
-  GW->>OR: Proxy request
-
-  OR->>SC: Check semantic cache (cosine >= 0.92?)
-  SC-->>OR: Cache hit OR miss
-
-  alt Cache Miss
-    OR->>DB: Load agent + guardrails + playbook state
-    OR->>RD: Load conversation history (20 turns)
-    OR->>OR: Emergency + jailbreak + injection checks
-    OR->>OR: ML Moderation (input)
-    OR->>MCP: RAG retrieval (pgvector cosine search)
-    OR->>OR: PII anonymize message (Presidio)
-    OR->>OR: PromptManager.get_active_prompt() [version + A/B]
-    OR->>RD: Check daily token budget
-
-    loop Tool Loop (max 3)
-      OR->>LLM: Complete (model selected by ModelRouter)
-      LLM-->>OR: Response (tool_calls OR final)
-      OR->>OR: Validate + de-tokenize tool args
-      OR->>MCP: Execute tools
-      MCP-->>OR: Tool results (re-anonymized)
-    end
-
-    OR->>OR: parse_envelope() + restore PII tokens
-    OR->>OR: apply_output_guardrails() + ML moderation (output)
-    OR->>DB: Persist messages + ConversationTrace
-    OR->>RD: Update memory + token budget
-    OR->>OR: maybe_summarize() if > 18 turns
-    OR->>OR: extract_long_term_memory() if customer_identifier set
-    OR->>SC: Cache response if cacheable
-  end
-
-  OR-->>GW: ChatResponse
-  GW-->>C: 200 OK
-```
-
-### 2.4 Playbook Execution Flow
-
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant OR as Orchestrator
-  participant PB as PlaybookEngine
-  participant RD as Redis
-  participant DB as PostgreSQL
-  participant MCP as MCP Server
-
-  C->>OR: POST /chat {message}
-  OR->>RD: Check playbook_state:{session_id}
-
-  alt Active Playbook
-    OR->>PB: advance(session_id, user_input)
-    PB->>RD: Load state (variables, current_step_id)
-
-    alt WaitInput Step
-      PB->>PB: validate input (regex if configured)
-      PB->>PB: store in variables[field_name]
-      PB->>PB: advance to next_step_id
-    else ToolStep
-      PB->>MCP: Execute tool with mapped args
-      MCP-->>PB: Result
-      PB->>PB: Store in variables[output_variable]
-    else ConditionStep
-      PB->>PB: safe_eval(expression, variables)
-      PB->>PB: Branch to then_step OR else_step
-    else LLMStep
-      PB->>LLM: Complete with constrained prompt
-      LLM-->>PB: Structured output
-    else EndStep
-      PB->>PB: Mark playbook complete
-    end
-
-    PB->>RD: Save updated state
-    PB->>DB: Checkpoint execution
-    PB-->>OR: {response, awaiting_input, complete}
-  else No Active Playbook
-    OR->>OR: Check trigger_keywords → auto-start?
-    OR->>OR: Regular LLM pipeline
-  end
-
-  OR-->>C: Response
+                    ┌─────────────────────────────────────┐
+                    │            DATA LAYER               │
+                    │                                     │
+                    │  ┌──────────────┐  ┌──────────────┐ │
+                    │  │  PostgreSQL  │  │    Redis 7    │ │
+                    │  │  16+pgvector │  │              │ │
+                    │  │              │  │  Sessions    │ │
+                    │  │  23+ Tables  │  │  Sem. Cache  │ │
+                    │  │  RLS Policies│  │  Rate Limits │ │
+                    │  │  Vector Search│ │  PII Context │ │
+                    │  └──────────────┘  │  OTP Storage │ │
+                    │                    │  LTM Cache   │ │
+                    │                    └──────────────┘ │
+                    └─────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Data Architecture
+## 2. Service Overview
 
-### 3.1 Core Database Schema
+### 2.1 API Gateway (:8000)
 
-```mermaid
-erDiagram
-  tenants {
-    uuid id PK
-    string name
-    string slug UK
-    string business_type
-    string plan
-    bool is_active
-    datetime trial_ends_at
-  }
+**Technology:** FastAPI (Python), Uvicorn (4 workers in production)
 
-  users {
-    uuid id PK
-    uuid tenant_id FK
-    string email UK
-    string hashed_password
-    string role
-    bool is_active
-  }
+**Role:** Single entry point for all external HTTP traffic. Handles authentication, rate limiting, plan enforcement, and request routing.
 
-  agents {
-    uuid id PK
-    uuid tenant_id FK
-    string name
-    text system_prompt
-    bool voice_enabled
-    json tools
-    json knowledge_base_ids
-    json llm_config
-    bool is_active
-  }
+**Key Responsibilities:**
+- JWT authentication and cookie management
+- Per-tenant rate limiting (300 req/min authenticated, 30 req/min unauthenticated)
+- Plan limit enforcement (agent slots, message quotas)
+- Reverse proxy to internal services
+- Stripe webhook handling for billing
+- Admin portal and compliance endpoints
 
-  sessions {
-    uuid id PK
-    uuid tenant_id FK
-    uuid agent_id FK
-    string customer_identifier
-    string channel
-    string status
-    json metadata
-  }
+**Routers (10 total):**
+| Router | Prefix | Purpose |
+|--------|--------|---------|
+| Auth | `/api/v1/auth` | Registration, login, OTP, password reset |
+| Tenants | `/api/v1/tenants` | Tenant CRUD operations |
+| Users | `/api/v1/users` | User management within tenants |
+| API Keys | `/api/v1/api-keys` | API key lifecycle management |
+| Webhooks | `/api/v1/webhooks` | Outbound webhook configuration |
+| Billing | `/api/v1/billing` | Subscription, usage, Stripe integration |
+| Compliance | `/api/v1/compliance` | Audit logs, data export |
+| Proxy | `/api/v1/proxy` | Reverse proxy to internal services |
+| Team | `/api/v1/team` | Team member management |
+| Admin | `/api/v1/admin` | Platform administration |
 
-  messages {
-    uuid id PK
-    uuid session_id FK
-    uuid tenant_id FK
-    string role
-    text content
-    int tokens_used
-    int latency_ms
-    string guardrail_triggered
-  }
+**Middleware Stack (outermost to innermost):**
+1. CORS (handles preflight for all responses)
+2. W3C Traceparent propagation
+3. Request logging (trace ID, timing)
+4. Auth middleware (JWT validation, tenant resolution)
+5. Rate limiting (Redis-backed sliding window)
 
-  prompt_versions {
-    uuid id PK
-    uuid agent_id FK
-    uuid tenant_id FK
-    int version
-    text content
-    string description
-    string environment
-    bool is_active
-    int ab_traffic_percent
-    string ab_variant
-    uuid created_by FK
-  }
+### 2.2 MCP Server (:8001)
 
-  playbook_definitions {
-    uuid id PK
-    uuid tenant_id FK
-    uuid agent_id FK
-    string name
-    int version
-    json definition
-    json trigger_keywords
-    bool is_active
-  }
+**Technology:** FastAPI (Python), Uvicorn (2 workers in production)
 
-  playbook_executions {
-    uuid id PK
-    uuid session_id FK
-    uuid playbook_id FK
-    uuid tenant_id FK
-    string status
-    string current_step_id
-    json variables
-    json step_history
-    datetime started_at
-    datetime completed_at
-  }
+**Role:** Model Context Protocol server providing standardized tool execution and context retrieval. Decouples the AI Orchestrator from external service integrations.
 
-  conversation_traces {
-    uuid id PK
-    string session_id FK
-    uuid tenant_id FK
-    uuid agent_id FK
-    int turn_index
-    text system_prompt
-    json memory_snapshot
-    json retrieved_chunks
-    json messages_sent
-    string llm_provider
-    string raw_llm_response
-    json tool_calls
-    json guardrail_actions
-    text final_response
-    json latency_breakdown
-    int tokens_used
-  }
+**Key Responsibilities:**
+- Tool registry (CRUD for tool definitions per tenant)
+- Tool execution (built-in handlers + HTTP endpoints)
+- RAG context retrieval (pgvector semantic search)
+- Authentication header resolution for external APIs
+- Per-tool rate limiting
 
-  eval_cases {
-    uuid id PK
-    uuid tenant_id FK
-    uuid agent_id FK
-    string name
-    text input_message
-    json expected_tool_calls
-    json expected_response_contains
-    text rubric
-    float min_score
-  }
+**Built-in Tool Categories (25+ tools):**
+| Category | Tools |
+|----------|-------|
+| Demo | `pizza_order`, `order_status`, `appointment_book/list/cancel`, `crm_lookup/update`, `send_sms` |
+| Calendar | `calendar_check_availability`, `calendar_book_appointment`, `calendly_availability`, `calendly_book` |
+| Payment | `stripe_payment_link`, `stripe_check_payment`, `helcim_process_payment`, `paypal_create_order`, `moneris_process_payment`, `square_create_payment` |
+| Communication | `twilio_send_sms`, `gmail_send_email`, `mailchimp_add_subscriber`, `telnyx_send_bulk_sms` |
+| Productivity | `google_sheets_read`, `google_sheets_append` |
+| Custom | `custom_webhook` (arbitrary HTTP endpoints) |
 
-  eval_runs {
-    uuid id PK
-    uuid tenant_id FK
-    uuid agent_id FK
-    string triggered_by
-    string commit_sha
-    string status
-    int total_cases
-    int passed_cases
-    float pass_rate
-    bool blocking
-  }
+**Routers (4 total):**
+| Router | Prefix | Purpose |
+|--------|--------|---------|
+| Tools | `/api/v1/tools` | Tool CRUD and listing |
+| Execution | `/api/v1/execute` | Tool execution endpoint |
+| Context | `/api/v1/context` | RAG retrieval (knowledge, history, customer) |
+| Streaming | `/ws` | WebSocket streaming for tool execution |
 
-  eval_scores {
-    uuid id PK
-    uuid eval_run_id FK
-    uuid eval_case_id FK
-    text actual_response
-    float score
-    bool passed
-    json score_breakdown
-    text llm_judge_reasoning
-  }
+### 2.3 AI Orchestrator (:8002)
 
-  tenants ||--o{ users : ""
-  tenants ||--o{ agents : ""
-  tenants ||--o{ sessions : ""
-  agents ||--o{ sessions : ""
-  sessions ||--o{ messages : ""
-  agents ||--o{ prompt_versions : ""
-  agents ||--o{ playbook_definitions : ""
-  sessions ||--o{ playbook_executions : ""
-  sessions ||--o{ conversation_traces : ""
-  agents ||--o{ eval_cases : ""
-  agents ||--o{ eval_runs : ""
+**Technology:** FastAPI (Python), Uvicorn (2 workers in production)
+
+**Role:** The cognitive core of the platform. Manages the complete request lifecycle from message intake to response delivery.
+
+**Key Components:**
+| Component | Purpose |
+|-----------|---------|
+| Orchestrator | Main processing loop (38 steps per turn) |
+| PII Service | Reversible pseudonymization (Presidio-backed) |
+| Memory Manager | 3-tier memory (short-term, summary, long-term) |
+| Playbook Engine | Declarative state machine for structured flows |
+| LLM Client | Multi-provider abstraction (Gemini, OpenAI, Vertex) |
+| Semantic Cache | Embedding-based response caching (threshold >= 0.92) |
+| Moderation Service | Content moderation (OpenAI API + detoxify fallback) |
+| Model Router | Automatic model tier selection based on complexity |
+| Trace Logger | Full conversation trace persistence |
+| Document Indexer | Background worker for RAG document processing |
+| Session Cleanup | Background worker for expired session cleanup |
+
+**Routers (15 total):**
+| Router | Prefix | Purpose |
+|--------|--------|---------|
+| Chat | `/api/v1/chat` | Chat endpoint (text + streaming) |
+| Agents | `/api/v1/agents` | Agent CRUD |
+| Sessions | `/api/v1/sessions` | Session management |
+| Feedback | `/api/v1/feedback` | Thumbs up/down + corrections |
+| Analytics | `/api/v1/analytics` | Usage analytics |
+| Playbooks | `/api/v1/agents/{id}/playbooks` | Playbook CRUD |
+| Guardrails | `/api/v1/agents/{id}/guardrails` | Guardrails configuration |
+| Learning | `/api/v1/agents/{id}/learning` | Learning insights |
+| Documents | `/api/v1/agents/{id}/documents` | Knowledge base management |
+| Internal | `/api/v1/internal` | Service-to-service endpoints |
+| Replay | `/api/v1/replay` | Conversation replay for debugging |
+| Evals | `/api/v1/agents/{id}/evals` | Evaluation cases and runs |
+| Prompts | `/api/v1/agents/{id}/prompts` | Prompt versioning and A/B tests |
+| Templates | `/api/v1/templates` | Agent template management |
+| Variables | `/api/v1/agents/{id}/variables` | Agent variable CRUD |
+
+**WebSocket Endpoint:**
+- `/ws/{tenant_id}/{session_id}` - Real-time streaming chat with JWT authentication
+
+### 2.4 Voice Pipeline (:8003)
+
+**Technology:** FastAPI (Python), Uvicorn (2 workers in production)
+
+**Role:** Real-time voice interaction pipeline: Speech-to-Text (STT) -> AI Orchestrator -> Text-to-Speech (TTS).
+
+**Key Components:**
+| Component | Purpose |
+|-----------|---------|
+| STT Service | Speech-to-Text (Gemini, OpenAI, Deepgram) |
+| TTS Service | Text-to-Speech (Cartesia, Google, ElevenLabs, OpenAI) |
+| Voice Pipeline | Full duplex conversation manager |
+| VAD Engine | Energy-based Voice Activity Detection |
+| Barge-in Handler | Interrupt TTS when user speaks |
+| Backchannel Filler | Pre-synthesized filler phrases ("mm-hmm", "I see") |
+
+**WebSocket Endpoint:**
+- `/ws/voice/{tenant_id}/{session_id}` - Bidirectional real-time voice
+  - Client sends: Binary frames (raw PCM 16-bit, 16kHz mono) + JSON control messages
+  - Server sends: Binary frames (TTS audio) + JSON text frames (transcripts, status)
+
+### 2.5 Frontend (:3000)
+
+**Technology:** Next.js 14, React 18, TypeScript, Tailwind CSS
+
+**Key Dependencies:**
+| Package | Purpose |
+|---------|---------|
+| `@tanstack/react-query` | Data fetching and caching |
+| `zustand` | State management |
+| `react-hook-form` + `zod` | Form handling and validation |
+| `recharts` | Charts and analytics visualization |
+| `framer-motion` | Animations |
+| `@radix-ui/*` | Accessible UI components |
+| `lucide-react` | Icon library |
+
+---
+
+## 3. Data Flow: Text Chat
+
+```
+User Message
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  1. API Gateway (:8000)                                          │
+│     - JWT validation (cookie or Bearer token)                    │
+│     - Tenant resolution from JWT claims                          │
+│     - Rate limit check (Redis sliding window)                    │
+│     - Plan limit enforcement (agent slots, message quotas)       │
+│     - Strip forbidden fields from chat body (TC-E04)             │
+│     - Forward to AI Orchestrator via reverse proxy               │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  2. AI Orchestrator (:8002)                                      │
+│                                                                  │
+│  Pre-LLM Pipeline:                                               │
+│  ├── Session expiry check                                        │
+│  ├── Input sanitization                                          │
+│  ├── Emergency bypass (TC-E01): healthcare keywords -> 911       │
+│  ├── Jailbreak detection (TC-B04/B05)                            │
+│  ├── ML Moderation (OpenAI API -> detoxify -> regex)             │
+│  ├── Intent detection                                            │
+│  ├── Playbook routing (PlaybookEngine state machine)             │
+│  ├── Guardrail check (blocked keywords, profanity)               │
+│  ├── Short-term memory load (Redis: session:memory:{sid})        │
+│  ├── Session summary load (Redis: session:summary:{sid})         │
+│  ├── PII pseudonymization (Redis: pii_ctx:{sid}, 2h TTL)         │
+│  ├── RAG context retrieval (pgvector similarity search)          │
+│  ├── System prompt construction                                  │
+│  ├── Tool schema loading                                         │
+│  └── Semantic cache check (embedding similarity >= 0.92)         │
+│                                                                  │
+│  LLM Tool Loop (max 3 iterations):                               │
+│  ├── LLM call (with circuit breaker + timeout)                   │
+│  ├── Filter unauthorized tool calls                              │
+│  ├── High-risk tool confirmation gate                            │
+│  ├── PII restore in tool arguments                               │
+│  ├── Tool execution via MCP Server                               │
+│  ├── Credential scrubbing from error messages                    │
+│  └── PII re-anonymize tool results                               │
+│                                                                  │
+│  Post-LLM Pipeline:                                              │
+│  ├── Receipt summary for high-risk tool actions                  │
+│  ├── Output guardrails (PII restore, length cap, disclaimer)     │
+│  ├── Professional claim prevention (TC-E02)                      │
+│  ├── Fallback escalation check (3 consecutive -> escalate)       │
+│  ├── Semantic cache store (if eligible)                          │
+│  ├── ConversationTrace persist                                   │
+│  ├── Memory persist (short-term + LTM extraction)                │
+│  ├── Auto-summarization (every 18 turns)                         │
+│  ├── DB message persist                                          │
+│  ├── Analytics update                                            │
+│  └── Token budget record                                         │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  3. Response Delivery                                            │
+│     - Streaming via SSE or WebSocket                              │
+│     - PII restoration in streaming chunks                         │
+│     - Usage metering (messages, chat units)                       │
+│     - Webhook dispatch (if configured)                            │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Redis Key Reference
-
-| Key Pattern | Type | TTL | Purpose |
-|---|---|---|---|
-| `rate_limit:{tenant_id}:{minute}` | String | 60s | Token-bucket rate limiting |
-| `session:mem:{session_id}` | List (JSON) | 24h | Short-term conversation history |
-| `session:summary:{session_id}` | String | 24h | LLM-compressed conversation summary |
-| `summary_lock:{session_id}` | String | 30s | SETNX lock prevents duplicate summarization |
-| `session:fallbacks:{session_id}` | String | 1h | Consecutive fallback counter |
-| `pii_ctx:{session_id}` | String (JSON) | 1h | PII token ↔ value map |
-| `token_budget:{tenant_id}:{date}` | String | 25h | Daily LLM token counter |
-| `active_prompt:{agent_id}:{env}` | String (JSON) | 5min | Cached active prompt version |
-| `tool_schemas:{agent_id}` | String (JSON) | 5min | Cached MCP tool schemas |
-| `semantic_cache:{tenant_id}:{agent_id}:embeddings` | Hash | 1h | Cached query embeddings |
-| `playbook_state:{session_id}` | String (JSON) | 24h | Active playbook execution state |
-| `customer:ltm:{tenant_id}:{customer_id}` | String (JSON) | 30d | Long-term customer memory |
-| `idempotency:{key}` | String | 5min | Chat idempotency dedup |
-| `document_index_queue:{tenant_id}` | List | — | Background indexing job queue |
-| `doc_status:{doc_id}` | String | 24h | Document indexing status |
-
 ---
 
-## 4. Technology Stack
+## 4. Data Flow: Voice
 
-| Layer | Technology | Justification |
-|---|---|---|
-| **Frontend** | Next.js 14 (App Router) | SSR, TypeScript-first, Vercel ecosystem |
-| **State** | Zustand + React Query | Minimal boilerplate; server state caching |
-| **Styling** | TailwindCSS + Radix UI | Accessible headless components; no CSS bloat |
-| **API Framework** | FastAPI | Native async; OpenAPI auto-gen; Pydantic |
-| **ORM** | SQLAlchemy 2.0 async | asyncpg driver; type-safe; Alembic migrations |
-| **Auth** | python-jose + passlib | HS256 JWT; bcrypt passwords |
-| **LLM** | google-genai + openai SDK | Native async; multi-provider circuit breaker |
-| **PII** | Presidio + spaCy | 50+ entity types; reversible pseudonymization |
-| **Logging** | structlog (JSON) | Structured output; processor pipeline |
-| **Metrics** | prometheus-fastapi-instrumentator | Zero-config RED metrics |
-| **Primary DB** | PostgreSQL 16 + pgvector | SQL store + Vector similarity search |
-| **Cache** | Redis 7 | Sub-ms latency; atomic ops; TTL |
-| **Containers** | Docker + Compose | Universal reproducibility |
-| **CI/CD** | GitHub Actions | OIDC; matrix builds; no extra infra |
-| **Tracing** | OpenTelemetry (vendor-neutral) | Supports Jaeger/Honeycomb/Tempo |
-
----
-
-## 5. Security Architecture
-
-### RBAC Matrix
-
-| Permission | owner | admin | viewer |
-|---|---|---|---|
-| Create/delete agents | ✅ | ✅ | ❌ |
-| Billing + team management | ✅ | ❌ | ❌ |
-| API key management | ✅ | ✅ | ❌ |
-| View analytics | ✅ | ✅ | ✅ |
-| GDPR erasure | ✅ | ❌ | ❌ |
-
-### Encryption Reference
-
-| Data | Method |
-|---|---|
-| Passwords | bcrypt (12 rounds) |
-| API keys (stored) | SHA-256 one-way |
-| Tool credentials | AES-256 Fernet |
-| JWT signing | HMAC-SHA256 (min 32-char key) |
-| PII in LLM context | Reversible `{{PII_TYPE_N}}` tokens |
-| Data in transit | TLS 1.2+ (Nginx termination) |
-
-### OWASP Top 10 Mitigations
-
-| Risk | Mitigation |
-|---|---|
-| Broken Access Control | `tenant_id` on every query + PostgreSQL RLS |
-| Injection (SQL) | SQLAlchemy parameterized queries |
-| Prompt Injection | `_ROLE_INJECTION_PATTERN` + `_JAILBREAK_PATTERN` + agents.py validation |
-| Cryptographic Failures | Fernet encryption; bcrypt; SHA-256 for API keys |
-| Security Misconfiguration | SECRET_KEY min-length validation at startup; CSP dev-only `unsafe-eval` |
-| Credential Exposure | `_CREDENTIAL_SCRUB_PATTERN` in error messages; never log content |
-
----
-
-## 6. DevOps & Deployment
-
-### CI/CD Pipeline
-
-```mermaid
-graph LR
-  subgraph "Every PR"
-    L1["Ruff lint (4 services)"]
-    L2["TypeScript + ESLint + Next build"]
-    T1["pytest + testcontainers (api-gateway)"]
-  end
-  subgraph "Merge to main"
-    D1["Docker build (all 5 images)"]
-    E1["Eval gate (pass_rate >= 0.8)"]
-    PUSH["Push to registry"]
-  end
-  subgraph "Deploy"
-    ROLL["Rolling restart"]
-    SMOKE["Health check probes"]
-    RB["Auto-rollback on failure"]
-  end
-  L1 & L2 & T1 --> D1 --> E1 --> PUSH --> ROLL --> SMOKE --> RB
+```
+Caller (Twilio SIP/RTP)
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  1. Voice Pipeline (:8003)                                       │
+│     - Receive audio frames via WebSocket                         │
+│     - Energy-based VAD (Voice Activity Detection)                │
+│     - Buffer frames until end-of-utterance                       │
+│     - Barge-in detection: cancel TTS if user speaks              │
+│     - Pre-recorded greeting playback (cost-free)                 │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  2. STT Service                                                  │
+│     - Provider: Gemini (default), OpenAI, or Deepgram            │
+│     - Output: Transcript + confidence score                      │
+│     - Guardrail: confidence < 0.6 -> ask user to repeat          │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  3. AI Orchestrator (:8002)                                      │
+│     - Same pipeline as text chat                                 │
+│     - Voice-specific system prompt (no markdown, 3-sentence max) │
+│     - Multi-lingual IVR protocol (EN/FR/ZH/ES)                   │
+│     - Voice guardrails (GG-01 through GG-16)                     │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  4. TTS Service                                                  │
+│     - Provider: Cartesia (default), Google, ElevenLabs, OpenAI   │
+│     - Sentence-by-sentence synthesis for low latency             │
+│     - Pre-synthesized backchannel fillers ($0 runtime cost)      │
+│     - Audio streaming back to client via WebSocket               │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+Caller receives audio response
 ```
 
-### Health Probes
-
-| Endpoint | Type | Checks | K8s Use |
-|---|---|---|---|
-| `/health/startup` | Heavy | DB + Redis + MCP | startupProbe |
-| `/health/ready` | Fast | DB + Redis | readinessProbe |
-| `/health/live` | Minimal | Process alive | livenessProbe |
-| `/health` | Summary | Status + versions | Uptime monitoring |
-
 ---
 
-## 7. Testing Strategy
+## 5. Database Schema
 
-### Testing Pyramid
+### 5.1 PostgreSQL Tables (23+ models)
 
-| Layer | Coverage | Tools |
-|---|---|---|
-| Unit | Guardrails, PII, playbook conditions, memory | pytest |
-| Integration | DB CRUD, Redis ops, pgvector search | testcontainers |
-| API | All endpoints with real services | httpx.AsyncClient |
-| E2E | Full user journeys | Playwright |
-| Performance | 100 concurrent users | Locust |
-| Security | OWASP scan + dependency audit | OWASP ZAP + pip-audit |
+The database uses PostgreSQL 16 with the `pgvector` extension for semantic search. Tables are created by SQLAlchemy at service startup.
 
-### Critical Path Regression Checklist
+#### API Gateway Schema
 
-- [ ] Register → login → JWT claims correct
-- [ ] Text chat (sync + stream) returns valid response
-- [ ] Session memory persists across 5 consecutive turns
-- [ ] Summarization fires at turn 18, history trimmed to 4 turns
-- [ ] Playbook starts on trigger keyword, advances through steps, completes
-- [ ] RAG sources included in response with score > 0.7
-- [ ] Blocked keyword → guardrail_triggered set, 0 tokens used
-- [ ] Emergency bypass → instant hardcoded response, no LLM
-- [ ] PII tokens never appear in final response or DB message content
-- [ ] Prompt version A/B: ~50% sessions hit treatment over 100 requests
-- [ ] ConversationTrace created with full system_prompt for every turn
-- [ ] Eval gate blocks deploy if pass_rate < 0.8
-- [ ] Cross-tenant isolation: Tenant A cannot read Tenant B's agents
-- [ ] PostgreSQL RLS: direct DB query with wrong tenant_id returns 0 rows
-- [ ] Semantic cache returns identical response for cosine similarity >= 0.92
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `tenants` | Multi-tenant organization | id, name, slug, plan, stripe_customer_id, subscription_status |
+| `users` | User accounts within tenants | id, tenant_id, email, hashed_password, role, is_email_verified |
+| `api_keys` | Programmatic access keys | id, tenant_id, user_id, key_hash, key_prefix, scopes, agent_id |
+| `webhooks` | Outbound webhook subscriptions | id, tenant_id, url, events, secret (HMAC-SHA256) |
+| `tenant_usage` | Monthly usage tracking | tenant_id, agent_count, current_month_sessions/messages/chat_units/tokens/voice_minutes, total_cost_usd |
 
----
+#### AI Orchestrator Schema
 
-## 8. Observability
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `agents` | AI agent definitions | id, tenant_id, name, business_type, system_prompt, voice_enabled, llm_config, tools |
+| `sessions` | Conversation sessions | id, tenant_id, agent_id, customer_identifier, channel, status, turn_count |
+| `messages` | Individual conversation messages | id, session_id, tenant_id, role, content, tool_calls, tokens_used, latency_ms |
+| `agent_analytics` | Daily usage analytics | id, tenant_id, agent_id, date, total_sessions, total_messages, avg_response_latency_ms, estimated_cost_usd |
+| `message_feedback` | User/operator feedback | id, message_id, session_id, rating, labels, ideal_response, correction_reason |
+| `agent_playbooks` | Conversation playbooks | id, agent_id, name, intent_triggers, instructions, tone, scenarios |
+| `agent_guardrails` | Per-agent content policies | id, agent_id, blocked_keywords, profanity_filter, pii_redaction, pii_pseudonymization |
+| `agent_documents` | Knowledge base documents | id, agent_id, name, file_type, chunk_count, embedding (768-dim vector), status |
+| `agent_document_chunks` | Document chunks for RAG | id, doc_id, content, embedding (768-dim vector), chunk_index |
+| `playbook_executions` | Playbook state machine state | id, session_id, playbook_id, current_step_id, variables, history |
+| `agent_tools` | Agent-specific tool definitions | id, agent_id, name, connector_type, input_schema, output_schema, config |
+| `agent_variables` | Agent variables (global/local) | id, agent_id, name, scope, data_type, default_value |
+| `escalation_attempts` | Human escalation audit trail | id, tenant_id, session_id, connector_type, status, ticket_id |
+| `conversation_traces` | Full LLM call artifacts | id, session_id, turn_index, system_prompt, messages_sent, tool_calls, guardrail_actions, final_response |
+| `prompt_versions` | Immutable prompt snapshots | id, agent_id, version_number, content, environment, is_active |
+| `prompt_ab_tests` | A/B test experiments | id, agent_id, version_a_id, version_b_id, traffic_split_percent, status |
+| `eval_cases` | Golden dataset entries | id, agent_id, input_text, expected_intent, expected_tools, rubric |
+| `eval_runs` | Batch evaluation runs | id, agent_id, trigger, status, pass_rate, avg_composite_score |
+| `eval_scores` | Per-case LLM-as-judge scores | id, run_id, case_id, relevance_score, accuracy_score, composite_score |
+| `agent_templates` | Pre-built agent templates | id, key, name, category |
+| `template_versions` | Template version snapshots | id, template_id, version, system_prompt_template |
+| `template_variables` | Template variable definitions | id, template_id, key, type, default_value |
+| `template_playbooks` | Template playbook definitions | id, template_version_id, name, trigger_condition, flow_definition |
+| `template_tools` | Template tool definitions | id, template_version_id, tool_name, required_config_schema |
+| `agent_template_instances` | Template instantiation records | id, tenant_id, agent_id, template_version_id, variable_values |
+| `audit_logs` | Compliance audit trail | id, user_id, tenant_id, action, resource_type, details, ip_address |
 
-### Structured Log Format
+#### MCP Server Schema
 
-```json
-{
-  "timestamp": "2026-03-28T10:15:32.450Z",
-  "level": "info",
-  "event": "chat_response_generated",
-  "session_id": "sess_xyz",
-  "tenant_id": "tenant_abc",
-  "latency_ms": 842,
-  "tokens_used": 347,
-  "tool_calls": 1,
-  "prompt_version_id": "v12",
-  "cache_hit": false,
-  "pii_entity_types": ["PERSON", "PHONE_NUMBER"],
-  "guardrail_actions": [],
-  "trace_id": "4bf92f3577b34da6"
-}
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `mcp_tools` | Tool definitions per tenant | id, tenant_id, name, category, input_schema, output_schema, endpoint_url, auth_config, is_builtin |
+| `mcp_tool_executions` | Tool execution records | id, tenant_id, tool_id, session_id, status, input_data, output_data, duration_ms |
+| `knowledge_bases` | RAG knowledge base containers | id, tenant_id, agent_id, name, description |
+| `knowledge_documents` | Knowledge base documents | id, kb_id, tenant_id, title, content, embedding (768-dim vector), content_type |
+
+### 5.2 Database Initialization
+
+The `shared/db/init.sql` script runs on first PostgreSQL startup:
+
+```sql
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Enable pgvector for knowledge base embeddings
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Create audit_logs table
+CREATE TABLE IF NOT EXISTS audit_logs (...);
 ```
 
-### Key Prometheus Metrics
+All other tables are created by SQLAlchemy `create_all()` during service startup.
 
-| Metric | Alert Threshold |
-|---|---|
-| `http_request_duration_seconds` P99 | > 4s |
-| `ascenai_pii_envelope_parse_failures_total` | > 5% of requests |
-| `llm_circuit_breaker_state` | open (any) |
-| `ascenai_eval_pass_rate` | < 0.8 |
-| `ascenai_semantic_cache_hit_rate` | < 10% (indicates cache not working) |
-| `ascenai_playbook_step_failures_total` | > 1% per step |
-| `token_budget_exceeded_total` | Any > 0 (alert tenant) |
+### 5.3 Row-Level Security (RLS)
+
+PostgreSQL RLS policies enforce tenant isolation at the database layer. Each tenant can only access its own data. The API Gateway sets the RLS context from JWT claims on every request.
+
+---
+
+## 6. Redis Usage
+
+Redis 7 serves as the caching and session layer with the following key patterns:
+
+### 6.1 Key Patterns
+
+| Key Pattern | Purpose | TTL |
+|-------------|---------|-----|
+| `session:memory:{session_id}` | Short-term conversation memory (Redis List) | 7 days |
+| `session:summary:{session_id}` | LLM-generated session summary | 7 days |
+| `pii_ctx:{session_id}` | PII pseudonymization context (real <-> pseudo mappings) | 2 hours |
+| `customer:ltm:{tenant_id}:{customer_id}` | Long-term customer memory | Persistent |
+| `playbook_state:{session_id}` | PlaybookEngine state machine state | 24 hours |
+| `sem_cache:{tenant_id}:{agent_id}` | Semantic cache (embedding-based) | 1 hour |
+| `ratelimit:tenant:{tenant_id}:{minute}` | Rate limiting counters | 2 minutes |
+| `ratelimit:ip:{ip}:{minute}` | Unauthenticated rate limiting | 2 minutes |
+| `session:fallbacks:{session_id}` | Consecutive fallback counter for escalation | Session lifetime |
+| `otp:{email}` | Email verification OTP codes | 10 minutes |
+| `password_reset:{token}` | Password reset tokens | 1 hour |
+| `pending_activation:{email}` | Pending account activations | 24 hours |
+| `corrections:{agent_id}` | Operator corrections for learning | Persistent |
+| `tool_rate:{tenant_id}:{tool_name}` | Per-tool rate limiting (sorted set) | 60 seconds |
+
+### 6.2 Redis Configuration
+
+```
+--maxmemory 512mb
+--maxmemory-policy allkeys-lru
+--appendonly yes
+```
+
+### 6.3 Semantic Cache Details
+
+- **Storage:** Redis Hash per (tenant, agent) bucket
+- **Embedding:** `sentence-transformers/all-MiniLM-L6-v2` (384-dim)
+- **Similarity:** Cosine similarity, threshold >= 0.92
+- **Max entries:** 500 per bucket (FIFO eviction, deletes oldest 50 when full)
+- **Eligibility:** No tool calls, no PII tokens, no guardrail actions triggered
+- **Bypass:** Disabled when `pii_pseudonymization` is enabled (prevents cross-session leakage)
+
+---
+
+## 7. Stripe Integration
+
+### 7.1 Billing Model
+
+AscenAI2 uses a **chat equivalent** billing model where all usage is normalized to a single unit:
+
+- 1 text message = 1 chat equivalent
+- 1 voice minute = 100 chat equivalents
+- 1 chat unit = 10 text messages
+
+### 7.2 Plan Structure
+
+| Plan | Price/Agent | Chat Equivalents | Voice Minutes |
+|------|-------------|-----------------|---------------|
+| Starter | $49/mo | 20,000 | 0 |
+| Growth | $99/mo | 80,000 | 1,500 |
+| Business | $199/mo | 170,000 | 3,500 |
+| Enterprise | Custom | Custom | Custom |
+
+### 7.3 Stripe Integration Points
+
+| Integration | Endpoint | Purpose |
+|-------------|----------|---------|
+| Checkout Session | `POST /api/v1/billing/create-checkout-session` | Create subscription |
+| Agent Slot Session | `POST /api/v1/billing/create-agent-slot-session` | Purchase additional agent |
+| Portal Session | `POST /api/v1/billing/portal-session` | Stripe customer portal |
+| Invoice List | `GET /api/v1/billing/invoices` | List recent invoices |
+| Billing Webhook | `POST /api/v1/billing/webhook` | Handle Stripe events |
+
+### 7.4 Webhook Events Handled
+
+| Event | Action |
+|-------|--------|
+| `checkout.session.completed` | Activate tenant, set plan, grant agent slots |
+| `customer.subscription.created` | Update subscription status and agent count |
+| `customer.subscription.updated` | Sync plan changes and agent slots |
+| `invoice.paid` | Ensure tenant is active, grant minimum 1 slot |
+
+### 7.5 Overage Calculation
+
+When usage exceeds plan limits:
+- Overage rate: $0.002 per chat equivalent
+- Voice overage is included in the chat equivalent pool (1 min = 100 equivalents)
+
+---
+
+## 8. Security Architecture
+
+### 8.1 Authentication
+
+- **JWT tokens:** Access tokens (short-lived) and refresh tokens (long-lived)
+- **Cookie-based:** HttpOnly, Secure (non-dev), SameSite=Lax cookies
+- **API keys:** SHA-256 hashed, scoped permissions, optional agent-specific
+- **WebSocket auth:** JWT via query parameter or Authorization header
+
+### 8.2 PII Protection
+
+- **Pseudonymization:** Reversible pseudo-values (not irreversible redaction)
+- **Detection:** Presidio NLP engine with regex fallback
+- **Flow:** Detect -> Replace -> LLM processes -> Restore -> Deliver
+- **Supported types:** Email, phone, credit card, SIN, SSN
+
+### 8.3 Guardrail Layers
+
+1. **Pre-LLM:** Emergency bypass, jailbreak detection, ML moderation, input guardrails
+2. **LLM-level:** Role injection stripping, voice-specific system prompts
+3. **Post-LLM:** PII restoration, output guardrails, professional claim prevention, credential scrubbing
+4. **Session-level:** Fallback escalation, tool confirmation gate, tool loop cap
+
+### 8.4 Rate Limiting
+
+- **Authenticated:** 300 requests/minute per tenant
+- **Unauthenticated:** 30 requests/minute per IP
+- **Per-tool:** Configurable per tool (default 60/minute)
+- **Implementation:** Redis sorted sets with atomic Lua scripts
+
+### 8.5 Prompt Injection Protection
+
+- System prompt fields stripped from client chat requests (TC-E04)
+- Role injection patterns stripped from user input
+- PII pseudonymization prevents data leakage in prompts
+- Credential scrubbing on tool error messages

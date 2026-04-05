@@ -9,8 +9,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ascenai}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: ${POSTGRES_DB:-ascenai}
-    ports:
-      - "5432:5432"
+    # VULN-041 FIX: Do not expose database port to host in production
+    # ports:
+    #   - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./shared/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -19,6 +20,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - data-net
     deploy:
       resources:
         limits:
@@ -37,8 +40,9 @@ services:
       --maxmemory 512mb
       --maxmemory-policy allkeys-lru
       ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
-    ports:
-      - "6379:6379"
+    # VULN-041 FIX: Do not expose Redis port to host in production
+    # ports:
+    #   - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -46,6 +50,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    networks:
+      - data-net
     deploy:
       resources:
         limits:
@@ -66,6 +72,9 @@ services:
       - "8025:8025"
     environment:
       MH_UI_WEB_PATH: ""
+    networks:
+      - backend-net
+      - data-net
     deploy:
       resources:
         limits:
@@ -90,16 +99,29 @@ services:
       MCP_SERVER_URL: http://mcp-server:8001
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       VOICE_PIPELINE_URL: http://voice-pipeline:8003
+    command: >
+      sh -c "python -m app.scripts.seed_platform && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ai-orchestrator:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+      voice-pipeline:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f --max-time 10 http://localhost:8000/health || exit 1"]
       interval: 20s
       timeout: 10s
       retries: 5
+    networks:
+      - frontend-net
+      - backend-net
+      - data-net
+      - mcp-net
     deploy:
       resources:
         limits:
@@ -114,8 +136,9 @@ services:
       context: ./services/mcp-server
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8001:8001"
+    # VULN-041 FIX: MCP Server should not be directly accessible from outside
+    # ports:
+    #   - "8001:8001"
     env_file:
       - .env
     environment:
@@ -132,6 +155,10 @@ services:
       interval: 20s
       timeout: 5s
       retries: 5
+    networks:
+      - backend-net
+      - data-net
+      - mcp-net
     deploy:
       resources:
         limits:
@@ -146,8 +173,9 @@ services:
       context: ./services/ai-orchestrator
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8002:8002"
+    # VULN-041 FIX: Orchestrator should not be directly accessible from outside
+    # ports:
+    #   - "8002:8002"
     env_file:
       - .env
     environment:
@@ -167,6 +195,10 @@ services:
       interval: 20s
       timeout: 10s
       retries: 5
+    networks:
+      - backend-net
+      - data-net
+      - mcp-net
     deploy:
       resources:
         limits:
@@ -181,8 +213,9 @@ services:
       context: ./services/voice-pipeline
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8003:8003"
+    # VULN-041 FIX: Voice Pipeline should not be directly accessible from outside
+    # ports:
+    #   - "8003:8003"
     env_file:
       - .env
     environment:
@@ -199,6 +232,9 @@ services:
       interval: 20s
       timeout: 10s
       retries: 5
+    networks:
+      - backend-net
+      - data-net
     deploy:
       resources:
         limits:
@@ -215,14 +251,26 @@ services:
     build:
       context: ./frontend/web
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api.lvh.me:8000}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://api.lvh.me:8000}
+        NEXT_PUBLIC_ROOT_DOMAIN: ${NEXT_PUBLIC_ROOT_DOMAIN:-lvh.me:3000}
+        NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+        NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
     restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
-      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8002}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api.lvh.me:8000}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://api.lvh.me:8000}
+      NEXT_PUBLIC_ROOT_DOMAIN: ${NEXT_PUBLIC_ROOT_DOMAIN:-lvh.me:3000}
+      NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+      NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
+      ADMIN_SUBDOMAIN: ${ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
     depends_on:
       - api-gateway
+    networks:
+      - frontend-net
     deploy:
       resources:
         limits:
@@ -235,3 +283,18 @@ services:
 volumes:
   postgres_data:
   redis_data:
+
+# VULN-041 FIX: Network segmentation by trust boundary
+# backend-net: API Gateway, AI Orchestrator, Voice Pipeline (trusted services)
+# data-net: Postgres, Redis (data layer — only backend services can reach)
+# mcp-net: MCP Server + integrations (untrusted tool execution zone)
+# frontend-net: Frontend + API Gateway (public-facing)
+networks:
+  frontend-net:
+    driver: bridge
+  backend-net:
+    driver: bridge
+  data-net:
+    driver: bridge
+  mcp-net:
+    driver: bridge

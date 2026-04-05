@@ -46,6 +46,18 @@ _OPENAI_TIERS = {
 _LOW_TOKEN_LIMIT = 800
 _HIGH_TOKEN_LIMIT = 4000
 
+# Hard cap: max tokens per session before forcing low-cost model
+_MAX_SESSION_TOKENS = 50_000
+
+# Cost weights (relative cost multiplier per tier)
+_TIER_COST = {"low": 1, "medium": 3, "high": 10}
+
+# Hard cap: max tokens per session before forcing low-cost model
+_MAX_SESSION_TOKENS = 50_000
+
+# Cost weights (relative cost multiplier per tier)
+_TIER_COST = {"low": 1, "medium": 3, "high": 10}
+
 
 def _rough_token_count(text: str) -> int:
     """Very fast word-based token approximation (1 word ≈ 1.3 tokens)."""
@@ -84,6 +96,7 @@ class ModelRouter:
         tool_calls_in_turn: int = 0,
         is_playbook_llm_step: bool = False,
         agent_llm_config: Optional[dict] = None,
+        session_token_count: int = 0,
     ) -> str:
         """
         Return the model name to use for this request.
@@ -93,6 +106,7 @@ class ModelRouter:
         :param tool_calls_in_turn: number of tool calls made so far this turn
         :param is_playbook_llm_step: whether this call is from a PlaybookEngine LLMStep
         :param agent_llm_config: agent.llm_config dict (may contain overrides)
+        :param session_token_count: approximate tokens used in current session (for cost capping)
         :returns: model identifier string
         """
         config = agent_llm_config or {}
@@ -103,13 +117,22 @@ class ModelRouter:
             logger.debug("model_router_override", model=override)
             return override
 
-        complexity = self._classify(
-            messages=messages,
-            system_prompt=system_prompt,
-            tool_calls_in_turn=tool_calls_in_turn,
-            is_playbook_llm_step=is_playbook_llm_step,
-            config=config,
-        )
+        # Cost guardrail: force low-cost model when session exceeds budget
+        if session_token_count >= _MAX_SESSION_TOKENS:
+            logger.warning(
+                "model_router_cost_cap_hit",
+                session_tokens=session_token_count,
+                cap=_MAX_SESSION_TOKENS,
+            )
+            complexity = "low"
+        else:
+            complexity = self._classify(
+                messages=messages,
+                system_prompt=system_prompt,
+                tool_calls_in_turn=tool_calls_in_turn,
+                is_playbook_llm_step=is_playbook_llm_step,
+                config=config,
+            )
 
         model = self._tier_model(complexity)
         logger.debug("model_router_selected", complexity=complexity, model=model)

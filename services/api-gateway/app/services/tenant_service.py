@@ -11,9 +11,8 @@ from app.models.tenant import Tenant, TenantUsage
 
 logger = structlog.get_logger(__name__)
 
-# Plan limits definition — single source of truth, aligned with billing.py pricing.
-# -1 = unlimited.  Keys match Tenant.plan values.
-PLAN_LIMITS: dict[str, dict] = {
+# Plan limits definition — fallback default.
+DEFAULT_PLAN_LIMITS: dict[str, dict] = {
     "text_growth": {
         "chats_included": 1_500,
         "max_voice_minutes_per_month": 0,
@@ -56,15 +55,31 @@ PLAN_LIMITS: dict[str, dict] = {
     },
 }
 
-# Legacy plan name aliases
-PLAN_LIMITS["professional"] = PLAN_LIMITS["voice_growth"]
-PLAN_LIMITS["business"] = PLAN_LIMITS["voice_business"]
-PLAN_LIMITS["starter"] = PLAN_LIMITS["text_growth"]
+# Aliases
+DEFAULT_PLAN_LIMITS["professional"] = DEFAULT_PLAN_LIMITS["voice_growth"]
+DEFAULT_PLAN_LIMITS["business"] = DEFAULT_PLAN_LIMITS["voice_business"]
+DEFAULT_PLAN_LIMITS["starter"] = DEFAULT_PLAN_LIMITS["text_growth"]
 
 
-def get_plan_limits(plan: str) -> dict:
+async def get_all_plan_limits(db: AsyncSession) -> dict[str, dict]:
+    """Fetch plan limits from platform_settings."""
+    try:
+        from app.models.platform import PlatformSetting
+        result = await db.execute(
+            select(PlatformSetting).where(PlatformSetting.key == "plan_limits")
+        )
+        setting = result.scalar_one_or_none()
+        if setting and setting.value:
+            return setting.value
+    except Exception as e:
+        logger.warning("failed_to_fetch_plan_limits", error=str(e))
+    return DEFAULT_PLAN_LIMITS
+
+
+async def get_plan_limits(plan: str, db: AsyncSession) -> dict:
     """Return the limits dict for a plan, defaulting to professional."""
-    return PLAN_LIMITS.get(plan, PLAN_LIMITS["professional"])
+    limits = await get_all_plan_limits(db)
+    return limits.get(plan, limits.get("professional", limits.get("voice_growth", {})))
 
 
 def check_limit(limit_value: int, current: int) -> bool:
@@ -117,7 +132,8 @@ class TenantService:
     ) -> Tenant:
         from fastapi import HTTPException
 
-        if new_plan not in PLAN_LIMITS:
+        limits = await get_all_plan_limits(db)
+        if new_plan not in limits:
             raise HTTPException(status_code=400, detail=f"Unknown plan: {new_plan}")
 
         tenant = await self.get_tenant(tenant_id, db)
@@ -125,7 +141,7 @@ class TenantService:
             raise HTTPException(status_code=404, detail="Tenant not found.")
 
         tenant.plan = new_plan
-        tenant.plan_limits = PLAN_LIMITS[new_plan]
+        tenant.plan_limits = await get_plan_limits(new_plan, db)
         await db.commit()
         await db.refresh(tenant)
         logger.info("tenant_plan_upgraded", tenant_id=tenant_id, plan=new_plan)

@@ -26,6 +26,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Manage calendar events and availability via Google Calendar API.",
         "category": "calendar",
         "requires_config": True,
+        "is_builtin": True,
         "config_schema": {
             "type": "object",
             "properties": {
@@ -78,6 +79,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Sync and manage scheduling via Calendly.",
         "category": "calendar",
         "requires_config": True,
+        "is_builtin": True,
         "config_schema": {
             "type": "object",
             "properties": {
@@ -102,6 +104,11 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Process payments and manage subscriptions.",
         "category": "payments",
         "requires_config": True,
+        "is_builtin": True,
+        "voice_capable": True,
+        "pci_method": "hosted_page",
+        "pci_compliant": True,
+        "channel_support": ["voice", "chat"],
         "config_schema": {
             "type": "object",
             "properties": {
@@ -132,6 +139,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Send and receive SMS messages via Twilio.",
         "category": "messaging",
         "requires_config": True,
+        "is_builtin": True,
         "config_schema": {
             "type": "object",
             "properties": {
@@ -167,6 +175,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Send confirmation or notification emails.",
         "category": "messaging",
         "requires_config": True,
+        "is_builtin": True,
         "config_schema": {
             "type": "object",
             "properties": {
@@ -205,6 +214,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Read and write data to Google Sheets.",
         "category": "data",
         "requires_config": True,
+        "is_builtin": True,
         "config_schema": {
             "type": "object",
             "properties": {
@@ -247,6 +257,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "POST data to any custom HTTP endpoint with optional authentication.",
         "category": "custom",
         "requires_config": True,
+        "is_builtin": True,
         "allow_multiple": True,
         "config_schema": {
             "type": "object",
@@ -284,6 +295,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Manage email marketing campaigns and subscribers.",
         "category": "messaging",
         "requires_config": True,
+        "is_builtin": True,
         "config_schema": {
             "type": "object",
             "properties": {
@@ -313,44 +325,16 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         ]
     },
     {
-        "id": "telnyx",
-        "name": "Telnyx",
-        "description": "Send bulk SMS, make calls, and manage numbers via Telnyx.",
-        "category": "messaging",
-        "requires_config": True,
-        "config_schema": {
-            "type": "object",
-            "properties": {
-                "api_key": {"type": "string", "description": "Telnyx V2 API Key"},
-                "from_number": {"type": "string"}
-            },
-            "required": ["api_key", "from_number"]
-        },
-        "credentials": [
-            {"field": "api_key", "label": "API Key", "type": "password"},
-            {"field": "from_number", "label": "From Number", "type": "text"}
-        ],
-        "tools": [
-            {
-                "name": "telnyx_send_bulk_sms",
-                "description": "Send SMS messages to multiple recipients via Telnyx.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "to": {"type": "array", "items": {"type": "string"}},
-                        "text": {"type": "string"}
-                    },
-                    "required": ["to", "text"]
-                }
-            }
-        ]
-    },
-    {
         "id": "square",
         "name": "Square",
         "description": "Process payments, create checkout links, and manage Square orders.",
         "category": "payments",
         "requires_config": True,
+        "is_builtin": True,
+        "voice_capable": True,
+        "pci_method": "hosted_page",
+        "pci_compliant": True,
+        "channel_support": ["voice", "chat"],
         "config_schema": {
             "type": "object",
             "properties": {
@@ -387,6 +371,11 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Process Canadian e-commerce payments securely via Moneris Gateway.",
         "category": "payments",
         "requires_config": True,
+        "is_builtin": True,
+        "voice_capable": False,
+        "pci_method": "direct",
+        "pci_compliant": False,
+        "channel_support": ["chat"],
         "config_schema": {
             "type": "object",
             "properties": {
@@ -424,6 +413,11 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Process Canadian e-commerce payments securely via Helcim.",
         "category": "payments",
         "requires_config": True,
+        "is_builtin": True,
+        "voice_capable": False,
+        "pci_method": "direct",
+        "pci_compliant": False,
+        "channel_support": ["chat"],
         "config_schema": {
             "type": "object",
             "properties": {
@@ -457,6 +451,11 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "description": "Process payments globally via PayPal orders.",
         "category": "payments",
         "requires_config": True,
+        "is_builtin": True,
+        "voice_capable": True,
+        "pci_method": "hosted_page",
+        "pci_compliant": True,
+        "channel_support": ["voice", "chat"],
         "config_schema": {
             "type": "object",
             "properties": {
@@ -482,8 +481,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
                     "required": ["amount"]
                 }
             }
-        ]
-    }
+        ]}
 ]
 
 

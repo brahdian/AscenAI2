@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { playbookApi, agentsApi } from '@/lib/api'
+import { playbookApi, agentsApi, playbooksApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   BookOpen,
@@ -177,6 +177,7 @@ export default function PlaybookEditorPage() {
   const [escalationMessage, setEscalationMessage] = useState('')
   const [isActive, setIsActive] = useState(true)
   const [isDirty, setIsDirty] = useState(false)
+  const [safetyWarning, setSafetyWarning] = useState<string | null>(null)
 
   const { data: agent } = useQuery({
     queryKey: ['agent', agentId],
@@ -230,6 +231,32 @@ export default function PlaybookEditorPage() {
 
   function mark() { setIsDirty(true) }
 
+  async function handleSave() {
+    const combinedText = [
+      greetingMessage,
+      instructions,
+      ...scenarios.map((s) => `${s.trigger} ${s.response}`),
+      outOfScope,
+      fallback,
+      escalationMessage,
+    ]
+      .filter(Boolean)
+      .join(' ')
+
+    try {
+      const result = await playbooksApi.validateSafety(combinedText)
+      if (!result.safe) {
+        setSafetyWarning(result.warning || 'Safety validation failed')
+        toast.error(result.warning || 'Playbook content failed safety check')
+        return
+      }
+      setSafetyWarning(null)
+      save.mutate()
+    } catch (error) {
+      toast.error('Failed to validate safety')
+    }
+  }
+
   return (
     <div className="p-8 max-w-3xl mx-auto">
       {/* Header */}
@@ -265,7 +292,7 @@ export default function PlaybookEditorPage() {
             Active
           </label>
           <button
-            onClick={() => save.mutate()}
+            onClick={handleSave}
             disabled={save.isPending || !isDirty}
             className="flex items-center gap-2 px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white text-sm font-medium transition-colors"
           >
@@ -457,7 +484,7 @@ Never discuss competitor restaurants. If asked, say "We focus on making the best
           {/* Save footer */}
           <div className="flex justify-end pb-4">
             <button
-              onClick={() => save.mutate()}
+              onClick={handleSave}
               disabled={save.isPending || !isDirty}
               className="flex items-center gap-2 px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white font-medium transition-colors"
             >

@@ -21,6 +21,7 @@ from app.services.tool_executor_service import ToolExecutionService
 from app.services.context_builder_service import ContextBuilderService
 from app.services.playbook_handler import PlaybookHandler
 from app.services.session_billing_service import SessionBillingService
+from app.services.moderation_service import ModerationService, OutputBlockedError
 
 logger = structlog.get_logger(__name__)
 
@@ -40,6 +41,7 @@ class Orchestrator:
         memory_manager: MemoryManager,
         db: AsyncSession,
         redis_client=None,
+        moderation_service: Optional[ModerationService] = None,
     ):
         self.llm = llm_client
         self.mcp = mcp_client
@@ -47,6 +49,7 @@ class Orchestrator:
         self.db = db
         self.redis = redis_client
         self.intent_detector = IntentDetector()
+        self.moderation_service = moderation_service
 
         # Instantiate Delegates
         self.guardrail_service = GuardrailService(redis_client=self.redis)
@@ -246,6 +249,19 @@ class Orchestrator:
         if final_response is None:
             logger.warning("max_tool_iterations_reached", session_id=session_id, iterations=MAX_TOOL_ITERATIONS, agent_id=str(agent.id))
             final_response = llm_response.content or "I wasn't able to fully complete your request."
+
+        # Moderation gate: check LLM output before it reaches the user.
+        if self.moderation_service and final_response:
+            try:
+                await self.moderation_service.check_output(final_response)
+            except OutputBlockedError as _obe:
+                logger.warning(
+                    "llm_output_blocked",
+                    session_id=session_id,
+                    categories=_obe.categories,
+                    reason=_obe.reason,
+                )
+                final_response = "I'm sorry, I'm not able to help with that."
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         receipt = self.tool_executor.build_receipt_summary(tool_calls_made)

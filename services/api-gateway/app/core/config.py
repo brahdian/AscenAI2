@@ -60,6 +60,17 @@ class Settings(BaseSettings):
     # PRODUCTION: set via env var (e.g. openssl rand -hex 32).
     INTERNAL_API_KEY: str = ""
 
+    @field_validator("INTERNAL_API_KEY")
+    @classmethod
+    def validate_internal_api_key(cls, v: str) -> str:
+        import os
+        if os.getenv("ENVIRONMENT", "production") == "production" and not v:
+            raise ValueError(
+                "INTERNAL_API_KEY must be set in production. "
+                "Generate one with: openssl rand -hex 32"
+            )
+        return v
+
     # SMTP / email
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587

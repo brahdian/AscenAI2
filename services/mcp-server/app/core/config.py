@@ -75,6 +75,17 @@ class Settings(BaseSettings):
     # Encryption
     ENCRYPTION_KEY: Optional[str] = None  # Fernet key for encrypting stored secrets
 
+    @field_validator("ENCRYPTION_KEY")
+    @classmethod
+    def validate_encryption_key(cls, v: Optional[str]) -> Optional[str]:
+        import os
+        if os.getenv("ENVIRONMENT", "production") == "production" and not v:
+            raise ValueError(
+                "ENCRYPTION_KEY must be set in production to encrypt stored tool secrets. "
+                "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            )
+        return v
+
     # Observability
     PROMETHEUS_ENABLED: bool = True
     SENTRY_DSN: Optional[str] = None

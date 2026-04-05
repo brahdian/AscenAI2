@@ -144,6 +144,7 @@ async def chat(
 
     llm_client = getattr(request.app.state, "llm_client", None)
     mcp_client = getattr(request.app.state, "mcp_client", None)
+    moderation_service = getattr(request.app.state, "moderation_service", None)
 
     memory_manager = MemoryManager(redis_client=redis_client, db=db)
     orchestrator = Orchestrator(
@@ -152,6 +153,7 @@ async def chat(
         memory_manager=memory_manager,
         db=db,
         redis_client=redis_client,
+        moderation_service=moderation_service,
     )
 
     response = await orchestrator.process_message(
@@ -192,6 +194,7 @@ async def chat_stream(
     redis_client = getattr(request.app.state, "redis", None)
     llm_client = getattr(request.app.state, "llm_client", None)
     mcp_client = getattr(request.app.state, "mcp_client", None)
+    moderation_service = getattr(request.app.state, "moderation_service", None)
 
     memory_manager = MemoryManager(redis_client=redis_client, db=db)
     orchestrator = Orchestrator(
@@ -200,6 +203,7 @@ async def chat_stream(
         memory_manager=memory_manager,
         db=db,
         redis_client=redis_client,
+        moderation_service=moderation_service,
     )
 
     async def event_generator():

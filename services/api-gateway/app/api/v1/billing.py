@@ -576,7 +576,7 @@ async def create_agent_slot_session(
         return {"checkout_url": checkout_session.url}
     except stripe.error.StripeError as e:
         logger.error("stripe_slot_checkout_error", error=str(e), tenant_id=str(tenant.id))
-        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Payment processing failed. Please try again later.")
     except Exception as e:
         logger.error("unexpected_slot_checkout_error", error=str(e), tenant_id=str(tenant.id))
         raise HTTPException(status_code=500, detail="An unexpected error occurred while initiating purchase.")

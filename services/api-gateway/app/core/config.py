@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     STRIPE_VOICE_GROWTH_PRICE_ID: str = ""
     STRIPE_VOICE_BUSINESS_PRICE_ID: str = ""
 
+    # WhatsApp (Meta Business API)
+    WHATSAPP_VERIFY_TOKEN: str = ""     # Webhook verification challenge token
+    WHATSAPP_APP_SECRET: str = ""       # App secret for X-Hub-Signature-256 verification
+
     # Twilio
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""

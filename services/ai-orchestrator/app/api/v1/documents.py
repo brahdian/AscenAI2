@@ -23,6 +23,35 @@ router = APIRouter()
 ALLOWED_EXTENSIONS = {"pdf", "txt", "md", "docx"}
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# Magic-byte → allowed extension mapping.  Client-supplied filename and
+# Content-Type are untrusted; we validate the actual file content instead.
+_DOC_MAGIC: list[tuple[bytes, str]] = [
+    (b"%PDF-", "pdf"),                                              # PDF
+    (b"PK\x03\x04", "docx"),                                       # ZIP-based (docx, xlsx …)
+    # Plain text / markdown: no reliable magic bytes — allowed by extension only
+]
+
+
+def _validate_doc_magic(content: bytes, declared_ext: str) -> None:
+    """Raise HTTPException if the file's magic bytes conflict with its extension."""
+    if declared_ext in ("txt", "md"):
+        # No reliable magic bytes for plain text; accept as-is (already size-limited)
+        return
+    for magic, expected_ext in _DOC_MAGIC:
+        if content[:len(magic)] == magic:
+            if declared_ext != expected_ext:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File content does not match declared extension '.{declared_ext}'.",
+                )
+            return
+    # None of the known magic bytes matched for a binary format
+    if declared_ext in ("pdf", "docx"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File does not appear to be a valid .{declared_ext} document.",
+        )
+
 
 def _tenant_id(request: Request) -> str:
     tid = request.headers.get("X-Tenant-ID") or getattr(request.state, "tenant_id", None)
@@ -303,6 +332,9 @@ async def upload_document(
             status_code=413,
             detail=f"File too large. Maximum size is {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
         )
+
+    # Validate actual file content against declared extension
+    _validate_doc_magic(content, ext)
 
     # Store file — use persistent storage path (configure DOCUMENT_STORAGE_PATH env var)
     doc_uuid = uuid.uuid4()

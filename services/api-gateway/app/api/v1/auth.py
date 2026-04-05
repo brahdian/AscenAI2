@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import time
+
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +27,52 @@ from app.schemas.auth import (
 )
 from app.services.auth_service import auth_service
 
+logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/auth")
+
+# ---------------------------------------------------------------------------
+# Per-endpoint rate limiting (tighter than the global middleware limit)
+# ---------------------------------------------------------------------------
+
+async def _auth_rate_limit(request: Request, action: str, limit: int, window: int) -> None:
+    """
+    Enforce a per-IP + per-action sliding-window rate limit for sensitive auth
+    endpoints.  Raises HTTP 429 when the limit is exceeded.
+
+    :param action:  Unique key for this endpoint (e.g. "login", "otp_verify")
+    :param limit:   Max requests allowed per *window* seconds
+    :param window:  Window duration in seconds
+    """
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return  # Fail-open if Redis is unavailable (global middleware still applies)
+
+    client_ip = request.client.host if request.client else "unknown"
+    bucket = f"auth_rl:{action}:{client_ip}:{int(time.time()) // window}"
+    try:
+        _lua = """
+local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return c
+"""
+        count = await redis.eval(_lua, 1, bucket, window * 2)
+        if count > limit:
+            retry_after = window - (int(time.time()) % window)
+            logger.warning(
+                "auth_rate_limit_exceeded",
+                action=action,
+                ip=client_ip,
+                count=count,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many {action} attempts. Please wait before trying again.",
+                headers={"Retry-After": str(retry_after)},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("auth_rate_limit_redis_error", error=str(exc))
 
 # ---------------------------------------------------------------------------
 # Cookie helpers
@@ -101,6 +150,7 @@ async def register(
     db: AsyncSession = Depends(get_db),
 ):
     """Register a new tenant + owner user and send verification OTP."""
+    await _auth_rate_limit(http_request, "register", limit=5, window=3600)  # 5/hr per IP
     redis = getattr(http_request.app.state, "redis", None)
     return await auth_service.register(request, db, redis)
 
@@ -112,6 +162,7 @@ async def verify_email(
     db: AsyncSession = Depends(get_db),
 ):
     """Verify email with OTP. Returns payment-required response."""
+    await _auth_rate_limit(http_request, "otp_verify", limit=10, window=60)  # 10/min per IP
     redis = getattr(http_request.app.state, "redis", None)
     return await auth_service.verify_email(request.email, request.otp, db, redis)
 
@@ -123,6 +174,7 @@ async def resend_otp(
     db: AsyncSession = Depends(get_db),
 ):
     """Resend a new verification OTP."""
+    await _auth_rate_limit(http_request, "otp_resend", limit=3, window=60)  # 3/min per IP
     redis = getattr(http_request.app.state, "redis", None)
     await auth_service.resend_otp(request.email, db, redis)
     return {"detail": "New verification code sent."}
@@ -136,6 +188,7 @@ async def login(
     db: AsyncSession = Depends(get_db),
 ):
     """Authenticate and return JWT tokens (+ set HttpOnly cookies)."""
+    await _auth_rate_limit(http_request, "login", limit=10, window=60)  # 10/min per IP
     redis = getattr(http_request.app.state, "redis", None)
     tokens = await auth_service.login(request, db, redis)
     _set_auth_cookies(response, tokens, http_request)
@@ -228,6 +281,7 @@ async def forgot_password(
     Generate a password-reset token stored in Redis (1-hour TTL) and send an email.
     Always returns 202 regardless of whether the email exists — prevents enumeration.
     """
+    await _auth_rate_limit(http_request, "forgot_password", limit=3, window=3600)  # 3/hr per IP
     redis = getattr(http_request.app.state, "redis", None)
     await auth_service.request_password_reset(body.email, db, redis)
     return {"detail": "If that email exists, a reset link has been sent."}

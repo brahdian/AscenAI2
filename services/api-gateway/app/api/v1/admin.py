@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Optional, Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.services.admin_service import AdminService, get_all_roles
 
+logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/admin")
 
 
@@ -54,12 +56,15 @@ def _get_admin_service(request: Request, db: AsyncSession) -> AdminService:
     return AdminService(db, redis)
 
 
+_VALID_TENANT_STATUSES = {"", "active", "suspended", "deleted"}
+
+
 @router.get("/tenants")
 async def list_tenants(
     request: Request,
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
-    status: str = "",
+    status: str = Query("", pattern="^(active|suspended|deleted|)$"),
     db: AsyncSession = Depends(get_db),
 ):
     """List all tenants (super_admin only)."""

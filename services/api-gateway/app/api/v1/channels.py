@@ -38,9 +38,9 @@ router = APIRouter()
 
 # Settings pulled from environment — these are GLOBAL defaults and can be
 # overridden per-tenant via a future ChannelCredentials DB lookup.
-_WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-_WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 from app.core.config import settings
+_WHATSAPP_VERIFY_TOKEN = settings.WHATSAPP_VERIFY_TOKEN
+_WHATSAPP_APP_SECRET = settings.WHATSAPP_APP_SECRET
 _TWILIO_AUTH_TOKEN = settings.TWILIO_AUTH_TOKEN
 _SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 _SENDGRID_WEBHOOK_KEY = os.getenv("SENDGRID_WEBHOOK_KEY", "")
@@ -104,6 +104,84 @@ async def _forward_to_orchestrator(
     except Exception as exc:
         logger.error("orchestrator_forward_error", channel=channel, error=str(exc))
         return None
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp (Meta Business API)
+# ---------------------------------------------------------------------------
+
+def _verify_whatsapp_signature(app_secret: str, raw_body: bytes, signature: str) -> bool:
+    """Verify Meta's X-Hub-Signature-256 HMAC-SHA256."""
+    if not signature.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        app_secret.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+@router.get("/{tenant_id}/{agent_id}/whatsapp/webhook")
+async def whatsapp_webhook_verify(tenant_id: str, agent_id: str, request: Request):
+    """Handle WhatsApp webhook URL verification challenge."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if not _WHATSAPP_VERIFY_TOKEN:
+        logger.error("whatsapp_verify_token_not_configured", tenant_id=tenant_id)
+        raise HTTPException(status_code=503, detail="WhatsApp endpoint not configured.")
+
+    if mode != "subscribe" or token != _WHATSAPP_VERIFY_TOKEN:
+        logger.warning("whatsapp_verify_token_mismatch", tenant_id=tenant_id)
+        raise HTTPException(status_code=403, detail="WhatsApp verification failed.")
+
+    return Response(content=challenge, media_type="text/plain")
+
+
+@router.post("/{tenant_id}/{agent_id}/whatsapp/webhook")
+async def whatsapp_webhook(tenant_id: str, agent_id: str, request: Request):
+    """Handle inbound WhatsApp messages from Meta Business API."""
+    # Fail-closed signature verification
+    if not _WHATSAPP_APP_SECRET:
+        logger.error("whatsapp_app_secret_not_configured", tenant_id=tenant_id)
+        raise HTTPException(status_code=503, detail="WhatsApp endpoint not configured.")
+
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not _verify_whatsapp_signature(_WHATSAPP_APP_SECRET, raw_body, signature):
+        logger.warning("whatsapp_signature_invalid", tenant_id=tenant_id)
+        raise HTTPException(status_code=403, detail="Invalid WhatsApp signature.")
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for msg in value.get("messages", []):
+                msg_id = msg.get("id", "")
+                if msg_id and await _dedup(msg_id):
+                    continue
+
+                from_number = msg.get("from", "")
+                text = (msg.get("text") or {}).get("body", "")
+                if not from_number or not text:
+                    continue
+
+                logger.info("whatsapp_message_received", from_number=from_number, tenant_id=tenant_id)
+                session_id = f"wa_{from_number}"
+                await _forward_to_orchestrator(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    message=text[:4000],
+                    customer_identifier=from_number,
+                    channel="whatsapp",
+                    tenant_id=tenant_id,
+                )
+
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -433,14 +511,17 @@ async def slack_events(tenant_id: str, agent_id: str, request: Request):
     """Handle Slack Events API callbacks (app_mention, message.im)."""
     body_bytes = await request.body()
 
-    if _SLACK_SIGNING_SECRET:
-        if not _verify_slack_signature(
-            _SLACK_SIGNING_SECRET,
-            body_bytes,
-            dict(request.headers),
-        ):
-            logger.warning("slack_signature_invalid", tenant_id=tenant_id)
-            raise HTTPException(status_code=403, detail="Invalid Slack signature")
+    # Fail-closed: reject the request if signing secret is not configured.
+    if not _SLACK_SIGNING_SECRET:
+        logger.error("slack_signing_secret_not_configured", tenant_id=tenant_id)
+        raise HTTPException(status_code=503, detail="Slack endpoint not configured.")
+    if not _verify_slack_signature(
+        _SLACK_SIGNING_SECRET,
+        body_bytes,
+        dict(request.headers),
+    ):
+        logger.warning("slack_signature_invalid", tenant_id=tenant_id)
+        raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
     try:
         payload = json.loads(body_bytes)
@@ -545,7 +626,17 @@ async def email_inbound(tenant_id: str, agent_id: str, request: Request):
     """Handle inbound email via SendGrid Inbound Parse webhook."""
     # ── SendGrid webhook signature verification ───────────────────────────────
     sendgrid_key = getattr(settings, "SENDGRID_WEBHOOK_VERIFICATION_KEY", "")
-    if sendgrid_key:
+    if not sendgrid_key:
+        # Log a warning so operators know verification is not enforced.
+        # We allow through (not fail-closed) because SendGrid Inbound Parse
+        # does not guarantee the key is available in all account tiers —
+        # operators should configure SENDGRID_WEBHOOK_VERIFICATION_KEY in prod.
+        logger.warning(
+            "sendgrid_inbound_signature_not_configured",
+            tenant_id=tenant_id,
+            detail="Set SENDGRID_WEBHOOK_VERIFICATION_KEY to enforce webhook verification.",
+        )
+    else:
         raw_body = await request.body()
         sg_timestamp = request.headers.get("X-Twilio-Email-Event-Webhook-Timestamp", "")
         sg_signature = request.headers.get("X-Twilio-Email-Event-Webhook-Signature", "")

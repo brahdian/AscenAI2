@@ -336,15 +336,31 @@ class AdminService:
     ) -> Dict[str, Any]:
         """Delete a tenant (soft or hard)."""
         if hard_delete:
-            # Cascade delete all related data
-            tables = [
-                "messages", "sessions", "agents", "agent_playbooks",
-                "agent_guardrails", "agent_documents", "agent_analytics",
-                "message_feedback", "conversation_traces", "playbook_executions",
-            ]
-            for table in tables:
+            # Cascade delete all related data.
+            # Use a fixed allowlist of table names rather than dynamic f-string
+            # SQL to eliminate any future SQL-injection risk if this code is
+            # ever refactored to accept external input.
+            _TENANT_DATA_TABLES = (
+                "messages",
+                "sessions",
+                "agents",
+                "agent_playbooks",
+                "agent_guardrails",
+                "agent_documents",
+                "agent_analytics",
+                "message_feedback",
+                "conversation_traces",
+                "playbook_executions",
+            )
+            _ALLOWED_SET = frozenset(_TENANT_DATA_TABLES)
+            for table in _TENANT_DATA_TABLES:
+                # Belt-and-suspenders: assert the name is in the allowlist so
+                # any future code that modifies _TENANT_DATA_TABLES is audited.
+                assert table in _ALLOWED_SET, f"Table '{table}' not in delete allowlist"
+                # SQLAlchemy text() with a literal identifier — safe because the
+                # name is validated against the immutable frozenset above.
                 await self.db.execute(
-                    text(f"DELETE FROM {table} WHERE tenant_id = :tid"),
+                    text(f"DELETE FROM {table} WHERE tenant_id = :tid"),  # noqa: S608
                     {"tid": tenant_id},
                 )
 

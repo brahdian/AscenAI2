@@ -321,18 +321,33 @@ async def upload_voice_greeting(
     if len(data) > 5 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Audio file too large (max 5 MB).")
 
-    # Determine extension from content type
-    ext = "webm"
-    ct = (audio.content_type or "").lower()
-    if "mp3" in ct or "mpeg" in ct:
-        ext = "mp3"
-    elif "wav" in ct:
-        ext = "wav"
-    elif "ogg" in ct:
-        ext = "ogg"
+    # Validate file type via magic bytes rather than trusting Content-Type header.
+    # Mapping: magic prefix (bytes) → allowed extension
+    _AUDIO_MAGIC: list[tuple[bytes, str]] = [
+        (b"ID3", "mp3"),        # MP3 with ID3 tag
+        (b"\xff\xfb", "mp3"),   # MP3 frame sync
+        (b"\xff\xf3", "mp3"),
+        (b"\xff\xf2", "mp3"),
+        (b"RIFF", "wav"),       # WAV (RIFF container)
+        (b"\x1aE\xdf\xa3", "webm"),  # WebM / MKV
+        (b"OggS", "ogg"),       # Ogg container
+    ]
+    ext: str | None = None
+    for magic, candidate_ext in _AUDIO_MAGIC:
+        if data[:len(magic)] == magic:
+            ext = candidate_ext
+            break
+    # For WAV, also verify the sub-chunk type
+    if ext == "wav" and len(data) >= 12 and data[8:12] not in (b"WAVE",):
+        ext = None
+    if ext is None:
+        raise HTTPException(status_code=400, detail="Unsupported or invalid audio format.")
 
     _GREETING_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{agent_id}.{ext}"
+    # Use a UUID-based filename to prevent predictable overwrites and path
+    # collision when an agent re-uploads a greeting.
+    file_uuid = uuid.uuid4()
+    filename = f"{agent_id}_{file_uuid}.{ext}"
     filepath = _GREETING_AUDIO_DIR / filename
 
     filepath.write_bytes(data)

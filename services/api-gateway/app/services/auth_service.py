@@ -458,9 +458,20 @@ class AuthService:
         user.hashed_password = self.hash_password(new_password)
         await db.commit()
 
-        # Invalidate the token immediately (one-time use)
+        # Invalidate the reset token immediately (one-time use)
         if redis:
             await redis.delete(f"pwd_reset:{token_hash}")
+
+        # Invalidate all active JWT auth-cache entries for this user so any
+        # stolen tokens are rejected at next use (within the cache TTL window).
+        if redis:
+            try:
+                pattern = f"auth:jwt:{user.id}:*"
+                async for cache_key in redis.scan_iter(match=pattern, count=100):
+                    await redis.delete(cache_key)
+                logger.info("jwt_cache_invalidated_after_password_reset", user_id=str(user.id))
+            except Exception as exc:
+                logger.warning("jwt_cache_invalidation_failed", error=str(exc))
 
         logger.info("password_reset_completed", user_id=str(user.id))
 

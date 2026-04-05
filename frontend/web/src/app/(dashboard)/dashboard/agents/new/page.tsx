@@ -32,9 +32,12 @@ export default function NewAgentPage() {
     }
   }, [success, router])
 
+  const templateIdParam = searchParams.get('template')
+
   const [selectedTemplate, setSelectedTemplate] = useState<any | null>(null)
-  const [step, setStep] = useState<number>(1)
-  
+  // If a template ID was passed from the marketplace, jump straight to step 2
+  const [step, setStep] = useState<number>(templateIdParam ? 2 : 1)
+
   // Form State
   const [agentName, setAgentName] = useState('')
   const [description, setDescription] = useState('')
@@ -47,6 +50,22 @@ export default function NewAgentPage() {
   const { data: templates = [], isLoading: loadingTemplates } = useQuery({
     queryKey: ['templates'],
     queryFn: templatesApi.list,
+    // Pre-select template from marketplace link once templates are loaded
+    select: (data: any[]) => {
+      if (templateIdParam && !selectedTemplate) {
+        const preselected = data.find((t) => t.id === templateIdParam)
+        if (preselected) {
+          setSelectedTemplate(preselected)
+          const defaults: Record<string, any> = {}
+          preselected.variables?.forEach((v: any) => {
+            if (v.default_value?.value) defaults[v.key] = v.default_value.value
+          })
+          setVariables(defaults)
+          setAgentName(`My ${preselected.name}`)
+        }
+      }
+      return data
+    },
   })
 
   // Fetch current agents and billing to check slots

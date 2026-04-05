@@ -28,12 +28,14 @@ import {
   ChevronRight,
   GitBranch,
   ShieldCheck,
+  Sparkles,
 } from 'lucide-react'
 import { agentsApi } from '@/lib/api'
 
 const navItems = [
   { href: '/dashboard', icon: LayoutDashboard, label: 'Overview' },
   { href: '/dashboard/agents', icon: Bot, label: 'Agents' },
+  { href: '/dashboard/templates', icon: Sparkles, label: 'Templates' },
   { href: '/dashboard/sessions', icon: MessageSquare, label: 'Chat History' },
   { href: '/dashboard/analytics', icon: BarChart2, label: 'Analytics' },
   { href: '/dashboard/feedback', icon: ThumbsUp, label: 'Feedback' },
@@ -63,6 +65,7 @@ const agentSubNav = [
 const SEGMENT_LABELS: Record<string, string> = {
   dashboard: 'Dashboard',
   agents: 'Agents',
+  templates: 'Templates',
   playbooks: 'Playbooks',
   documents: 'Documents',
   guardrails: 'Guardrails',

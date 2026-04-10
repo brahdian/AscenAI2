@@ -49,8 +49,11 @@ class Tenant(Base):
     # Subscription
     plan: Mapped[str] = mapped_column(
         String(50), nullable=False, default="starter"
-    )  # "starter", "growth", "enterprise"
+    )  # "starter", "growth", "business", "enterprise"
     plan_limits: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    subscription_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Status
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -91,6 +94,31 @@ class Tenant(Base):
         "Webhook", back_populates="tenant", cascade="all, delete-orphan"
     )
 
+    PLAN_DISPLAY_NAMES: dict[str, str] = {
+        "text_growth": "Starter",
+        "voice_growth": "Growth",
+        "voice_business": "Business",
+        "enterprise": "Enterprise",
+        "professional": "Growth",
+        "business": "Business",
+        "starter": "Starter",
+        "growth": "Growth",
+    }
+
+    @property
+    def plan_display_name(self) -> str:
+        """Return a human-friendly plan name, including status if not active."""
+        if not self.plan or self.plan == "none":
+            return "Not Subscribed"
+            
+        base_name = self.PLAN_DISPLAY_NAMES.get(self.plan, self.plan.replace("_", " ").title())
+        
+        if self.subscription_status == "active":
+            return base_name
+        
+        status_label = (self.subscription_status or "inactive").title()
+        return f"{base_name} ({status_label})"
+
     def __repr__(self) -> str:
         return f"<Tenant slug={self.slug} plan={self.plan}>"
 
@@ -112,10 +140,16 @@ class TenantUsage(Base):
         unique=True,
     )
 
+    # Running count of active agents for this tenant (incremented/decremented via proxy)
+    agent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     current_month_sessions: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
     current_month_messages: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    current_month_chat_units: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
     current_month_tokens: Mapped[int] = mapped_column(
@@ -142,3 +176,26 @@ class TenantUsage(Base):
 
     def __repr__(self) -> str:
         return f"<TenantUsage tenant={self.tenant_id} sessions={self.current_month_sessions}>"
+
+
+class PendingAgentPurchase(Base):
+    __tablename__ = "pending_agent_purchases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    config: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PendingAgentPurchase tenant={self.tenant_id} id={self.id}>"

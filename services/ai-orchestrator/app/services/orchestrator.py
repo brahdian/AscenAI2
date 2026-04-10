@@ -1,50 +1,41 @@
 import asyncio
 import time
+import json
 import uuid
-from datetime import datetime, date, timezone
 from typing import AsyncGenerator, Optional
-
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
-
-import json
+from sqlalchemy import select, func
 
 from app.core.config import settings
-from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, Session as AgentSession, Message, AgentAnalytics
-from app.schemas.chat import ChatResponse, StreamChatEvent
-from app.services.llm_client import LLMClient, LLMResponse, ToolCall
+from app.models.agent import Agent, Session, Message
+from app.schemas.chat import ChatResponse, SourceCitation, StreamChatEvent
+from app.services import pii_service
+from app.services.llm_client import LLMClient, LLMResponse
 from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
 from app.services.intent_detector import IntentDetector
-from app.prompts.system_prompts import build_system_prompt
+
+from app.services.guardrail_service import GuardrailService
+from app.services.tool_executor_service import ToolExecutionService
+from app.services.context_builder_service import ContextBuilderService
+from app.services.playbook_handler import PlaybookHandler
+from app.services.session_billing_service import SessionBillingService
+from app.services.moderation_service import ModerationService, OutputBlockedError
+from app.core.metrics import CONTEXT_RETRIEVALS
+from app.services.session_state_machine import SessionStateMachine
 
 logger = structlog.get_logger(__name__)
 
 MAX_TOOL_ITERATIONS = settings.MAX_TOOL_ITERATIONS
-ESCALATION_KEYWORDS = [
-    "speak to human", "talk to agent", "real person", "supervisor",
-    "I can't help", "beyond my capabilities", "escalating",
-]
-# Module-level constant — do NOT define inside the hot-path _check_input_guardrails
-_PROFANITY_LIST = frozenset([
-    "fuck", "shit", "bitch", "asshole", "cunt", "bastard",
-])
+LLM_TIMEOUT_SECONDS: int = getattr(settings, "LLM_TIMEOUT_SECONDS", 30)
+_FALLBACK_ESCALATION_THRESHOLD = 3
 
 
 class Orchestrator:
     """
-    Core orchestration engine for the AI assistant.
-
-    Manages the full request lifecycle:
-    - Memory retrieval
-    - Context augmentation via MCP
-    - LLM reasoning with tool use
-    - Tool execution via MCP
-    - Response generation and persistence
-    - Analytics tracking
+    Core orchestration engine, refactored to delegate to focused services.
     """
-
     def __init__(
         self,
         llm_client: LLMClient,
@@ -52,6 +43,7 @@ class Orchestrator:
         memory_manager: MemoryManager,
         db: AsyncSession,
         redis_client=None,
+        moderation_service: Optional[ModerationService] = None,
     ):
         self.llm = llm_client
         self.mcp = mcp_client
@@ -59,159 +51,36 @@ class Orchestrator:
         self.db = db
         self.redis = redis_client
         self.intent_detector = IntentDetector()
+        self.moderation_service = moderation_service
 
-    # ------------------------------------------------------------------
-    # Helpers: playbook + corrections
-    # ------------------------------------------------------------------
+        # Instantiate Delegates
+        self.guardrail_service = GuardrailService(redis_client=self.redis)
+        self.tool_executor = ToolExecutionService(db=self.db, mcp=self.mcp, redis_client=self.redis)
+        self.context_builder = ContextBuilderService(db=self.db, mcp=self.mcp, redis_client=self.redis)
+        self.playbook_handler = PlaybookHandler(db=self.db, llm_client=self.llm, redis_client=self.redis)
+        self.billing_service = SessionBillingService(db=self.db, memory_manager=self.memory, redis_client=self.redis)
 
-    async def _load_playbook(self, agent_id) -> Optional[AgentPlaybook]:
-        """Load the active playbook for this agent, if any."""
-        from sqlalchemy import select as sa_select
-        result = await self.db.execute(
-            sa_select(AgentPlaybook).where(
-                AgentPlaybook.agent_id == agent_id,
-                AgentPlaybook.is_active.is_(True),
-            )
-        )
-        return result.scalar_one_or_none()
-
-    async def _load_corrections(self, agent_id: str) -> list[dict]:
-        """Fetch operator corrections stored in Redis for this agent."""
-        if self.redis is None:
-            return []
+    async def _llm_complete_with_timeout(self, **kwargs) -> LLMResponse:
         try:
-            key = f"corrections:{agent_id}"
-            raw_items = await self.redis.lrange(key, 0, 19)
-            corrections = []
-            for raw in raw_items:
-                try:
-                    corrections.append(json.loads(raw))
-                except Exception:
-                    pass
-            return corrections
-        except Exception:
-            return []
-
-    async def _load_guardrails(self, agent_id):
-        """Load active guardrails for this agent."""
-        from app.models.agent import AgentGuardrails
-        from sqlalchemy import select as sa_select
-        result = await self.db.execute(
-            sa_select(AgentGuardrails).where(
-                AgentGuardrails.agent_id == agent_id,
-                AgentGuardrails.is_active.is_(True),
+            return await asyncio.wait_for(
+                self.llm.complete(**kwargs),
+                timeout=LLM_TIMEOUT_SECONDS,
             )
-        )
-        return result.scalar_one_or_none()
-
-    def _check_input_guardrails(self, user_message: str, guardrails) -> Optional[str]:
-        """Return a block reason string if message should be blocked, else None."""
-        if not guardrails:
-            return None
-        msg_lower = user_message.lower()
-
-        # Hard keyword block
-        for kw in (guardrails.blocked_keywords or []):
-            if kw.lower() in msg_lower:
-                return f"blocked_keyword:{kw}"
-
-        # Profanity filter
-        if guardrails.profanity_filter:
-            for word in _PROFANITY_LIST:
-                if word in msg_lower:
-                    return "profanity"
-
-        return None
-
-    def _apply_output_guardrails(self, response: str, guardrails) -> str:
-        """Apply output-side guardrails: PII redaction, length cap, disclaimer."""
-        import re
-        if not guardrails:
-            return response
-
-        if guardrails.pii_redaction:
-            response = re.sub(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b', '[EMAIL]', response)
-            response = re.sub(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b', '[PHONE]', response)
-            response = re.sub(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b', '[CARD]', response)
-
-        if guardrails.max_response_length and len(response) > guardrails.max_response_length:
-            response = response[:guardrails.max_response_length].rstrip() + "…"
-
-        if guardrails.require_disclaimer:
-            response = response + "\n\n" + guardrails.require_disclaimer
-
-        return response
-
-    def _is_fallback_response(self, response: str, playbook) -> bool:
-        """Detect if the response is a fallback/uncertain reply."""
-        fallback_phrases = [
-            "i don't know", "i'm not sure", "i cannot help",
-            "i'm unable to", "beyond my", "i don't have information",
-        ]
-        r = response.lower()
-        if any(phrase in r for phrase in fallback_phrases):
-            return True
-        if playbook and playbook.fallback_response:
-            if playbook.fallback_response.strip().lower() in r:
-                return True
-        return False
-
-    async def _maybe_send_greeting(
-        self, agent: Agent, session: AgentSession, playbook: Optional[AgentPlaybook]
-    ) -> Optional[str]:
-        """
-        If this is a brand-new session (no messages yet) and the playbook
-        has a greeting, persist it and return the greeting text.
-        """
-        if not playbook or not playbook.greeting_message:
-            return None
-
-        from sqlalchemy import select as sa_select, func as sa_func
-        count_result = await self.db.execute(
-            sa_select(sa_func.count()).select_from(Message).where(
-                Message.session_id == session.id
+        except asyncio.TimeoutError:
+            logger.error("llm_timeout", timeout_s=LLM_TIMEOUT_SECONDS, model=getattr(self.llm, "model", "unknown"))
+            from app.services.llm_client import LLMResponse, TokenUsage
+            return LLMResponse(
+                content="I'm sorry, I'm taking longer than expected to respond. Please try again in a moment.",
+                tool_calls=None,
+                finish_reason="timeout",
+                usage=TokenUsage(),
             )
-        )
-        msg_count = count_result.scalar() or 0
-        if msg_count > 0:
-            return None  # Not a new session
 
-        greeting = playbook.greeting_message
-        self.db.add(Message(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            role="assistant",
-            content=greeting,
-            tokens_used=0,
-            latency_ms=0,
-        ))
-        await self.memory.add_to_short_term_memory(
-            session.id, {"role": "assistant", "content": greeting}
-        )
-        return greeting
+    # ------------------------------------------------------------------
+    # Non-streaming path
+    # ------------------------------------------------------------------
 
-    async def process_message(
-        self,
-        agent: Agent,
-        session: AgentSession,
-        user_message: str,
-        stream: bool = False,
-    ) -> ChatResponse | AsyncGenerator:
-        """
-        Main orchestration loop for processing a user message.
-
-        Steps:
-        1. Load conversation memory (last N messages from Redis)
-        2. Retrieve context from MCP (knowledge base, customer history)
-        3. Build system prompt with injected context
-        4. Get available tool schemas for this agent
-        5. Call LLM with messages + tools
-        6. If LLM returns tool_calls, execute each via MCP and re-call LLM
-        7. Repeat tool loop up to MAX_TOOL_ITERATIONS
-        8. Save messages to memory and DB
-        9. Update analytics
-        10. Return ChatResponse
-        """
+    async def process_message(self, agent: Agent, session: Session, user_message: str, stream: bool = False) -> ChatResponse | AsyncGenerator:
         if stream:
             return self.stream_response(agent, session, user_message)
 
@@ -219,704 +88,808 @@ class Orchestrator:
         tenant_id = str(session.tenant_id)
         session_id = session.id
 
-        # --- Pre-classification ---
+        expiry_response = self.billing_service.check_session_expiry(session)
+        if expiry_response:
+            return expiry_response
+
+        user_message = self.guardrail_service.sanitize_user_message(user_message)
+
+        session_meta = dict(session.metadata_ or {})
+        escalation_state = session_meta.get("_escalation_state")
+        if escalation_state:
+            return await self.playbook_handler.handle_escalation_info_collection(
+                agent, session, user_message, start_time, escalation_state, session_meta
+            )
+
+        emergency_response = self.guardrail_service.check_emergency(user_message, agent)
+        if emergency_response:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_message, tokens_used=0, latency_ms=0))
+            self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="assistant", content=emergency_response, tokens_used=0, latency_ms=latency_ms))
+            SessionStateMachine.escalate(session, reason="emergency_detected")
+            return ChatResponse(session_id=session_id, message=emergency_response, tool_calls_made=[], suggested_actions=["Call 911"], escalate_to_human=True, latency_ms=latency_ms, tokens_used=0)
+
+        jailbreak_response = self.guardrail_service.check_jailbreak(user_message, agent)
+        if jailbreak_response:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return ChatResponse(session_id=session_id, message=jailbreak_response, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=latency_ms, tokens_used=0)
+
         intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
-            return await self._build_escalation_response(
-                agent, session, user_message, start_time
-            )
+            return await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
 
-        # --- Load playbook + corrections ---
-        playbook = await self._load_playbook(agent.id)
-        corrections = await self._load_corrections(str(agent.id))
-        await self._maybe_send_greeting(agent, session, playbook)
+        playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
+        playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), str(session.id), playbook)
+        corrections = await self.context_builder.load_corrections(str(agent.id))
+        await self.billing_service.maybe_send_greeting(agent, session, playbook)
 
-        guardrails = await self._load_guardrails(agent.id)
+        guardrails = await self.context_builder.load_guardrails(str(agent.id))
+        custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
+        platform_guardrails = await self.context_builder.load_platform_guardrails()
+        variables = await self.context_builder.load_variables(str(agent.id), str(playbook.id) if playbook else None)
 
-        # --- Input guardrail check ---
-        block_reason = self._check_input_guardrails(user_message, guardrails)
+        block_reason = self.guardrail_service.check_input_guardrails(user_message, guardrails)
         if block_reason:
-            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
-            # Persist the blocked user message for learning insights
-            blocked_user_msg = Message(
-                session_id=session_id,
-                tenant_id=session.tenant_id,
-                role="user",
-                content=user_message,
-                guardrail_triggered=block_reason,
-                tokens_used=0,
-                latency_ms=0,
-            )
-            self.db.add(blocked_user_msg)
-            latency_ms = int((time.monotonic() - start_time) * 1000)
-            return ChatResponse(
-                session_id=session_id,
-                message=block_msg,
-                tool_calls_made=[],
-                suggested_actions=[],
-                escalate_to_human=False,
-                latency_ms=latency_ms,
-                tokens_used=0,
-            )
+            block_msg = (guardrails.get("blocked_message") if guardrails else "I'm sorry, I can't help with that.")
+            self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_message, guardrail_triggered=block_reason, tokens_used=0, latency_ms=0))
+            return ChatResponse(session_id=session_id, message=block_msg, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0, guardrail_triggered=block_reason)
 
-        # --- Step 1: Load short-term memory ---
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
 
-        # --- Step 2: Retrieve MCP context ---
-        kb_ids = agent.knowledge_base_ids or []
-        context_items = await self.mcp.retrieve_context(
-            tenant_id=tenant_id,
-            query=user_message,
-            session_id=session_id,
-            context_types=["knowledge", "history"],
-            knowledge_base_ids=kb_ids if kb_ids else None,
-        )
+        pii_ctx = await self.guardrail_service.get_pii_context(session_id)
+        llm_user_message = self.guardrail_service.redact_user_message(user_message, pii_ctx, session_id)
 
-        # --- Step 3: Build system prompt ---
-        customer_profile: dict = {}
-        if session.customer_identifier:
-            customer_profile = await self.memory.get_long_term_customer_memory(
-                tenant_id, session.customer_identifier
+        agent_cfg = agent.agent_config or {}
+        kb_ids = agent_cfg.get("knowledge_base_ids", []) or []
+        try:
+            context_items = await self.mcp.retrieve_context(
+                tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"], knowledge_base_ids=kb_ids if kb_ids else None,
             )
+            CONTEXT_RETRIEVALS.labels(status="success").inc()
+        except Exception as _rag_exc:
+            logger.warning("rag_retrieval_failed", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            context_items = []
 
-        system_prompt = build_system_prompt(
-            agent=agent,
-            context_items=context_items,
-            business_info={"customer_profile": customer_profile, "intent": intent},
-            playbook=playbook,
-            corrections=corrections,
-            guardrails=guardrails,
+        source_citations = [
+            SourceCitation(
+                type=item.get("type", "knowledge"), title=item.get("metadata", {}).get("title"), source_url=item.get("metadata", {}).get("source_url"),
+                excerpt=(item.get("content", "") or "")[:150], score=float(item.get("score", 1.0)),
+                document_id=str(item.get("metadata", {}).get("document_id")) if item.get("metadata", {}).get("document_id") else None,
+                chunk_id=str(item.get("metadata", {}).get("chunk_id")) if item.get("metadata", {}).get("chunk_id") else None,
+            ) for item in context_items if isinstance(item, dict)
+        ]
+
+        customer_profile = {}
+        if session.customer_identifier:
+            customer_profile = await self.memory.get_long_term_customer_memory(tenant_id, session.customer_identifier)
+
+        session_language = session_meta.get("language")
+
+        if agent_cfg.get("auto_detect_language", False):
+            detected_lang = self.intent_detector.detect_language(
+                user_message, agent_cfg.get("supported_languages", []) or []
+            )
+            if detected_lang and detected_lang != session_language:
+                session_language = detected_lang
+                # B5 FIX: fresh dict assignment so MutableDict tracks the change
+                new_meta = dict(session_meta)
+                new_meta["language"] = detected_lang
+                session.metadata_ = new_meta
+                session_meta = new_meta
+
+        system_prompt = self.context_builder.build_system_prompt(
+            agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
+            session_language=session_language, playbook=playbook, corrections=corrections,
+            guardrails=guardrails, custom_guardrails=custom_guardrails,
+            platform_guardrails=platform_guardrails,
+            variables=variables, session_meta=session_meta, local_vars=local_vars
         )
 
-        # --- Step 4: Get tool schemas ---
-        tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)
+        tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
 
-        # --- Build message list for LLM ---
         messages = [{"role": "system", "content": system_prompt}]
-
         if summary:
-            messages.append({
-                "role": "system",
-                "content": f"[Conversation summary so far]: {summary}",
-            })
-
+            messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
         messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": llm_user_message})
 
-        # --- Step 5-7: Tool-augmented LLM loop ---
-        tool_calls_made: list[dict] = []
+        if not await self.billing_service.check_token_budget(tenant_id):
+            return ChatResponse(session_id=session_id, message="I'm temporarily unavailable due to high usage. Please try again later.", tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0)
+
+        tool_calls_made = []
         total_tokens = 0
-        llm_config = agent.llm_config or {}
+        llm_config = agent_cfg.get("llm_config", {}) or {}
         temperature = llm_config.get("temperature", 0.7)
         max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
 
-        final_response: Optional[str] = None
+        final_response = None
         iterations = 0
+        system_tools = agent_cfg.get("tools", []) or []
+        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
+        enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         while iterations < MAX_TOOL_ITERATIONS:
-            llm_response: LLMResponse = await self.llm.complete(
-                messages=messages,
-                tools=tool_schemas if tool_schemas else None,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
-            )
-
+            llm_response = await self._llm_complete_with_timeout(messages=messages, tools=tool_schemas if tool_schemas else None, temperature=temperature, max_tokens=max_tokens, stream=False, session_id=session_id)
             total_tokens += llm_response.usage.total_tokens
+
+            if llm_response.finish_reason == "timeout":
+                final_response = llm_response.content
+                break
 
             if llm_response.tool_calls:
                 iterations += 1
-                # Execute all tool calls in parallel
-                tool_results = await self._execute_tool_calls(
-                    tool_calls=llm_response.tool_calls,
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                )
+                allowed_calls = self.tool_executor.filter_unauthorized_tool_calls(llm_response.tool_calls, enabled_tools)
+                if not allowed_calls:
+                    final_response = llm_response.content or "I wasn't able to complete that action."
+                    break
 
-                # Record tool calls for response metadata
-                for tc, result in zip(llm_response.tool_calls, tool_results):
-                    tool_calls_made.append({
-                        "tool": tc.name,
-                        "arguments": tc.arguments,
-                        "result": result,
-                    })
+                confirmation_prompt = self.tool_executor.requires_confirmation(allowed_calls, user_message, history)
+                if confirmation_prompt:
+                    final_response = confirmation_prompt
+                    break
 
-                # Append assistant message with tool calls
-                messages.append({
-                    "role": "assistant",
-                    "content": llm_response.content or "",
-                    "tool_calls": [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in llm_response.tool_calls
-                    ],
-                })
+                if pii_ctx is not None and pii_ctx.has_mappings():
+                    for tc in allowed_calls:
+                        if isinstance(tc.arguments, dict):
+                            tc.arguments = pii_service.restore_dict(tc.arguments, pii_ctx, session_id)
 
-                # Append tool results
-                for tc, result in zip(llm_response.tool_calls, tool_results):
-                    messages.append({
-                        "role": "tool",
-                        "name": tc.name,
-                        "tool_call_id": tc.id,
-                        "content": str(result),
-                    })
+                tool_results = await self.tool_executor.execute_tool_calls(tool_calls=allowed_calls, tenant_id=tenant_id, session_id=session_id)
+                tool_results = [{k: self.guardrail_service.scrub_credentials(str(v)) if isinstance(v, str) else v for k, v in r.items()} if isinstance(r, dict) else r for r in tool_results]
+
+                if pii_ctx is not None:
+                    _re_anon = []
+                    for _r in tool_results:
+                        if isinstance(_r, dict):
+                            _re_anon.append(pii_service.redact_dict(_r, pii_ctx, session_id))
+                        else:
+                            _re_anon.append(_r)
+                    tool_results = _re_anon
+
+                for tc, result in zip(allowed_calls, tool_results):
+                    safe_args = tc.arguments if not pii_ctx else pii_service.redact_dict(tc.arguments, pii_ctx, session_id) if isinstance(tc.arguments, dict) else tc.arguments
+                    tool_calls_made.append({"tool": tc.name, "arguments": safe_args, "result": result})
+
+                messages.append({"role": "assistant", "content": llm_response.content or "", "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in allowed_calls]})
+                for tc, result in zip(allowed_calls, tool_results):
+                    sanitized_result = self.guardrail_service.sanitize_tool_output(str(result))
+                    messages.append({"role": "tool", "name": tc.name, "tool_call_id": tc.id, "content": sanitized_result})
+                continue
             else:
-                # No more tool calls - we have the final answer
                 final_response = llm_response.content or ""
                 break
 
         if final_response is None:
-            # Max iterations reached; use last response content
-            final_response = llm_response.content or "I'm sorry, I was unable to complete your request."
+            logger.warning("max_tool_iterations_reached", session_id=session_id, iterations=MAX_TOOL_ITERATIONS, agent_id=str(agent.id))
+            final_response = llm_response.content or "I wasn't able to fully complete your request."
+
+        if self.moderation_service and final_response:
+            try:
+                await self.moderation_service.check_output(final_response)
+            except OutputBlockedError as _obe:
+                logger.warning(
+                    "llm_output_blocked",
+                    session_id=session_id,
+                    categories=_obe.categories,
+                    reason=_obe.reason,
+                )
+                final_response = "I'm sorry, I'm not able to help with that."
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
+        receipt = self.tool_executor.build_receipt_summary(tool_calls_made)
+        if receipt:
+            final_response = final_response.rstrip() + " " + receipt
 
-        final_response = self._apply_output_guardrails(final_response, guardrails)
-        is_fallback = self._is_fallback_response(final_response, playbook)
+        pseudo_final_response = final_response
 
-        # --- Step 8: Persist to memory ---
-        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
-        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": final_response})
+        final_response, guardrail_actions = self.guardrail_service.apply_output_guardrails(final_response, guardrails, pii_ctx, session_id)
+        if pii_ctx is not None:
+            await self.guardrail_service.save_pii_context(session_id, pii_ctx)
 
-        # --- Persist messages to DB ---
+        final_response = self.guardrail_service.check_professional_claims(final_response)
+        is_fallback = self.playbook_handler.is_fallback_response(final_response, playbook)
+
+        if is_fallback:
+            fallback_count = await self.playbook_handler.increment_fallback_counter(session_id)
+            if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
+                SessionStateMachine.escalate(session, reason="fallback_threshold_exceeded")
+                final_response = "I've been unable to help with your last few requests. Let me connect you with a human agent."
+                pseudo_final_response = final_response
+                await self.playbook_handler.reset_fallback_counter(session_id)
+        else:
+            await self.playbook_handler.reset_fallback_counter(session_id)
+
+        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": llm_user_message})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": pseudo_final_response})
+
+        try:
+            await self.memory.maybe_summarize(session_id, self.llm)
+            if session.customer_identifier:
+                await self.memory.extract_and_store_long_term_memory(
+                    tenant_id=tenant_id, customer_identifier=session.customer_identifier,
+                    conversation_text=f"User: {user_message}\nAssistant: {final_response}",
+                    llm_client=self.llm,
+                )
+        except Exception as _mem_exc:
+            logger.warning("memory_post_turn_error", error=str(_mem_exc))
+
         user_msg = Message(
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="user",
-            content=user_message,
+            content=pii_service.redact_for_display(user_message, pii_ctx) if (pii_ctx and guardrails and guardrails.pii_redaction) else user_message,
             tokens_used=0,
-            latency_ms=0,
+            latency_ms=0
         )
         assistant_msg = Message(
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="assistant",
-            content=final_response,
-            tool_calls=tool_calls_made if tool_calls_made else None,
-            tokens_used=total_tokens,
-            latency_ms=latency_ms,
-            is_fallback=is_fallback,
+            content=pii_service.redact_for_display(final_response, pii_ctx) if (pii_ctx and guardrails and guardrails.pii_redaction) else final_response,
+            tool_calls=tool_calls_made if tool_calls_made else None, tokens_used=total_tokens, latency_ms=latency_ms,
+            is_fallback=is_fallback, playbook_name=playbook.name if playbook else None,
+            sources=json.loads(json.dumps([c.model_dump() for c in source_citations])) if source_citations else [],
         )
         self.db.add(user_msg)
         self.db.add(assistant_msg)
 
-        # --- Step 9: Update analytics ---
-        await self._update_analytics(
+        is_new = (session.turn_count == 0)
+
+        chat_unit_increment = 0
+        if is_new:
+            chat_unit_increment = 1
+        elif session.turn_count > 0 and (session.turn_count + 1) % 10 == 0:
+            chat_unit_increment = 1
+
+        session.turn_count += 1
+        await self.billing_service.update_analytics(
             tenant_id=session.tenant_id,
             agent_id=session.agent_id,
             tokens=total_tokens,
             latency_ms=latency_ms,
             tool_count=len(tool_calls_made),
+            is_new_session=is_new,
+            chat_units=chat_unit_increment
         )
+        await self.billing_service.record_token_usage(tenant_id, total_tokens)
 
-        # --- Step 10: Escalation check ---
-        should_escalate = await self._should_escalate(agent, final_response, messages)
+        should_escalate = await self.playbook_handler.should_escalate(agent, final_response, messages)
         if should_escalate:
-            session.status = "escalated"
-
-        suggested_actions = self._extract_suggested_actions(final_response, intent)
+            SessionStateMachine.escalate(session, reason="should_escalate_check")
 
         return ChatResponse(
-            session_id=session_id,
-            message=final_response,
-            tool_calls_made=tool_calls_made,
-            suggested_actions=suggested_actions,
-            escalate_to_human=should_escalate,
-            latency_ms=latency_ms,
-            tokens_used=total_tokens,
+            session_id=session_id, message=final_response, tool_calls_made=tool_calls_made,
+            source_citations=source_citations if source_citations else None,
+            suggested_actions=self.billing_service.extract_suggested_actions(final_response, intent),
+            escalate_to_human=should_escalate, latency_ms=latency_ms, tokens_used=total_tokens,
+            playbook_executed=playbook.name if playbook else None,
+            playbook_variables=local_vars if local_vars else None,
+            turn_count=session.turn_count, session_status=session.status,
+            guardrail_actions=guardrail_actions,
         )
 
-    async def stream_response(
-        self,
-        agent: Agent,
-        session: AgentSession,
-        user_message: str,
-    ) -> AsyncGenerator[StreamChatEvent, None]:
-        """
-        Streaming version of process_message.
-        Yields StreamChatEvent objects for real-time delivery via SSE or WebSocket.
-        """
+    # ------------------------------------------------------------------
+    # Streaming path
+    # ------------------------------------------------------------------
+
+    async def stream_response(self, agent: Agent, session: Session, user_message: str) -> AsyncGenerator:
+        start_time = time.monotonic()
         tenant_id = str(session.tenant_id)
         session_id = session.id
-        start_time = time.monotonic()
+        tool_calls_made: list = []
+        total_tokens = 0
 
-        intent = self.intent_detector.detect_intent(user_message)
+        yield StreamChatEvent(type="started", data={"session_id": session_id}, session_id=session_id)
 
-        if self.intent_detector.should_escalate_immediately(user_message):
-            yield StreamChatEvent(
-                type="text_delta",
-                data="I'll connect you with a human agent right away. Please hold on.",
-                session_id=session_id,
+        user_message = self.guardrail_service.sanitize_user_message(user_message)
+
+        session_meta = dict(session.metadata_ or {})
+        escalation_state = session_meta.get("_escalation_state")
+        if escalation_state:
+            info_collection_response = await self.playbook_handler.handle_escalation_info_collection(
+                agent, session, user_message, start_time, escalation_state, session_meta
             )
-            yield StreamChatEvent(
-                type="done",
-                data={"escalate": True, "session_id": session_id},
-                session_id=session_id,
-            )
+            yield StreamChatEvent(type="text_delta", data=info_collection_response.message, session_id=session_id)
+            yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": info_collection_response.latency_ms, "tokens_used": 0, "escalate_to_human": info_collection_response.escalate_to_human, "escalation_action": info_collection_response.escalation_action}, session_id=session_id)
             return
 
-        # Load memory and context
-        playbook = await self._load_playbook(agent.id)
-        corrections = await self._load_corrections(str(agent.id))
-        await self._maybe_send_greeting(agent, session, playbook)
+        emergency_response = self.guardrail_service.check_emergency(user_message, agent)
+        if emergency_response:
+            SessionStateMachine.escalate(session, reason="stream_emergency_detected")
+            yield StreamChatEvent(type="text_delta", data=emergency_response, session_id=session_id)
+            yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "escalate_to_human": True}, session_id=session_id)
+            return
 
-        guardrails = await self._load_guardrails(agent.id)
+        jailbreak_response = self.guardrail_service.check_jailbreak(user_message, agent)
+        if jailbreak_response:
+            yield StreamChatEvent(type="text_delta", data=jailbreak_response, session_id=session_id)
+            yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "escalate_to_human": False}, session_id=session_id)
+            return
 
-        # --- Input guardrail check ---
-        block_reason = self._check_input_guardrails(user_message, guardrails)
+        intent = self.intent_detector.detect_intent(user_message)
+        if self.intent_detector.should_escalate_immediately(user_message):
+            escalation_response = await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
+            yield StreamChatEvent(type="text_delta", data=escalation_response.message, session_id=session_id)
+            yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": escalation_response.latency_ms, "tokens_used": 0, "escalate_to_human": True, "escalation_action": escalation_response.escalation_action}, session_id=session_id)
+            return
+
+        playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
+        playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
+        corrections = await self.context_builder.load_corrections(str(agent.id))
+        await self.billing_service.maybe_send_greeting(agent, session, playbook)
+
+        guardrails = await self.context_builder.load_guardrails(str(agent.id))
+        custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
+        platform_guardrails = await self.context_builder.load_platform_guardrails()
+        variables = await self.context_builder.load_variables(str(agent.id), str(playbook.id) if playbook else None)
+
+        stream_agent_cfg = agent.agent_config or {}
+        llm_config = stream_agent_cfg.get("llm_config", {}) or {}
+
+        block_reason = self.guardrail_service.check_input_guardrails(user_message, guardrails)
         if block_reason:
-            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
-            blocked_user_msg = Message(
-                session_id=session_id,
-                tenant_id=session.tenant_id,
-                role="user",
-                content=user_message,
-                guardrail_triggered=block_reason,
-                tokens_used=0,
-                latency_ms=0,
-            )
-            self.db.add(blocked_user_msg)
-            yield StreamChatEvent(
-                type="text_delta",
-                data=block_msg,
-                session_id=session_id,
-            )
-            yield StreamChatEvent(
-                type="done",
-                data={"session_id": session_id, "latency_ms": 0, "tokens_used": 0,
-                      "tool_calls_made": 0, "escalate_to_human": False},
-                session_id=session_id,
-            )
+            block_msg = (guardrails.get("blocked_message") if guardrails else "I'm sorry, I can't help with that.")
+            yield StreamChatEvent(type="text_delta", data=block_msg, session_id=session_id)
+            yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "escalate_to_human": False, "guardrail_triggered": block_reason}, session_id=session_id)
             return
 
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
-        kb_ids = agent.knowledge_base_ids or []
 
-        context_items = await self.mcp.retrieve_context(
-            tenant_id=tenant_id,
-            query=user_message,
-            session_id=session_id,
-            context_types=["knowledge", "history"],
-            knowledge_base_ids=kb_ids if kb_ids else None,
-        )
+        stream_pii_ctx = await self.guardrail_service.get_pii_context(session_id)
+        llm_user_message = self.guardrail_service.redact_user_message(user_message, stream_pii_ctx, session_id)
+        _pii_active = stream_pii_ctx is not None and stream_pii_ctx.has_mappings()
 
-        customer_profile: dict = {}
-        if session.customer_identifier:
-            customer_profile = await self.memory.get_long_term_customer_memory(
-                tenant_id, session.customer_identifier
+        kb_ids = stream_agent_cfg.get("knowledge_base_ids", []) or []
+        try:
+            context_items = await self.mcp.retrieve_context(
+                tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
+                knowledge_base_ids=kb_ids if kb_ids else None,
             )
+            CONTEXT_RETRIEVALS.labels(status="success").inc()
+        except Exception as _rag_exc:
+            logger.warning("rag_retrieval_failed", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            context_items = []
 
-        system_prompt = build_system_prompt(
-            agent=agent,
-            context_items=context_items,
-            business_info={"customer_profile": customer_profile, "intent": intent},
-            playbook=playbook,
-            corrections=corrections,
-            guardrails=guardrails,
+        stream_source_citations = [
+            SourceCitation(
+                type=item.get("type", "knowledge"), title=item.get("metadata", {}).get("title"), source_url=item.get("metadata", {}).get("source_url"),
+                excerpt=(item.get("content", "") or "")[:150], score=float(item.get("score", 1.0)),
+                document_id=str(item.get("metadata", {}).get("document_id")) if item.get("metadata", {}).get("document_id") else None,
+                chunk_id=str(item.get("metadata", {}).get("chunk_id")) if item.get("metadata", {}).get("chunk_id") else None,
+            ) for item in context_items if isinstance(item, dict)
+        ]
+        stream_llm_config = stream_agent_cfg.get("llm_config", {}) or {}
+
+        customer_profile = {}
+        if session.customer_identifier:
+            customer_profile = await self.memory.get_long_term_customer_memory(tenant_id, session.customer_identifier)
+
+        session_meta = dict(session.metadata_ or {}) if hasattr(session, "metadata_") else {}
+        session_language = session_meta.get("language")
+
+        system_prompt = self.context_builder.build_system_prompt(
+            agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
+            session_language=session_language, playbook=playbook, corrections=corrections,
+            guardrails=guardrails, custom_guardrails=custom_guardrails,
+            platform_guardrails=platform_guardrails,
+            variables=variables, session_meta=session_meta, local_vars=local_vars
         )
 
-        tool_schemas = await self._get_agent_tools_schema(agent, tenant_id)
+        tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
 
         messages = [{"role": "system", "content": system_prompt}]
         if summary:
-            messages.append({"role": "system", "content": f"[Summary]: {summary}"})
+            messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
         messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
-
-        llm_config = agent.llm_config or {}
-        temperature = llm_config.get("temperature", 0.7)
-        max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
-
-        tool_calls_made: list[dict] = []
-        total_tokens = 0
-        full_response_text = ""
-
-        # If there are tools, do non-streaming tool loop first, then stream the final answer
-        if tool_schemas:
-            iterations = 0
-            llm_response = None
-            while iterations < MAX_TOOL_ITERATIONS:
-                llm_response = await self.llm.complete(
-                    messages=messages,
-                    tools=tool_schemas,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=False,
-                )
-                total_tokens += llm_response.usage.total_tokens
-
-                if llm_response.tool_calls:
-                    iterations += 1
-                    yield StreamChatEvent(
-                        type="tool_call",
-                        data={
-                            "tools": [
-                                {"name": tc.name, "arguments": tc.arguments}
-                                for tc in llm_response.tool_calls
-                            ]
-                        },
-                        session_id=session_id,
-                    )
-
-                    tool_results = await self._execute_tool_calls(
-                        tool_calls=llm_response.tool_calls,
-                        tenant_id=tenant_id,
-                        session_id=session_id,
-                    )
-
-                    for tc, result in zip(llm_response.tool_calls, tool_results):
-                        tool_calls_made.append({
-                            "tool": tc.name,
-                            "arguments": tc.arguments,
-                            "result": result,
-                        })
-                        yield StreamChatEvent(
-                            type="tool_result",
-                            data={"tool": tc.name, "result": result},
-                            session_id=session_id,
-                        )
-
-                    messages.append({
-                        "role": "assistant",
-                        "content": llm_response.content or "",
-                        "tool_calls": [
-                            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                            for tc in llm_response.tool_calls
-                        ],
-                    })
-                    for tc, result in zip(llm_response.tool_calls, tool_results):
-                        messages.append({
-                            "role": "tool",
-                            "name": tc.name,
-                            "tool_call_id": tc.id,
-                            "content": str(result),
-                        })
-                else:
-                    full_response_text = llm_response.content or ""
-                    break
-
-            if not full_response_text and llm_response:
-                full_response_text = llm_response.content or "I was unable to complete your request."
-
-            # Stream the final text word by word for a natural feel
-            words = full_response_text.split(" ")
-            for word in words:
-                yield StreamChatEvent(
-                    type="text_delta",
-                    data=word + " ",
-                    session_id=session_id,
-                )
-                await asyncio.sleep(0.01)
-        else:
-            # No tools — use real streaming
-            gen = await self.llm.complete(
-                messages=messages,
-                tools=None,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            async for chunk in gen:
-                full_response_text += chunk
-                yield StreamChatEvent(
-                    type="text_delta",
-                    data=chunk,
-                    session_id=session_id,
-                )
+        messages.append({"role": "user", "content": llm_user_message})
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
+        
+        # Calculate Chat Units and New Session flags (TC-B01)
+        is_new = (session.turn_count == 0)
+        chat_unit_increment = 0
+        if is_new:
+            chat_unit_increment = 1
+        elif session.turn_count > 0 and (session.turn_count + 1) % 10 == 0:
+            chat_unit_increment = 1
 
-        full_response_text = self._apply_output_guardrails(full_response_text, guardrails)
-        is_fallback = self._is_fallback_response(full_response_text, playbook)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        temperature = stream_llm_config.get("temperature", 0.7)
+        max_tokens = stream_llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
+        system_tools = stream_agent_cfg.get("tools", []) or []
+        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
+        enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
-        # Persist to memory and DB
-        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": user_message})
-        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": full_response_text})
+        full_response_text = ""
+        iterations = 0
+        llm_response = None
 
-        user_msg = Message(
-            session_id=session_id,
-            tenant_id=session.tenant_id,
-            role="user",
-            content=user_message,
-            tokens_used=0,
-            latency_ms=0,
-        )
+        while iterations < MAX_TOOL_ITERATIONS:
+            llm_response = await self._llm_complete_with_timeout(
+                messages=messages, tools=tool_schemas if tool_schemas else None, temperature=temperature, max_tokens=max_tokens, stream=False, session_id=session_id
+            )
+            total_tokens += llm_response.usage.total_tokens
+
+            if llm_response.finish_reason == "timeout":
+                full_response_text = llm_response.content or "I'm sorry, I'm taking longer than expected."
+                break
+
+            if not llm_response.tool_calls:
+                full_response_text = llm_response.content or ""
+                break
+
+            iterations += 1
+            allowed_calls = self.tool_executor.filter_unauthorized_tool_calls(llm_response.tool_calls, enabled_tools)
+            if not allowed_calls:
+                full_response_text = llm_response.content or "I wasn't able to complete that action."
+                break
+
+            confirmation_prompt = self.tool_executor.requires_confirmation(allowed_calls, user_message, history)
+            if confirmation_prompt:
+                full_response_text = confirmation_prompt
+                break
+
+            yield StreamChatEvent(type="tool_call", data={"tools": [{"name": tc.name, "arguments": tc.arguments} for tc in allowed_calls]}, session_id=session_id)
+
+            if stream_pii_ctx is not None and stream_pii_ctx.has_mappings():
+                for tc in allowed_calls:
+                    if isinstance(tc.arguments, dict):
+                        tc.arguments = pii_service.restore_dict(tc.arguments, stream_pii_ctx, session_id)
+
+            tool_results = await self.tool_executor.execute_tool_calls(tool_calls=allowed_calls, tenant_id=tenant_id, session_id=session_id)
+            tool_results = [{k: self.guardrail_service.scrub_credentials(str(v)) if isinstance(v, str) else v for k, v in r.items()} if isinstance(r, dict) else r for r in tool_results]
+
+            if stream_pii_ctx is not None:
+                _re_anon_s = []
+                for _r in tool_results:
+                    if isinstance(_r, dict):
+                        _re_anon_s.append(pii_service.redact_dict(_r, stream_pii_ctx, session_id))
+                    else:
+                        _re_anon_s.append(_r)
+                tool_results = _re_anon_s
+
+            for tc, result in zip(allowed_calls, tool_results):
+                safe_args = tc.arguments if not stream_pii_ctx else pii_service.redact_dict(tc.arguments, stream_pii_ctx, session_id) if isinstance(tc.arguments, dict) else tc.arguments
+                tool_calls_made.append({"tool": tc.name, "arguments": safe_args, "result": result})
+                yield StreamChatEvent(type="tool_result", data={"tool": tc.name, "result": result}, session_id=session_id)
+
+            messages.append({"role": "assistant", "content": llm_response.content or "", "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in allowed_calls]})
+            for tc, result in zip(allowed_calls, tool_results):
+                sanitized_result = self.guardrail_service.sanitize_tool_output(str(result))
+                messages.append({"role": "tool", "name": tc.name, "tool_call_id": tc.id, "content": sanitized_result})
+
+        if not full_response_text and llm_response:
+            logger.warning("stream_max_tool_iterations_reached", session_id=session_id, iterations=MAX_TOOL_ITERATIONS)
+            full_response_text = llm_response.content or "I wasn't able to fully complete your request."
+
+        receipt = self.tool_executor.build_receipt_summary(tool_calls_made)
+        if receipt:
+            full_response_text = full_response_text.rstrip() + " " + receipt
+
+        pseudo_full_response = full_response_text
+
+        if _pii_active and full_response_text:
+            parser = pii_service.create_streaming_parser(stream_pii_ctx, session_id)
+            full_response_text = parser.process_chunk(full_response_text) + parser.flush()
+
+        # Apply output guardrails (including PII restoration) BEFORE streaming to client
+        full_response_text, stream_guardrail_actions = self.guardrail_service.apply_output_guardrails(full_response_text, guardrails, stream_pii_ctx, session_id)
+
+        words = full_response_text.split(" ")
+        for word in words:
+            yield StreamChatEvent(type="text_delta", data=word + " ", session_id=session_id)
+            await asyncio.sleep(0.01)
+
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        if stream_pii_ctx is not None:
+            await self.guardrail_service.save_pii_context(session_id, stream_pii_ctx)
+
+        full_response_text = self.guardrail_service.check_professional_claims(full_response_text)
+        is_fallback = self.playbook_handler.is_fallback_response(full_response_text, playbook)
+
+        if is_fallback:
+            fallback_count = await self.playbook_handler.increment_fallback_counter(session_id)
+            if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
+                SessionStateMachine.escalate(session, reason="stream_fallback_threshold_exceeded")
+                full_response_text = "I've been unable to help with your last few requests. Let me connect you with a human agent."
+                pseudo_full_response = full_response_text
+                await self.playbook_handler.reset_fallback_counter(session_id)
+        else:
+            await self.playbook_handler.reset_fallback_counter(session_id)
+
+        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": llm_user_message})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": pseudo_full_response})
+
+        try:
+            await self.memory.maybe_summarize(session_id, self.llm)
+            if session.customer_identifier:
+                await self.memory.extract_and_store_long_term_memory(
+                    tenant_id=tenant_id, customer_identifier=session.customer_identifier,
+                    conversation_text=f"User: {user_message}\nAssistant: {full_response_text}",
+                    llm_client=self.llm,
+                )
+        except Exception as _mem_exc:
+            logger.warning("stream_memory_post_turn_error", error=str(_mem_exc))
+
+        user_msg_content = pii_service.redact_for_display(user_message, stream_pii_ctx) if stream_pii_ctx else user_message
+        assistant_msg_content = pii_service.redact_for_display(full_response_text, stream_pii_ctx) if stream_pii_ctx else full_response_text
+
+        user_msg = Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_msg_content, tokens_used=0, latency_ms=0)
         assistant_msg = Message(
-            session_id=session_id,
-            tenant_id=session.tenant_id,
-            role="assistant",
-            content=full_response_text,
-            tool_calls=tool_calls_made if tool_calls_made else None,
-            tokens_used=total_tokens,
-            latency_ms=latency_ms,
-            is_fallback=is_fallback,
+            session_id=session_id, tenant_id=session.tenant_id, role="assistant", content=assistant_msg_content,
+            tool_calls=tool_calls_made if tool_calls_made else None, tokens_used=total_tokens, latency_ms=latency_ms,
+            is_fallback=is_fallback, playbook_name=playbook.name if playbook else None,
+            sources=json.loads(json.dumps([c.model_dump() for c in stream_source_citations])) if stream_source_citations else [],
         )
         self.db.add(user_msg)
         self.db.add(assistant_msg)
 
-        await self._update_analytics(
+        session.turn_count += 1
+        await self.billing_service.update_analytics(
             tenant_id=session.tenant_id,
             agent_id=session.agent_id,
             tokens=total_tokens,
             latency_ms=latency_ms,
             tool_count=len(tool_calls_made),
+            is_new_session=is_new,
+            chat_units=chat_unit_increment
         )
+        await self.billing_service.record_token_usage(tenant_id, total_tokens)
 
-        should_escalate = await self._should_escalate(agent, full_response_text, messages)
+        should_escalate = await self.playbook_handler.should_escalate(agent, full_response_text, messages)
         if should_escalate:
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="stream_should_escalate_check")
+
+        if stream_source_citations:
+            yield StreamChatEvent(type="sources", data=[c.model_dump() for c in stream_source_citations], session_id=session_id)
 
         yield StreamChatEvent(
             type="done",
             data={
-                "session_id": session_id,
-                "latency_ms": latency_ms,
-                "tokens_used": total_tokens,
-                "tool_calls_made": len(tool_calls_made),
-                "escalate_to_human": should_escalate,
+                "session_id": session_id, "latency_ms": latency_ms, "tokens_used": total_tokens, "tool_calls_made": len(tool_calls_made),
+                "escalate_to_human": should_escalate, "guardrail_actions": stream_guardrail_actions, "turn_count": session.turn_count,
             },
             session_id=session_id,
         )
 
-    async def _build_system_prompt(
-        self, agent: Agent, context_items: list
-    ) -> str:
-        """Build dynamic system prompt with business context."""
-        return build_system_prompt(
-            agent=agent,
-            context_items=context_items,
-            business_info={},
-        )
+    # ------------------------------------------------------------------
+    # Async streaming (non-SSE)
+    # ------------------------------------------------------------------
 
-    async def _should_escalate(
-        self, agent: Agent, response: str, messages: list
-    ) -> bool:
-        """
-        Determine if the conversation should be escalated to a human.
-        Checks:
-        1. Agent escalation config
-        2. Keywords in the LLM's response indicating inability to help
-        3. Repeated user frustration signals in recent messages
-        """
-        escalation_config = agent.escalation_config or {}
-        if not escalation_config.get("escalate_to_human", False):
-            return False
+    async def stream_response_async(self, agent: Agent, session: Session, user_message: str) -> ChatResponse:
+        start_time = time.monotonic()
+        tenant_id = str(session.tenant_id)
+        session_id = session.id
+        tool_calls_made: list = []
+        total_tokens = 0
 
-        # Check if assistant response suggests escalation
-        response_lower = response.lower()
-        for keyword in ESCALATION_KEYWORDS:
-            if keyword.lower() in response_lower:
-                return True
+        user_message = self.guardrail_service.sanitize_user_message(user_message)
 
-        # Check last 3 user messages for repeated frustration
-        user_messages = [
-            m["content"] for m in messages
-            if m.get("role") == "user"
-        ][-3:]
-
-        frustration_count = 0
-        frustration_signals = ["again", "still", "not working", "doesn't help", "useless", "terrible"]
-        for msg in user_messages:
-            for signal in frustration_signals:
-                if signal in msg.lower():
-                    frustration_count += 1
-
-        return frustration_count >= 2
-
-    async def _get_agent_tools_schema(
-        self, agent: Agent, tenant_id: str
-    ) -> list[dict]:
-        """
-        Retrieve OpenAI-format tool schemas from MCP server for the tools
-        enabled on this agent.
-        """
-        enabled_tools = agent.tools or []
-        if not enabled_tools:
-            return []
-
-        schemas = await self.mcp.get_tool_schemas(
-            tenant_id=tenant_id,
-            tool_names=enabled_tools,
-        )
-        return schemas
-
-    async def _execute_tool_calls(
-        self,
-        tool_calls: list[ToolCall],
-        tenant_id: str,
-        session_id: str,
-    ) -> list[dict]:
-        """
-        Execute all tool calls in parallel via the MCP client.
-        Returns a list of results in the same order as the input tool_calls.
-        """
-        trace_id = str(uuid.uuid4())
-        tasks = [
-            self.mcp.execute_tool(
-                tenant_id=tenant_id,
-                tool_name=tc.name,
-                parameters=tc.arguments,
-                session_id=session_id,
-                trace_id=f"{trace_id}-{i}",
+        session_meta = dict(session.metadata_ or {})
+        escalation_state = session_meta.get("_escalation_state")
+        if escalation_state:
+            return await self.playbook_handler.handle_escalation_info_collection(
+                agent, session, user_message, start_time, escalation_state, session_meta
             )
-            for i, tc in enumerate(tool_calls)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        processed: list[dict] = []
-        for tc, result in zip(tool_calls, results):
-            if isinstance(result, Exception):
-                logger.error(
-                    "tool_execution_exception",
-                    tool=tc.name,
-                    error=str(result),
-                )
-                processed.append({"success": False, "error": str(result), "tool": tc.name})
-            else:
-                processed.append(result)
+        emergency_response = self.guardrail_service.check_emergency(user_message, agent)
+        if emergency_response:
+            SessionStateMachine.escalate(session, reason="async_stream_emergency_detected")
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return ChatResponse(session_id=session_id, message=emergency_response, tool_calls_made=[], suggested_actions=["Call 911"], escalate_to_human=True, latency_ms=latency_ms, tokens_used=0)
 
-        return processed
+        jailbreak_response = self.guardrail_service.check_jailbreak(user_message, agent)
+        if jailbreak_response:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return ChatResponse(session_id=session_id, message=jailbreak_response, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=latency_ms, tokens_used=0)
 
-    async def _update_analytics(
-        self,
-        tenant_id,
-        agent_id,
-        tokens: int,
-        latency_ms: int,
-        tool_count: int,
-        escalated: bool = False,
-        completed: bool = True,
-    ):
-        """
-        Upsert today's analytics record for this agent.
-        Uses INSERT ... ON CONFLICT DO UPDATE pattern via SQLAlchemy.
-        """
+        intent = self.intent_detector.detect_intent(user_message)
+        if self.intent_detector.should_escalate_immediately(user_message):
+            return await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
+
+        playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
+        playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
+        corrections = await self.context_builder.load_corrections(str(agent.id))
+        await self.billing_service.maybe_send_greeting(agent, session, playbook)
+
+        guardrails = await self.context_builder.load_guardrails(str(agent.id))
+        custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
+        platform_guardrails = await self.context_builder.load_platform_guardrails()
+        variables = await self.context_builder.load_variables(str(agent.id), str(playbook.id) if playbook else None)
+
+        block_reason = self.guardrail_service.check_input_guardrails(user_message, guardrails)
+        if block_reason:
+            block_msg = (guardrails.get("blocked_message") if guardrails else "I'm sorry, I can't help with that.")
+            self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_message, guardrail_triggered=block_reason, tokens_used=0, latency_ms=0))
+            return ChatResponse(session_id=session_id, message=block_msg, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0, guardrail_triggered=block_reason)
+
+        history = await self.memory.get_short_term_memory(session_id)
+        summary = await self.memory.get_session_summary(session_id)
+
+        pii_ctx = await self.guardrail_service.get_pii_context(session_id)
+        llm_user_message = self.guardrail_service.redact_user_message(user_message, pii_ctx, session_id)
+
+        agent_cfg = agent.agent_config or {}
+        kb_ids = agent_cfg.get("knowledge_base_ids", []) or []
         try:
-            today = date.today()
-            result = await self.db.execute(
-                select(AgentAnalytics).where(
-                    and_(
-                        AgentAnalytics.tenant_id == tenant_id,
-                        AgentAnalytics.agent_id == agent_id,
-                        AgentAnalytics.date == today,
-                    )
-                )
+            context_items = await self.mcp.retrieve_context(
+                tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
+                knowledge_base_ids=kb_ids if kb_ids else None,
             )
-            analytics = result.scalar_one_or_none()
+            CONTEXT_RETRIEVALS.labels(status="success").inc()
+        except Exception as _rag_exc:
+            logger.warning("rag_retrieval_failed", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            context_items = []
 
-            if analytics is None:
-                analytics = AgentAnalytics(
-                    tenant_id=tenant_id,
-                    agent_id=agent_id,
-                    date=today,
-                    total_sessions=0,
-                    total_messages=1,
-                    avg_response_latency_ms=float(latency_ms),
-                    total_tokens_used=tokens,
-                    estimated_cost_usd=self._estimate_cost(tokens),
-                    tool_executions=tool_count,
-                    escalations=1 if escalated else 0,
-                    successful_completions=1 if completed else 0,
-                )
-                self.db.add(analytics)
-            else:
-                analytics.total_messages += 1
-                analytics.total_tokens_used += tokens
-                analytics.estimated_cost_usd += self._estimate_cost(tokens)
-                analytics.tool_executions += tool_count
-                if escalated:
-                    analytics.escalations += 1
-                if completed:
-                    analytics.successful_completions += 1
-                # Rolling average for latency
-                n = analytics.total_messages
-                analytics.avg_response_latency_ms = (
-                    (analytics.avg_response_latency_ms * (n - 1) + latency_ms) / n
-                )
-        except Exception as exc:
-            logger.error("analytics_update_error", error=str(exc))
+        source_citations = [
+            SourceCitation(
+                type=item.get("type", "knowledge"), title=item.get("metadata", {}).get("title"), source_url=item.get("metadata", {}).get("source_url"),
+                excerpt=(item.get("content", "") or "")[:150], score=float(item.get("score", 1.0)),
+                document_id=str(item.get("metadata", {}).get("document_id")) if item.get("metadata", {}).get("document_id") else None,
+                chunk_id=str(item.get("metadata", {}).get("chunk_id")) if item.get("metadata", {}).get("chunk_id") else None,
+            ) for item in context_items if isinstance(item, dict)
+        ]
 
-    def _estimate_cost(self, tokens: int) -> float:
-        """
-        Rough cost estimate in USD.
-        Gemini Flash: ~$0.075 per 1M tokens (input) / $0.30 per 1M (output)
-        Approximation: $0.0001 per 1K tokens
-        """
-        return (tokens / 1000) * 0.0001
+        customer_profile = {}
+        if session.customer_identifier:
+            customer_profile = await self.memory.get_long_term_customer_memory(tenant_id, session.customer_identifier)
 
-    async def _build_escalation_response(
-        self,
-        agent: Agent,
-        session: AgentSession,
-        user_message: str,
-        start_time: float,
-    ) -> ChatResponse:
-        """Build a response when immediate escalation is needed."""
-        escalation_config = agent.escalation_config or {}
-        escalation_number = escalation_config.get("escalation_number", "")
+        session_language = session_meta.get("language")
 
-        if escalation_number:
-            message = (
-                f"I'll connect you with a human agent right away. "
-                f"You can also reach them directly at {escalation_number}."
+        system_prompt = self.context_builder.build_system_prompt(
+            agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
+            session_language=session_language, playbook=playbook, corrections=corrections,
+            guardrails=guardrails, custom_guardrails=custom_guardrails,
+            platform_guardrails=platform_guardrails,
+            variables=variables, session_meta=session_meta, local_vars=local_vars
+        )
+
+        tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if summary:
+            messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
+        messages.extend(history)
+        messages.append({"role": "user", "content": llm_user_message})
+
+        if not await self.billing_service.check_token_budget(tenant_id):
+            return ChatResponse(session_id=session_id, message="I'm temporarily unavailable due to high usage. Please try again later.", tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0)
+
+        llm_config = agent_cfg.get("llm_config", {}) or {}
+        temperature = llm_config.get("temperature", 0.7)
+        max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
+        system_tools = agent_cfg.get("tools", []) or []
+        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
+        enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
+
+        full_response_text = ""
+        iterations = 0
+
+        while iterations < MAX_TOOL_ITERATIONS:
+            llm_response = await self._llm_complete_with_timeout(
+                messages=messages, tools=tool_schemas if tool_schemas else None, temperature=temperature, max_tokens=max_tokens, stream=False, session_id=session_id
             )
-        else:
-            message = "I'll connect you with a human agent right away. Please hold on."
+            total_tokens += llm_response.usage.total_tokens
 
-        session.status = "escalated"
+            if llm_response.finish_reason == "timeout":
+                full_response_text = llm_response.content or "I'm sorry, I'm taking longer than expected."
+                break
+
+            if not llm_response.tool_calls:
+                full_response_text = llm_response.content or ""
+                break
+
+            iterations += 1
+            allowed_calls = self.tool_executor.filter_unauthorized_tool_calls(llm_response.tool_calls, enabled_tools)
+            if not allowed_calls:
+                full_response_text = llm_response.content or "I wasn't able to complete that action."
+                break
+
+            confirmation_prompt = self.tool_executor.requires_confirmation(allowed_calls, user_message, history)
+            if confirmation_prompt:
+                full_response_text = confirmation_prompt
+                break
+
+            if pii_ctx is not None and pii_ctx.has_mappings():
+                for tc in allowed_calls:
+                    if isinstance(tc.arguments, dict):
+                        tc.arguments = pii_service.restore_dict(tc.arguments, pii_ctx, session_id)
+
+            tool_results = await self.tool_executor.execute_tool_calls(tool_calls=allowed_calls, tenant_id=tenant_id, session_id=session_id)
+            tool_results = [{k: self.guardrail_service.scrub_credentials(str(v)) if isinstance(v, str) else v for k, v in r.items()} if isinstance(r, dict) else r for r in tool_results]
+
+            if pii_ctx is not None:
+                _re_anon = []
+                for _r in tool_results:
+                    if isinstance(_r, dict):
+                        _re_anon.append(pii_service.redact_dict(_r, pii_ctx, session_id))
+                    else:
+                        _re_anon.append(_r)
+                tool_results = _re_anon
+
+            for tc, result in zip(allowed_calls, tool_results):
+                safe_args = tc.arguments if not pii_ctx else pii_service.redact_dict(tc.arguments, pii_ctx, session_id) if isinstance(tc.arguments, dict) else tc.arguments
+                tool_calls_made.append({"tool": tc.name, "arguments": safe_args, "result": result})
+
+            messages.append({"role": "assistant", "content": llm_response.content or "", "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in allowed_calls]})
+            for tc, result in zip(allowed_calls, tool_results):
+                sanitized_result = self.guardrail_service.sanitize_tool_output(str(result))
+                messages.append({"role": "tool", "name": tc.name, "tool_call_id": tc.id, "content": sanitized_result})
+            continue
+
+        if not full_response_text and llm_response:
+            full_response_text = llm_response.content or "I wasn't able to fully complete your request."
+
         latency_ms = int((time.monotonic() - start_time) * 1000)
+        receipt = self.tool_executor.build_receipt_summary(tool_calls_made)
+        if receipt:
+            full_response_text = full_response_text.rstrip() + " " + receipt
 
-        # Save the interaction
-        self.db.add(Message(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            role="user",
-            content=user_message,
-            tokens_used=0,
-            latency_ms=0,
-        ))
-        self.db.add(Message(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            role="assistant",
-            content=message,
-            tokens_used=0,
-            latency_ms=latency_ms,
-        ))
+        pseudo_full_response = full_response_text
+
+        full_response_text, guardrail_actions = self.guardrail_service.apply_output_guardrails(full_response_text, guardrails, pii_ctx, session_id)
+        if pii_ctx is not None:
+            await self.guardrail_service.save_pii_context(session_id, pii_ctx)
+
+        full_response_text = self.guardrail_service.check_professional_claims(full_response_text)
+        is_fallback = self.playbook_handler.is_fallback_response(full_response_text, playbook)
+
+        if is_fallback:
+            fallback_count = await self.playbook_handler.increment_fallback_counter(session_id)
+            if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
+                session.status = "escalated"
+                full_response_text = "I've been unable to help with your last few requests. Let me connect you with a human agent."
+                pseudo_full_response = full_response_text
+                await self.playbook_handler.reset_fallback_counter(session_id)
+        else:
+            await self.playbook_handler.reset_fallback_counter(session_id)
+
+        await self.memory.add_to_short_term_memory(session_id, {"role": "user", "content": llm_user_message})
+        await self.memory.add_to_short_term_memory(session_id, {"role": "assistant", "content": pseudo_full_response})
+
+        try:
+            await self.memory.maybe_summarize(session_id, self.llm)
+            if session.customer_identifier:
+                await self.memory.extract_and_store_long_term_memory(
+                    tenant_id=tenant_id, customer_identifier=session.customer_identifier,
+                    conversation_text=f"User: {user_message}\nAssistant: {full_response_text}",
+                    llm_client=self.llm,
+                )
+        except Exception as _mem_exc:
+            logger.warning("stream_memory_post_turn_error", error=str(_mem_exc))
+
+        user_msg = Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=pii_service.redact_for_display(user_message, pii_ctx) if pii_ctx else user_message, tokens_used=0, latency_ms=0)
+        assistant_msg = Message(
+            session_id=session_id, tenant_id=session.tenant_id, role="assistant",
+            content=pii_service.redact_for_display(full_response_text, pii_ctx) if pii_ctx else full_response_text,
+            tool_calls=tool_calls_made if tool_calls_made else None, tokens_used=total_tokens, latency_ms=latency_ms,
+            is_fallback=is_fallback, playbook_name=playbook.name if playbook else None,
+            sources=json.loads(json.dumps([c.model_dump() for c in source_citations])) if source_citations else [],
+        )
+        self.db.add(user_msg)
+        self.db.add(assistant_msg)
+
+        session.turn_count += 1
+        await self.billing_service.update_analytics(tenant_id=session.tenant_id, agent_id=session.agent_id, tokens=total_tokens, latency_ms=latency_ms, tool_count=len(tool_calls_made))
+        await self.billing_service.record_token_usage(tenant_id, total_tokens)
+
+        should_escalate = await self.playbook_handler.should_escalate(agent, full_response_text, messages)
+        if should_escalate:
+            SessionStateMachine.escalate(session, reason="async_should_escalate_check")
 
         return ChatResponse(
-            session_id=session.id,
-            message=message,
-            tool_calls_made=[],
-            suggested_actions=[],
-            escalate_to_human=True,
-            latency_ms=latency_ms,
-            tokens_used=0,
+            session_id=session_id, message=full_response_text, tool_calls_made=tool_calls_made,
+            source_citations=source_citations if source_citations else None,
+            suggested_actions=self.billing_service.extract_suggested_actions(full_response_text, intent),
+            escalate_to_human=should_escalate, latency_ms=latency_ms, tokens_used=total_tokens,
+            playbook_executed=playbook.name if playbook else None,
+            playbook_variables=local_vars if local_vars else None,
+            turn_count=session.turn_count, session_status=session.status,
+            guardrail_actions=guardrail_actions,
         )
+        
 
-    def _extract_suggested_actions(self, response: str, intent: str) -> list[str]:
-        """
-        Extract or generate suggested follow-up actions based on the response and intent.
-        """
-        suggestions: list[str] = []
-        response_lower = response.lower()
-
-        intent_suggestions = {
-            "order_food": ["Track my order", "Modify my order", "Cancel order"],
-            "book_appointment": ["View my appointments", "Cancel appointment", "Reschedule"],
-            "status_check": ["View order history", "Contact support"],
-            "pricing": ["Place an order", "View full menu", "Get a quote"],
-            "complaint": ["Speak to a manager", "Request a refund", "Track resolution"],
-            "greeting": ["View services", "Make a booking", "Check prices"],
-        }
-
-        if intent in intent_suggestions:
-            suggestions = intent_suggestions[intent][:2]
-
-        # Add escalation suggestion if response hints at limitations
-        if any(phrase in response_lower for phrase in ["i'm not able", "cannot help", "beyond my"]):
-            if "Speak to a human agent" not in suggestions:
-                suggestions.append("Speak to a human agent")
-
-        return suggestions

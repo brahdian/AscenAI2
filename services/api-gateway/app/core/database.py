@@ -1,6 +1,7 @@
 from typing import AsyncGenerator
 
 import structlog
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -25,6 +26,10 @@ if "sqlite" not in settings.DATABASE_URL:
         "pool_size": 10,
         "max_overflow": 20,
         "pool_pre_ping": True,
+        # Recycle connections every 30 min to avoid stale connections after
+        # PostgreSQL keepalive / firewall idle-connection timeouts.
+        "pool_recycle": 1800,
+        "pool_timeout": 30,
     }
 else:
     _pool_kwargs = {"poolclass": NullPool}
@@ -44,9 +49,17 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_db(tenant_id: str | None = None) -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:
+            # SECURITY: Set the per-session Postgres variable that RLS policies
+            # use to filter rows by tenant. SET LOCAL scopes this to the
+            # current transaction only — it cannot leak across connections.
+            if tenant_id:
+                await session.execute(
+                    text("SELECT set_config('app.current_tenant_id', :tid, true)"),
+                    {"tid": str(tenant_id)},
+                )
             yield session
             await session.commit()
         except Exception as exc:
@@ -59,8 +72,29 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Create all tables (dev / testing only — use Alembic in production)."""
+    # Register all models before create_all
+    import app.models.audit_log  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # audit_logs schema is managed by Alembic migration 0008.
+        # alembic upgrade head runs before this in the startup command.
+
+        # Idempotent migration for missing tenant subscription columns
+        await conn.execute(
+            text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(50);")
+        )
+        await conn.execute(
+            text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_id VARCHAR(255);")
+        )
+
+        # Idempotent migration for missing agent_count column
+        await conn.execute(
+            text("ALTER TABLE tenant_usage ADD COLUMN IF NOT EXISTS agent_count INTEGER DEFAULT 0 NOT NULL;")
+        )
+        await conn.execute(
+            text("ALTER TABLE tenant_usage ADD COLUMN IF NOT EXISTS current_month_chat_units INTEGER DEFAULT 0;")
+        )
     logger.info("database_initialized")
 
 

@@ -10,6 +10,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.rbac import require_scope
 from app.models.user import User
 from app.services.auth_service import auth_service
 
@@ -17,7 +18,7 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/team")
 
 _VALID_ROLES = {"owner", "admin", "developer", "viewer"}
-_MANAGEMENT_ROLES = {"owner", "admin"}
+_MANAGEMENT_ROLES = {"owner", "admin", "super_admin"}
 
 
 class InviteRequest(BaseModel):
@@ -75,14 +76,23 @@ def _user_to_response(user: User) -> TeamMemberResponse:
 async def list_team(
     request: Request,
     db: AsyncSession = Depends(get_db),
+    page: int = 1,
+    limit: int = 50,
 ):
-    """List all users in the tenant. Requires owner or admin role."""
+    """List users in the tenant. Requires owner or admin role. Paginated."""
     tenant_id, _ = _require_management(request)
+
+    if page < 1:
+        page = 1
+    limit = min(max(limit, 1), 200)  # clamp 1–200
+    offset = (page - 1) * limit
 
     result = await db.execute(
         select(User)
         .where(User.tenant_id == uuid.UUID(tenant_id))
         .order_by(User.created_at.asc())
+        .limit(limit)
+        .offset(offset)
     )
     return [_user_to_response(u) for u in result.scalars().all()]
 
@@ -91,6 +101,7 @@ async def list_team(
 async def invite_user(
     body: InviteRequest,
     request: Request,
+    _scope=require_scope("team:write"),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -106,9 +117,15 @@ async def invite_user(
             detail=f"Invalid role '{body.role}'. Valid roles: {', '.join(sorted(_VALID_ROLES))}",
         )
 
-    # Check if email already exists in this tenant
+    # Normalize email to lowercase before any comparison or storage
+    normalized_email = body.email.lower()
+
+    # Check uniqueness WITHIN THIS TENANT ONLY (prevents cross-tenant enumeration)
     existing = await db.execute(
-        select(User).where(User.email == body.email)
+        select(User).where(
+            User.email == normalized_email,
+            User.tenant_id == uuid.UUID(tenant_id),
+        )
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A user with this email already exists.")
@@ -119,7 +136,7 @@ async def invite_user(
     new_user = User(
         id=uuid.uuid4(),
         tenant_id=uuid.UUID(tenant_id),
-        email=body.email,
+        email=normalized_email,
         hashed_password=auth_service.hash_password(temp_password),
         full_name=body.full_name,
         role=body.role,
@@ -147,6 +164,7 @@ async def change_user_role(
     user_id: str,
     body: RoleChangeRequest,
     request: Request,
+    _scope=require_scope("team:write"),
     db: AsyncSession = Depends(get_db),
 ):
     """Change a team member's role. Cannot demote/change the last owner."""
@@ -195,6 +213,7 @@ async def change_user_role(
 async def deactivate_user(
     user_id: str,
     request: Request,
+    _scope=require_scope("team:write"),
     db: AsyncSession = Depends(get_db),
 ):
     """Deactivate a team member. Cannot remove yourself or the last owner."""

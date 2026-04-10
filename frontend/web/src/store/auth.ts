@@ -12,51 +12,67 @@ interface UserInfo {
 interface AuthState {
   user: UserInfo | null
   tenantId: string | null
-  accessToken: string | null
-  refreshToken: string | null
   isAuthenticated: boolean
   _hasHydrated: boolean
 
-  setTokens: (access: string, refresh: string) => void
   setUser: (user: UserInfo, tenantId: string) => void
+  markAuthenticated: () => void
   logout: () => void
+  syncAuth: () => Promise<void>
   setHasHydrated: (v: boolean) => void
 }
 
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       user: null,
       tenantId: null,
-      accessToken: null,
-      refreshToken: null,
       isAuthenticated: false,
       _hasHydrated: false,
 
       setHasHydrated: (v) => set({ _hasHydrated: v }),
 
-      setTokens: (access, refresh) => {
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('access_token', access)
-          localStorage.setItem('refresh_token', refresh)
-        }
-        set({ accessToken: access, refreshToken: refresh, isAuthenticated: true })
-      },
+      setUser: (user, tenantId) => set({
+        user,
+        tenantId,
+        isAuthenticated: true,
+      }),
 
-      setUser: (user, tenantId) => set({ user, tenantId }),
+      markAuthenticated: () => set({ isAuthenticated: true }),
 
-      logout: () => {
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem('access_token')
-          localStorage.removeItem('refresh_token')
-        }
+      logout: () =>
         set({
           user: null,
           tenantId: null,
-          accessToken: null,
-          refreshToken: null,
           isAuthenticated: false,
-        })
+        }),
+
+      syncAuth: async () => {
+        const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+        try {
+          const axios = (await import('axios')).default
+          const { data } = await axios.get(`${API_URL}/api/v1/auth/me`, {
+            withCredentials: true,
+          })
+          if (data.user) {
+            set({
+              user: data.user,
+              tenantId: data.tenant_id,
+              isAuthenticated: true,
+            })
+          }
+        } catch (error) {
+          const axios = (await import('axios')).default
+          if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
+            // Only clear auth state if we don't already have a user in local state.
+            // This prevents wiping a fresh login when /auth/me can't be reached
+            // (e.g. cookie SameSite mismatch on localhost vs lvh.me during dev).
+            const current = get()
+            if (!current.user) {
+              set({ user: null, tenantId: null, isAuthenticated: false })
+            }
+          }
+        }
       },
     }),
     {

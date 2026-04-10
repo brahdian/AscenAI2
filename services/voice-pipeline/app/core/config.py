@@ -14,7 +14,8 @@ _WEAK_KEYS = frozenset({
 
 class Settings(BaseSettings):
     # STT config
-    STT_PROVIDER: str = "gemini"  # "gemini" | "openai" | "deepgram"
+    # Deepgram Nova-2 is recommended for STT ($0.46/hr). Gemini is fallback.
+    STT_PROVIDER: str = "deepgram"  # "cartesia" | "deepgram" | "gemini" | "openai"
     OPENAI_API_KEY: str = ""
     DEEPGRAM_API_KEY: str = ""
 
@@ -27,7 +28,10 @@ class Settings(BaseSettings):
     GEMINI_STT_MODEL: str = "gemini-2.5-flash-lite-preview-06-17"
 
     # TTS config
-    TTS_PROVIDER: str = "google"  # "google" | "openai" | "elevenlabs"
+    # Cartesia Sonic ($31/1M chars, sub-100ms latency) OR Deepgram Aura 2 ($30/1M chars)
+    TTS_PROVIDER: str = "cartesia"  # "cartesia" | "deepgram" | "google" | "elevenlabs" | "openai"
+    CARTESIA_API_KEY: str = ""
+    CARTESIA_VOICE_ID: str = "a0e99841-438c-4a64-b679-ae501e7d6091"  # neutral English
     ELEVENLABS_API_KEY: str = ""
     GOOGLE_TTS_VOICE: str = "en-US-Neural2-D"
     GOOGLE_APPLICATION_CREDENTIALS: str = ""  # Path to GCP service account JSON
@@ -78,7 +82,14 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # CORS — override in production with explicit origin list
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    ALLOWED_ORIGINS: any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def validate_allowed_origins(cls, v: any) -> list[str]:
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
 
     # Observability
     SENTRY_DSN: str = ""

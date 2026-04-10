@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npm/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+bin/
+lib/
+include/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+
+# Environment Variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Docker
+.docker/
+
+# Build
+dist/
+build/
+.next/
+out/
+.turbo/
+
+# Claude / Agentic
+.claude/
+.agents/
+.agent/
+_agents/
+_agent/
+brain/
+*.webp
+*.png
+*.jpg
+*.mp4

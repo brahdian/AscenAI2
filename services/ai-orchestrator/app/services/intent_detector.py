@@ -198,3 +198,35 @@ class IntentDetector:
     def is_farewell(self, text: str) -> bool:
         """Check if message is a farewell."""
         return self.detect_intent(text) == "farewell"
+
+    def detect_language(self, text: str, supported_langs: list[str]) -> Optional[str]:
+        """
+        Heuristic-based language detection for common patterns.
+        Falls back to None if unsure.
+        """
+        if not text: return None
+        t = text.lower().strip()
+        
+        # French patterns
+        fr_patterns = [
+            r"\bbonjour\b", r"\bsalut\b", r"\bpouvez-vous\b", r"\baidez-moi\b",
+            r"\bcomment\b", r"\bmerci\b", r"\boui\b", r"\bnon\b", r"\bfrançais\b",
+        ]
+        
+        if any(re.search(p, t) for p in fr_patterns):
+            # Resolve to the specific supported code if possible (e.g. fr-CA or fr)
+            if "fr-CA" in supported_langs: return "fr-CA"
+            if "fr" in supported_langs: return "fr"
+            return "fr"
+
+        # English patterns
+        en_patterns = [
+            r"\bhello\b", r"\bhi\b", r"\bcan you\b", r"\bhelp\b", r"\bhow\b",
+            r"\bthanks\b", r"\byes\b", r"\bno\b", r"\benglish\b",
+        ]
+        if any(re.search(p, t) for p in en_patterns):
+            if "en-US" in supported_langs: return "en-US"
+            if "en" in supported_langs: return "en"
+            return "en"
+            
+        return None

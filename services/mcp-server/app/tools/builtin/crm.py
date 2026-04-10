@@ -1,5 +1,9 @@
-"""Built-in CRM tool handlers."""
+"""Built-in CRM tool handlers — stub implementations awaiting real CRM integration."""
 from __future__ import annotations
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 CRM_LOOKUP_SCHEMA = {
     "type": "object",
@@ -43,7 +47,7 @@ CRM_UPDATE_SCHEMA = {
 
 
 async def handle_crm_lookup(parameters: dict, tenant_config: dict) -> dict:
-    """Return a simulated CRM lookup result."""
+    """CRM lookup — stub awaiting real CRM integration."""
     identifier = (
         parameters.get("customer_id")
         or parameters.get("phone")
@@ -52,27 +56,20 @@ async def handle_crm_lookup(parameters: dict, tenant_config: dict) -> dict:
     if not identifier:
         return {"found": False, "customer": None}
 
-    # Simulated customer data
+    logger.warning("crm_stub_lookup", identifier=identifier, note="Real CRM integration not yet implemented")
     return {
-        "found": True,
-        "customer": {
-            "id": "CUST-001",
-            "name": "Alex Johnson",
-            "email": parameters.get("email", "alex@example.com"),
-            "phone": parameters.get("phone", "+15551234567"),
-            "visit_count": 5,
-            "last_visit": "2025-03-15",
-            "notes": "Prefers pepperoni pizza, no mushrooms.",
-        },
+        "found": False,
+        "error": "CRM integration is not yet active. Customer data is not available.",
+        "status": "stub_not_implemented",
     }
 
 
 async def handle_crm_update(parameters: dict, tenant_config: dict) -> dict:
-    """Simulate updating a CRM record."""
+    """CRM update — stub awaiting real CRM integration."""
     customer_id = parameters.get("customer_id", "UNKNOWN")
+    logger.warning("crm_stub_update", customer_id=customer_id, note="Real CRM integration not yet implemented")
     return {
-        "success": True,
-        "customer_id": customer_id,
-        "updated_fields": [k for k in parameters if k != "customer_id"],
-        "message": f"Customer {customer_id} updated successfully.",
+        "success": False,
+        "error": "CRM integration is not yet active. Cannot update customer records.",
+        "status": "stub_not_implemented",
     }

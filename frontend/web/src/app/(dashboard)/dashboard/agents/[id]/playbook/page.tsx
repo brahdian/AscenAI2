@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { playbookApi, agentsApi } from '@/lib/api'
+import { playbookApi, agentsApi, playbooksApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   BookOpen,
@@ -177,6 +177,7 @@ export default function PlaybookEditorPage() {
   const [escalationMessage, setEscalationMessage] = useState('')
   const [isActive, setIsActive] = useState(true)
   const [isDirty, setIsDirty] = useState(false)
+  const [safetyWarning, setSafetyWarning] = useState<string | null>(null)
 
   const { data: agent } = useQuery({
     queryKey: ['agent', agentId],
@@ -192,15 +193,16 @@ export default function PlaybookEditorPage() {
   // Hydrate form from existing playbook
   useEffect(() => {
     if (existing) {
-      setGreetingMessage(existing.greeting_message ?? '')
-      setInstructions(existing.instructions ?? '')
-      setTone(existing.tone ?? 'professional')
-      setDos(existing.dos ?? [])
-      setDonts(existing.donts ?? [])
-      setScenarios(existing.scenarios ?? [])
-      setOutOfScope(existing.out_of_scope_response ?? '')
-      setFallback(existing.fallback_response ?? '')
-      setEscalationMessage(existing.custom_escalation_message ?? '')
+      const cfg = existing.config || {}
+      setGreetingMessage(cfg.greeting_message || existing.greeting_message || '')
+      setInstructions(cfg.instructions || existing.instructions || '')
+      setTone(cfg.tone || existing.tone || 'professional')
+      setDos(cfg.dos || existing.dos || [])
+      setDonts(cfg.donts || existing.donts || [])
+      setScenarios(cfg.scenarios || existing.scenarios || [])
+      setOutOfScope(cfg.out_of_scope_response || existing.out_of_scope_response || '')
+      setFallback(cfg.fallback_response || existing.fallback_response || '')
+      setEscalationMessage(cfg.custom_escalation_message || existing.custom_escalation_message || '')
       setIsActive(existing.is_active ?? true)
       setIsDirty(false)
     }
@@ -229,6 +231,32 @@ export default function PlaybookEditorPage() {
   })
 
   function mark() { setIsDirty(true) }
+
+  async function handleSave() {
+    const combinedText = [
+      greetingMessage,
+      instructions,
+      ...scenarios.map((s) => `${s.trigger} ${s.response}`),
+      outOfScope,
+      fallback,
+      escalationMessage,
+    ]
+      .filter(Boolean)
+      .join(' ')
+
+    try {
+      const result = await playbooksApi.validateSafety(combinedText)
+      if (!result.safe) {
+        setSafetyWarning(result.warning || 'Safety validation failed')
+        toast.error(result.warning || 'Playbook content failed safety check')
+        return
+      }
+      setSafetyWarning(null)
+      save.mutate()
+    } catch (error) {
+      toast.error('Failed to validate safety')
+    }
+  }
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
@@ -265,7 +293,7 @@ export default function PlaybookEditorPage() {
             Active
           </label>
           <button
-            onClick={() => save.mutate()}
+            onClick={handleSave}
             disabled={save.isPending || !isDirty}
             className="flex items-center gap-2 px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white text-sm font-medium transition-colors"
           >
@@ -457,7 +485,7 @@ Never discuss competitor restaurants. If asked, say "We focus on making the best
           {/* Save footer */}
           <div className="flex justify-end pb-4">
             <button
-              onClick={() => save.mutate()}
+              onClick={handleSave}
               disabled={save.isPending || !isDirty}
               className="flex items-center gap-2 px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white font-medium transition-colors"
             >

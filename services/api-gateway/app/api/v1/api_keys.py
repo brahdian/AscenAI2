@@ -41,6 +41,23 @@ async def create_api_key(
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required.")
 
+    # Check plan limit: max_api_keys
+    from app.models.tenant import Tenant, TenantUsage
+    from app.services.tenant_service import get_plan_limits, check_limit
+    t_res = await db.execute(select(Tenant).where(Tenant.id == uuid.UUID(tenant_id)))
+    tenant = t_res.scalar_one_or_none()
+    limits = await get_plan_limits(tenant.plan if tenant else "professional", db)
+    existing_count_res = await db.execute(
+        select(APIKey).where(APIKey.tenant_id == uuid.UUID(tenant_id), APIKey.is_active.is_(True))
+    )
+    existing_count = len(existing_count_res.scalars().all())
+    if not check_limit(limits["max_api_keys"], existing_count):
+        raise HTTPException(
+            status_code=429,
+            detail=f"API key limit reached: your plan allows up to {limits['max_api_keys']} active key(s). "
+                   f"Delete an existing key or upgrade your plan.",
+        )
+
     # Validate requested scopes
     requested = set(body.scopes)
     invalid = requested - _ALL_VALID_SCOPES
@@ -94,14 +111,24 @@ async def create_api_key(
 async def list_api_keys(
     request: Request,
     db: AsyncSession = Depends(get_db),
+    page: int = 1,
+    limit: int = 50,
 ):
-    """List all API keys for the current tenant."""
+    """List all API keys for the current tenant. Paginated."""
     tenant_id = _require_tenant(request)
+    if page < 1:
+        page = 1
+    limit = min(max(limit, 1), 200)
+    offset = (page - 1) * limit
     result = await db.execute(
-        select(APIKey).where(
+        select(APIKey)
+        .where(
             APIKey.tenant_id == uuid.UUID(tenant_id),
             APIKey.is_active.is_(True),
         )
+        .order_by(APIKey.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     keys = result.scalars().all()
     return [

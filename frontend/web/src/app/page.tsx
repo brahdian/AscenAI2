@@ -15,6 +15,9 @@ export default function HomePage() {
           <Link href="/pricing" className="text-gray-300 hover:text-white transition-colors text-sm">
             Pricing
           </Link>
+          <Link href="/docs" className="text-gray-300 hover:text-white transition-colors text-sm">
+            Docs
+          </Link>
           <Link href="/login" className="text-gray-300 hover:text-white transition-colors text-sm">
             Sign in
           </Link>

@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 import sentry_sdk
 import structlog
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 
 from app.core.config import settings
-from app.core.redis_client import init_redis, close_redis
+from app.core.redis_client import init_redis, close_redis, get_redis
 from app.api.v1 import voice as voice_router
 
 # ---------------------------------------------------------------------------
@@ -86,13 +90,72 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+_AUDIO_CLEANUP_DIRS = [
+    Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings")),
+    Path(os.environ.get("TTS_AUDIO_PATH", "/tmp/tts-cache")),
+]
+_AUDIO_MAX_AGE_SECONDS = 86400  # 24 hours
+
+
+async def _cleanup_audio_files() -> None:
+    """Periodically remove audio files older than 24 hours to prevent disk exhaustion."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # run every hour
+            cutoff = time.time() - _AUDIO_MAX_AGE_SECONDS
+            for base_dir in _AUDIO_CLEANUP_DIRS:
+                if not base_dir.exists():
+                    continue
+                removed = 0
+                for f in base_dir.iterdir():
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+                if removed:
+                    logger.info("audio_cleanup_complete", directory=str(base_dir), removed=removed)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("audio_cleanup_error", error=type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("voice_pipeline_starting", version=settings.APP_VERSION)
+
+    # Ensure audio directories exist
+    for d in _AUDIO_CLEANUP_DIRS:
+        d.mkdir(parents=True, exist_ok=True)
+
     redis = await init_redis()
     app.state.redis = redis
+
+    # Pre-synthesise backchannel filler clips to disk so they are ready for realtime use
+    try:
+        from app.services.voice_pipeline import VoicePipeline
+        from app.services.stt_service import STTService
+        from app.services.tts_service import TTSService
+        # Instantiate temporarily just to run the synthesis
+        temp_pipeline = VoicePipeline(
+            stt=STTService(),
+            tts=TTSService(),
+            orchestrator_url="",
+            redis=None
+        )
+        # Note: _presynthesize_backchannels is a fast no-op if files already exist
+        await temp_pipeline._presynthesize_backchannels()
+    except Exception as exc:
+        logger.error("backchannel_presynthesis_failed", error=str(exc))
+
+    # Start audio cleanup background task
+    cleanup_task = asyncio.create_task(_cleanup_audio_files())
+
+    app.state.startup_complete = True
     logger.info("voice_pipeline_ready")
     yield
+
+    cleanup_task.cancel()
+    await asyncio.gather(cleanup_task, return_exceptions=True)
     await close_redis()
     logger.info("voice_pipeline_stopped")
 
@@ -121,6 +184,55 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 @app.get("/health", tags=["health"])
 async def health():
     return {"status": "ok", "service": settings.APP_NAME, "version": settings.APP_VERSION}
+
+
+@app.get("/health/startup", include_in_schema=False)
+async def health_startup(request: Request):
+    """Kubernetes startupProbe — Redis check. Returns 503 until startup_complete."""
+    if not getattr(request.app.state, "startup_complete", False):
+        return JSONResponse(status_code=503, content={"status": "starting", "service": settings.APP_NAME})
+
+    checks: dict = {"status": "ok", "service": settings.APP_NAME}
+    failed = False
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready():
+    """Kubernetes readinessProbe — Redis fast check. Returns 503 if Redis is down."""
+    checks: dict = {"status": "ok", "service": settings.APP_NAME}
+    failed = False
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Kubernetes livenessProbe — lightweight check that process and event loop are alive."""
+    return {"alive": True}
 
 
 def _verify_ws_token(token: str, path_tenant_id: str) -> bool:
@@ -211,3 +323,65 @@ async def voice_websocket(
     finally:
         await pipeline.on_disconnect()
         manager.disconnect(client_id)
+
+
+@app.websocket("/ws/voice/{agent_id}")
+async def voice_websocket_agent(
+    websocket: WebSocket,
+    agent_id: str,
+):
+    """
+    WebSocket endpoint for real-time voice — agent-scoped path used by
+    Twilio Media Streams and browser clients that embed agent_id in the path.
+
+    Twilio connects here when the TwiML ``<Stream>`` URL is:
+      ``wss://{host}/ws/voice/{agent_id}?tenant_id=...&session_id=...&token=...``
+
+    Browser clients can also use this endpoint to avoid encoding tenant/session
+    in the path (they pass them as query parameters instead).
+
+    Query parameters:
+      tenant_id  — required; must match the JWT claim
+      session_id — optional; auto-generated if absent
+      token      — required JWT access token
+    """
+    from app.services.voice_pipeline import VoicePipeline
+    from app.services.stt_service import STTService
+    from app.services.tts_service import TTSService
+
+    tenant_id = websocket.query_params.get("tenant_id", "")
+    session_id = websocket.query_params.get("session_id") or str(uuid.uuid4())
+    token = websocket.query_params.get("token", "")
+
+    if not tenant_id or not token:
+        await websocket.close(code=4401, reason="tenant_id and token are required")
+        return
+
+    redis = getattr(app.state, "redis", None)
+
+    pipeline = VoicePipeline(
+        stt=STTService(),
+        tts=TTSService(),
+        orchestrator_url=settings.AI_ORCHESTRATOR_URL,
+        redis=redis,
+    )
+
+    try:
+        await pipeline.handle_websocket(
+            websocket=websocket,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            token=token,
+        )
+    except Exception as exc:
+        logger.error("voice_ws_agent_error", agent_id=agent_id, error=str(exc))
+        try:
+            if websocket.client_state.value == 1:  # CONNECTED
+                await websocket.send_text(
+                    json.dumps({"type": "error", "message": "An internal error occurred"})
+                )
+        except Exception:
+            pass
+    finally:
+        await pipeline.close()

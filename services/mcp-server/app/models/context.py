@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -79,7 +81,12 @@ class KnowledgeDocument(Base):
         String(50), nullable=False, default="text"
     )
 
-    # Qdrant point ID for vector lookup
+    # pgvector embedding column (768-dim, Gemini text-embedding-004)
+    embedding: Mapped[Optional[list[float]]] = mapped_column(
+        Vector(768), nullable=True
+    )
+
+    # Legacy Vector ID (kept for backwards compat, no longer used for lookup)
     vector_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     doc_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)

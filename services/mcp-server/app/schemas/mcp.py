@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -67,6 +67,43 @@ class MCPContextResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Tool Authentication Configuration
+# ---------------------------------------------------------------------------
+
+class ToolAuthConfig(BaseModel):
+    """Structured auth config stored in AgentTool.config.auth_config (JSONB).
+    Using model_config extra='forbid' ensures unknown credential fields are rejected
+    at write time, preventing silent misconfigurations.
+    """
+    model_config = {"extra": "forbid"}
+
+    type: Literal["none", "api_key", "bearer", "basic", "oauth2_cc"] = Field(
+        default="none",
+        description="Authentication method for this tool's endpoint",
+    )
+    # api_key / bearer
+    value: Optional[str] = Field(
+        None,
+        max_length=4096,
+        description="Credential value — API key or bearer token (stored encrypted at rest)",
+    )
+    header: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Header name for api_key auth (e.g. 'X-API-Key', 'Authorization')",
+    )
+    # basic auth
+    username: Optional[str] = Field(None, max_length=255)
+    password: Optional[str] = Field(None, max_length=4096, description="Basic auth password (encrypted)")
+    # oauth2_cc (client credentials)
+    token_url: Optional[str] = Field(None, max_length=2048)
+    client_id: Optional[str] = Field(None, max_length=512)
+    client_secret: Optional[str] = Field(None, max_length=4096, description="OAuth2 client secret (encrypted)")
+    scope: Optional[str] = Field(None, max_length=512)
+    audience: Optional[str] = Field(None, max_length=512)
+
+
+# ---------------------------------------------------------------------------
 # Tool Registration
 # ---------------------------------------------------------------------------
 
@@ -77,7 +114,7 @@ class ToolRegistration(BaseModel):
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
     endpoint_url: Optional[str] = Field(None, max_length=2048)
-    auth_config: Optional[dict[str, Any]] = None
+    auth_config: Optional[ToolAuthConfig] = None
     rate_limit_per_minute: int = Field(default=60, ge=1, le=10000)
     timeout_seconds: int = Field(default=30, ge=1, le=300)
     is_builtin: bool = False
@@ -90,22 +127,28 @@ class ToolUpdate(BaseModel):
     input_schema: Optional[dict[str, Any]] = None
     output_schema: Optional[dict[str, Any]] = None
     endpoint_url: Optional[str] = None
-    auth_config: Optional[dict[str, Any]] = None
+    auth_config: Optional[ToolAuthConfig] = None
     rate_limit_per_minute: Optional[int] = Field(None, ge=1, le=10000)
     timeout_seconds: Optional[int] = Field(None, ge=1, le=300)
     is_active: Optional[bool] = None
     tool_metadata: Optional[dict[str, Any]] = None
 
 
+class ToolTestExecutionRequest(BaseModel):
+    tool_config: ToolRegistration = Field(..., description="The transient tool configuration to test")
+    parameters: dict[str, Any] = Field(default_factory=dict, description="Sample input parameters")
+
+
 class ToolResponse(BaseModel):
-    id: str
-    tenant_id: str
+    id: UUID
+    tenant_id: UUID
     name: str
     description: str
     category: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     endpoint_url: Optional[str]
+    auth_config: Optional[dict[str, Any]] = None
     rate_limit_per_minute: int
     timeout_seconds: int
     is_active: bool
@@ -211,5 +254,4 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     redis: str
-    qdrant: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -2,8 +2,9 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { tenantApi, agentsApi, sessionsApi } from '@/lib/api'
+import { getPlanDisplayName } from '@/lib/plans'
 import { useAuthStore } from '@/store/auth'
-import { Bot, MessageSquare, Zap, TrendingUp } from 'lucide-react'
+import { Bot, MessageSquare, Zap, TrendingUp, AlertCircle } from 'lucide-react'
 
 function StatCard({
   icon: Icon,
@@ -37,17 +38,17 @@ export default function DashboardPage() {
 
   const { data: usage } = useQuery({
     queryKey: ['usage'],
-    queryFn: tenantApi.getUsage,
+    queryFn: () => tenantApi.getUsage(),
   })
 
   const { data: agents } = useQuery({
     queryKey: ['agents'],
-    queryFn: agentsApi.list,
+    queryFn: () => agentsApi.list(),
   })
 
   const { data: tenant } = useQuery({
     queryKey: ['tenant'],
-    queryFn: tenantApi.getMe,
+    queryFn: () => tenantApi.getMe(),
   })
 
   return (
@@ -62,43 +63,35 @@ export default function DashboardPage() {
         </p>
       </div>
 
-      {/* Plan badge */}
-      {tenant && (
-        <div className="mb-6 inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-50 dark:bg-violet-900/20 border border-violet-100 dark:border-violet-800 text-violet-700 dark:text-violet-300 text-sm font-medium">
-          <Zap size={14} />
-          {tenant.plan.charAt(0).toUpperCase() + tenant.plan.slice(1)} Plan
-        </div>
-      )}
-
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard
           icon={MessageSquare}
-          label="Sessions this month"
+          label="Sessions"
           value={usage?.current_month_sessions ?? '—'}
+          sub="Total conversations"
           color="bg-blue-500"
         />
         <StatCard
-          icon={TrendingUp}
-          label="Messages"
-          value={usage?.current_month_messages ?? '—'}
+          icon={Bot}
+          label="Chat Equivalents"
+          value={usage?.current_month_chat_units ?? '—'}
+          sub="10 turns = 1 chat"
           color="bg-violet-500"
         />
         <StatCard
-          icon={Bot}
-          label="Active agents"
-          value={agents?.length ?? '—'}
-          color="bg-emerald-500"
+          icon={Zap}
+          label="Voice Minutes"
+          value={usage?.current_month_voice_minutes !== undefined ? usage.current_month_voice_minutes.toFixed(1) + 'm' : '—'}
+          sub="AI-user calls"
+          color="bg-orange-500"
         />
         <StatCard
-          icon={Zap}
-          label="Tokens used"
-          value={
-            usage?.current_month_tokens
-              ? (usage.current_month_tokens / 1000).toFixed(1) + 'k'
-              : '—'
-          }
-          color="bg-orange-500"
+          icon={TrendingUp}
+          label="Active agents"
+          value={Array.isArray(agents) ? agents.length : 0}
+          sub="Manage assistants"
+          color="bg-emerald-500"
         />
       </div>
 

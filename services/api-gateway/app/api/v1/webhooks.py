@@ -1,19 +1,78 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import ipaddress
+import json
 import secrets
+import urllib.parse
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog import get_logger
 
 from app.core.database import get_db
-from app.models.user import Webhook
-from app.schemas.auth import WebhookCreateRequest, WebhookResponse, WebhookUpdateRequest
+from app.models.user import User, Webhook
+from app.schemas.auth import WebhookCreateRequest, WebhookCreatedResponse, WebhookResponse, WebhookUpdateRequest
+from app.services.auth_service import auth_service
+from app.services.auth_service import auth_service
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/webhooks")
+
+# ---------------------------------------------------------------------------
+# SSRF guard (Critical fix)
+# ---------------------------------------------------------------------------
+
+_PRIVATE_PREFIXES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),  # Carrier-grade NAT
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+_MAX_EVENTS = 20  # prevent unbounded event list
+
+
+def _validate_webhook_url(url: str) -> None:
+    """
+    Reject URLs that target localhost, private/internal IPs, or use non-HTTPS
+    schemes. Prevents SSRF via webhook registration.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid webhook URL.")
+
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=422, detail="Webhook URL must use HTTPS.")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise HTTPException(status_code=422, detail="Webhook URL must include a hostname.")
+
+    if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        raise HTTPException(status_code=422, detail="Webhook URL must not target localhost.")
+
+    # Reject private / link-local / loopback IP ranges
+    try:
+        ip = ipaddress.ip_address(hostname)
+        for net in _PRIVATE_PREFIXES:
+            if ip in net:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Webhook URL must not target a private or reserved IP address.",
+                )
+    except ValueError:
+        pass  # hostname is a domain name — allowed
 
 
 def _require_tenant(request: Request) -> str:
@@ -23,14 +82,29 @@ def _require_tenant(request: Request) -> str:
     return tenant_id
 
 
-@router.post("", response_model=WebhookResponse, status_code=201)
+@router.post("", response_model=WebhookCreatedResponse, status_code=201)
 async def create_webhook(
     body: WebhookCreateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new webhook endpoint."""
+    """
+    Create a new webhook endpoint.
+    The signing secret is returned ONCE in this response and never again.
+    Store it securely — it cannot be recovered after creation.
+    """
     tenant_id = _require_tenant(request)
+
+    # SSRF guard
+    _validate_webhook_url(body.url)
+
+    # Enforce event list size cap
+    if len(body.events) > _MAX_EVENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many events. Maximum {_MAX_EVENTS} event types per webhook.",
+        )
+
     secret = "whsec_" + secrets.token_hex(32)
     webhook = Webhook(
         id=uuid.uuid4(),
@@ -43,13 +117,15 @@ async def create_webhook(
     db.add(webhook)
     await db.commit()
     await db.refresh(webhook)
-    return WebhookResponse(
+    # Return secret ONE TIME only — mirrors APIKeyCreatedResponse pattern
+    return WebhookCreatedResponse(
         id=str(webhook.id),
         tenant_id=str(webhook.tenant_id),
         url=webhook.url,
         events=webhook.events,
         is_active=webhook.is_active,
         created_at=webhook.created_at.isoformat(),
+        secret=secret,
     )
 
 
@@ -97,8 +173,14 @@ async def update_webhook(
         raise HTTPException(status_code=404, detail="Webhook not found.")
 
     if body.url is not None:
+        _validate_webhook_url(body.url)  # SSRF guard on update too
         webhook.url = body.url
     if body.events is not None:
+        if len(body.events) > _MAX_EVENTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Too many events. Maximum {_MAX_EVENTS} event types per webhook.",
+            )
         webhook.events = body.events
     if body.is_active is not None:
         webhook.is_active = body.is_active
@@ -134,3 +216,22 @@ async def delete_webhook(
         raise HTTPException(status_code=404, detail="Webhook not found.")
     await db.delete(webhook)
     await db.commit()
+
+
+# Redundant stripe_webhook removed — use /api/v1/billing/webhook instead.
+
+
+async def _send_welcome_email_async(email: str, full_name: str) -> None:
+    """Send a welcome email after payment activation."""
+    from app.core.config import settings
+    from app.services.email_service import send_email
+
+    html_body = f"""
+    <html><body>
+    <h1>Welcome to AscenAI, {full_name}!</h1>
+    <p>Your account is now active. Get started at <a href="{settings.FRONTEND_URL}">{settings.FRONTEND_URL}</a></p>
+    </body></html>
+    """
+    await send_email(email, "Welcome to AscenAI!", html_body)
+
+

@@ -1,108 +1,79 @@
+'use client'
+
+import { useState } from 'react'
 import Link from 'next/link'
-import { Check, Zap, X } from 'lucide-react'
-
-const tiers = [
-  {
-    name: 'Professional',
-    price: 99,
-    description: 'Perfect for salons, restaurants, clinics and small businesses.',
-    badge: null,
-    color: 'border-white/10',
-    highlight: false,
-    limits: {
-      chat_messages: '5,000 / month',
-      voice_minutes: '200 min / month',
-      playbooks: '5 per agent',
-      rag_documents: '25 documents',
-      team_seats: '3 seats',
-      api_access: true,
-      webhooks: true,
-      guardrails: true,
-      analytics: 'Standard',
-      support: 'Email',
-    },
-    overage: {
-      chat: '$0.015 / message',
-      voice: '$0.15 / min',
-    },
-    cta: 'Get started',
-  },
-  {
-    name: 'Business',
-    price: 299,
-    description: 'For growing businesses with high call and chat volume.',
-    badge: 'Most popular',
-    color: 'border-violet-500/50',
-    highlight: true,
-    limits: {
-      chat_messages: '25,000 / month',
-      voice_minutes: '1,000 min / month',
-      playbooks: 'Unlimited',
-      rag_documents: '200 documents',
-      team_seats: '10 seats',
-      api_access: true,
-      webhooks: true,
-      guardrails: true,
-      analytics: 'Advanced + exports',
-      support: 'Priority email (24h)',
-    },
-    overage: {
-      chat: '$0.012 / message',
-      voice: '$0.12 / min',
-    },
-    cta: 'Get started',
-  },
-]
-
-const featureRows = [
-  { label: 'Chat messages / month', key: 'chat_messages' },
-  { label: 'Voice minutes / month', key: 'voice_minutes' },
-  { label: 'Playbooks per agent', key: 'playbooks' },
-  { label: 'RAG knowledge base', key: 'rag_documents' },
-  { label: 'Team seats', key: 'team_seats' },
-  { label: 'API access & embed widget', key: 'api_access', bool: true },
-  { label: 'Webhook events', key: 'webhooks', bool: true },
-  { label: 'Guardrails & content filtering', key: 'guardrails', bool: true },
-  { label: 'Analytics', key: 'analytics' },
-  { label: 'Support', key: 'support' },
-]
-
-const faqs = [
-  {
-    q: 'Is there a free trial or setup fee?',
-    a: 'No setup fees, no free trial. Unlike platforms that charge $30,000+ in onboarding fees (Ada, Intercom), AscenAI is fully self-serve. Sign up and have an agent live in minutes.',
-  },
-  {
-    q: 'What counts as a chat message?',
-    a: 'Each user message sent to an agent counts as one message. AI responses do not count separately.',
-  },
-  {
-    q: 'What counts as a voice minute?',
-    a: 'Billed per minute, rounded up. Includes STT (transcription), AI response time, and TTS (speech synthesis). A 90-second call = 2 minutes.',
-  },
-  {
-    q: 'What happens when I exceed my limits?',
-    a: 'Your agent keeps running — we never cut off an active conversation. Overage is billed at the per-unit rate shown in your plan and appears on your next invoice.',
-  },
-  {
-    q: 'Which AI model powers the agents?',
-    a: 'All plans run on Gemini 2.5 Flash Lite — Google\'s fastest multimodal model optimised for real-time voice and chat. It handles both audio transcription and text responses in a single model, keeping costs low and latency under 200ms.',
-  },
-  {
-    q: 'How does this compare to Ada or Intercom Fin?',
-    a: 'Ada charges $30,000+ in setup fees before you deploy a single agent. Intercom Fin bills $0.99 per resolution — a busy support team can easily hit $5,000+/month. AscenAI is flat-rate, self-serve, and includes voice out of the box.',
-  },
-  {
-    q: 'Can I have multiple agents on one account?',
-    a: 'Yes. Each agent is billed separately. You could run a booking agent, a support agent, and a sales agent for $297/month on Professional — or $897/month on Business.',
-  },
-  {
-    q: 'What is included in Enterprise?',
-    a: 'Unlimited messages and voice minutes, dedicated infrastructure, custom Gemini model selection (Flash, Pro, or future Gemini 3.x), white-label branding, SLA, HIPAA/SOC2 compliance, and a named account manager.',
-  },
-]
+import { useQuery } from '@tanstack/react-query'
+import { billingApi } from '@/lib/api'
+import { Check, Zap, X, RefreshCw } from 'lucide-react'
 
 export default function PricingPage() {
+  const [isYearly, setIsYearly] = useState(false)
+
+  const { data: plansData, isLoading } = useQuery({
+    queryKey: ['public-plans'],
+    queryFn: () => billingApi.listPlans(),
+  })
+
+  if (isLoading || !plansData) {
+    return (
+      <div className="min-h-screen bg-[#0f0728] flex items-center justify-center">
+        <RefreshCw className="animate-spin text-white/20" size={32} />
+      </div>
+    )
+  }
+
+  // Convert Record<string, Plan> to sorted array for the grid
+  // We want Starter -> Growth -> Business order
+  const order = ['starter', 'growth', 'business']
+  const plans = order.map(key => ({
+    key,
+    ...plansData[key]
+  })).filter(p => p.display_name)
+
+  const featureRows = [
+    { label: 'Usage (chat equivalents)', key: 'chat_equivalents_included', format: (v: any) => `${(v || 0).toLocaleString()} / month` },
+    { label: 'Voice minutes', key: 'voice_minutes_included', format: (v: any) => v ? `${v.toLocaleString()} mins included` : 'None' },
+    { label: 'Playbooks per agent', key: 'playbooks_per_agent', format: (v: any) => v ? `${v} per agent` : 'Unlimited' },
+    { label: 'RAG knowledge base', key: 'rag_documents', format: (v: any) => `${v} documents` },
+    { label: 'Team seats', key: 'team_seats', format: (v: any) => `${v} seats` },
+    { label: 'API access & embed widget', key: 'api_access', bool: true, defaultValue: true },
+    { label: 'Webhook events', key: 'webhooks', bool: true, defaultValue: true },
+    { label: 'Guardrails & filtering', key: 'guardrails', bool: true, defaultValue: true },
+    { label: 'Analytics', key: 'analytics', format: () => 'Advanced' },
+    { label: 'Support', key: 'support', format: () => 'Priority email' },
+  ]
+
+  const faqs = [
+    {
+      q: 'How does the "chat equivalents" model work?',
+      a: 'Each plan gives you a pool of "chat equivalents" you can use any way you want. 1 voice minute = 100 chat equivalents. For example, on the Growth plan you get 80,000 chat equivalents — you could use all 80,000 as chats, or 800 voice minutes, or any combination — like 400 mins + 40,000 chats.',
+    },
+    {
+      q: 'What is a chat equivalent?',
+      a: 'A chat equivalent is our unified unit of usage. 1 chat = 1 chat equivalent. 1 voice minute = 100 chat equivalents. This lets you use your plan allowance flexibly across both chat and voice.',
+    },
+    {
+      q: 'How are voice minutes calculated?',
+      a: 'Billed per minute, rounded up. Each voice minute includes STT (transcription), AI response time, and TTS (speech synthesis). A 90-second call = 2 voice minutes = 200 chat equivalents.',
+    },
+    {
+      q: 'What happens when I exceed my limits?',
+      a: 'Your agent keeps running — we never cut off an active conversation. Overage is billed at the rates specified in your plan and appears on your next invoice.',
+    },
+    {
+      q: 'Do I need my own Twilio or Telnyx account?',
+      a: 'Yes. You bring your own Twilio or Telnyx account for telephony. This means you only pay us for the AI layer (STT, LLM, and TTS) — not for carrier costs. That\'s how we can offer significantly more voice minutes at lower prices compared to competitors who bundle telephony.',
+    },
+    {
+      q: 'Can I switch between plans?',
+      a: 'Yes, you can upgrade or downgrade your plan at any time. Changes take effect on your next billing cycle, and we\'ll prorate any differences.',
+    },
+    {
+      q: 'Which AI model powers the agents?',
+      a: 'All plans run on Gemini 2.5 Flash Lite — Google\'s fastest multimodal model optimised for real-time voice and chat. It handles both audio transcription and text responses in a single model, keeping costs low and latency under 200ms.',
+    },
+  ]
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-[#0f0728] via-[#1a1040] to-[#0c1e4a] text-white">
       {/* Navbar */}
@@ -127,63 +98,112 @@ export default function PricingPage() {
       </nav>
 
       {/* Header */}
-      <section className="max-w-4xl mx-auto px-8 pt-16 pb-12 text-center">
+      <section className="max-w-4xl mx-auto px-8 pt-16 pb-8 text-center">
         <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-500/10 border border-violet-500/20 text-violet-300 text-sm mb-6">
           No setup fees · No per-resolution billing · Cancel anytime
         </div>
         <h1 className="text-5xl font-bold mb-4">Simple pricing, no surprises</h1>
         <p className="text-gray-400 text-lg max-w-2xl mx-auto">
-          Flat monthly rate per agent. While others charge $30,000+ in setup fees,
-          AscenAI is fully self-serve — live in minutes.
+          Flat monthly rate per agent. Choose Chat-only or add Voice. While others charge 
+          $30,000+ in setup fees, AscenAI is fully self-serve — live in minutes.
         </p>
         <p className="mt-3 text-sm text-violet-300">
-          Powered by Gemini 2.5 Flash Lite · Google Cloud TTS · Twilio voice
+          Powered by Gemini 2.5 Flash Lite · Google Cloud TTS · BYO Twilio/Telnyx
         </p>
+
+        {/* Billing Toggle */}
+        <div className="mt-8 flex items-center justify-center gap-4">
+          <span className={`text-sm ${!isYearly ? 'text-white font-medium' : 'text-gray-400'}`}>
+            Monthly
+          </span>
+          <button
+            onClick={() => setIsYearly(!isYearly)}
+            className={`relative w-14 h-7 rounded-full transition-colors ${
+              isYearly ? 'bg-violet-600' : 'bg-gray-600'
+            }`}
+          >
+            <div
+              className={`absolute top-1 w-5 h-5 rounded-full bg-white transition-transform ${
+                isYearly ? 'translate-x-8' : 'translate-x-1'
+              }`}
+            />
+          </button>
+          <span className={`text-sm ${isYearly ? 'text-white font-medium' : 'text-gray-400'}`}>
+            Yearly
+          </span>
+          {isYearly && (
+            <span className="ml-2 px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs font-medium">
+              Save 20%
+            </span>
+          )}
+        </div>
       </section>
 
-      {/* Tier cards */}
-      <section className="max-w-4xl mx-auto px-8 pb-16">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-3xl mx-auto">
-          {tiers.map((tier) => (
+      {/* Plans Grid */}
+      <section className="max-w-6xl mx-auto px-8 pb-16">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {plans.map((plan) => (
             <div
-              key={tier.name}
-              className={`relative rounded-2xl border ${tier.color} bg-white/[0.03] backdrop-blur-sm p-7 flex flex-col ${
-                tier.highlight ? 'shadow-[0_0_60px_rgba(124,58,237,0.2)]' : ''
+              key={plan.key}
+              className={`relative rounded-2xl border ${plan.color || 'border-white/10'} bg-white/[0.03] backdrop-blur-sm p-7 flex flex-col ${
+                plan.highlight ? 'shadow-[0_0_60px_rgba(124,58,237,0.2)]' : ''
               }`}
             >
-              {tier.badge && (
-                <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-semibold">
-                  {tier.badge}
+              {plan.badge && (
+                <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-semibold whitespace-nowrap">
+                  {plan.badge}
                 </div>
               )}
 
               <div className="mb-6">
-                <h2 className="text-lg font-semibold text-white mb-1">{tier.name}</h2>
-                <p className="text-gray-400 text-sm mb-4">{tier.description}</p>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 rounded-md bg-violet-500/20 text-violet-300 text-xs font-medium">
+                    {plan.display_name}
+                  </span>
+                </div>
+                <p className="text-gray-400 text-sm mb-4 h-10 line-clamp-2">{plan.description}</p>
                 <div className="flex items-end gap-1">
-                  <span className="text-5xl font-bold text-white">${tier.price}</span>
-                  <span className="text-gray-400 mb-1.5">/ agent / month</span>
+                  <span className="text-5xl font-bold text-white">
+                    ${isYearly 
+                      ? Math.round((plan.price_per_agent || 0) * 12 * 0.8) 
+                      : (plan.price_per_agent || 0)
+                    }
+                  </span>
+                  <span className="text-gray-400 mb-1.5">/ agent / {isYearly ? 'year' : 'month'}</span>
+                </div>
+                {isYearly && (
+                  <p className="text-sm text-gray-500 mt-1">
+                    (${plan.price_per_agent}/month billed annually)
+                  </p>
+                )}
+                <div className="mt-3 space-y-1">
+                   <p className="text-violet-300 text-sm font-medium">
+                     {(plan.chat_equivalents_included || 0).toLocaleString()} chats/month
+                   </p>
                 </div>
               </div>
 
               <Link
                 href="/register"
                 className={`block text-center py-3 rounded-xl text-sm font-semibold mb-6 transition-all ${
-                  tier.highlight
+                  plan.highlight
                     ? 'bg-gradient-to-r from-violet-600 to-blue-600 text-white hover:opacity-90'
                     : 'border border-white/20 text-white hover:bg-white/5'
                 }`}
               >
-                {tier.cta}
+                Get Started
               </Link>
 
               <div className="space-y-3 flex-1">
                 {featureRows.map((row) => {
-                  const val = tier.limits[row.key as keyof typeof tier.limits]
+                  const val = plan[row.key as keyof typeof plan]
+                  const displayVal = row.format ? row.format(val) : (row.bool ? (val ?? row.defaultValue) : String(val))
+                  const isEnabled = row.bool ? (val ?? row.defaultValue) : true
+
                   return (
                     <div key={row.key} className="flex items-start gap-2.5 text-sm">
                       {row.bool ? (
-                        val ? (
+                        isEnabled ? (
                           <Check size={15} className="text-violet-400 shrink-0 mt-0.5" />
                         ) : (
                           <X size={15} className="text-gray-600 shrink-0 mt-0.5" />
@@ -191,9 +211,9 @@ export default function PricingPage() {
                       ) : (
                         <Check size={15} className="text-violet-400 shrink-0 mt-0.5" />
                       )}
-                      <span className={`${row.bool && !val ? 'text-gray-600' : 'text-gray-300'}`}>
+                      <span className={`${row.bool && !isEnabled ? 'text-gray-600' : 'text-gray-300'}`}>
                         <span className="text-gray-500 mr-1">{row.label}:</span>
-                        {row.bool ? (val ? '' : 'Not included') : String(val)}
+                        {row.bool ? (isEnabled ? 'Included' : 'Not included') : displayVal}
                       </span>
                     </div>
                   )
@@ -201,23 +221,27 @@ export default function PricingPage() {
               </div>
 
               <div className="mt-6 pt-5 border-t border-white/5 text-xs text-gray-500 space-y-1">
-                <p className="font-medium text-gray-400 mb-1.5">Overage (agents never go offline):</p>
-                <p>Chat: {tier.overage.chat}</p>
-                <p>Voice: {tier.overage.voice}</p>
+                <p className="font-medium text-gray-400 mb-1.5">Overage:</p>
+                <p>Chat: ${plan.overage_per_chat_equivalent} per chat</p>
+                {plan.overage_per_voice_minute > 0 && (
+                  <p>Voice: ${plan.overage_per_voice_minute}/min</p>
+                )}
               </div>
             </div>
           ))}
         </div>
+      </section>
 
-        {/* Enterprise */}
-        <div className="mt-6 max-w-3xl mx-auto rounded-2xl border border-white/10 bg-white/[0.02] p-6 flex flex-col md:flex-row items-center justify-between gap-4">
+      {/* Enterprise */}
+      <section className="max-w-3xl mx-auto px-8 pb-16">
+        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-6 flex flex-col md:flex-row items-center justify-between gap-4">
           <div>
             <div className="flex items-center gap-2 mb-1">
               <Zap size={16} className="text-yellow-400" />
               <h3 className="font-semibold text-white">Enterprise</h3>
             </div>
             <p className="text-gray-400 text-sm">
-              Unlimited messages & voice · Custom Gemini model (Flash, Pro, Gemini 3.x) ·
+              High volume (contact for custom limits) · Custom Gemini model (Flash, Pro, Gemini 3.x) ·
               Dedicated infrastructure · White-label · SLA 99.9% · HIPAA/SOC2 · Named account manager
             </p>
           </div>
@@ -227,80 +251,6 @@ export default function PricingPage() {
           >
             Talk to sales →
           </a>
-        </div>
-      </section>
-
-      {/* Comparison vs competitors */}
-      <section className="max-w-3xl mx-auto px-8 pb-20">
-        <h2 className="text-2xl font-bold text-center mb-2">How we compare</h2>
-        <p className="text-gray-400 text-sm text-center mb-8">Same outcome, fraction of the cost</p>
-        <div className="rounded-2xl border border-white/10 bg-white/[0.02] overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-white/5">
-                <th className="text-left px-5 py-3 text-gray-400 font-medium">Platform</th>
-                <th className="text-right px-5 py-3 text-gray-400 font-medium">Setup fee</th>
-                <th className="text-right px-5 py-3 text-gray-400 font-medium">Monthly cost</th>
-                <th className="text-right px-5 py-3 text-gray-400 font-medium">Voice included</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/5">
-              {[
-                ['Ada', '$30,000+', 'Custom', 'Extra'],
-                ['Intercom Fin', 'None', '$0.99/resolution', 'No'],
-                ['Bland.ai', 'None', '$0.09/min voice only', 'Yes'],
-                ['VAPI', 'None', '$0.05–0.10/min', 'Yes, no chat'],
-                ['AscenAI Professional', 'None', '$99/agent flat', 'Yes — included'],
-                ['AscenAI Business', 'None', '$299/agent flat', 'Yes — included'],
-              ].map(([platform, setup, monthly, voice], i) => (
-                <tr key={platform} className={i >= 4 ? 'bg-violet-500/5' : ''}>
-                  <td className={`px-5 py-3 ${i >= 4 ? 'text-violet-300 font-medium' : 'text-gray-300'}`}>
-                    {platform}
-                  </td>
-                  <td className="px-5 py-3 text-right text-gray-400">{setup}</td>
-                  <td className={`px-5 py-3 text-right font-mono ${i >= 4 ? 'text-violet-300 font-semibold' : 'text-gray-400'}`}>
-                    {monthly}
-                  </td>
-                  <td className="px-5 py-3 text-right text-gray-400">{voice}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="text-xs text-gray-600 text-center mt-3">
-          Competitor pricing sourced from public pricing pages. Actual costs vary.
-        </p>
-      </section>
-
-      {/* Example calculation */}
-      <section className="max-w-3xl mx-auto px-8 pb-20">
-        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-6">
-          <h3 className="font-semibold text-white mb-1">Example: Multi-location salon group</h3>
-          <p className="text-gray-400 text-sm mb-4">
-            3 locations, each with a booking + support agent
-          </p>
-          <div className="space-y-2 text-sm">
-            {[
-              ['3 agents × $299/month (Business plan)', '$897'],
-              ['Overage: 200 extra voice minutes @ $0.12', '$24'],
-              ['Total / month', '$921'],
-              ['vs. 1 part-time receptionist (Canada avg)', '$2,200+'],
-            ].map(([label, amount], i) => (
-              <div
-                key={label}
-                className={`flex justify-between ${
-                  i === 3
-                    ? 'pt-3 mt-1 border-t border-white/5 text-gray-500 line-through'
-                    : i === 2
-                    ? 'pt-3 mt-1 border-t border-white/5 font-semibold text-white'
-                    : 'text-gray-300'
-                }`}
-              >
-                <span>{label}</span>
-                <span className="font-mono">{amount}</span>
-              </div>
-            ))}
-          </div>
         </div>
       </section>
 

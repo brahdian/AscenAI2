@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # CORS
+    ALLOWED_ORIGINS: any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
+    ALLOWED_METHODS: str = "GET,POST,PUT,DELETE,OPTIONS"
+    ALLOWED_HEADERS: str = "*"
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def validate_allowed_origins(cls, v: any) -> list[str]:
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
+
     @field_validator("SECRET_KEY")
     @classmethod
     def validate_secret_key(cls, v: str) -> str:
@@ -49,26 +61,10 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Qdrant
-    QDRANT_HOST: str = "localhost"
-    QDRANT_PORT: int = 6333
-    QDRANT_COLLECTION_NAME: str = "knowledge_base"
-    QDRANT_COLLECTION_PREFIX: str = "kb_"
-    QDRANT_VECTOR_SIZE: int = 384  # all-MiniLM-L6-v2 size
-
-    # Tool Execution
-    MAX_TOOL_EXECUTION_TIMEOUT: int = 30
-    RATE_LIMIT_PER_MINUTE: int = 100
-    RATE_LIMIT_WINDOW_SECONDS: int = 60
-
-    # CORS — override in production with explicit origin list
-    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
-    ALLOWED_METHODS: list[str] = ["*"]
-    ALLOWED_HEADERS: list[str] = ["*"]
-
-    # Embeddings
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSION: int = 1536  # text-embedding-3-small dimension
+    # Embeddings — Google Gemini text-embedding-004 (768-dim)
+    GEMINI_API_KEY: str = ""
+    EMBEDDING_MODEL: str = "text-embedding-004"
+    EMBEDDING_DIMENSION: int = 768
 
     # External Services
     OPENAI_API_KEY: Optional[str] = None
@@ -76,8 +72,23 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: Optional[str] = None
     TWILIO_FROM_NUMBER: Optional[str] = None
 
+    # Webhook signing secrets — required in production to verify payload authenticity
+    STRIPE_WEBHOOK_SECRET: Optional[str] = None      # whsec_... from Stripe dashboard
+    CALENDLY_WEBHOOK_SECRET: Optional[str] = None    # signing secret from Calendly webhooks page
+
     # Encryption
     ENCRYPTION_KEY: Optional[str] = None  # Fernet key for encrypting stored secrets
+
+    @field_validator("ENCRYPTION_KEY")
+    @classmethod
+    def validate_encryption_key(cls, v: Optional[str]) -> Optional[str]:
+        import os
+        if os.getenv("ENVIRONMENT", "production") == "production" and not v:
+            raise ValueError(
+                "ENCRYPTION_KEY must be set in production to encrypt stored tool secrets. "
+                "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            )
+        return v
 
     # Observability
     PROMETHEUS_ENABLED: bool = True

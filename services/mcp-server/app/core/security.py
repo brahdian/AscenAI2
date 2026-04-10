@@ -41,9 +41,35 @@ def create_access_token(data: dict, expires_delta_minutes: Optional[int] = None)
 
 
 def decode_token(token: str) -> dict:
-    """Decode and verify a JWT token. Raises HTTPException on failure."""
+    """Decode and verify a JWT token. Raises HTTPException on failure.
+
+    Enforces:
+    - Signature and expiry
+    - Token type must be None or 'access' (refresh tokens rejected)
+    - tenant_id claim must be a valid UUID
+    """
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+
+        if payload.get("type") not in (None, "access"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Validate tenant_id claim format
+        tenant_id = payload.get("tenant_id", "")
+        if tenant_id:
+            try:
+                UUID(str(tenant_id))
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Malformed token claims",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
         return payload
     except JWTError as exc:
         raise HTTPException(

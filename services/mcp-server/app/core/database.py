@@ -6,6 +6,9 @@ import structlog
 
 from app.core.config import settings
 
+from pgvector.asyncpg import register_vector
+from sqlalchemy import event
+
 logger = structlog.get_logger(__name__)
 
 engine = create_async_engine(
@@ -25,6 +28,10 @@ SessionLocal = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
+
+@event.listens_for(engine.sync_engine, "connect")
+def register_pgvector(dbapi_connection, connection_record):
+    dbapi_connection.run_async(register_vector)
 
 
 class Base(DeclarativeBase):

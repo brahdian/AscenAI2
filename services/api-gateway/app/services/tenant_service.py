@@ -11,36 +11,78 @@ from app.models.tenant import Tenant, TenantUsage
 
 logger = structlog.get_logger(__name__)
 
-# Plan limits definition (used by auth_service and tenant routes)
-PLAN_LIMITS: dict[str, dict] = {
+# Plan limits definition — fallback default.
+DEFAULT_PLAN_LIMITS: dict[str, dict] = {
     "starter": {
-        "max_sessions_per_month": 500,
-        "max_messages_per_month": 5000,
-        "max_tokens_per_month": 1_000_000,
-        "max_voice_minutes_per_month": 60,
-        "max_agents": 1,
-        "max_api_keys": 3,
-        "max_webhooks": 2,
+        "chats_included": 20_000,
+        "max_voice_minutes_per_month": 0,
+        "max_agents": 5,
+        "max_api_keys": 5,
+        "max_webhooks": 5,
+        "max_playbooks_per_agent": 5,
+        "max_rag_documents": 50,
+        "max_team_seats": 5,
     },
     "growth": {
-        "max_sessions_per_month": 5000,
-        "max_messages_per_month": 50_000,
-        "max_tokens_per_month": 10_000_000,
-        "max_voice_minutes_per_month": 600,
-        "max_agents": 5,
+        "chats_included": 80_000,
+        "max_voice_minutes_per_month": 1_500,
+        "max_agents": 10,
         "max_api_keys": 10,
         "max_webhooks": 10,
+        "max_playbooks_per_agent": 10,
+        "max_rag_documents": 100,
+        "max_team_seats": 10,
+    },
+    "business": {
+        "chats_included": 170_000,
+        "max_voice_minutes_per_month": 3_500,
+        "max_agents": 25,
+        "max_api_keys": 25,
+        "max_webhooks": 25,
+        "max_playbooks_per_agent": 100,
+        "max_rag_documents": 500,
+        "max_team_seats": 25,
     },
     "enterprise": {
-        "max_sessions_per_month": -1,  # unlimited
-        "max_messages_per_month": -1,
-        "max_tokens_per_month": -1,
-        "max_voice_minutes_per_month": -1,
-        "max_agents": -1,
-        "max_api_keys": -1,
-        "max_webhooks": -1,
+        "chats_included": 500_000,
+        "max_voice_minutes_per_month": 10_000,
+        "max_agents": 500,
+        "max_api_keys": 500,
+        "max_webhooks": 500,
+        "max_playbooks_per_agent": 1_000,
+        "max_rag_documents": 10_000,
+        "max_team_seats": 500,
     },
 }
+
+
+async def get_all_plan_limits(db: AsyncSession) -> dict[str, dict]:
+    """Fetch plan limits from platform_settings."""
+    try:
+        from app.models.platform import PlatformSetting
+        result = await db.execute(
+            select(PlatformSetting).where(PlatformSetting.key == "plan_limits")
+        )
+        setting = result.scalar_one_or_none()
+        if setting and setting.value:
+            return setting.value
+    except Exception as e:
+        logger.warning("failed_to_fetch_plan_limits", error=str(e))
+    return DEFAULT_PLAN_LIMITS
+
+
+async def get_plan_limits(plan: str, db: AsyncSession) -> dict:
+    """Return the limits dict for a plan, defaulting to professional."""
+    limits = await get_all_plan_limits(db)
+    return limits.get(plan, limits.get("professional", limits.get("voice_growth", {})))
+
+
+def check_limit(limit_value: int, current: int) -> bool:
+    """Return True when the tenant is within the limit.
+    -1 means unlimited and always passes."""
+    if limit_value == -1:
+        return True
+    return current < limit_value
 
 
 class TenantService:
@@ -85,7 +127,8 @@ class TenantService:
     ) -> Tenant:
         from fastapi import HTTPException
 
-        if new_plan not in PLAN_LIMITS:
+        limits = await get_all_plan_limits(db)
+        if new_plan not in limits:
             raise HTTPException(status_code=400, detail=f"Unknown plan: {new_plan}")
 
         tenant = await self.get_tenant(tenant_id, db)
@@ -93,7 +136,7 @@ class TenantService:
             raise HTTPException(status_code=404, detail="Tenant not found.")
 
         tenant.plan = new_plan
-        tenant.plan_limits = PLAN_LIMITS[new_plan]
+        tenant.plan_limits = await get_plan_limits(new_plan, db)
         await db.commit()
         await db.refresh(tenant)
         logger.info("tenant_plan_upgraded", tenant_id=tenant_id, plan=new_plan)

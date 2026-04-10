@@ -71,6 +71,19 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 tenant_id = parts[2]
                 logger.debug("tenant_from_ws_path", tenant_id=tenant_id, path=path)
 
+                # Verify the tenant actually exists and is active in the DB
+                ws_tenant_valid = await self._validate_tenant(request, tenant_id)
+                if not ws_tenant_valid:
+                    logger.warning(
+                        "ws_tenant_not_found_or_inactive",
+                        tenant_id=tenant_id,
+                        path=path,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Tenant not found or inactive.", "code": 4001},
+                    )
+
         if not tenant_id:
             return JSONResponse(
                 status_code=403,
@@ -83,6 +96,26 @@ class TenantMiddleware(BaseHTTPMiddleware):
         request.state.tenant_id = tenant_id
         response = await call_next(request)
         return response
+
+    @staticmethod
+    async def _validate_tenant(request: Request, tenant_id: str) -> bool:
+        """Verify that tenant_id exists and is active in the tenants table."""
+        try:
+            from app.core.database import SessionLocal
+            from sqlalchemy import text
+
+            async with SessionLocal() as session:
+                result = await session.execute(
+                    text(
+                        "SELECT 1 FROM tenants "
+                        "WHERE id = :tenant_id AND is_active = true LIMIT 1"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                return result.fetchone() is not None
+        except Exception as exc:
+            logger.warning("tenant_db_validation_failed", error=str(exc))
+            return True  # fail-open to avoid blocking legitimate WS connections
 
     @staticmethod
     async def _lookup_api_key(request: Request, api_key: str) -> Optional[str]:

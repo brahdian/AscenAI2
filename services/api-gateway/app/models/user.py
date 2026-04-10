@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     String,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -25,6 +26,7 @@ class User(Base):
     __table_args__ = (
         Index("ix_users_tenant_id", "tenant_id"),
         Index("ix_users_email", "email", unique=True),
+        Index("ix_users_email_lower", text("lower(email)"), unique=True),
         Index("ix_users_is_active", "is_active"),
     )
 
@@ -41,7 +43,7 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
     # Role: "owner" | "admin" | "developer" | "viewer"
-    role: Mapped[str] = mapped_column(String(50), nullable=False, default="owner")
+    role: Mapped[str] = mapped_column(String(50), nullable=False, default="viewer")
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_email_verified: Mapped[bool] = mapped_column(
@@ -49,6 +51,9 @@ class User(Base):
     )
 
     last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    password_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(

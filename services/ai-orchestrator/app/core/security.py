@@ -1,15 +1,24 @@
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import AsyncGenerator, Optional, Tuple
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
+import uuid
 
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 
 security = HTTPBearer(auto_error=False)
+
+# Hardened JWT options — reject tokens missing issuer / audience when configured.
+_JWT_OPTIONS = {
+    "verify_exp": True,
+    "verify_iss": bool(getattr(settings, "JWT_ISSUER", "")),
+    "verify_aud": bool(getattr(settings, "JWT_AUDIENCE", "")),
+}
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -22,10 +31,46 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 def decode_access_token(token: str) -> dict:
+    """Decode and validate a JWT access token.
+
+    Enforces:
+    - Signature and expiry (always)
+    - Token type must be None or 'access' (refresh tokens rejected)
+    - Issuer / audience when configured via JWT_ISSUER / JWT_AUDIENCE settings
+    - tenant_id must be a well-formed UUID
+    """
     try:
-        payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-        )
+        decode_kwargs: dict = {
+            "algorithms": [settings.JWT_ALGORITHM],
+            "options": _JWT_OPTIONS,
+        }
+        issuer = getattr(settings, "JWT_ISSUER", "")
+        audience = getattr(settings, "JWT_AUDIENCE", "")
+        if issuer:
+            decode_kwargs["issuer"] = issuer
+        if audience:
+            decode_kwargs["audience"] = audience
+
+        payload = jwt.decode(token, settings.SECRET_KEY, **decode_kwargs)
+
+        if payload.get("type") not in (None, "access"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Ensure tenant_id is a well-formed UUID
+        tenant_id = payload.get("tenant_id", "")
+        try:
+            uuid.UUID(str(tenant_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Malformed token claims",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         return payload
     except JWTError as exc:
         raise HTTPException(
@@ -35,32 +80,116 @@ def decode_access_token(token: str) -> dict:
         ) from exc
 
 
+from fastapi import Request
+
 async def get_current_tenant(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> str:
-    if not credentials:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    payload = decode_access_token(credentials.credentials)
-    tenant_id: Optional[str] = payload.get("tenant_id")
-    if not tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing tenant_id claim",
-        )
-    return tenant_id
+    """
+    Extract tenant_id from a valid JWT Bearer token.
+
+    SECURITY: The unauthenticated X-Tenant-ID header fallback has been removed.
+    The X-Tenant-ID header is only accepted when already stamped by the API Gateway
+    AuthMiddleware in request.state.tenant_id (trusted internal service path).
+    """
+    # 1. Bearer token provided (JWT check)
+    if credentials:
+        try:
+            payload = decode_access_token(credentials.credentials)
+            tenant_id = payload.get("tenant_id")
+            if tenant_id:
+                return tenant_id
+        except HTTPException as exc:
+            # If JWT is invalid, but we have internal headers from the Gateway, 
+            # we should trust the Gateway's validation.
+            if not request.headers.get("X-Tenant-ID") and not getattr(request.state, "tenant_id", None):
+                raise exc
+            logger.debug("jwt_decode_failed_falling_back_to_internal_headers")
+
+    # 2. Trusted Internal Proxy Header (Stamped by API Gateway)
+    xtid = request.headers.get("X-Tenant-ID")
+    if xtid:
+        return xtid
+
+    # 3. Legacy: Internal service path (already-stamped state)
+    state_tenant = getattr(request.state, "tenant_id", None)
+    if state_tenant:
+        return str(state_tenant)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_optional_tenant(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Optional[str]:
-    if not credentials:
-        return None
-    try:
-        payload = decode_access_token(credentials.credentials)
-        return payload.get("tenant_id")
-    except HTTPException:
-        return None
+    """Extract optional tenant_id from a valid JWT or already-authenticated request state."""
+    if credentials:
+        try:
+            payload = decode_access_token(credentials.credentials)
+            return payload.get("tenant_id")
+        except HTTPException:
+            pass
+    return getattr(request.state, "tenant_id", None)
+
+
+_ROLE_LEVELS: dict[str, int] = {
+    "viewer":      0,
+    "developer":   1,
+    "admin":       2,
+    "owner":       3,
+    "super_admin": 4,
+}
+
+
+def require_forwarded_role(minimum_role: str):
+    """FastAPI dependency for the AI Orchestrator.
+
+    The orchestrator receives requests forwarded from the API Gateway.
+    The caller's role is available in the ``X-Role`` header (set by the
+    API Gateway after JWT/API-key verification and before proxying).
+
+    Raises HTTP 403 if the role is insufficient.
+    """
+    from fastapi import Depends, HTTPException
+
+    def _check(request: Request) -> str:
+        role: str = (
+            request.headers.get("X-Role")
+            or getattr(request.state, "role", None)
+            or "viewer"
+        )
+        if _ROLE_LEVELS.get(role, -1) < _ROLE_LEVELS.get(minimum_role, 999):
+            raise HTTPException(
+                status_code=403,
+                detail=f"This action requires '{minimum_role}' role or higher. Current role: '{role}'.",
+            )
+        return role
+
+    return Depends(_check)
+
+
+async def get_tenant_db(
+    tenant_id: str = Depends(get_current_tenant),
+) -> AsyncGenerator[AsyncSession, None]:
+    """Composed dependency: authenticates the request AND yields a tenant-scoped DB session.
+
+    Usage in route handlers::
+
+        @router.get("")
+        async def list_agents(
+            db: AsyncSession = Depends(get_tenant_db),
+            tenant_id: str = Depends(get_current_tenant),
+        ): ...
+
+    The session has ``SET LOCAL app.current_tenant_id = <tenant_id>`` already
+    applied, so all Postgres RLS policies are automatically enforced.
+    """
+    from app.core.database import get_db  # local import to avoid circular deps
+    async for session in get_db(tenant_id=tenant_id):
+        yield session

@@ -5,6 +5,7 @@ import structlog
 from sqlalchemy import select, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import decrypt_sensitive_fields, encrypt_sensitive_fields
 from app.models.tool import Tool
 from app.schemas.mcp import ToolRegistration, ToolUpdate
 
@@ -41,12 +42,13 @@ class ToolRegistry:
             input_schema=tool_data.input_schema,
             output_schema=tool_data.output_schema,
             endpoint_url=tool_data.endpoint_url,
-            auth_config=tool_data.auth_config,
+            # Encrypt sensitive credential fields before storing
+            auth_config=encrypt_sensitive_fields(tool_data.auth_config),
             rate_limit_per_minute=tool_data.rate_limit_per_minute,
             timeout_seconds=tool_data.timeout_seconds,
             is_active=True,
             is_builtin=tool_data.is_builtin,
-            tool_metadata=tool_data.tool_metadata,
+            tool_metadata=encrypt_sensitive_fields(tool_data.tool_metadata),
         )
         self.db.add(tool)
         await self.db.flush()  # Get the ID without committing
@@ -112,6 +114,9 @@ class ToolRegistry:
 
         update_data = updates.model_dump(exclude_unset=True)
         for field, value in update_data.items():
+            # Encrypt sensitive fields before storing
+            if field in ("tool_metadata", "auth_config") and isinstance(value, dict):
+                value = encrypt_sensitive_fields(value)
             setattr(tool, field, value)
 
         await self.db.flush()
@@ -171,83 +176,7 @@ class ToolRegistry:
 
     async def seed_builtin_tools(self, tenant_id: str) -> list[Tool]:
         """
-        Register platform-provided built-in tools for a tenant if not already present.
-        Returns the list of newly created tools.
+        No longer seeds hardcoded tools. 
+        All tools are now dynamically registered or provided via MCP.
         """
-        from app.tools.builtin.pizza import PIZZA_ORDER_SCHEMA, PIZZA_ORDER_OUTPUT_SCHEMA
-        from app.tools.builtin.appointment import (
-            APPOINTMENT_BOOK_SCHEMA,
-            APPOINTMENT_BOOK_OUTPUT_SCHEMA,
-            APPOINTMENT_LIST_SCHEMA,
-            APPOINTMENT_LIST_OUTPUT_SCHEMA,
-            APPOINTMENT_CANCEL_SCHEMA,
-        )
-        from app.tools.builtin.crm import (
-            CRM_LOOKUP_SCHEMA,
-            CRM_LOOKUP_OUTPUT_SCHEMA,
-            CRM_UPDATE_SCHEMA,
-        )
-
-        builtin_definitions = [
-            ToolRegistration(
-                name="pizza_order",
-                description="Place a pizza order via POS integration",
-                category="ordering",
-                input_schema=PIZZA_ORDER_SCHEMA,
-                output_schema=PIZZA_ORDER_OUTPUT_SCHEMA,
-                is_builtin=True,
-                rate_limit_per_minute=30,
-                timeout_seconds=15,
-            ),
-            ToolRegistration(
-                name="appointment_book",
-                description="Book an appointment for a customer",
-                category="booking",
-                input_schema=APPOINTMENT_BOOK_SCHEMA,
-                output_schema=APPOINTMENT_BOOK_OUTPUT_SCHEMA,
-                is_builtin=True,
-            ),
-            ToolRegistration(
-                name="appointment_list",
-                description="List available appointment slots",
-                category="booking",
-                input_schema=APPOINTMENT_LIST_SCHEMA,
-                output_schema=APPOINTMENT_LIST_OUTPUT_SCHEMA,
-                is_builtin=True,
-            ),
-            ToolRegistration(
-                name="appointment_cancel",
-                description="Cancel an existing appointment",
-                category="booking",
-                input_schema=APPOINTMENT_CANCEL_SCHEMA,
-                output_schema={"type": "object"},
-                is_builtin=True,
-            ),
-            ToolRegistration(
-                name="crm_lookup",
-                description="Look up a customer profile in the CRM",
-                category="crm",
-                input_schema=CRM_LOOKUP_SCHEMA,
-                output_schema=CRM_LOOKUP_OUTPUT_SCHEMA,
-                is_builtin=True,
-            ),
-            ToolRegistration(
-                name="crm_update",
-                description="Update a customer record in the CRM",
-                category="crm",
-                input_schema=CRM_UPDATE_SCHEMA,
-                output_schema={"type": "object"},
-                is_builtin=True,
-            ),
-        ]
-
-        created = []
-        for tool_def in builtin_definitions:
-            try:
-                tool = await self.register_tool(tenant_id, tool_def)
-                created.append(tool)
-            except ValueError:
-                # Already exists — skip
-                pass
-
-        return created
+        return []

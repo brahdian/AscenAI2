@@ -31,13 +31,24 @@ class Settings(BaseSettings):
     # Vertex AI (set LLM_PROVIDER=vertex to use Gemini via Google Cloud IAM auth)
     VERTEX_PROJECT_ID: str = ""
     VERTEX_LOCATION: str = "us-central1"
+    # API-key based auth for Vertex AI (simpler than service-account IAM)
+    VERTEX_API_KEY: str = ""
+    # Base URL for Vertex AI REST API — override for private endpoints or VPC-SC
+    VERTEX_API_ENDPOINT: str = "https://aiplatform.googleapis.com/v1/publishers/google/models"
 
     # OpenAI (fallback)
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
 
     # Embedding model
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_MODEL: str = "text-embedding-004"
+    EMBEDDING_DIMENSION: int = 768
+
+    # Shared secret for internal service-to-service calls (api-gateway → ai-orchestrator).
+    # Set via INTERNAL_API_KEY env var.  When empty, the internal key check logs a
+    # warning but does NOT block requests (backwards-compatible for local dev).
+    # PRODUCTION: always set a strong random value (e.g. openssl rand -hex 32).
+    INTERNAL_API_KEY: str = ""
 
     SECRET_KEY: str = "change-this-secret-key-in-production"
 
@@ -65,14 +76,26 @@ class Settings(BaseSettings):
     # Orchestration limits
     MAX_TOOL_ITERATIONS: int = 3
     TOOL_TIMEOUT_SECONDS: int = 30
+    LLM_TIMEOUT_SECONDS: int = 30  # TC-F02: hard timeout per LLM call
+
+    # Session auto-close
+    SESSION_EXPIRY_MINUTES: int = 30  # Inactivity timeout before auto-close
+    SESSION_EXPIRY_WARNING_MINUTES: int = 5  # Warning threshold before expiry
 
     # Service settings
     APP_NAME: str = "AI Orchestrator"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
-    # CORS
-    ALLOWED_ORIGINS: list[str] = ["*"]
+    # CORS — default to localhost for dev; set ALLOWED_ORIGINS in prod
+    ALLOWED_ORIGINS: any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def validate_allowed_origins(cls, v: any) -> list[str]:
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
 
     # Observability
     SENTRY_DSN: str = ""

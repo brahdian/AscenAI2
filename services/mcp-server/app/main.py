@@ -19,6 +19,7 @@ from app.core.database import close_db, init_db, SessionLocal
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.tenant import TenantMiddleware
 from app.schemas.mcp import HealthResponse, StreamMessage, WebSocketMessage
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -82,21 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("database_init_failed", error=str(exc))
         raise
 
-    # 2. Connect to Qdrant
-    try:
-        from qdrant_client import QdrantClient
-        qdrant_client = QdrantClient(
-            host=settings.QDRANT_HOST,
-            port=settings.QDRANT_PORT,
-            timeout=10,
-        )
-        app.state.qdrant = qdrant_client
-        logger.info("qdrant_connected", host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
-    except Exception as exc:
-        logger.warning("qdrant_connect_failed", error=str(exc))
-        app.state.qdrant = None
-
-    # 3. Connect to Redis
+    # 2. Connect to Redis
     try:
         redis_client = aioredis.from_url(
             settings.REDIS_URL,
@@ -114,6 +101,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.error("redis_connect_failed", error=str(exc))
         raise
+
+    # 3. Warm up PII service (Presidio)
+    try:
+        await pii_service.warmup()
+        logger.info("pii_service_initialized")
+    except Exception as exc:
+        logger.error("pii_service_init_failed", error=str(exc))
+        # Don't fail the whole app if PII fails, but log it loudly
 
     logger.info("mcp_server_ready")
     yield
@@ -170,12 +165,14 @@ def create_app() -> FastAPI:
     app.include_router(context_router, prefix="/api/v1", tags=["context"])
     app.include_router(streaming_router, tags=["streaming"])
 
+    from app.api.v1.webhooks import router as webhooks_router
+    app.include_router(webhooks_router, prefix="/api/v1", tags=["webhooks"])
+
     # ---- Health check ----
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health_check() -> HealthResponse:
         db_status = "ok"
         redis_status = "ok"
-        qdrant_status = "ok"
 
         # Check DB
         try:
@@ -191,18 +188,6 @@ def create_app() -> FastAPI:
         except Exception as exc:
             redis_status = f"error: {exc}"
 
-        # Check Qdrant (lightweight HTTP probe)
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(
-                    f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}/healthz"
-                )
-                if resp.status_code != 200:
-                    qdrant_status = f"unhealthy: {resp.status_code}"
-        except Exception as exc:
-            qdrant_status = f"error: {exc}"
-
         overall = "ok" if all(
             s == "ok" for s in [db_status, redis_status]
         ) else "degraded"
@@ -212,7 +197,6 @@ def create_app() -> FastAPI:
             version=settings.APP_VERSION,
             database=db_status,
             redis=redis_status,
-            qdrant=qdrant_status,
         )
 
     # ---- Global exception handler ----

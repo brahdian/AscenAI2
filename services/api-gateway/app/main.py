@@ -7,6 +7,7 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -16,8 +17,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.database import close_db, init_db
+from app.core.scheduler import start_scheduler
+from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
-from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing
+from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
+from app.api.v1 import channels as channels_router
+from app.api.v1 import admin as admin_router
+from app.api.v1 import compliance_audit as compliance_audit_router
+from app.api.v1 import playbooks as playbooks_router
+from app.api.v1 import console as console_router
 
 logger = structlog.get_logger(__name__)
 
@@ -61,7 +69,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     Default: 300 requests / minute per tenant, 30 / minute for unauthenticated.
     """
 
-    EXEMPT_PATHS = {"/health", "/metrics"}
+    EXEMPT_PATHS = {"/health", "/health/startup", "/health/ready", "/health/live", "/metrics"}
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
         if request.url.path in self.EXEMPT_PATHS:
@@ -90,8 +98,17 @@ if c == 1 then redis.call('EXPIRE', KEYS[1], 120) end
 return c
 """
             count = await redis.eval(_lua, 1, window_key)
-        except Exception:
-            # If Redis is down, allow the request through
+        except Exception as _redis_err:
+            logger.warning("rate_limiter_redis_unavailable", error=type(_redis_err).__name__)
+            if settings.ENVIRONMENT == "production":
+                # Fail-closed in production: return 503 so we don't silently
+                # disable rate limiting when Redis is down.
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Service temporarily unavailable. Please try again shortly."},
+                    headers={"Retry-After": "5"},
+                )
+            # In dev/staging: fail-open so Redis outages don't block development
             count = 0
 
         if count > limit:
@@ -183,6 +200,11 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis_client  # expose for password reset and other routes
     logger.info("redis_connected", url=settings.REDIS_URL)
 
+    start_scheduler(app)
+
+    app.state.startup_complete = True
+    logger.info("api_gateway_started")
+
     yield
 
     await close_db()
@@ -204,7 +226,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# --- CORS (must be first so preflight requests are handled) ----------------
+# --- Middlewares (Added inside out: last added is outermost in execution) ---
+
+# 1. Rate limiting (Innermost, relies on Auth having run)
+app.add_middleware(RateLimitMiddleware)
+
+# 2. Auth (Protects the router, sets request.state.user for ratelimit)
+app.add_middleware(AuthMiddleware)
+
+# 3. Request logging 
+app.add_middleware(RequestLoggingMiddleware)
+
+# 4. CORS (Must be outer so it catches 401s from Auth and 429s from RateLimit)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -214,14 +247,8 @@ app.add_middleware(
     expose_headers=["X-Trace-ID", "X-Response-Time", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
 
-# --- Request logging --------------------------------------------------------
-app.add_middleware(RequestLoggingMiddleware)
-
-# --- Auth (sets request.state.user / tenant_id) ----------------------------
-app.add_middleware(AuthMiddleware)
-
-# --- Rate limiting (reads tenant_id set by AuthMiddleware) -----------------
-app.add_middleware(RateLimitMiddleware)
+# 5. W3C traceparent propagation (Outermost — wraps everything)
+app.add_middleware(TracingMiddleware)
 
 # --- Prometheus metrics -----------------------------------------------------
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
@@ -236,7 +263,19 @@ app.include_router(api_keys.router, prefix="/api/v1", tags=["api-keys"])
 app.include_router(webhooks.router, prefix="/api/v1", tags=["webhooks"])
 app.include_router(team.router, prefix="/api/v1", tags=["team"])
 app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
+app.include_router(compliance.router, prefix="/api/v1", tags=["compliance"])
 app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
+app.include_router(channels_router.router, prefix="/api/v1/channels", tags=["channels"])
+app.include_router(admin_router.router, prefix="/api/v1", tags=["admin"])
+app.include_router(compliance_audit_router.router, prefix="/api/v1", tags=["compliance-audit"])
+app.include_router(playbooks_router.router, prefix="/api/v1", tags=["playbooks"])
+app.include_router(console_router.router, prefix="/api/v1", tags=["console"])
+
+# ── Static assets — widget.js served at /widget/widget.js ─────────────────
+import os as _os
+_static_dir = _os.path.join(_os.path.dirname(__file__), "..", "static")
+if _os.path.isdir(_static_dir):
+    app.mount("/widget", StaticFiles(directory=_static_dir), name="widget")
 
 
 # ---------------------------------------------------------------------------
@@ -255,3 +294,72 @@ async def health():
         checks["redis"] = f"error: {exc}"
         checks["status"] = "degraded"
     return checks
+
+
+@app.get("/health/startup", include_in_schema=False)
+async def health_startup(request: Request):
+    """Kubernetes startupProbe — heavy check: DB + Redis. Returns 503 until startup_complete."""
+    if not getattr(request.app.state, "startup_complete", False):
+        return JSONResponse(status_code=503, content={"status": "starting", "service": "api-gateway"})
+
+    checks: dict = {"status": "ok", "service": "api-gateway"}
+    failed = False
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        failed = True
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready(request: Request):
+    """Kubernetes readinessProbe — checks DB + Redis. Returns 503 if a critical dependency is down."""
+    checks: dict = {"status": "ok", "service": "api-gateway"}
+    failed = False
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        failed = True
+
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+        failed = True
+
+    if failed:
+        checks["status"] = "degraded"
+        return JSONResponse(status_code=503, content=checks)
+    return checks
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Kubernetes livenessProbe — lightweight check that process and event loop are alive."""
+    return {"alive": True}

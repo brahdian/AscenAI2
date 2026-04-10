@@ -17,8 +17,6 @@ import {
 } from 'recharts'
 import {
   MessageSquare,
-  Zap,
-  DollarSign,
   Clock,
   TrendingUp,
   Wrench,
@@ -84,13 +82,14 @@ export default function AnalyticsPage() {
   const dailyData = (data?.daily ?? []).map((d: any) => ({
     ...d,
     date: d.date.slice(5),          // "MM-DD"
-    cost: +d.estimated_cost_usd.toFixed(4),
   }))
+
+  const totalChats = data?.total_chats ?? 0
+  const avgTurnsPerChat = totalChats > 0 ? ((data?.total_messages ?? 0) / totalChats).toFixed(1) : '—'
 
   const agentData = (data?.by_agent ?? []).map((a: any) => ({
     name: a.agent_name.length > 14 ? a.agent_name.slice(0, 14) + '…' : a.agent_name,
-    messages: a.total_messages,
-    cost: +a.estimated_cost_usd.toFixed(4),
+    chats: a.total_chats,
     latency: a.avg_latency_ms,
     feedback: a.positive_feedback_pct ?? 0,
   }))
@@ -101,7 +100,7 @@ export default function AnalyticsPage() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Analytics</h1>
           <p className="text-gray-500 dark:text-gray-400 mt-1">
-            Usage, cost, and performance across all agents.
+            Usage and performance across all agents.
           </p>
         </div>
         {/* Period selector */}
@@ -140,22 +139,17 @@ export default function AnalyticsPage() {
               color="violet"
             />
             <StatCard
-              label="Total Messages"
-              value={fmt(data?.total_messages ?? 0)}
+              label="Total Chats"
+              value={fmt(totalChats)}
+              sub="1-10 turns = 1 chat, 11-20 = 2 chats, 21-30 = 3 chats, etc."
               icon={TrendingUp}
               color="blue"
             />
             <StatCard
-              label="Tokens Used"
-              value={fmt(data?.total_tokens ?? 0)}
-              icon={Zap}
+              label="Avg Turns per Chat"
+              value={avgTurnsPerChat}
+              icon={TrendingUp}
               color="amber"
-            />
-            <StatCard
-              label="Est. Cost"
-              value={`$${(data?.total_cost_usd ?? 0).toFixed(4)}`}
-              icon={DollarSign}
-              color="green"
             />
             <StatCard
               label="Avg Latency"
@@ -183,11 +177,11 @@ export default function AnalyticsPage() {
             />
           </div>
 
-          {/* Daily sessions + messages line chart */}
+          {/* Daily sessions + chats line chart */}
           {dailyData.length > 0 && (
             <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6 mb-6">
               <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">
-                Sessions & Messages Over Time
+                Sessions & Chats Over Time
               </h2>
               <ResponsiveContainer width="100%" height={240}>
                 <LineChart data={dailyData}>
@@ -206,8 +200,8 @@ export default function AnalyticsPage() {
                   />
                   <Line
                     type="monotone"
-                    dataKey="total_messages"
-                    name="Messages"
+                    dataKey="total_chats"
+                    name="Chats"
                     stroke="#3b82f6"
                     strokeWidth={2}
                     dot={false}
@@ -218,29 +212,11 @@ export default function AnalyticsPage() {
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-            {/* Daily cost */}
-            {dailyData.length > 0 && (
-              <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
-                <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">
-                  Daily Cost (USD)
-                </h2>
-                <ResponsiveContainer width="100%" height={200}>
-                  <BarChart data={dailyData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                    <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="#9ca3af" />
-                    <YAxis tick={{ fontSize: 11 }} stroke="#9ca3af" />
-                    <Tooltip contentStyle={{ fontSize: 12 }} formatter={(v: any) => `$${v}`} />
-                    <Bar dataKey="cost" name="Cost $" fill="#7c3aed" radius={[4, 4, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-
-            {/* Per-agent messages */}
+            {/* Per-agent chats */}
             {agentData.length > 0 && (
               <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
                 <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">
-                  Messages by Agent
+                  Chats by Agent
                 </h2>
                 <ResponsiveContainer width="100%" height={200}>
                   <BarChart data={agentData} layout="vertical">
@@ -248,7 +224,7 @@ export default function AnalyticsPage() {
                     <XAxis type="number" tick={{ fontSize: 11 }} stroke="#9ca3af" />
                     <YAxis type="category" dataKey="name" width={100} tick={{ fontSize: 11 }} stroke="#9ca3af" />
                     <Tooltip contentStyle={{ fontSize: 12 }} />
-                    <Bar dataKey="messages" name="Messages" fill="#3b82f6" radius={[0, 4, 4, 0]} />
+                    <Bar dataKey="chats" name="Chats" fill="#3b82f6" radius={[0, 4, 4, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -266,7 +242,7 @@ export default function AnalyticsPage() {
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 dark:bg-gray-800/50">
                   <tr>
-                    {['Agent', 'Sessions', 'Messages', 'Tokens', 'Cost', 'Avg Latency', '👍 %'].map((h) => (
+                    {['Agent', 'Sessions', 'Chats', 'Avg Latency', '👍 %'].map((h) => (
                       <th key={h} className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">
                         {h}
                       </th>
@@ -278,9 +254,7 @@ export default function AnalyticsPage() {
                     <tr key={a.agent_id} className="hover:bg-gray-50 dark:hover:bg-gray-800/30">
                       <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{a.agent_name}</td>
                       <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{a.total_sessions}</td>
-                      <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{fmt(a.total_messages)}</td>
-                      <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{fmt(a.total_tokens)}</td>
-                      <td className="px-4 py-3 text-gray-600 dark:text-gray-400">${a.estimated_cost_usd.toFixed(4)}</td>
+                      <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{fmt(a.total_chats)}</td>
                       <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{Math.round(a.avg_latency_ms)}ms</td>
                       <td className="px-4 py-3">
                         {a.positive_feedback_pct != null ? (

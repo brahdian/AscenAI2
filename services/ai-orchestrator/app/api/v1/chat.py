@@ -209,6 +209,8 @@ async def chat_stream(
     async def event_generator():
         import json as _json
         try:
+            # Emit session id immediately so the frontend can correlate the stream
+            yield f"data: {_json.dumps({'type': 'session', 'data': str(session.id), 'session_id': str(session.id)})}\n\n"
             async for event in orchestrator.stream_response(
                 agent=agent, session=session, user_message=body.message
             ):

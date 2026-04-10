@@ -41,6 +41,7 @@ class VariableCreate(BaseModel):
     data_type: str = "string"  # 'string', 'number', 'boolean', 'object'
     default_value: Optional[dict] = None
     playbook_id: Optional[str] = None
+    is_secret: bool = False
 
 
 class VariableUpdate(BaseModel):
@@ -50,11 +51,7 @@ class VariableUpdate(BaseModel):
     data_type: Optional[str] = None
     default_value: Optional[dict] = None
     playbook_id: Optional[str] = None
-    name: Optional[str] = None
-    description: Optional[str] = None
-    scope: Optional[str] = None
-    data_type: Optional[str] = None
-    default_value: Optional[dict] = None
+    is_secret: Optional[bool] = None
 
 
 @router.get("/{agent_id}/variables")
@@ -105,6 +102,7 @@ async def create_variable(
         scope=payload.scope,
         data_type=payload.data_type,
         default_value=payload.default_value,
+        is_secret=payload.is_secret,
     )
     db.add(var)
     await db.commit()
@@ -154,6 +152,8 @@ async def update_variable(
         var.default_value = payload.default_value
     if payload.playbook_id is not None:
         var.playbook_id = uuid.UUID(payload.playbook_id) if payload.playbook_id else None
+    if payload.is_secret is not None:
+        var.is_secret = payload.is_secret
 
     await db.commit()
     await db.refresh(var)

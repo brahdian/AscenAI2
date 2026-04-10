@@ -326,23 +326,26 @@ async def instantiate_template(
     db.add(instance)
 
     # --- 4. Handle RAG Documents (FAQs) ---
+    # Collect pending background tasks; they are scheduled AFTER commit to ensure
+    # the document row exists in DB before the background worker tries to read it.
+    _pending_background_tasks: list[tuple] = []
     for key, value in body.variable_values.items():
         if key.lower() == "faqs" and value:
             from pathlib import Path
             from app.api.v1.documents import _process_document
-            
+
             doc_uuid = uuid.uuid4()
             doc_name = "Frequently Asked Questions"
-            
+
             storage_dir = Path(settings.DOCUMENT_STORAGE_PATH) / tenant / str(agent.id)
             storage_dir.mkdir(parents=True, exist_ok=True)
             safe_filename = f"{doc_uuid}_faq.txt"
             storage_path = str(storage_dir / safe_filename)
-            
+
             try:
                 with open(storage_path, "w", encoding="utf-8") as f:
                     f.write(str(value))
-                
+
                 doc = AgentDocument(
                     id=doc_uuid,
                     agent_id=agent.id,
@@ -351,17 +354,15 @@ async def instantiate_template(
                     file_type="txt",
                     file_size_bytes=len(str(value)),
                     storage_path=storage_path,
-                    status="processing"
+                    status="processing",
                 )
                 db.add(doc)
-                
-                background_tasks.add_task(
+                # Queue task for post-commit scheduling — not yet registered
+                _pending_background_tasks.append((
                     _process_document,
-                    doc_id=str(doc.id),
-                    file_path=storage_path,
-                    agent_id=str(agent.id),
-                    tenant_id=tenant,
-                )
+                    dict(doc_id=str(doc.id), file_path=storage_path,
+                         agent_id=str(agent.id), tenant_id=tenant),
+                ))
             except Exception as exc:
                 logger.error("template_faq_rag_failed", agent_id=str(agent.id), error=str(exc))
 
@@ -375,6 +376,13 @@ async def instantiate_template(
         )
     )
 
+    # Commit all changes atomically before scheduling background tasks.
+    # If the commit fails, no background tasks fire — preventing workers from
+    # referencing DB rows that were rolled back.
     await db.commit()
     await db.refresh(agent)
+
+    for fn, kwargs in _pending_background_tasks:
+        background_tasks.add_task(fn, **kwargs)
+
     return agent.to_dict()

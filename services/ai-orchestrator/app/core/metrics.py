@@ -105,7 +105,7 @@ ACTIVE_SESSIONS = Gauge(
 FALLBACK_RESPONSES = Counter(
     "ascenai_fallback_responses_total",
     "Responses that triggered the fallback escalation counter",
-    labelnames=["agent_id"],
+    # agent_id intentionally omitted — unbounded cardinality would OOM Prometheus
 )
 
 # ---------------------------------------------------------------------------
@@ -122,4 +122,24 @@ CONTEXT_ITEMS_RETURNED = Histogram(
     "ascenai_context_items_returned",
     "Number of context items returned per retrieval",
     buckets=[0, 1, 2, 3, 5, 10, 20],
+)
+
+# ---------------------------------------------------------------------------
+# Observability — queue depths and contract validation
+# ---------------------------------------------------------------------------
+
+DOC_INDEX_QUEUE_DEPTH = Gauge(
+    "ascenai_doc_index_queue_depth",
+    "Current depth of the document indexing queue",
+)
+
+DOC_INDEX_DLQ_DEPTH = Gauge(
+    "ascenai_doc_index_dlq_depth",
+    "Current depth of the document indexing dead-letter queue",
+)
+
+CONTRACT_VALIDATION_ERRORS = Counter(
+    "ascenai_contract_validation_errors_total",
+    "HTTP 422 request validation errors (API contract mismatches)",
+    labelnames=["path"],
 )

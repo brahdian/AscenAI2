@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: Optional[str] = None
     TWILIO_FROM_NUMBER: Optional[str] = None
 
+    # Webhook signing secrets — required in production to verify payload authenticity
+    STRIPE_WEBHOOK_SECRET: Optional[str] = None      # whsec_... from Stripe dashboard
+    CALENDLY_WEBHOOK_SECRET: Optional[str] = None    # signing secret from Calendly webhooks page
+
     # Encryption
     ENCRYPTION_KEY: Optional[str] = None  # Fernet key for encrypting stored secrets
 

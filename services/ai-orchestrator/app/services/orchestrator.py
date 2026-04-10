@@ -22,6 +22,7 @@ from app.services.context_builder_service import ContextBuilderService
 from app.services.playbook_handler import PlaybookHandler
 from app.services.session_billing_service import SessionBillingService
 from app.services.moderation_service import ModerationService, OutputBlockedError
+from app.core.metrics import CONTEXT_RETRIEVALS
 
 logger = structlog.get_logger(__name__)
 
@@ -138,9 +139,15 @@ class Orchestrator:
         llm_user_message = self.guardrail_service.redact_user_message(user_message, pii_ctx, session_id)
 
         kb_ids = agent.knowledge_base_ids or []
-        context_items = await self.mcp.retrieve_context(
-            tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"], knowledge_base_ids=kb_ids if kb_ids else None,
-        )
+        try:
+            context_items = await self.mcp.retrieve_context(
+                tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"], knowledge_base_ids=kb_ids if kb_ids else None,
+            )
+            CONTEXT_RETRIEVALS.labels(status="success").inc()
+        except Exception as _rag_exc:
+            logger.warning("rag_retrieval_failed", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            context_items = []
 
         source_citations = [
             SourceCitation(
@@ -428,10 +435,16 @@ class Orchestrator:
         _pii_active = stream_pii_ctx is not None and stream_pii_ctx.has_mappings()
 
         kb_ids = agent.knowledge_base_ids or []
-        context_items = await self.mcp.retrieve_context(
-            tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
-            knowledge_base_ids=kb_ids if kb_ids else None,
-        )
+        try:
+            context_items = await self.mcp.retrieve_context(
+                tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
+                knowledge_base_ids=kb_ids if kb_ids else None,
+            )
+            CONTEXT_RETRIEVALS.labels(status="success").inc()
+        except Exception as _rag_exc:
+            logger.warning("rag_retrieval_failed", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            context_items = []
 
         stream_source_citations = [
             SourceCitation(
@@ -682,10 +695,16 @@ class Orchestrator:
         llm_user_message = self.guardrail_service.redact_user_message(user_message, pii_ctx, session_id)
 
         kb_ids = agent.knowledge_base_ids or []
-        context_items = await self.mcp.retrieve_context(
-            tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
-            knowledge_base_ids=kb_ids if kb_ids else None,
-        )
+        try:
+            context_items = await self.mcp.retrieve_context(
+                tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
+                knowledge_base_ids=kb_ids if kb_ids else None,
+            )
+            CONTEXT_RETRIEVALS.labels(status="success").inc()
+        except Exception as _rag_exc:
+            logger.warning("rag_retrieval_failed", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
+            CONTEXT_RETRIEVALS.labels(status="error").inc()
+            context_items = []
 
         source_citations = [
             SourceCitation(

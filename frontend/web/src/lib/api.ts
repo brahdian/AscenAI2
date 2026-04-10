@@ -640,6 +640,22 @@ export const toolsApi = {
   update: (name: string, data: Record<string, unknown>) =>
     api.patch(`/proxy/tools/${name}`, data).then((r) => r.data),
   delete: (name: string) => api.delete(`/proxy/tools/${name}`),
+  /**
+   * Verify tool credentials before saving.
+   * For known providers (stripe, twilio, google_calendar …) this calls the
+   * provider's lightest read-only endpoint.
+   * For generic HTTP tools pass endpoint_url + config to test reachability.
+   */
+  verify: (payload: {
+    provider: string
+    config: Record<string, unknown>
+    endpoint_url?: string
+  }): Promise<{
+    ok: boolean
+    latency_ms: number
+    error?: string
+    details?: Record<string, unknown>
+  }> => api.post('/proxy/tools/verify', payload).then((r) => r.data),
   enableForAgent: (agentId: string, toolName: string, currentTools: string[]) => {
     if (currentTools.includes(toolName)) return Promise.resolve()
     return api.patch(`/proxy/agents/${agentId}`, { tools: [...currentTools, toolName] }).then((r) => r.data)

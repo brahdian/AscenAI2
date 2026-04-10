@@ -10,6 +10,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.rbac import require_scope
 from app.models.user import User
 from app.services.auth_service import auth_service
 
@@ -100,6 +101,7 @@ async def list_team(
 async def invite_user(
     body: InviteRequest,
     request: Request,
+    _scope=require_scope("team:write"),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -162,6 +164,7 @@ async def change_user_role(
     user_id: str,
     body: RoleChangeRequest,
     request: Request,
+    _scope=require_scope("team:write"),
     db: AsyncSession = Depends(get_db),
 ):
     """Change a team member's role. Cannot demote/change the last owner."""
@@ -210,6 +213,7 @@ async def change_user_role(
 async def deactivate_user(
     user_id: str,
     request: Request,
+    _scope=require_scope("team:write"),
     db: AsyncSession = Depends(get_db),
 ):
     """Deactivate a team member. Cannot remove yourself or the last owner."""

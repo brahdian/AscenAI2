@@ -156,6 +156,7 @@ async def init_db() -> None:
 
         # AgentVariable migrations
         await conn.execute(_t("ALTER TABLE agent_variables ADD COLUMN IF NOT EXISTS playbook_id UUID"))
+        await conn.execute(_t("ALTER TABLE agent_variables ADD COLUMN IF NOT EXISTS is_secret BOOLEAN NOT NULL DEFAULT FALSE"))
 
         # Session auto-close: last_activity_at column
         await conn.execute(_t("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ"))
@@ -237,13 +238,25 @@ async def init_db() -> None:
         await conn.execute(_t("ALTER TABLE messages ADD COLUMN IF NOT EXISTS playbook_name VARCHAR(255)"))
         await conn.execute(_t("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sources JSONB"))
 
+        # Agent lifecycle state machine — add status column if not present
+        await conn.execute(_t(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'active'"
+        ))
+        # Backfill: archived agents (is_active=FALSE) must have status='archived'
+        if not _is_sqlite:
+            await conn.execute(_t(
+                "UPDATE agents SET status = 'archived' WHERE is_active = FALSE AND status = 'active'"
+            ))
+
         # ── PostgreSQL Row-Level Security (RLS) ─────────────────────────────
         # Skip RLS for SQLite (dev/test environment)
         if not _is_sqlite:
             _rls_tables = [
                 "agents", "sessions", "messages", "agent_playbooks",
                 "agent_guardrails", "agent_documents", "agent_analytics",
-                "message_feedback", "conversation_traces", "playbook_executions"
+                "message_feedback", "conversation_traces", "playbook_executions",
+                # Extended coverage
+                "agent_tools", "agent_variables", "agent_lifecycle_audit",
             ]
 
             # Create helper function to read current_tenant_id from session variables

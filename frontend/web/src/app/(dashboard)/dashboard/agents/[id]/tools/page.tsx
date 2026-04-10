@@ -13,6 +13,9 @@ import {
   EyeOff,
   Plus,
   Trash2,
+  CheckCircle,
+  XCircle,
+  Loader2,
 } from 'lucide-react'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -136,6 +139,13 @@ function WebhookModal({
   const [authType, setAuthType] = useState(existingAuth.type || 'none')
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({})
   const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<{
+    ok: boolean
+    latency_ms: number
+    error?: string
+    details?: Record<string, unknown>
+  } | null>(null)
 
   // Auth fields
   const [apiKey, setApiKey] = useState(existingAuth.value?.replace(/^Bearer /, '') || '')
@@ -164,29 +174,52 @@ function WebhookModal({
   const updateParam = (i: number, key: keyof InputParam, value: any) =>
     setParams((p) => p.map((row, idx) => (idx === i ? { ...row, [key]: value } : row)))
 
+  const buildAuthConfig = (): Record<string, any> => {
+    const authConfig: Record<string, any> = { type: authType }
+    if (authType === 'api_key') {
+      authConfig.header = 'X-API-Key'
+      authConfig.value = apiKey
+    } else if (authType === 'bearer') {
+      authConfig.header = 'Authorization'
+      authConfig.value = `Bearer ${apiKey}`
+    } else if (authType === 'basic') {
+      authConfig.username = username
+      authConfig.password = password
+    } else if (authType === 'oauth2_cc') {
+      authConfig.token_url = tokenUrl
+      authConfig.client_id = clientId
+      authConfig.client_secret = clientSecret
+      if (scope) authConfig.scope = scope
+      if (audience) authConfig.audience = audience
+    }
+    return authConfig
+  }
+
+  const handleTest = async () => {
+    if (!url) { toast.error('Enter an endpoint URL first'); return }
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const result = await toolsApi.verify({
+        provider: entry.id,   // e.g. "stripe", "twilio", "webhook"
+        config: { ...buildAuthConfig(), url },
+        endpoint_url: url,
+      })
+      setTestResult(result)
+    } catch (e: any) {
+      setTestResult({ ok: false, latency_ms: 0, error: e.response?.data?.detail || 'Request failed' })
+    } finally {
+      setTesting(false)
+    }
+  }
+
   const handleSave = async () => {
     if (!name) { toast.error('Tool name is required'); return }
     if (!url) { toast.error('Endpoint URL is required'); return }
     setSaving(true)
     try {
       // Build auth_config
-      const authConfig: Record<string, any> = { type: authType }
-      if (authType === 'api_key') {
-        authConfig.header = 'X-API-Key'
-        authConfig.value = apiKey
-      } else if (authType === 'bearer') {
-        authConfig.header = 'Authorization'
-        authConfig.value = `Bearer ${apiKey}`
-      } else if (authType === 'basic') {
-        authConfig.username = username
-        authConfig.password = password
-      } else if (authType === 'oauth2_cc') {
-        authConfig.token_url = tokenUrl
-        authConfig.client_id = clientId
-        authConfig.client_secret = clientSecret
-        if (scope) authConfig.scope = scope
-        if (audience) authConfig.audience = audience
-      }
+      const authConfig = buildAuthConfig()
 
       const payload = {
         name,
@@ -446,18 +479,59 @@ function WebhookModal({
           </div>
         </div>
 
+        {/* Test result banner */}
+        {testResult && (
+          <div className={`mx-6 mb-0 mt-2 flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm ${
+            testResult.ok
+              ? 'bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300'
+              : 'bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-300'
+          }`}>
+            {testResult.ok
+              ? <CheckCircle size={16} className="flex-shrink-0 mt-0.5" />
+              : <XCircle size={16} className="flex-shrink-0 mt-0.5" />}
+            <div className="flex-1 min-w-0">
+              <p className="font-medium">
+                {testResult.ok ? 'Connection verified' : 'Verification failed'}
+                {testResult.latency_ms > 0 && (
+                  <span className="ml-2 font-normal opacity-70">· {testResult.latency_ms}ms</span>
+                )}
+              </p>
+              {testResult.error && <p className="text-xs mt-0.5 opacity-80">{testResult.error}</p>}
+              {testResult.ok && testResult.details && Object.keys(testResult.details).length > 0 && (
+                <p className="text-xs mt-0.5 opacity-70">
+                  {Object.entries(testResult.details)
+                    .filter(([, v]) => v && typeof v !== 'object')
+                    .map(([k, v]) => `${k}: ${v}`)
+                    .join(' · ')}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Footer */}
-        <div className="px-6 py-4 border-t border-gray-100 dark:border-gray-800 flex justify-end gap-2 flex-shrink-0 bg-gray-50/50 dark:bg-gray-800/50">
-          <button onClick={onClose} className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800">
-            Cancel
-          </button>
+        <div className="px-6 py-4 border-t border-gray-100 dark:border-gray-800 flex justify-between gap-2 flex-shrink-0 bg-gray-50/50 dark:bg-gray-800/50">
           <button
-            onClick={handleSave}
-            disabled={saving || !name || !url || !description}
-            className="px-6 py-2 rounded-lg bg-violet-600 text-white text-sm font-semibold hover:bg-violet-700 disabled:opacity-50 transition-colors"
+            onClick={handleTest}
+            disabled={testing || !url}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-40 transition-colors"
           >
-            {saving ? 'Saving…' : tool ? 'Update webhook' : 'Create webhook'}
+            {testing
+              ? <><Loader2 size={14} className="animate-spin" /> Testing…</>
+              : 'Run Test'}
           </button>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800">
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving || !name || !url || !description}
+              className="px-6 py-2 rounded-lg bg-violet-600 text-white text-sm font-semibold hover:bg-violet-700 disabled:opacity-50 transition-colors"
+            >
+              {saving ? 'Saving…' : tool ? 'Update webhook' : 'Create webhook'}
+            </button>
+          </div>
         </div>
       </div>
     </div>

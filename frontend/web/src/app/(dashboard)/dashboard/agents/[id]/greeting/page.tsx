@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { agentsApi } from '@/lib/api'
@@ -51,7 +51,6 @@ type RecordingState = 'idle' | 'recording' | 'recorded'
 
 export default function GreetingPage() {
   const params = useParams()
-  const router = useRouter()
   const qc = useQueryClient()
   const id = params.id as string
 
@@ -305,6 +304,12 @@ export default function GreetingPage() {
     <div className="p-8 w-full space-y-6">
       {/* Header */}
       <div className="flex items-center gap-3">
+        <Link
+          href={`/dashboard/agents/${id}`}
+          className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+        >
+          <ArrowLeft size={20} className="text-gray-600 dark:text-gray-400" />
+        </Link>
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
             Greeting &amp; Language

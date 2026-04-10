@@ -1,6 +1,25 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 import uuid
+
+
+class LLMConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+    model: Optional[str] = Field(None, max_length=100)
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(None, ge=1, le=32768)
+    provider: Optional[Literal["openai", "gemini", "anthropic"]] = None
+
+
+class VoiceConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+    provider: Optional[Literal["openai", "elevenlabs", "google"]] = None
+    speaking_rate: Optional[float] = Field(None, ge=0.25, le=4.0)
+
+
+class EscalationConfig(BaseModel):
+    model_config = {"extra": "allow"}
+    connector_type: Optional[str] = Field(None, max_length=50)
 
 
 class ChatMessage(BaseModel):
@@ -82,7 +101,7 @@ class ChatResponse(BaseModel):
 class StreamChatEvent(BaseModel):
     type: str = Field(
         ...,
-        description="Event type: text_delta, tool_call, tool_result, sources, done, error",
+        description="Event type: text_delta, tool_call, tool_result, sources, session, done, error",
     )
     data: Union[str, dict, list]
     session_id: str
@@ -104,9 +123,10 @@ class AgentCreate(BaseModel):
     voice_system_prompt: Optional[str] = None
     tools: list[str] = Field(default_factory=list)
     knowledge_base_ids: list[str] = Field(default_factory=list)
-    llm_config: dict = Field(default_factory=dict)
-    escalation_config: dict = Field(default_factory=dict)
-    is_active: Optional[bool] = None
+    llm_config: Optional[LLMConfig] = None
+    escalation_config: Optional[EscalationConfig] = None
+    # is_active intentionally omitted from AgentCreate — agents start active by default.
+    # Use DELETE /agents/{id} to deactivate or POST /agents/{id}/restore to reactivate.
 
 
 class AgentUpdate(BaseModel):
@@ -125,9 +145,10 @@ class AgentUpdate(BaseModel):
     voice_system_prompt: Optional[str] = None
     tools: Optional[list[str]] = None
     knowledge_base_ids: Optional[list[str]] = None
-    llm_config: Optional[dict] = None
-    escalation_config: Optional[dict] = None
-    is_active: Optional[bool] = None
+    llm_config: Optional[LLMConfig] = None
+    escalation_config: Optional[EscalationConfig] = None
+    # is_active intentionally omitted — use DELETE /agents/{id} and POST /agents/{id}/restore
+    # to control activation state through the lifecycle state machine.
 
 
 class AgentResponse(BaseModel):

@@ -2,17 +2,31 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
-import { tenantApi, complianceApi } from '@/lib/api'
+import { useRouter } from 'next/navigation'
+import { tenantApi, agentsApi, complianceApi } from '@/lib/api'
+import { useAuthStore } from '@/store/auth'
 import { getPlanDisplayName } from '@/lib/plans'
 import toast from 'react-hot-toast'
 import { useEffect, useState } from 'react'
-import { Shield, Trash2, ExternalLink } from 'lucide-react'
+import { Shield, Trash2, Download, AlertTriangle, X } from 'lucide-react'
 
 export default function SettingsPage() {
   const qc = useQueryClient()
+  const router = useRouter()
+  const { user, logout } = useAuthStore()
+
+  // Erasure state
   const [erasureContact, setErasureContact] = useState('')
   const [erasureReason, setErasureReason] = useState('customer_request')
   const [erasureSubmitting, setErasureSubmitting] = useState(false)
+
+  // Export state
+  const [exporting, setExporting] = useState(false)
+
+  // Delete account modal state
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [deleteConfirm, setDeleteConfirm] = useState('')
+  const [deleting, setDeleting] = useState(false)
 
   const { data: tenant, isLoading } = useQuery({
     queryKey: ['tenant'],
@@ -80,6 +94,54 @@ export default function SettingsPage() {
       toast.error('Failed to submit erasure request')
     } finally {
       setErasureSubmitting(false)
+    }
+  }
+
+  async function handleExport() {
+    setExporting(true)
+    try {
+      const [tenantData, agentsData, usageData] = await Promise.all([
+        tenantApi.getMe(),
+        agentsApi.list(),
+        tenantApi.getUsage(),
+      ])
+      const payload = {
+        exported_at: new Date().toISOString(),
+        tenant: tenantData,
+        usage: usageData,
+        agents: agentsData,
+      }
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `ascenai-export-${new Date().toISOString().split('T')[0]}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success('Export downloaded')
+    } catch {
+      toast.error('Failed to export data')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  async function handleDeleteAccount() {
+    if (deleteConfirm !== 'DELETE') return
+    setDeleting(true)
+    try {
+      await complianceApi.requestErasure({
+        contact_identifier: user?.email || '',
+        reason: 'customer_request',
+      })
+      toast.success('Account deletion requested — signing you out.')
+      setTimeout(() => {
+        logout()
+        router.push('/login')
+      }, 2000)
+    } catch {
+      toast.error('Failed to submit account deletion request')
+      setDeleting(false)
     }
   }
 
@@ -273,14 +335,21 @@ export default function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Export Data</h3>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                Download all your account data, including agents, sessions, and settings.
+                Download all your account data, including agents, usage stats, and settings as JSON.
               </p>
             </div>
             <button
               type="button"
-              className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+              onClick={handleExport}
+              disabled={exporting}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50 transition-colors"
             >
-              Export
+              {exporting ? (
+                <div className="w-4 h-4 border-2 border-gray-400/30 border-t-gray-400 rounded-full animate-spin" />
+              ) : (
+                <Download size={14} />
+              )}
+              {exporting ? 'Exporting…' : 'Export'}
             </button>
           </div>
 
@@ -293,6 +362,7 @@ export default function SettingsPage() {
             </div>
             <button
               type="button"
+              onClick={() => { setDeleteConfirm(''); setShowDeleteModal(true) }}
               className="px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 transition-colors"
             >
               Delete Account
@@ -300,6 +370,73 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>
+
+      {/* Delete Account Confirmation Modal */}
+      {showDeleteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 shadow-xl w-full max-w-md p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center flex-shrink-0">
+                  <AlertTriangle size={18} className="text-red-600 dark:text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-base font-semibold text-gray-900 dark:text-white">Delete Account</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">This action is permanent and cannot be reversed.</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowDeleteModal(false)}
+                className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+              All your agents, sessions, API keys, and data will be permanently deleted within 30 days.
+              You will be immediately signed out.
+            </p>
+
+            <div className="mb-5">
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1.5">
+                Type <span className="font-mono font-bold text-red-600">DELETE</span> to confirm
+              </label>
+              <input
+                type="text"
+                value={deleteConfirm}
+                onChange={(e) => setDeleteConfirm(e.target.value)}
+                placeholder="DELETE"
+                className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-400 transition-colors"
+                autoFocus
+              />
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setShowDeleteModal(false)}
+                className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteAccount}
+                disabled={deleteConfirm !== 'DELETE' || deleting}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition-colors"
+              >
+                {deleting ? (
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Trash2 size={14} />
+                )}
+                {deleting ? 'Deleting…' : 'Delete my account'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

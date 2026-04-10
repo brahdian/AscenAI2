@@ -19,6 +19,7 @@ from app.core.database import close_db, init_db, SessionLocal
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.tenant import TenantMiddleware
 from app.schemas.mcp import HealthResponse, StreamMessage, WebSocketMessage
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -100,6 +101,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.error("redis_connect_failed", error=str(exc))
         raise
+
+    # 3. Warm up PII service (Presidio)
+    try:
+        await pii_service.warmup()
+        logger.info("pii_service_initialized")
+    except Exception as exc:
+        logger.error("pii_service_init_failed", error=str(exc))
+        # Don't fail the whole app if PII fails, but log it loudly
 
     logger.info("mcp_server_ready")
     yield

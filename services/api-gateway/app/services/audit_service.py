@@ -68,8 +68,8 @@ async def audit_log(
                 _actor_role = getattr(request.state, "role", None)
 
         entry = AuditLog(
-            tenant_id=uuid.UUID(_tenant_id) if _tenant_id else None,
-            actor_user_id=uuid.UUID(_actor_user_id) if _actor_user_id else None,
+            tenant_id=_tenant_id if _tenant_id else None,
+            actor_user_id=_actor_user_id if _actor_user_id else None,
             actor_email=actor_email,
             actor_role=_actor_role,
             action=action,

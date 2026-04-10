@@ -16,6 +16,8 @@ import {
   CheckCircle,
   XCircle,
   Loader2,
+  Play,
+  CheckCircle2,
 } from 'lucide-react'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -146,6 +148,10 @@ function WebhookModal({
     error?: string
     details?: Record<string, unknown>
   } | null>(null)
+  const [testInput, setTestInput] = useState('{\n  \n}')
+  const [testOutput, setTestOutput] = useState<any>(null)
+  const [isTesting, setIsTesting] = useState(false)
+  const [testError, setTestError] = useState<string | null>(null)
 
   // Auth fields
   const [apiKey, setApiKey] = useState(existingAuth.value?.replace(/^Bearer /, '') || '')
@@ -195,21 +201,17 @@ function WebhookModal({
     return authConfig
   }
 
-  const handleTest = async () => {
-    if (!url) { toast.error('Enter an endpoint URL first'); return }
-    setTesting(true)
-    setTestResult(null)
-    try {
-      const result = await toolsApi.verify({
-        provider: entry.id,   // e.g. "stripe", "twilio", "webhook"
-        config: { ...buildAuthConfig(), url },
-        endpoint_url: url,
-      })
-      setTestResult(result)
-    } catch (e: any) {
-      setTestResult({ ok: false, latency_ms: 0, error: e.response?.data?.detail || 'Request failed' })
-    } finally {
-      setTesting(false)
+  const getPayload = () => {
+    const authConfig = buildAuthConfig()
+    return {
+      name,
+      description,
+      category: entry.category,
+      is_builtin: false,
+      endpoint_url: url,
+      input_schema: buildInputSchema(params),
+      tool_metadata: { catalog_id: entry.id, method },
+      auth_config: authConfig,
     }
   }
 
@@ -218,19 +220,7 @@ function WebhookModal({
     if (!url) { toast.error('Endpoint URL is required'); return }
     setSaving(true)
     try {
-      // Build auth_config
-      const authConfig = buildAuthConfig()
-
-      const payload = {
-        name,
-        description,
-        category: entry.category,
-        is_builtin: false,
-        endpoint_url: url,
-        input_schema: buildInputSchema(params),
-        tool_metadata: { catalog_id: entry.id, method },
-        auth_config: authConfig,
-      }
+      const payload = getPayload()
 
       if (tool) {
         await toolsApi.update(tool.name, payload)
@@ -244,6 +234,37 @@ function WebhookModal({
       toast.error(e.response?.data?.detail || 'Save failed')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleTest = async () => {
+    if (!name || !url) { toast.error('Name and URL required for testing'); return }
+    let parsedInput = {}
+    try {
+      if (testInput.trim()) {
+        parsedInput = JSON.parse(testInput)
+      }
+    } catch (e) {
+      toast.error('Invalid JSON tool input')
+      return
+    }
+    
+    setIsTesting(true)
+    setTestError(null)
+    setTestOutput(null)
+    try {
+      const res = await toolsApi.testExecute({
+        tool_config: getPayload(),
+        parameters: parsedInput
+      })
+      if (res.status === 'failed' || res.status === 'timeout') {
+        setTestError(res.error || 'Execution failed')
+      }
+      setTestOutput(res)
+    } catch (e: any) {
+      setTestError(e.response?.data?.detail || e.message || 'Test failed')
+    } finally {
+      setIsTesting(false)
     }
   }
 
@@ -477,6 +498,40 @@ function WebhookModal({
               </div>
             ))}
           </div>
+
+          {/* ── Section 4: Test Execution ── */}
+          <div className={sectionCls}>
+            <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Test Execution</p>
+            <p className="text-[10px] text-gray-500">Run a live test of this webhook before saving. Provide sample JSON input below.</p>
+            
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Sample Input (JSON)</label>
+              <textarea
+                rows={4}
+                value={testInput}
+                onChange={(e) => setTestInput(e.target.value)}
+                className="w-full px-3 py-2 bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg text-xs font-mono resize-y focus:ring-1 focus:ring-violet-500"
+              />
+            </div>
+            
+            {testError && (
+              <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-xs text-red-600 dark:text-red-400 border border-red-100 dark:border-red-900/30">
+                <strong className="block mb-1">Execution Error:</strong>
+                {testError}
+              </div>
+            )}
+            
+            {testOutput?.result && (
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 size={14} /> Execution Successful <span className="text-gray-400">({testOutput.duration_ms}ms)</span>
+                </div>
+                <pre className="p-3 rounded-lg bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 text-[10px] font-mono text-gray-700 dark:text-gray-300 overflow-x-auto max-h-40 overflow-y-auto">
+                  {JSON.stringify(testOutput.result, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Test result banner */}
@@ -510,15 +565,14 @@ function WebhookModal({
         )}
 
         {/* Footer */}
-        <div className="px-6 py-4 border-t border-gray-100 dark:border-gray-800 flex justify-between gap-2 flex-shrink-0 bg-gray-50/50 dark:bg-gray-800/50">
+        <div className="px-6 py-4 border-t border-gray-100 dark:border-gray-800 flex justify-end gap-2 flex-shrink-0 bg-gray-50/50 dark:bg-gray-800/50">
           <button
             onClick={handleTest}
-            disabled={testing || !url}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-40 transition-colors"
+            disabled={isTesting || !name || !url || !description}
+            className="mr-auto flex items-center gap-1.5 px-4 py-2 rounded-lg border border-violet-200 dark:border-violet-800 text-violet-700 dark:text-violet-400 text-sm font-medium hover:bg-violet-50 dark:hover:bg-violet-900/20 disabled:opacity-50 transition-colors"
           >
-            {testing
-              ? <><Loader2 size={14} className="animate-spin" /> Testing…</>
-              : 'Run Test'}
+            <Play size={14} />
+            {isTesting ? 'Testing…' : 'Run Test'}
           </button>
           <div className="flex gap-2">
             <button onClick={onClose} className="px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800">
@@ -570,7 +624,7 @@ export default function AgentToolsPage() {
 
   const { data: registeredTools = [] } = useQuery<ToolRecord[]>({
     queryKey: ['tools', agentId],
-    queryFn: toolsApi.list,
+    queryFn: () => toolsApi.list(agentId),
     enabled: !!agentId,
   })
 
@@ -784,15 +838,13 @@ export default function AgentToolsPage() {
                           >
                             <Settings size={12} />
                           </button>
-                          {allowsMultiple && (
-                            <button
-                              onClick={() => handleDeleteTool(tool.name)}
-                              className="p-1.5 text-gray-400 hover:text-red-500"
-                              title="Delete"
-                            >
-                              <X size={12} />
-                            </button>
-                          )}
+                          <button
+                            onClick={() => handleDeleteTool(tool.name)}
+                            className="p-1.5 text-gray-400 hover:text-red-500"
+                            title="Delete"
+                          >
+                            <Trash2 size={12} />
+                          </button>
                           <button
                             onClick={() => toggleMutation.mutate(tool.name)}
                             disabled={toggleMutation.isPending}

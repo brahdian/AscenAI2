@@ -23,6 +23,7 @@ from app.services.playbook_handler import PlaybookHandler
 from app.services.session_billing_service import SessionBillingService
 from app.services.moderation_service import ModerationService, OutputBlockedError
 from app.core.metrics import CONTEXT_RETRIEVALS
+from app.services.session_state_machine import SessionStateMachine
 
 logger = structlog.get_logger(__name__)
 
@@ -105,7 +106,7 @@ class Orchestrator:
             latency_ms = int((time.monotonic() - start_time) * 1000)
             self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_message, tokens_used=0, latency_ms=0))
             self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="assistant", content=emergency_response, tokens_used=0, latency_ms=latency_ms))
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="emergency_detected")
             return ChatResponse(session_id=session_id, message=emergency_response, tool_calls_made=[], suggested_actions=["Call 911"], escalate_to_human=True, latency_ms=latency_ms, tokens_used=0)
 
         jailbreak_response = self.guardrail_service.check_jailbreak(user_message, agent)
@@ -123,22 +124,24 @@ class Orchestrator:
         await self.billing_service.maybe_send_greeting(agent, session, playbook)
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
+        custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
+        platform_guardrails = await self.context_builder.load_platform_guardrails()
         variables = await self.context_builder.load_variables(str(agent.id), str(playbook.id) if playbook else None)
 
         block_reason = self.guardrail_service.check_input_guardrails(user_message, guardrails)
         if block_reason:
-            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
+            block_msg = (guardrails.get("blocked_message") if guardrails else "I'm sorry, I can't help with that.")
             self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_message, guardrail_triggered=block_reason, tokens_used=0, latency_ms=0))
             return ChatResponse(session_id=session_id, message=block_msg, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0, guardrail_triggered=block_reason)
 
         history = await self.memory.get_short_term_memory(session_id)
         summary = await self.memory.get_session_summary(session_id)
 
-        # SECURITY FIX: Always load PII context and pseudonymize if required
         pii_ctx = await self.guardrail_service.get_pii_context(session_id)
         llm_user_message = self.guardrail_service.redact_user_message(user_message, pii_ctx, session_id)
 
-        kb_ids = agent.knowledge_base_ids or []
+        agent_cfg = agent.agent_config or {}
+        kb_ids = agent_cfg.get("knowledge_base_ids", []) or []
         try:
             context_items = await self.mcp.retrieve_context(
                 tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"], knowledge_base_ids=kb_ids if kb_ids else None,
@@ -164,19 +167,23 @@ class Orchestrator:
 
         session_language = session_meta.get("language")
 
-        # Multilingual: Detect language if auto_detect is ON
-        if getattr(agent, "auto_detect_language", False):
+        if agent_cfg.get("auto_detect_language", False):
             detected_lang = self.intent_detector.detect_language(
-                user_message, getattr(agent, "supported_languages", []) or []
+                user_message, agent_cfg.get("supported_languages", []) or []
             )
             if detected_lang and detected_lang != session_language:
                 session_language = detected_lang
-                session_meta["language"] = detected_lang
-                session.metadata = dict(session_meta) # Persist it
+                # B5 FIX: fresh dict assignment so MutableDict tracks the change
+                new_meta = dict(session_meta)
+                new_meta["language"] = detected_lang
+                session.metadata_ = new_meta
+                session_meta = new_meta
 
         system_prompt = self.context_builder.build_system_prompt(
             agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
-            session_language=session_language, playbook=playbook, corrections=corrections, guardrails=guardrails,
+            session_language=session_language, playbook=playbook, corrections=corrections,
+            guardrails=guardrails, custom_guardrails=custom_guardrails,
+            platform_guardrails=platform_guardrails,
             variables=variables, session_meta=session_meta, local_vars=local_vars
         )
 
@@ -193,14 +200,14 @@ class Orchestrator:
 
         tool_calls_made = []
         total_tokens = 0
-        llm_config = agent.llm_config or {}
+        llm_config = agent_cfg.get("llm_config", {}) or {}
         temperature = llm_config.get("temperature", 0.7)
         max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
 
         final_response = None
         iterations = 0
-        system_tools = agent.tools or []
-        playbook_tools = playbook.tools or [] if playbook else []
+        system_tools = agent_cfg.get("tools", []) or []
+        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
         enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         while iterations < MAX_TOOL_ITERATIONS:
@@ -257,7 +264,6 @@ class Orchestrator:
             logger.warning("max_tool_iterations_reached", session_id=session_id, iterations=MAX_TOOL_ITERATIONS, agent_id=str(agent.id))
             final_response = llm_response.content or "I wasn't able to fully complete your request."
 
-        # Moderation gate: check LLM output before it reaches the user.
         if self.moderation_service and final_response:
             try:
                 await self.moderation_service.check_output(final_response)
@@ -287,7 +293,7 @@ class Orchestrator:
         if is_fallback:
             fallback_count = await self.playbook_handler.increment_fallback_counter(session_id)
             if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
-                session.status = "escalated"
+                SessionStateMachine.escalate(session, reason="fallback_threshold_exceeded")
                 final_response = "I've been unable to help with your last few requests. Let me connect you with a human agent."
                 pseudo_final_response = final_response
                 await self.playbook_handler.reset_fallback_counter(session_id)
@@ -309,17 +315,17 @@ class Orchestrator:
             logger.warning("memory_post_turn_error", error=str(_mem_exc))
 
         user_msg = Message(
-            session_id=session_id, 
-            tenant_id=session.tenant_id, 
-            role="user", 
-            content=pii_service.redact_for_display(user_message, pii_ctx) if (pii_ctx and guardrails and guardrails.pii_redaction) else user_message, 
-            tokens_used=0, 
+            session_id=session_id,
+            tenant_id=session.tenant_id,
+            role="user",
+            content=pii_service.redact_for_display(user_message, pii_ctx) if (pii_ctx and guardrails and guardrails.pii_redaction) else user_message,
+            tokens_used=0,
             latency_ms=0
         )
         assistant_msg = Message(
-            session_id=session_id, 
-            tenant_id=session.tenant_id, 
-            role="assistant", 
+            session_id=session_id,
+            tenant_id=session.tenant_id,
+            role="assistant",
             content=pii_service.redact_for_display(final_response, pii_ctx) if (pii_ctx and guardrails and guardrails.pii_redaction) else final_response,
             tool_calls=tool_calls_made if tool_calls_made else None, tokens_used=total_tokens, latency_ms=latency_ms,
             is_fallback=is_fallback, playbook_name=playbook.name if playbook else None,
@@ -329,11 +335,7 @@ class Orchestrator:
         self.db.add(assistant_msg)
 
         is_new = (session.turn_count == 0)
-        
-        # Calculate Chat Unit increment (TC-B01)
-        # Rule: 1 Chat point per session floor, then +1 per 10 messages (turns).
-        # Turn 1 (count 0->1): +1 unit
-        # Turn 11 (count 10->11): +1 unit, etc.
+
         chat_unit_increment = 0
         if is_new:
             chat_unit_increment = 1
@@ -342,10 +344,10 @@ class Orchestrator:
 
         session.turn_count += 1
         await self.billing_service.update_analytics(
-            tenant_id=session.tenant_id, 
-            agent_id=session.agent_id, 
-            tokens=total_tokens, 
-            latency_ms=latency_ms, 
+            tenant_id=session.tenant_id,
+            agent_id=session.agent_id,
+            tokens=total_tokens,
+            latency_ms=latency_ms,
             tool_count=len(tool_calls_made),
             is_new_session=is_new,
             chat_units=chat_unit_increment
@@ -354,7 +356,7 @@ class Orchestrator:
 
         should_escalate = await self.playbook_handler.should_escalate(agent, final_response, messages)
         if should_escalate:
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="should_escalate_check")
 
         return ChatResponse(
             session_id=session_id, message=final_response, tool_calls_made=tool_calls_made,
@@ -394,7 +396,7 @@ class Orchestrator:
 
         emergency_response = self.guardrail_service.check_emergency(user_message, agent)
         if emergency_response:
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="stream_emergency_detected")
             yield StreamChatEvent(type="text_delta", data=emergency_response, session_id=session_id)
             yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "escalate_to_human": True}, session_id=session_id)
             return
@@ -418,11 +420,16 @@ class Orchestrator:
         await self.billing_service.maybe_send_greeting(agent, session, playbook)
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
+        custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
+        platform_guardrails = await self.context_builder.load_platform_guardrails()
         variables = await self.context_builder.load_variables(str(agent.id), str(playbook.id) if playbook else None)
+
+        stream_agent_cfg = agent.agent_config or {}
+        llm_config = stream_agent_cfg.get("llm_config", {}) or {}
 
         block_reason = self.guardrail_service.check_input_guardrails(user_message, guardrails)
         if block_reason:
-            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
+            block_msg = (guardrails.get("blocked_message") if guardrails else "I'm sorry, I can't help with that.")
             yield StreamChatEvent(type="text_delta", data=block_msg, session_id=session_id)
             yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "escalate_to_human": False, "guardrail_triggered": block_reason}, session_id=session_id)
             return
@@ -434,7 +441,7 @@ class Orchestrator:
         llm_user_message = self.guardrail_service.redact_user_message(user_message, stream_pii_ctx, session_id)
         _pii_active = stream_pii_ctx is not None and stream_pii_ctx.has_mappings()
 
-        kb_ids = agent.knowledge_base_ids or []
+        kb_ids = stream_agent_cfg.get("knowledge_base_ids", []) or []
         try:
             context_items = await self.mcp.retrieve_context(
                 tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
@@ -454,6 +461,7 @@ class Orchestrator:
                 chunk_id=str(item.get("metadata", {}).get("chunk_id")) if item.get("metadata", {}).get("chunk_id") else None,
             ) for item in context_items if isinstance(item, dict)
         ]
+        stream_llm_config = stream_agent_cfg.get("llm_config", {}) or {}
 
         customer_profile = {}
         if session.customer_identifier:
@@ -464,11 +472,19 @@ class Orchestrator:
 
         system_prompt = self.context_builder.build_system_prompt(
             agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
-            session_language=session_language, playbook=playbook, corrections=corrections, guardrails=guardrails,
+            session_language=session_language, playbook=playbook, corrections=corrections,
+            guardrails=guardrails, custom_guardrails=custom_guardrails,
+            platform_guardrails=platform_guardrails,
             variables=variables, session_meta=session_meta, local_vars=local_vars
         )
 
         tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if summary:
+            messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
+        messages.extend(history)
+        messages.append({"role": "user", "content": llm_user_message})
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         
@@ -481,10 +497,10 @@ class Orchestrator:
             chat_unit_increment = 1
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
-        temperature = llm_config.get("temperature", 0.7)
-        max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
-        system_tools = agent.tools or []
-        playbook_tools = playbook.tools or [] if playbook else []
+        temperature = stream_llm_config.get("temperature", 0.7)
+        max_tokens = stream_llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
+        system_tools = stream_agent_cfg.get("tools", []) or []
+        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
         enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         full_response_text = ""
@@ -577,7 +593,7 @@ class Orchestrator:
         if is_fallback:
             fallback_count = await self.playbook_handler.increment_fallback_counter(session_id)
             if fallback_count >= _FALLBACK_ESCALATION_THRESHOLD:
-                session.status = "escalated"
+                SessionStateMachine.escalate(session, reason="stream_fallback_threshold_exceeded")
                 full_response_text = "I've been unable to help with your last few requests. Let me connect you with a human agent."
                 pseudo_full_response = full_response_text
                 await self.playbook_handler.reset_fallback_counter(session_id)
@@ -625,7 +641,7 @@ class Orchestrator:
 
         should_escalate = await self.playbook_handler.should_escalate(agent, full_response_text, messages)
         if should_escalate:
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="stream_should_escalate_check")
 
         if stream_source_citations:
             yield StreamChatEvent(type="sources", data=[c.model_dump() for c in stream_source_citations], session_id=session_id)
@@ -661,7 +677,7 @@ class Orchestrator:
 
         emergency_response = self.guardrail_service.check_emergency(user_message, agent)
         if emergency_response:
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="async_stream_emergency_detected")
             latency_ms = int((time.monotonic() - start_time) * 1000)
             return ChatResponse(session_id=session_id, message=emergency_response, tool_calls_made=[], suggested_actions=["Call 911"], escalate_to_human=True, latency_ms=latency_ms, tokens_used=0)
 
@@ -680,11 +696,13 @@ class Orchestrator:
         await self.billing_service.maybe_send_greeting(agent, session, playbook)
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
+        custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
+        platform_guardrails = await self.context_builder.load_platform_guardrails()
         variables = await self.context_builder.load_variables(str(agent.id), str(playbook.id) if playbook else None)
 
         block_reason = self.guardrail_service.check_input_guardrails(user_message, guardrails)
         if block_reason:
-            block_msg = (guardrails.blocked_message if guardrails else "I'm sorry, I can't help with that.")
+            block_msg = (guardrails.get("blocked_message") if guardrails else "I'm sorry, I can't help with that.")
             self.db.add(Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_message, guardrail_triggered=block_reason, tokens_used=0, latency_ms=0))
             return ChatResponse(session_id=session_id, message=block_msg, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0, guardrail_triggered=block_reason)
 
@@ -694,7 +712,8 @@ class Orchestrator:
         pii_ctx = await self.guardrail_service.get_pii_context(session_id)
         llm_user_message = self.guardrail_service.redact_user_message(user_message, pii_ctx, session_id)
 
-        kb_ids = agent.knowledge_base_ids or []
+        agent_cfg = agent.agent_config or {}
+        kb_ids = agent_cfg.get("knowledge_base_ids", []) or []
         try:
             context_items = await self.mcp.retrieve_context(
                 tenant_id=tenant_id, query=user_message, session_id=session_id, context_types=["knowledge", "history"],
@@ -723,7 +742,9 @@ class Orchestrator:
 
         system_prompt = self.context_builder.build_system_prompt(
             agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
-            session_language=session_language, playbook=playbook, corrections=corrections, guardrails=guardrails,
+            session_language=session_language, playbook=playbook, corrections=corrections,
+            guardrails=guardrails, custom_guardrails=custom_guardrails,
+            platform_guardrails=platform_guardrails,
             variables=variables, session_meta=session_meta, local_vars=local_vars
         )
 
@@ -738,11 +759,11 @@ class Orchestrator:
         if not await self.billing_service.check_token_budget(tenant_id):
             return ChatResponse(session_id=session_id, message="I'm temporarily unavailable due to high usage. Please try again later.", tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=int((time.monotonic() - start_time) * 1000), tokens_used=0)
 
-        llm_config = agent.llm_config or {}
+        llm_config = agent_cfg.get("llm_config", {}) or {}
         temperature = llm_config.get("temperature", 0.7)
         max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
-        system_tools = agent.tools or []
-        playbook_tools = playbook.tools or [] if playbook else []
+        system_tools = agent_cfg.get("tools", []) or []
+        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
         enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         full_response_text = ""
@@ -858,7 +879,7 @@ class Orchestrator:
 
         should_escalate = await self.playbook_handler.should_escalate(agent, full_response_text, messages)
         if should_escalate:
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="async_should_escalate_check")
 
         return ChatResponse(
             session_id=session_id, message=full_response_text, tool_calls_made=tool_calls_made,
@@ -870,3 +891,5 @@ class Orchestrator:
             turn_count=session.turn_count, session_status=session.status,
             guardrail_actions=guardrail_actions,
         )
+        
+

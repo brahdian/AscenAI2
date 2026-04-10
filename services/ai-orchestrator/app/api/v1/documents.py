@@ -217,6 +217,7 @@ async def list_documents(
 class TextDocumentCreateRequest(BaseModel):
     name: str = Field(..., max_length=255)
     content: str
+    status: Optional[str] = Field(None, pattern="^(draft|published)$")
 
 class TextDocumentUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, max_length=255)
@@ -229,11 +230,16 @@ async def create_text_document(
     agent_id: str,
     payload: TextDocumentCreateRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    """Create a raw text document directly (starts as 'draft')."""
+    """Create a raw text document directly. Defaults to 'draft' unless status='published'."""
     tenant_id = _tenant_id(request)
     agent = await _verify_agent(agent_id, tenant_id, db)
+
+    initial_status = payload.status or "draft"
+    if initial_status == "published":
+        initial_status = "processing"
 
     doc = AgentDocument(
         id=uuid.uuid4(),
@@ -243,12 +249,22 @@ async def create_text_document(
         file_type="txt",
         file_size_bytes=len(payload.content.encode('utf-8')),
         content=payload.content,
-        status="draft",
+        status=initial_status,
     )
     db.add(doc)
     await db.commit()
     await db.refresh(doc)
-    
+
+    # Trigger processing if published
+    if payload.status == "published":
+        background_tasks.add_task(
+            _process_document,
+            doc_id=str(doc.id),
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            file_path=doc.storage_path
+        )
+
     return doc.to_dict()
 
 

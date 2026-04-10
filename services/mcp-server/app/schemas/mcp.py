@@ -134,15 +134,21 @@ class ToolUpdate(BaseModel):
     tool_metadata: Optional[dict[str, Any]] = None
 
 
+class ToolTestExecutionRequest(BaseModel):
+    tool_config: ToolRegistration = Field(..., description="The transient tool configuration to test")
+    parameters: dict[str, Any] = Field(default_factory=dict, description="Sample input parameters")
+
+
 class ToolResponse(BaseModel):
-    id: str
-    tenant_id: str
+    id: UUID
+    tenant_id: UUID
     name: str
     description: str
     category: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     endpoint_url: Optional[str]
+    auth_config: Optional[dict[str, Any]] = None
     rate_limit_per_minute: int
     timeout_seconds: int
     is_active: bool

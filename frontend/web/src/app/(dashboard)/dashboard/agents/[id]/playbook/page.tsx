@@ -193,15 +193,16 @@ export default function PlaybookEditorPage() {
   // Hydrate form from existing playbook
   useEffect(() => {
     if (existing) {
-      setGreetingMessage(existing.greeting_message ?? '')
-      setInstructions(existing.instructions ?? '')
-      setTone(existing.tone ?? 'professional')
-      setDos(existing.dos ?? [])
-      setDonts(existing.donts ?? [])
-      setScenarios(existing.scenarios ?? [])
-      setOutOfScope(existing.out_of_scope_response ?? '')
-      setFallback(existing.fallback_response ?? '')
-      setEscalationMessage(existing.custom_escalation_message ?? '')
+      const cfg = existing.config || {}
+      setGreetingMessage(cfg.greeting_message || existing.greeting_message || '')
+      setInstructions(cfg.instructions || existing.instructions || '')
+      setTone(cfg.tone || existing.tone || 'professional')
+      setDos(cfg.dos || existing.dos || [])
+      setDonts(cfg.donts || existing.donts || [])
+      setScenarios(cfg.scenarios || existing.scenarios || [])
+      setOutOfScope(cfg.out_of_scope_response || existing.out_of_scope_response || '')
+      setFallback(cfg.fallback_response || existing.fallback_response || '')
+      setEscalationMessage(cfg.custom_escalation_message || existing.custom_escalation_message || '')
       setIsActive(existing.is_active ?? true)
       setIsDirty(false)
     }

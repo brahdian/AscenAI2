@@ -1,13 +1,13 @@
 import uuid
-from typing import List
+from typing import List, Dict, Any, Optional
 import structlog
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
-from typing import Dict, Any
 
 # AgentTemplate rows are GLOBAL seed data — they have no tenant_id column and
 # must be read with a session that bypasses RLS (get_db_no_rls).
@@ -35,7 +35,7 @@ router = APIRouter(tags=["Templates"])
 # Instance endpoints — registered first to prevent shadowing by /{template_id}
 # ---------------------------------------------------------------------------
 
-@router.get("/instances/by-agent/{agent_id}", response_model=AgentTemplateInstanceSchema)
+@router.get("/instances/by-agent/{agent_id}", response_model=Optional[AgentTemplateInstanceSchema])
 async def get_instance_by_agent(
     agent_id: str,
     tenant=Depends(get_current_tenant),
@@ -57,8 +57,9 @@ async def get_instance_by_agent(
         .limit(1)
     )
     instance = result.scalar_one_or_none()
-    if not instance:
-        raise HTTPException(status_code=404, detail="No template instance found for this agent")
+    
+    # Return 200 OK with null if not found, rather than 404,
+    # as not all agents are expected to have templates.
     return instance
 
 
@@ -177,7 +178,6 @@ async def instantiate_template(
     Applies the template version's rules, copying playbooks and setting prompts based on variable values.
     Template catalog is read without RLS; instance is written into the tenant's RLS context.
     """
-    # tenant is provided by Depends(get_current_tenant)
     try:
         t_uuid = uuid.UUID(template_id)
         v_uuid = uuid.UUID(body.template_version_id)
@@ -192,9 +192,18 @@ async def instantiate_template(
     agent = agent_res.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-        
-    # Retrieve template version — read WITHOUT RLS because template tables are global
-    # We open a separate no-RLS session just for this read-only catalog lookup.
+
+    # -----------------------------------------------------------------------
+    # Retrieve template version from the global catalog using a NO-RLS session.
+    # IMPORTANT: Extract ALL data we need into plain Python objects INSIDE the
+    # `async with` block, before the session closes. Accessing ORM relationship
+    # attributes on detached objects (after session close) raises
+    # DetachedInstanceError, which would silently skip playbook creation.
+    # -----------------------------------------------------------------------
+    system_prompt_template: str | None = None
+    playbooks_data: list[dict] = []
+    tools_data: list[dict] = []
+
     async with AsyncSessionLocal() as catalog_db:
         version_res = await catalog_db.execute(
             select(TemplateVersion)
@@ -206,126 +215,173 @@ async def instantiate_template(
         )
         version = version_res.scalar_one_or_none()
 
-    if not version:
-        raise HTTPException(status_code=404, detail="Template version not found")
+        if not version:
+            raise HTTPException(status_code=404, detail="Template version not found")
+
+        # Snapshot everything into plain Python structures while session is open
+        system_prompt_template = version.system_prompt_template
+        version_id = version.id
+
+        for pbook in version.playbooks:
+            playbook_config = dict(pbook.config) if pbook.config else {}
+            playbooks_data.append({
+                "name": pbook.name,
+                "description": pbook.description,
+                "trigger_condition": dict(pbook.trigger_condition) if pbook.trigger_condition else {},
+                "flow_definition": playbook_config.get("flow_definition", {}),
+                "tone": playbook_config.get("tone", "professional"),
+                "dos": playbook_config.get("dos", []),
+                "donts": playbook_config.get("donts", []),
+                "scenarios": playbook_config.get("scenarios", []),
+                "out_of_scope_response": playbook_config.get("out_of_scope_response"),
+                "fallback_response": playbook_config.get("fallback_response"),
+                "custom_escalation_message": playbook_config.get("custom_escalation_message"),
+                "is_default": pbook.is_default
+            })
+
+        for vt in version.tools:
+            tools_data.append({
+                "tool_name": vt.tool_name,
+                "required_config_schema": dict(vt.required_config_schema) if vt.required_config_schema else {},
+            })
+    # catalog_db is now safely closed — we work only with plain dicts from here.
+
+    logger.info(
+        "template_instantiate_catalog_loaded",
+        template_id=template_id,
+        version_id=str(version_id),
+        playbook_count=len(playbooks_data),
+        tool_count=len(tools_data),
+    )
+
+    # -----------------------------------------------------------------------
+    # Helper: substitute {{key}} and {key} template variables in a string
+    # -----------------------------------------------------------------------
+    def _render(text: str) -> str:
+        for k, v in body.variable_values.items():
+            text = text.replace("{{" + k + "}}", str(v))
+            text = text.replace("{" + k + "}", str(v))
+        return text
 
     # Update agent system prompt by substituting variable_values
-    if version.system_prompt_template:
-        rendered_prompt = version.system_prompt_template
-        for k, v in body.variable_values.items():
-            rendered_prompt = rendered_prompt.replace("{{" + k + "}}", str(v))
-        agent.system_prompt = rendered_prompt
+    if system_prompt_template:
+        agent.system_prompt = _render(system_prompt_template)
 
     # Add tool configurations
-    if version.tools:
-        agent_tools = list(agent.tools or [])
-        for vt in version.tools:
-            tool_cfg = body.tool_configs.get(vt.tool_name, {})
+    if tools_data:
+        agent_cfg = agent.agent_config or {}
+        agent_tools = list(agent_cfg.get("tools", []) or [])
+        for vt in tools_data:
+            tool_cfg = body.tool_configs.get(vt["tool_name"], {})
             agent_tools.append({
-                "name": vt.tool_name,
-                "config": tool_cfg
+                "name": vt["tool_name"],
+                "config": tool_cfg,
             })
-        agent.tools = agent_tools
+        agent.agent_config["tools"] = agent_tools
+
+    # -----------------------------------------------------------------------
+    # Delete the auto-generated default playbooks so template ones replace them
+    # -----------------------------------------------------------------------
+    from sqlalchemy import delete
+    await db.execute(
+        delete(AgentPlaybook).where(
+            AgentPlaybook.agent_id == agent.id,
+        )
+    )
 
     # Copy template playbooks as AgentPlaybook rows
     first_playbook = True
-    for pbook in version.playbooks:
-        # Map TemplatePlaybook (trigger_condition, flow_definition) 
-        # to AgentPlaybook (intent_triggers, instructions, + rich fields)
-        triggers = pbook.trigger_condition.get("keywords", []) if pbook.trigger_condition else []
-        flow = pbook.flow_definition or {}
-        
-        # Aggregate instructions from all steps
-        instructions_list = []
+    for pbook in playbooks_data:
+        flow = pbook.get("flow_definition", {})
+        trigger_condition = pbook.get("trigger_condition", {})
+        triggers = trigger_condition.get("keywords", []) if isinstance(trigger_condition, dict) else []
+
+        instructions_parts: list[str] = []
         if "steps" in flow:
             for step in flow["steps"]:
                 if "instruction" in step:
-                    instructions_list.append(step["instruction"])
-        
-        instructions = "\n\n".join(instructions_list)
+                    instructions_parts.append(step["instruction"])
+        instructions = _render("\n\n".join(instructions_parts))
 
-        # Helper: substitute template variables in a string
-        def _render(text: str) -> str:
-            for k, v in body.variable_values.items():
-                text = text.replace("{{" + k + "}}", str(v))
-                text = text.replace("{" + k + "}", str(v))
-            return text
+        description = _render(pbook.get("description") or "")
+        tone = pbook.get("tone") or "professional"
+        dos = pbook.get("dos") or []
+        donts = pbook.get("donts") or []
+        scenarios_raw = pbook.get("scenarios") or []
+        out_of_scope_response = _render(pbook.get("out_of_scope_response") or "")
+        fallback_response = _render(pbook.get("fallback_response") or "")
+        custom_escalation_message = _render(pbook.get("custom_escalation_message") or "")
+        is_default = pbook.get("is_default", False)
 
-        # Substitute variables in playbook instructions
-        rendered_instructions = _render(instructions)
-
-        # Extract rich metadata from flow_definition
-        description = flow.get("description")
-        tone = flow.get("tone", "professional")
-        dos = flow.get("dos", [])
-        donts = flow.get("donts", [])
-        scenarios = flow.get("scenarios", [])
-        out_of_scope_response = flow.get("out_of_scope_response")
-        fallback_response = flow.get("fallback_response")
-        custom_escalation_message = flow.get("custom_escalation_message")
-        is_default = flow.get("is_default", False)
-
-        # Render variable substitutions in string fields
-        if out_of_scope_response:
-            out_of_scope_response = _render(out_of_scope_response)
-        if fallback_response:
-            fallback_response = _render(fallback_response)
-        if custom_escalation_message:
-            custom_escalation_message = _render(custom_escalation_message)
-        if description:
-            description = _render(description)
-
-        # Render variables in scenarios
-        rendered_scenarios = []
-        for s in scenarios:
-            rendered_scenarios.append({
+        rendered_scenarios = [
+            {
                 "trigger": _render(s.get("trigger", "")),
                 "response": _render(s.get("response", "")),
-            })
+            }
+            for s in scenarios_raw
+        ]
 
-        # Use is_default from template, or mark first playbook as default
         mark_default = is_default or first_playbook
         first_playbook = False
 
         playbook = AgentPlaybook(
             agent_id=agent.id,
             tenant_id=uuid.UUID(tenant),
-            name=pbook.name,
-            description=description,
+            name=pbook["name"],
+            description=description or None,
             intent_triggers=triggers,
-            instructions=rendered_instructions,
-            tone=tone,
-            dos=dos,
-            donts=donts,
-            scenarios=rendered_scenarios,
-            out_of_scope_response=out_of_scope_response,
-            fallback_response=fallback_response,
-            custom_escalation_message=custom_escalation_message,
+            config={
+                "instructions": instructions,
+                "tone": tone,
+                "dos": dos,
+                "donts": donts,
+                "scenarios": rendered_scenarios,
+                "out_of_scope_response": out_of_scope_response or None,
+                "fallback_response": fallback_response or None,
+                "custom_escalation_message": custom_escalation_message or None,
+                "flow_definition": flow,
+            },
             is_active=True,
             is_default=mark_default,
         )
         db.add(playbook)
+        logger.info("template_playbook_added", name=pbook["name"], agent_id=str(agent.id))
 
-    # Enable "Perfect Guardrails" by default
-    guardrails = AgentGuardrails(
-        agent_id=agent.id,
-        tenant_id=uuid.UUID(tenant),
-        pii_redaction=True,
-        profanity_filter=True,
-        is_active=True
-    )
-    db.add(guardrails)
+    # Update existing Guardrails, or create if missing
+    from sqlalchemy import select
+    gr_res = await db.execute(select(AgentGuardrails).where(AgentGuardrails.agent_id == agent.id))
+    guardrails = gr_res.scalar_one_or_none()
+    
+    if guardrails:
+        guardrails.config["pii_redaction"] = True
+        guardrails.config["profanity_filter"] = True
+        guardrails.is_active = True
+        flag_modified(guardrails, "config")
+    else:
+        guardrails = AgentGuardrails(
+            agent_id=agent.id,
+            tenant_id=uuid.UUID(tenant),
+            config={
+                "pii_redaction": True,
+                "profanity_filter": True,
+                "pii_pseudonymization": True,
+                "is_active": True,
+            },
+            is_active=True,
+        )
+        db.add(guardrails)
 
+    # Record the template instance (this proves instantiation succeeded)
     instance = AgentTemplateInstance(
         tenant_id=uuid.UUID(tenant),
         agent_id=agent.id,
-        template_version_id=version.id,
+        template_version_id=version_id,
         variable_values=body.variable_values,
-        tool_configs=body.tool_configs
+        tool_configs=body.tool_configs,
     )
     db.add(instance)
 
-    # --- 4. Handle RAG Documents (FAQs) ---
+    # Handle RAG Documents (FAQs) — index FAQ content for retrieval
     # Collect pending background tasks; they are scheduled AFTER commit to ensure
     # the document row exists in DB before the background worker tries to read it.
     _pending_background_tasks: list[tuple] = []
@@ -335,8 +391,6 @@ async def instantiate_template(
             from app.api.v1.documents import _process_document
 
             doc_uuid = uuid.uuid4()
-            doc_name = "Frequently Asked Questions"
-
             storage_dir = Path(settings.DOCUMENT_STORAGE_PATH) / tenant / str(agent.id)
             storage_dir.mkdir(parents=True, exist_ok=True)
             safe_filename = f"{doc_uuid}_faq.txt"
@@ -350,9 +404,9 @@ async def instantiate_template(
                     id=doc_uuid,
                     agent_id=agent.id,
                     tenant_id=uuid.UUID(tenant),
-                    name=doc_name,
+                    name="Frequently Asked Questions",
                     file_type="txt",
-                    file_size_bytes=len(str(value)),
+                    file_size_bytes=len(str(value).encode("utf-8")),
                     storage_path=storage_path,
                     status="processing",
                 )
@@ -366,16 +420,6 @@ async def instantiate_template(
             except Exception as exc:
                 logger.error("template_faq_rag_failed", agent_id=str(agent.id), error=str(exc))
 
-    # --- 5. Cleanup redundant playbooks ---
-    from sqlalchemy import delete
-    await db.execute(
-        delete(AgentPlaybook).where(
-            AgentPlaybook.agent_id == agent.id,
-            AgentPlaybook.name == "Default",
-            AgentPlaybook.is_default == True
-        )
-    )
-
     # Commit all changes atomically before scheduling background tasks.
     # If the commit fails, no background tasks fire — preventing workers from
     # referencing DB rows that were rolled back.
@@ -385,4 +429,12 @@ async def instantiate_template(
     for fn, kwargs in _pending_background_tasks:
         background_tasks.add_task(fn, **kwargs)
 
+    logger.info(
+        "template_instantiated_successfully",
+        template_id=template_id,
+        agent_id=str(agent.id),
+        tenant_id=tenant,
+        playbooks_created=len(playbooks_data),
+    )
     return agent.to_dict()
+

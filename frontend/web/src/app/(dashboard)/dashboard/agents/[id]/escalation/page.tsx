@@ -8,7 +8,7 @@ import { agentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ChevronRight, PhoneCall, MessageSquare, Webhook, Save,
-  Info, ExternalLink, AlertCircle, CheckCircle2, XCircle, Loader2,
+  Info, ExternalLink, AlertCircle, CheckCircle2, XCircle, Loader2, Hash, Plus, Trash2, Bot,
 } from 'lucide-react'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,20 +171,27 @@ export default function EscalationPage() {
   const [chatEnabled, setChatEnabled] = useState(false)
   const [chatAgentName, setChatAgentName] = useState('')
   const [connectorType, setConnectorType] = useState('')
-  const [connectorConfig, setConnectorConfig] = useState<Record<string, string>>({})
+  const [connectorConfig, setConnectorConfig] = useState<Record<string, any>>({})
+  // Extension transfer routes: [{extension, target_type, target}]
+  // target_type: "phone" | "agent_id"
+  const [extensionRoutes, setExtensionRoutes] = useState<
+    { extension: string; target_type: 'phone' | 'agent_id'; target: string }[]
+  >([])
   const [saved, setSaved] = useState(false)
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle')
   const [testMessage, setTestMessage] = useState('')
 
   useEffect(() => {
     if (!agent) return
-    const ec = agent.escalation_config || {}
+    const agentCfg = (agent.agent_config || {}) as Record<string, unknown>
+    const ec = (agentCfg.escalation_config as Record<string, unknown>) || (agent.escalation_config as Record<string, unknown>) || {}
     setEscalateEnabled(!!ec.escalate_to_human)
-    setPhone(ec.escalation_number || '')
+    setPhone((ec.escalation_number as string) || '')
     setChatEnabled(!!ec.chat_enabled)
-    setChatAgentName(ec.chat_agent_name || '')
-    setConnectorType(ec.connector_type || '')
-    setConnectorConfig(ec.connector_config || {})
+    setChatAgentName((ec.chat_agent_name as string) || '')
+    setConnectorType((ec.connector_type as string) || '')
+    setConnectorConfig((ec.connector_config as Record<string, any>) || {})
+    setExtensionRoutes((ec.extension_routes as any) || [])
   }, [agent])
 
   const selectedConnector = CONNECTORS.find(c => c.id === connectorType) ?? CONNECTORS[0]
@@ -208,8 +215,23 @@ export default function EscalationPage() {
       chat_agent_name: chatAgentName,
       connector_type: connectorType || null,
       connector_config: connectorType ? connectorConfig : {},
+      extension_routes: extensionRoutes.filter(r => r.extension && r.target),
     }
-    mutation.mutate({ escalation_config })
+    mutation.mutate({ agent_config: { escalation_config } })
+  }
+
+  const addExtensionRoute = () => {
+    setExtensionRoutes(prev => [...prev, { extension: '', target_type: 'phone', target: '' }])
+  }
+
+  const removeExtensionRoute = (index: number) => {
+    setExtensionRoutes(prev => prev.filter((_, i) => i !== index))
+  }
+
+  const updateExtensionRoute = (index: number, field: string, value: string) => {
+    setExtensionRoutes(prev =>
+      prev.map((r, i) => i === index ? { ...r, [field]: value } : r)
+    )
   }
 
   const setField = (key: string, value: string) => {
@@ -326,6 +348,74 @@ export default function EscalationPage() {
                   />
                 </div>
               )}
+            </section>
+
+            {/* Extension Transfer Routing */}
+            <section className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-5 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                  <Hash size={15} className="text-violet-500" />
+                  Extension Transfer Routing
+                </h2>
+                <button
+                  onClick={addExtensionRoute}
+                  className="flex items-center gap-1.5 text-xs text-violet-600 hover:text-violet-700 dark:text-violet-400 font-medium"
+                >
+                  <Plus size={13} /> Add Route
+                </button>
+              </div>
+              <p className="text-xs text-gray-500">
+                Map dial extensions (e.g. 101) to a phone number or another agent. Callers pressing an extension digit will be routed here.
+              </p>
+
+              {extensionRoutes.length === 0 && (
+                <p className="text-xs text-gray-400 italic">No extension routes configured. Click &ldquo;Add Route&rdquo; to define one.</p>
+              )}
+
+              {extensionRoutes.map((route, idx) => (
+                <div key={idx} className="grid grid-cols-[80px_140px_1fr_32px] gap-2 items-center">
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Extension</label>
+                    <input
+                      type="text"
+                      value={route.extension}
+                      onChange={e => updateExtensionRoute(idx, 'extension', e.target.value)}
+                      placeholder="101"
+                      maxLength={6}
+                      className="w-full px-2 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white text-center"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Target type</label>
+                    <select
+                      value={route.target_type}
+                      onChange={e => updateExtensionRoute(idx, 'target_type', e.target.value)}
+                      className="w-full px-2 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white"
+                    >
+                      <option value="phone">Phone number</option>
+                      <option value="agent_id">Agent (by ID)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">
+                      {route.target_type === 'phone' ? 'Phone Number' : 'Agent ID'}
+                    </label>
+                    <input
+                      type="text"
+                      value={route.target}
+                      onChange={e => updateExtensionRoute(idx, 'target', e.target.value)}
+                      placeholder={route.target_type === 'phone' ? '+1 555 000 0000' : 'uuid of target agent'}
+                      className="w-full px-2 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white"
+                    />
+                  </div>
+                  <button
+                    onClick={() => removeExtensionRoute(idx)}
+                    className="mt-5 p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
             </section>
 
             {/* Platform connector */}

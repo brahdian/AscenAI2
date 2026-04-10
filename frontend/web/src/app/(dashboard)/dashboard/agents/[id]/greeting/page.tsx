@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi } from '@/lib/api'
+import { agentsApi, voiceApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ArrowLeft,
@@ -68,6 +68,7 @@ export default function GreetingPage() {
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [isUploading, setIsUploading] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const [isGeneratingTts, setIsGeneratingTts] = useState(false)
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<BlobPart[]>([])
@@ -83,13 +84,15 @@ export default function GreetingPage() {
   // Populate form when agent loads
   useEffect(() => {
     if (agent) {
-      setLanguage(agent.language || 'en')
-      setAutoDetectLanguage(agent.auto_detect_language || false)
-      setSupportedLanguages(agent.supported_languages || [])
-      setGreetingText(agent.greeting_message || '')
-      setVoiceSystemPrompt(agent.voice_system_prompt || '')
-      if (agent.voice_greeting_url) {
-        setAudioUrl(agent.voice_greeting_url)
+      const cfg = (agent.agent_config || {}) as Record<string, unknown>
+      setLanguage((agent.language as string) || 'en')
+      setAutoDetectLanguage((cfg.auto_detect_language as boolean) || (agent.auto_detect_language as boolean) || false)
+      setSupportedLanguages((cfg.supported_languages as string[]) || (agent.supported_languages as string[]) || [])
+      setGreetingText((cfg.greeting_message as string) || (agent.greeting_message as string) || '')
+      setVoiceSystemPrompt((cfg.voice_system_prompt as string) || (agent.voice_system_prompt as string) || '')
+      const voiceUrl = (cfg.voice_greeting_url as string) || (agent.voice_greeting_url as string)
+      if (voiceUrl) {
+        setAudioUrl(voiceUrl)
         setRecordingState('recorded')
       }
     }
@@ -106,6 +109,37 @@ export default function GreetingPage() {
   }, [audioUrl])
 
   // ── Recording ────────────────────────────────────────────────────────────
+
+  const generateTtsRecording = async () => {
+    if (!greetingText.trim()) {
+      toast.error('Please enter a text greeting first.')
+      return
+    }
+    setIsGeneratingTts(true)
+    try {
+      const stream = await voiceApi.streamTts(greetingText, agent?.voice_id || 'alloy')
+      if (!stream) throw new Error('Failed to start TTS stream')
+      
+      const reader = stream.getReader()
+      const chunks: Uint8Array[] = []
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) chunks.push(value)
+      }
+      
+      const blob = new Blob(chunks as BlobPart[], { type: 'audio/mpeg' })
+      setAudioBlob(blob)
+      const url = URL.createObjectURL(blob)
+      setAudioUrl(url)
+      setRecordingState('recorded')
+      setRecordingSeconds(0)
+    } catch {
+      toast.error('Failed to generate recording via TTS.')
+    } finally {
+      setIsGeneratingTts(false)
+    }
+  }
 
   const startRecording = useCallback(async () => {
     try {
@@ -516,13 +550,25 @@ export default function GreetingPage() {
         {/* Recording controls */}
         <div className="flex flex-col gap-4">
           {recordingState === 'idle' && (
-            <button
-              onClick={startRecording}
-              className="flex items-center justify-center gap-2 w-full py-10 border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-xl hover:border-violet-400 dark:hover:border-violet-600 hover:bg-violet-50/30 dark:hover:bg-violet-900/10 transition-colors text-gray-500 dark:text-gray-400 hover:text-violet-600 dark:hover:text-violet-400"
-            >
-              <Mic size={20} />
-              <span className="text-sm font-medium">Click to record a greeting</span>
-            </button>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <button
+                onClick={startRecording}
+                className="flex items-center justify-center gap-2 flex-1 py-8 border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-xl hover:border-violet-400 dark:hover:border-violet-600 hover:bg-violet-50/30 dark:hover:bg-violet-900/10 transition-colors text-gray-500 dark:text-gray-400 hover:text-violet-600 dark:hover:text-violet-400"
+              >
+                <Mic size={20} />
+                <span className="text-sm font-medium">Record with Microphone</span>
+              </button>
+              <button
+                onClick={generateTtsRecording}
+                disabled={isGeneratingTts}
+                className="flex flex-col items-center justify-center gap-2 flex-1 py-8 border border-gray-200 dark:border-gray-800 rounded-xl hover:border-violet-400 dark:hover:border-violet-600 bg-gray-50 dark:bg-gray-800 transition-colors text-gray-700 dark:text-gray-300 hover:text-violet-600 dark:hover:text-violet-400 disabled:opacity-50"
+              >
+                <Volume2 size={20} className={isGeneratingTts ? 'animate-pulse text-violet-500' : ''} />
+                <span className="text-sm font-medium">
+                  {isGeneratingTts ? 'Generating TTS...' : 'Generate with Agent Voice'}
+                </span>
+              </button>
+            </div>
           )}
 
           {recordingState === 'recording' && (

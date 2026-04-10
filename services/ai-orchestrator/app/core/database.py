@@ -90,53 +90,17 @@ async def init_db() -> None:
     import app.models  # noqa: F401 — side-effect: registers all models
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Idempotent ALTER TABLE migrations for columns added after initial create_all.
-        # Safe to run on every startup — IF NOT EXISTS prevents errors on re-run.
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE message_feedback "
-                "ADD COLUMN IF NOT EXISTS playbook_correction JSONB"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE message_feedback "
-                "ADD COLUMN IF NOT EXISTS tool_corrections JSONB"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE agents "
-                "ADD COLUMN IF NOT EXISTS greeting_message TEXT"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE agents "
-                "ADD COLUMN IF NOT EXISTS voice_greeting_url VARCHAR(500)"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE agents "
-                "ADD COLUMN IF NOT EXISTS auto_detect_language BOOLEAN DEFAULT FALSE"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE agents "
-                "ADD COLUMN IF NOT EXISTS supported_languages JSONB"
-            )
-        )
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "ALTER TABLE agents "
-                "ADD COLUMN IF NOT EXISTS voice_system_prompt TEXT"
-            )
-        )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # ── Migration Centralization ──────────────────────────────────────────
+        # Manual ALTER TABLE statements have been moved to Alembic Migration 0014
+        # (residing in api-gateway) to ensure a single source of truth for schema.
+        # Only service-specific table-level initialization remains here.
+        # ──────────────────────────────────────────────────────────────────────
 
-        # AgentGuardrails migrations for content policy schema
+        # AgentDocument migrations (storage_path nullable fix)
         _t = __import__("sqlalchemy", fromlist=["text"]).text
+
         await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_keywords JSONB"))
         await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_topics JSONB"))
         await conn.execute(_t("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS allowed_topics JSONB"))
@@ -163,11 +127,15 @@ async def init_db() -> None:
         await conn.execute(_t("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS turn_count INTEGER DEFAULT 0"))
         await conn.execute(_t("CREATE INDEX IF NOT EXISTS ix_sessions_last_activity ON sessions (last_activity_at)"))
 
-        # AgentDocument migrations
         try:
             await conn.execute(_t("ALTER TABLE agent_documents ALTER COLUMN storage_path DROP NOT NULL"))
         except Exception as e:
             logger.warning("failed_to_drop_not_null_storage_path", error=str(e))
+
+        # Agent expiry and status migrations
+        await conn.execute(_t("ALTER TABLE agents ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'DRAFT'"))
+        await conn.execute(_t("ALTER TABLE agents ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"))
+        await conn.execute(_t("ALTER TABLE agents ADD COLUMN IF NOT EXISTS grace_period_ends_at TIMESTAMPTZ"))
         await conn.execute(_t("ALTER TABLE agent_documents ADD COLUMN IF NOT EXISTS content TEXT"))
         await conn.execute(_t("ALTER TABLE agent_documents ADD COLUMN IF NOT EXISTS embedding vector(768)"))
 

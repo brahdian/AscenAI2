@@ -1,5 +1,4 @@
 import uuid
-import uuid
 import time
 import structlog
 from datetime import datetime, date, timezone
@@ -148,7 +147,7 @@ class SessionBillingService:
                     current_month_voice_minutes = current_month_voice_minutes + :voice_minutes,
                     current_month_chat_units = current_month_chat_units + :chat_units,
                     updated_at = NOW()
-                WHERE tenant_id = :tenant_id::uuid
+                WHERE tenant_id = CAST(:tenant_id AS UUID)
             """)
             await self.db.execute(usage_query, {
                 "tokens": tokens,
@@ -158,8 +157,7 @@ class SessionBillingService:
                 "session_increment": 1 if is_new_session else 0
             })
             
-            # Commit all changes (critical for persistence)
-            await self.db.commit()
+            # The calling orchestrator handles db.commit() to ensure atomicity.
         except Exception as exc:
             logger.error("analytics_update_error", error=str(exc))
 

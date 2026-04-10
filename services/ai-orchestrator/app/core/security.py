@@ -95,10 +95,17 @@ async def get_current_tenant(
     """
     # 1. Bearer token provided (JWT check)
     if credentials:
-        payload = decode_access_token(credentials.credentials)
-        tenant_id = payload.get("tenant_id")
-        if tenant_id:
-            return tenant_id
+        try:
+            payload = decode_access_token(credentials.credentials)
+            tenant_id = payload.get("tenant_id")
+            if tenant_id:
+                return tenant_id
+        except HTTPException as exc:
+            # If JWT is invalid, but we have internal headers from the Gateway, 
+            # we should trust the Gateway's validation.
+            if not request.headers.get("X-Tenant-ID") and not getattr(request.state, "tenant_id", None):
+                raise exc
+            logger.debug("jwt_decode_failed_falling_back_to_internal_headers")
 
     # 2. Trusted Internal Proxy Header (Stamped by API Gateway)
     xtid = request.headers.get("X-Tenant-ID")

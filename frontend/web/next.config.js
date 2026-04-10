@@ -58,7 +58,7 @@ const nextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob: https:",
               "font-src 'self' data:",
-              `connect-src 'self' ${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'} ${process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8002'} wss: http://localhost:8000 http://lvh.me:8000 *.lvh.me:8000 http://lvh.me:3000 *.lvh.me:3000`,
+              `connect-src 'self' ${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'} ${process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8002'} wss: http://localhost:8000 http://lvh.me:8000 *.lvh.me:8000 http://lvh.me:3000 *.lvh.me:3000 http://ai-orchestrator:8002 http://mcp-server:8001 http://voice-pipeline:8003`,
               "media-src 'self' blob:",
               "object-src 'none'",
               "base-uri 'self'",

@@ -25,69 +25,23 @@ logger = structlog.get_logger(__name__)
 # Circuit breaker
 # ---------------------------------------------------------------------------
 
-class _CircuitBreakerOpen(Exception):
-    """Raised when the circuit is open and the call should be rejected fast."""
+from app.core.circuit_breaker import CircuitBreaker, CircuitOpenError
 
+# One breaker per provider (singleton per worker, backed by Redis)
+_breakers: dict[str, CircuitBreaker] = {}
 
-class _CircuitBreaker:
+def _get_breaker(provider: str) -> CircuitBreaker:
+    """Return the shared CircuitBreaker for the given LLM provider.
+    
+    Redis is injected lazily on first async call via complete().
     """
-    Per-provider circuit breaker.
-
-    States:
-      CLOSED   — normal operation
-      OPEN     — failing fast; no calls forwarded until cooldown expires
-      HALF_OPEN — single probe call allowed; if it succeeds → CLOSED
-    """
-    _FAILURE_THRESHOLD = 5
-    _COOLDOWN_SECONDS = 60.0
-
-    def __init__(self, name: str):
-        self.name = name
-        self._failures = 0
-        self._opened_at: Optional[float] = None
-
-    def _state(self) -> str:
-        if self._opened_at is None:
-            return "CLOSED"
-        elapsed = time.monotonic() - self._opened_at
-        if elapsed >= self._COOLDOWN_SECONDS:
-            return "HALF_OPEN"
-        return "OPEN"
-
-    def before_call(self) -> None:
-        state = self._state()
-        if state == "OPEN":
-            raise _CircuitBreakerOpen(
-                f"LLM circuit breaker OPEN for provider '{self.name}'. "
-                f"Retry in {int(self._COOLDOWN_SECONDS - (time.monotonic() - self._opened_at))}s."
-            )
-
-    def on_success(self) -> None:
-        self._failures = 0
-        self._opened_at = None
-        if self._state() == "HALF_OPEN":
-            logger.info("circuit_breaker_closed", provider=self.name)
-
-    def on_failure(self) -> None:
-        self._failures += 1
-        if self._failures >= self._FAILURE_THRESHOLD and self._opened_at is None:
-            self._opened_at = time.monotonic()
-            LLM_CIRCUIT_OPENS.labels(provider=self.name).inc()
-            logger.error(
-                "circuit_breaker_opened",
-                provider=self.name,
-                failures=self._failures,
-                cooldown_s=self._COOLDOWN_SECONDS,
-            )
-
-
-# One breaker per provider — module-level singletons
-_breakers: dict[str, _CircuitBreaker] = {}
-
-
-def _get_breaker(provider: str) -> _CircuitBreaker:
     if provider not in _breakers:
-        _breakers[provider] = _CircuitBreaker(provider)
+        _breakers[provider] = CircuitBreaker(
+            name=f"llm_{provider}",
+            redis=None,  # Injected lazily on first complete() call
+            failure_threshold=5,
+            recovery_timeout=60,
+        )
     return _breakers[provider]
 
 
@@ -126,6 +80,7 @@ class LLMClient:
         api_key: str = "",
         vertex_project: str = "",
         vertex_location: str = "us-central1",
+        redis=None,
     ):
         self.provider = provider
         self.model = model
@@ -135,6 +90,20 @@ class LLMClient:
         self._gemini_client = None
         self._openai_client = None
         self._vertex_client = None
+        # Wire Redis into the shared circuit breaker immediately if provided.
+        if redis is not None:
+            self.set_redis(redis)
+
+    def set_redis(self, redis) -> None:
+        """Inject the Redis client into this provider's circuit breaker.
+
+        Call this once at startup after the Redis pool is initialized.
+        The breaker is a module-level singleton so the change is visible
+        across all LLMClient instances for the same provider.
+        """
+        breaker = _get_breaker(self.provider)
+        breaker.redis = redis
+        logger.info("llm_circuit_breaker_redis_injected", provider=self.provider)
 
     def _get_gemini_client(self):
         if self._gemini_client is None:
@@ -170,14 +139,17 @@ class LLMClient:
         session_id: Optional[str] = None,
     ) -> "LLMResponse | AsyncGenerator":
         breaker = _get_breaker(self.provider)
-        breaker.before_call()
         _t0 = time.monotonic()
-        try:
-            result = await asyncio.wait_for(
+        
+        async def _run_llm_call():
+            return await asyncio.wait_for(
                 self._dispatch(messages, tools, temperature, max_tokens, stream, session_id),
                 timeout=settings.LLM_TIMEOUT_SECONDS,
             )
-            breaker.on_success()
+            
+        try:
+            result = await breaker.call(_run_llm_call)
+            
             LLM_LATENCY.labels(provider=self.provider, model=self.model).observe(
                 time.monotonic() - _t0
             )
@@ -191,7 +163,6 @@ class LLMClient:
                 )
             return result
         except asyncio.TimeoutError:
-            breaker.on_failure()
             LLM_ERRORS.labels(provider=self.provider, model=self.model, error_type="timeout").inc()
             logger.error(
                 "llm_call_timeout",
@@ -203,11 +174,10 @@ class LLMClient:
                 f"LLM call to {self.provider}/{self.model} timed out "
                 f"after {settings.LLM_TIMEOUT_SECONDS}s"
             )
-        except _CircuitBreakerOpen:
+        except CircuitOpenError:
             LLM_ERRORS.labels(provider=self.provider, model=self.model, error_type="circuit_open").inc()
             raise
         except Exception as exc:
-            breaker.on_failure()
             LLM_ERRORS.labels(provider=self.provider, model=self.model, error_type="api_error").inc()
             logger.error(
                 "llm_call_failed",
@@ -318,13 +288,13 @@ class LLMClient:
                     args = dict(part.function_call.args or {})
                     tool_calls.append(ToolCall(id=str(uuid.uuid4()), name=part.function_call.name, arguments=args))
                 elif hasattr(part, "text") and part.text:
-                    text_content = (text_content or "") + part.text
+                    text_content = (text_content or "") + str(part.text)
 
         usage_meta = response.usage_metadata
         usage = TokenUsage(
-            prompt_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
-            completion_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
-            total_tokens=getattr(usage_meta, "total_token_count", 0) or 0,
+            prompt_tokens=int(getattr(usage_meta, "prompt_token_count", 0) or 0),
+            completion_tokens=int(getattr(usage_meta, "candidates_token_count", 0) or 0),
+            total_tokens=int(getattr(usage_meta, "total_token_count", 0) or 0),
         )
 
         return LLMResponse(
@@ -347,7 +317,7 @@ class LLMClient:
         )
         for chunk in response_iter:
             if chunk.text:
-                yield chunk.text
+                yield str(chunk.text)
 
     # ------------------------------------------------------------------
     # OpenAI
@@ -511,9 +481,9 @@ class LLMClient:
 
         usage_meta = response.usage_metadata
         usage = TokenUsage(
-            prompt_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
-            completion_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
-            total_tokens=getattr(usage_meta, "total_token_count", 0) or 0,
+            prompt_tokens=int(getattr(usage_meta, "prompt_token_count", 0) or 0),
+            completion_tokens=int(getattr(usage_meta, "candidates_token_count", 0) or 0),
+            total_tokens=int(getattr(usage_meta, "total_token_count", 0) or 0),
         )
         return LLMResponse(
             content=text_content,
@@ -531,7 +501,7 @@ class LLMClient:
         )
         for chunk in response:
             if chunk.text:
-                yield chunk.text
+                yield str(chunk.text)
 
     # ------------------------------------------------------------------
     # Embeddings
@@ -635,12 +605,22 @@ def get_embedding_fn():
     return _embed
 
 
-def create_llm_client() -> LLMClient:
+def create_llm_client(redis=None) -> LLMClient:
+    """Factory for LLMClient. Pass the Redis client from app startup so the
+    circuit breaker has its shared state store from the very first request."""
     if settings.LLM_PROVIDER == "gemini":
-        return LLMClient(provider="gemini", model=settings.GEMINI_MODEL, api_key=settings.GEMINI_API_KEY)
+        return LLMClient(
+            provider="gemini", model=settings.GEMINI_MODEL,
+            api_key=settings.GEMINI_API_KEY, redis=redis,
+        )
     if settings.LLM_PROVIDER == "vertex":
         return LLMClient(
             provider="vertex", model=settings.GEMINI_MODEL,
-            vertex_project=settings.VERTEX_PROJECT_ID, vertex_location=settings.VERTEX_LOCATION,
+            vertex_project=settings.VERTEX_PROJECT_ID,
+            vertex_location=settings.VERTEX_LOCATION,
+            redis=redis,
         )
-    return LLMClient(provider="openai", model=settings.OPENAI_MODEL, api_key=settings.OPENAI_API_KEY)
+    return LLMClient(
+        provider="openai", model=settings.OPENAI_MODEL,
+        api_key=settings.OPENAI_API_KEY, redis=redis,
+    )

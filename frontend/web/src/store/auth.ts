@@ -64,7 +64,13 @@ export const useAuthStore = create<AuthState>()(
         } catch (error) {
           const axios = (await import('axios')).default
           if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
-            set({ user: null, tenantId: null, isAuthenticated: false })
+            // Only clear auth state if we don't already have a user in local state.
+            // This prevents wiping a fresh login when /auth/me can't be reached
+            // (e.g. cookie SameSite mismatch on localhost vs lvh.me during dev).
+            const current = get()
+            if (!current.user) {
+              set({ user: null, tenantId: null, isAuthenticated: false })
+            }
           }
         }
       },

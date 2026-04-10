@@ -1,61 +1,63 @@
 """
-PII Pseudonymization Service — Reference pseudo-values approach.
+PII Pseudonymization Service — Microsoft Presidio Edition
 
-Uses email-like pseudo-values with configurable domain to avoid Gemini
-safety filters redacting them:
-
-- john@example.com → user_x7k2m@ascenai.private
-- 647-123-4567 → +1-555-x7k2m
-- 123-45-6789 → x7k-yz9-0001
-- 4111-1111-1111-1111 → 4000-x7k2-yz9ab-0001
-
-Why this works:
-1. Natural-looking format that LLMs handle well
-2. Private TLD domain avoids matching real email providers
-3. Chat history shows [TYPE] labels via redact_for_display
-4. Output restores real values from mapping
+Uses presidio-analyzer to securely identify PII/Health Data and 
+replaces it with email-like pseudo-values to bypass LLM safety filters.
 """
-
 import json
 import os
 import re
-import time
 import uuid
-import hashlib
 from typing import Optional, Dict
 from dataclasses import dataclass, field
 import structlog
+
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
+from presidio_anonymizer import AnonymizerEngine
 
 logger = structlog.get_logger(__name__)
 
 PII_PSEUDO_DOMAIN = os.getenv("PII_PSEUDO_DOMAIN", "ascenai.private")
 
+_analyzer: Optional[AnalyzerEngine] = None
+_anonymizer: Optional[AnonymizerEngine] = None
 
 async def warmup() -> None:
-    """Pre-warm PII service at startup. No-op for regex-based detection."""
-    logger.info("pii_service_ready", method="pseudo_values")
-
+    """Pre-warm PII service at startup and configure Presidio."""
+    global _analyzer, _anonymizer
+    if _analyzer is None:
+        logger.info("pii_service_presidio_init_start")
+        # Load spaCy large model inside AnalyzerEngine
+        _analyzer = AnalyzerEngine()
+        
+        # Custom Recognizer for Medical/Health Conditions
+        health_recognizer = PatternRecognizer(
+            supported_entity="HEALTH_CONDITION",
+            patterns=[
+                Pattern(
+                    name="symptoms_and_conditions",
+                    regex=r"\b(headache|fever|cough|chest pain|stroke|cancer|diabetes|asthma|depression|anxiety|pain|COVID|flu)\b",
+                    score=0.8
+                )
+            ]
+        )
+        _analyzer.registry.add_recognizer(health_recognizer)
+        
+        _anonymizer = AnonymizerEngine()
+        logger.info("pii_service_presidio_init_complete", method="presidio_spacy_lg")
 
 def redact(text: str) -> str:
     """One-way PII redaction for output guardrail. Replaces PII with [TYPE] labels."""
-    if not text:
+    if not text or _analyzer is None:
         return text
-    result = text
-    for pii_type, pattern in PII_PATTERNS.items():
-        result = pattern.sub(f"[{pii_type}]", result)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# PII Detection Regex Patterns
-# ---------------------------------------------------------------------------
-PII_PATTERNS = {
-    'EMAIL': re.compile(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b'),
-    'PHONE': re.compile(r'\b(\+?1?\s*)?(\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})\b'),
-    'CREDIT_CARD': re.compile(r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'),
-    'SIN': re.compile(r'\b\d{3}[\s-]?\d{3}[\s-]?\d{3}\b'),
-    'SSN': re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
-}
+    
+    results = _analyzer.analyze(text=text, language='en')
+    results.sort(key=lambda x: x.start, reverse=True)
+    
+    result_text = text
+    for r in results:
+        result_text = result_text[:r.start] + f"[{r.entity_type}]" + result_text[r.end:]
+    return result_text
 
 
 # ---------------------------------------------------------------------------
@@ -90,16 +92,20 @@ class PIIContext:
         """Generate a pseudo-value that looks natural and is non-collidable."""
         hash_id = uuid.uuid4().hex[:8]
 
-        if pii_type == 'EMAIL':
+        if pii_type == 'EMAIL_ADDRESS':
             return f"user_{hash_id}@{PII_PSEUDO_DOMAIN}"
-        elif pii_type == 'PHONE':
+        elif pii_type == 'PHONE_NUMBER':
             return f"+1-555-{hash_id[:4]}"
         elif pii_type == 'CREDIT_CARD':
             return f"4000-{hash_id[:4]}-{hash_id[4:8]}-0001"
-        elif pii_type == 'SIN':
-            return f"{hash_id[:3]}-{hash_id[3:6]}-0001"
-        elif pii_type == 'SSN':
+        elif pii_type in ('US_SSN', 'SIN'):
             return f"{hash_id[:3]}-{hash_id[3:5]}-0001"
+        elif pii_type == 'PERSON':
+            return f"Person_{hash_id[:4]}"
+        elif pii_type == 'LOCATION':
+            return f"Location_{hash_id[:4]}"
+        elif pii_type == 'HEALTH_CONDITION':
+            return f"Condition_{hash_id[:4]}"
         else:
             return f"ref_{hash_id}@{PII_PSEUDO_DOMAIN}"
     
@@ -157,29 +163,34 @@ def redact_pii(text: str, ctx: PIIContext, session_id: str = "") -> str:
         return text
 
     logger.info("pii_redact_start", session_id=session_id, text_preview=text[:100])
-    result = text
-    found_types = []
+    
+    if _analyzer is None:
+        logger.error("presidio_analyzer_not_initialized")
+        return text
 
-    for pii_type, pattern in PII_PATTERNS.items():
-        def replacer(match, ptype=pii_type):
-            real_value = match.group(0)
-            pseudo = ctx.get_pseudo(ptype, real_value)
-            logger.info("pii_replaced", session_id=session_id, pii_type=ptype,
-                       pseudo=pseudo)
-            return pseudo
-
-        before = result
-        result = pattern.sub(replacer, result)
-        if result != before:
-            found_types.append(pii_type)
-
-    if found_types:
-        logger.info("pii_redacted", session_id=session_id, types=found_types,
-                   mappings=len(ctx.real_to_pseudo))
-    else:
+    results = _analyzer.analyze(text=text, language='en')
+    
+    if not results:
         logger.info("pii_no_match", session_id=session_id, text_preview=text[:100])
+        return text
 
-    return result
+    # Sort results in reverse so offsets don't change during replacement
+    results.sort(key=lambda x: x.start, reverse=True)
+    
+    result_text = text
+    found_types = []
+    
+    for r in results:
+        real_value = text[r.start:r.end]
+        pseudo = ctx.get_pseudo(r.entity_type, real_value)
+        result_text = result_text[:r.start] + pseudo + result_text[r.end:]
+        found_types.append(r.entity_type)
+        logger.info("pii_replaced", session_id=session_id, pii_type=r.entity_type, pseudo=pseudo)
+
+    logger.info("pii_redacted", session_id=session_id, types=list(set(found_types)),
+               mappings=len(ctx.real_to_pseudo))
+    
+    return result_text
 
 
 # ---------------------------------------------------------------------------
@@ -233,127 +244,77 @@ def redact_for_display(text: str, ctx: PIIContext) -> str:
     # First, redact pseudo-values (if they still exist in text)
     if ctx and ctx.has_mappings():
         for pseudo, real in ctx.pseudo_to_real.items():
-            if '@' in pseudo and PII_PSEUDO_DOMAIN in pseudo:
+            if pseudo.startswith('user_') and PII_PSEUDO_DOMAIN in pseudo:
                 result = result.replace(pseudo, '[EMAIL]')
             elif pseudo.startswith('+1-555'):
                 result = result.replace(pseudo, '[PHONE]')
             elif pseudo.startswith('4000-'):
                 result = result.replace(pseudo, '[CREDIT_CARD]')
-            elif re.match(r'\d{3}-\d{3}-\d{4}', pseudo):
-                result = result.replace(pseudo, '[SIN]')
-            elif re.match(r'\d{3}-\d{2}-\d{4}', pseudo):
+            elif pseudo.startswith('Person_'):
+                result = result.replace(pseudo, '[PERSON]')
+            elif pseudo.startswith('Location_'):
+                result = result.replace(pseudo, '[LOCATION]')
+            elif pseudo.startswith('Condition_'):
+                result = result.replace(pseudo, '[HEALTH_CONDITION]')
+            elif re.match(r'\w{3}-\w{2}-0001', pseudo):
                 result = result.replace(pseudo, '[SSN]')
             elif '@' in pseudo:
                 result = result.replace(pseudo, '[EMAIL]')
             else:
                 result = result.replace(pseudo, '[PII]')
 
-    # Second, redact any real PII that might have been restored by streaming parser
-    for pii_type, pattern in PII_PATTERNS.items():
-        result = pattern.sub(f'[{pii_type}]', result)
-
+    # Also apply the one-way redaction to catch any raw PII that slipped through
+    result = redact(result)
+    
     return result
 
 
-def redact_dict_for_display(d: dict, ctx: PIIContext) -> dict:
-    """Redact pseudo-values in dict for chat history display."""
-    return {
-        k: redact_for_display(v, ctx) if isinstance(v, str) else v
-        for k, v in d.items()
-    }
-
-
 # ---------------------------------------------------------------------------
-# Streaming Parser — Character-by-character for real-time restoration
+# Streaming Parser for Real-time Token Restoration
 # ---------------------------------------------------------------------------
 
-class StreamingParser:
+class PIIStreamingParser:
     """
-    State machine that restores pseudo-values to real values during streaming.
-    
-    Guarantees (per D2):
-    1. Partial pseudo-values split across chunks are fully restored before output.
-    2. No leakage or truncation of pseudo-values in output stream.
-    3. flush() must always be called at stream end to emit remaining buffer.
-    
-    Algorithm:
-    - Buffer accumulation retains max_pseudo_length trailing characters.
-    - Known pseudo-values are replaced only when a complete match is confirmed.
-    - On flush(), any remaining buffer undergoes full restoration.
+    Accumulates chunks of text and replaces pseudo-values with real values.
+    Handles pseudo-values that might be split across chunks.
     """
-    
-    def __init__(self, ctx: PIIContext, session_id: str):
+    def __init__(self, ctx: PIIContext, session_id: str = ""):
         self.ctx = ctx
         self.session_id = session_id
         self.buffer = ""
-        # Calculate max pseudo-value length for buffer retention
-        self.max_pseudo_len = max(len(p) for p in ctx.pseudo_to_real.keys()) if ctx.has_mappings() else 0
-    
+        # Longest possible pseudo-value length to wait for potential matches
+        self.max_pseudo_len = 64 
+
     def process_chunk(self, chunk: str) -> str:
-        """
-        Process a chunk, restoring pseudo-values to real values.
-        
-        Returns safe output that can be emitted immediately.
-        Partial pseudo-values are held in buffer until complete match.
-        """
-        if not self.ctx.has_mappings():
-            return chunk
-        
         self.buffer += chunk
         
-        last_replacement_end = None
-        
-        for pseudo, real in self.ctx.pseudo_to_real.items():
-            idx = self.buffer.find(pseudo)
-            if idx != -1:
-                self.buffer = self.buffer.replace(pseudo, real, 1)
-                last_replacement_end = idx + len(real)
-                logger.info("pii_stream_restored", session_id=self.session_id,
-                           pseudo_len=len(pseudo), real_len=len(real))
-        
-        if len(self.buffer) <= self.max_pseudo_len and last_replacement_end is None:
-            return ""
-        
-        if last_replacement_end is not None:
-            output = self.buffer[:last_replacement_end]
-            self.buffer = self.buffer[last_replacement_end:]
-            return output
-        
-        suffix = self.buffer[len(self.buffer) - self.max_pseudo_len:]
-        if len(suffix) >= 16 and "@" in suffix and suffix in self.ctx.pseudo_to_real:
-            return ""
-        
-        safe_end = len(self.buffer) - self.max_pseudo_len
-        output = self.buffer[:safe_end]
-        self.buffer = self.buffer[safe_end:]
-        
-        return output
-    
-    def flush(self) -> str:
-        """
-        Flush remaining buffer at stream end.
-        
-        Applies full restoration to any remaining content.
-        MUST be called when stream completes to avoid data loss.
-        """
-        if not self.ctx.has_mappings():
-            result = self.buffer
-            self.buffer = ""
-            return result
-        
-        # Restore any remaining pseudo-values in buffer
-        for pseudo, real in self.ctx.pseudo_to_real.items():
-            if pseudo in self.buffer:
-                self.buffer = self.buffer.replace(pseudo, real)
-                logger.info("pii_stream_flush_restored", session_id=self.session_id)
+        # If we have potential pseudo-tokens, we wait until we have enough buffer
+        # to ensure we don't return a partial token.
+        # For simplicity, we just replace everything we can in the current buffer
+        # and keep a small tail.
         
         result = self.buffer
+        for pseudo, real in self.ctx.pseudo_to_real.items():
+            if pseudo in result:
+                result = result.replace(pseudo, real)
+        
+        # Keep the last max_pseudo_len characters in buffer to catch split tokens
+        if len(result) > self.max_pseudo_len:
+            to_return = result[:-self.max_pseudo_len]
+            self.buffer = result[-self.max_pseudo_len:]
+            return to_return
+        else:
+            self.buffer = result
+            return ""
+
+    def flush(self) -> str:
+        final = self.buffer
+        for pseudo, real in self.ctx.pseudo_to_real.items():
+            final = final.replace(pseudo, real)
         self.buffer = ""
-        return result
+        return final
 
 
-def create_streaming_parser(ctx: PIIContext, session_id: str) -> StreamingParser:
-    """Factory to create a streaming parser."""
-    return StreamingParser(ctx, session_id)
-
-
+def create_streaming_parser(ctx: PIIContext, session_id: str = "") -> PIIStreamingParser:
+    """Factory for PIIStreamingParser."""
+    return PIIStreamingParser(ctx, session_id)

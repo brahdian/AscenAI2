@@ -18,6 +18,7 @@ import {
   Home,
   ShieldAlert,
   ClipboardList,
+  Activity,
 } from 'lucide-react'
 
 const ROOT_DOMAIN = process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'localhost:3000'
@@ -60,16 +61,17 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
 
   const navItems = [
     { label: 'Overview', href: '/admin/dashboard', icon: Home },
-    { label: 'Platform Economics', href: '/admin/analytics', icon: BarChart3 },
-    { label: 'Infrastructure', href: '/admin/tenants', icon: Building2 },
-    { label: 'Identity Directory', href: '/admin/users', icon: Users },
+    { label: 'Analytics', href: '/admin/analytics', icon: BarChart3 },
+    { label: 'System Health', href: '/admin/system', icon: Activity },
+    { label: 'Tenants', href: '/admin/tenants', icon: Building2 },
+    { label: 'Users', href: '/admin/users', icon: Users },
   ]
 
   const configItems = [
-    { label: 'Platform Guardrails', href: '/admin/guardrails', icon: ShieldAlert },
+    { label: 'Guardrails', href: '/admin/guardrails', icon: ShieldAlert },
     { label: 'Audit Logs', href: '/admin/audit-logs', icon: ClipboardList },
-    { label: 'Billing & Plans', href: '/admin/settings/plans', icon: Zap },
-    { label: 'Global Settings', href: '/admin/settings', icon: Settings },
+    { label: 'Plans & Pricing', href: '/admin/settings/plans', icon: Zap },
+    { label: 'Settings', href: '/admin/settings', icon: Settings },
   ]
 
   return (
@@ -82,10 +84,10 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
             <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-violet-600 to-blue-600 flex items-center justify-center text-white font-bold text-sm shadow-lg shadow-violet-500/20">
               <ShieldCheck size={18} />
             </div>
-            <span className="text-lg font-bold tracking-tight text-gray-900 dark:text-white">Super Admin</span>
+            <span className="text-lg font-bold tracking-tight text-gray-900 dark:text-white">{APP_NAME}</span>
           </div>
-          <p className="mt-1.5 text-[10px] uppercase font-bold tracking-widest text-gray-400 dark:text-gray-500 group-hover:text-violet-500 transition-colors">
-            {APP_NAME} Control Center
+          <p className="mt-1.5 text-[10px] uppercase font-bold tracking-widest text-gray-400 dark:text-gray-500">
+            Admin Console
           </p>
         </div>
 
@@ -150,11 +152,11 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
               {user?.full_name?.charAt(0)?.toUpperCase() || 'A'}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-black text-gray-900 dark:text-white truncate">
+              <p className="text-xs font-bold text-gray-900 dark:text-white truncate">
                 {user?.full_name || 'Admin'}
               </p>
-              <p className="text-[9px] font-bold text-violet-600 dark:text-violet-400 uppercase tracking-widest flex items-center gap-1">
-                 <ShieldCheck size={10} /> Root
+              <p className="text-[10px] font-medium text-violet-600 dark:text-violet-400 flex items-center gap-1">
+                <ShieldCheck size={10} /> Super Admin
               </p>
             </div>
             <button
@@ -168,8 +170,8 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
                   window.location.href = `${platformUrl || getMainOrigin()}/login`
                 }
               }}
-              className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 rounded-lg transition-all active:scale-90"
-              title="Terminate Global Session"
+              className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 rounded-lg transition-all"
+              title="Sign out"
             >
               <LogOut size={16} />
             </button>

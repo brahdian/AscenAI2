@@ -93,7 +93,7 @@ export default function TenantsPage() {
           onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}
           className="w-full sm:w-auto px-4 py-2 bg-gray-50 dark:bg-gray-950 border border-gray-100 dark:border-gray-800 rounded-xl text-gray-900 dark:text-white text-sm font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/20"
         >
-          <option value="">All Lifecycle States</option>
+          <option value="">All Statuses</option>
           <option value="active">Active</option>
           <option value="suspended">Suspended</option>
           <option value="deleted">Deleted</option>
@@ -107,9 +107,10 @@ export default function TenantsPage() {
             <thead>
               <tr className="bg-gray-50/50 dark:bg-gray-800/30 border-b border-gray-100 dark:border-gray-800">
                 <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Organization</th>
-                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Tier</th>
-                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Lifecycle</th>
-                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Provisioned</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Plan</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Agents</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Status</th>
+                <th className="px-6 py-4 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">Created</th>
                 <th className="px-6 py-4 text-right"></th>
               </tr>
             </thead>
@@ -119,7 +120,7 @@ export default function TenantsPage() {
                   <td colSpan={5} className="px-6 py-20 text-center">
                     <div className="flex flex-col items-center gap-3">
                         <div className="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin"></div>
-                        <p className="text-sm text-gray-500 font-medium tracking-tight">Syncing with registry...</p>
+                        <p className="text-sm text-gray-500 font-medium tracking-tight">Loading tenants…</p>
                     </div>
                   </td>
                 </tr>
@@ -152,21 +153,23 @@ export default function TenantsPage() {
                       </div>
                     </td>
                     <td className="px-6 py-4">
-                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-violet-50 dark:bg-violet-900/10 text-violet-600 dark:text-violet-400 border border-violet-100 dark:border-violet-900/30 uppercase tracking-tighter">
+                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-violet-50 dark:bg-violet-900/10 text-violet-700 dark:text-violet-300 capitalize">
                         {tenant.plan || 'Free'}
                       </span>
                     </td>
+                    <td className="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
+                      {tenant.agent_count ?? '—'}
+                    </td>
                     <td className="px-6 py-4">
                       <span
-                        className={`inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded-md border ${
+                        className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-0.5 rounded-full ${
                           tenant.status === 'active'
-                            ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-100 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400'
+                            ? 'bg-emerald-50 dark:bg-emerald-900/10 text-emerald-700 dark:text-emerald-400'
                             : tenant.status === 'suspended'
-                            ? 'bg-red-50 dark:bg-red-900/10 border-red-100 dark:border-red-900/30 text-red-600 dark:text-red-400'
-                            : 'bg-gray-50 dark:bg-gray-800 border-gray-100 dark:border-gray-700 text-gray-500 dark:text-gray-400'
+                            ? 'bg-red-50 dark:bg-red-900/10 text-red-700 dark:text-red-400'
+                            : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'
                         }`}
                       >
-                         <div className={`w-1 h-1 rounded-full ${tenant.status === 'active' ? 'bg-emerald-500' : 'bg-current'}`}></div>
                          {tenant.status}
                       </span>
                     </td>
@@ -188,7 +191,7 @@ export default function TenantsPage() {
         {/* Pagination Status */}
         <div className="px-6 py-4 bg-gray-50/50 dark:bg-gray-800/30 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
            <p className="text-xs font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">
-              Showing {filteredTenants?.length || 0} of {data?.pagination?.total || 0} Organizations
+              Showing {filteredTenants?.length || 0} of {data?.pagination?.total || 0} tenants
            </p>
            {totalPages > 1 && (
              <div className="flex items-center gap-1">
@@ -267,7 +270,7 @@ function CreateTenantModal({ onClose, onCreated }: { onClose: () => void; onCrea
         <div className="flex items-center justify-between px-8 py-6 border-b border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-800/20">
           <div>
               <h2 className="text-xl font-bold text-gray-900 dark:text-white tracking-tight">Provision New Tenant</h2>
-              <p className="text-xs text-gray-500 dark:text-gray-400 font-medium">Standardize organization onboarding and trial setup.</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400 font-medium">Create a new organization account with an admin user.</p>
           </div>
           <button onClick={onClose} className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-all">
             <X size={20} />
@@ -283,7 +286,7 @@ function CreateTenantModal({ onClose, onCreated }: { onClose: () => void; onCrea
           
           <div className="grid grid-cols-2 gap-4">
              <div className="col-span-2 sm:col-span-1">
-                <label className="block text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-2">Tenant Handle (Slug)</label>
+                <label className="block text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-2">Slug (URL identifier)</label>
                 <input
                   type="text"
                   required
@@ -321,7 +324,7 @@ function CreateTenantModal({ onClose, onCreated }: { onClose: () => void; onCrea
 
           <div className="p-6 bg-violet-50/50 dark:bg-violet-900/5 rounded-3xl border border-violet-100 dark:border-violet-900/20 space-y-4">
              <h3 className="text-xs font-bold text-violet-600 dark:text-violet-400 uppercase tracking-widest flex items-center gap-2">
-                <Users size={14} /> Root Identity Setup
+                <Users size={14} /> Admin Account
              </h3>
              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
@@ -355,7 +358,7 @@ function CreateTenantModal({ onClose, onCreated }: { onClose: () => void; onCrea
               onClick={onClose}
               className="flex-1 px-6 py-3 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-white rounded-xl text-sm font-bold transition-all"
             >
-              Discard
+              Cancel
             </button>
             <button
               type="submit"

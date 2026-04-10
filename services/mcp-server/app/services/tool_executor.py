@@ -17,6 +17,7 @@ from app.models.tool import Tool, ToolExecution
 from app.schemas.mcp import MCPToolCall, MCPToolResult
 from app.services.tool_registry import ToolRegistry
 from app.services.auth_manager import AuthManager
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -60,6 +61,7 @@ async def _get_builtin_handlers() -> dict:
     from app.tools.integrations.mailchimp_tool import handle_mailchimp_add_subscriber
     from app.tools.integrations.telnyx_tool import handle_telnyx_send_bulk_sms
     from app.tools.builtin.twilio_pay import handle_twilio_pay
+    from app.tools.builtin.agent_call import handle_agent_call
 
     return {
         # Demo / Built-in tools
@@ -109,6 +111,8 @@ async def _get_builtin_handlers() -> dict:
         "mailchimp_add_subscriber": handle_mailchimp_add_subscriber,
         "telnyx_send_bulk_sms": handle_telnyx_send_bulk_sms,
         "twilio_pay_initiate": handle_twilio_pay,
+        # Agent-as-Tool
+        "agent_call": handle_agent_call,
     }
 
 
@@ -255,14 +259,15 @@ class ToolExecutor:
                 status="failed",
             )
 
-        # 4. Create execution record
+        # 4. Create execution record. Redact input_data before DB persistence.
+        redacted_input = pii_service.redact_dict(tool_call.parameters, pii_service.PIIContext())
         execution = ToolExecution(
             id=uuid.UUID(execution_id),
             tenant_id=uuid.UUID(tenant_id),
             tool_id=tool.id,
             session_id=tool_call.session_id,
             trace_id=tool_call.trace_id,
-            input_data=tool_call.parameters,
+            input_data=redacted_input,
             status="running",
         )
         self.db.add(execution)
@@ -302,12 +307,17 @@ class ToolExecutor:
                 exc_info=exc,
             )
 
-        # 6. Persist result
+        # 6. Persist result (Redact output_data)
         end_ms = int(time.time() * 1000)
         duration_ms = end_ms - start_ms
         from datetime import datetime, timezone
         execution.status = status
-        execution.output_data = result_data
+        
+        redacted_output = None
+        if result_data:
+            redacted_output = pii_service.redact_dict(result_data, pii_service.PIIContext())
+            
+        execution.output_data = redacted_output
         execution.error_message = error_msg
         execution.duration_ms = duration_ms
         execution.completed_at = datetime.now(timezone.utc)
@@ -328,6 +338,87 @@ class ToolExecutor:
             duration_ms=duration_ms,
             trace_id=tool_call.trace_id,
             execution_id=execution_id,
+            status=status,
+        )
+
+    async def test_execute(
+        self, tenant_id: str, tool: Tool, tool_call: MCPToolCall
+    ) -> MCPToolResult:
+        """
+        Execute a tool call for testing (e.g. from the Admin/Config UI)
+        without persisting to the execution history DB and using a transient Tool object.
+        """
+        start_ms = int(time.time() * 1000)
+
+        # 1. Validate input against the transient tool's schema
+        try:
+            await self._validate_input(tool.input_schema, tool_call.parameters)
+        except ValidationError as exc:
+            return MCPToolResult(
+                tool_name=tool_call.tool_name,
+                error=f"Input validation failed: {exc}",
+                duration_ms=0,
+                trace_id=tool_call.trace_id,
+                status="failed",
+            )
+
+        # 2. Add an ad-hoc rate limit for test_execute to prevent abuse of the test endpoint
+        try:
+            await self._check_rate_limit(tenant_id, f"test_{tool.name}", 10) # Max 10 tests / min
+        except RateLimitError:
+             return MCPToolResult(
+                tool_name=tool_call.tool_name,
+                error=f"Too many test executions. Please wait and try again.",
+                duration_ms=0,
+                trace_id=tool_call.trace_id,
+                status="failed",
+            )
+
+        # 3. Execute with timeout
+        # Cap timeout_override to prevent resource exhaustion attacks
+        _MAX_TIMEOUT = getattr(settings, "MAX_TOOL_TIMEOUT_SECONDS", 300)
+        raw_timeout = tool_call.timeout_override or tool.timeout_seconds
+        timeout = min(float(raw_timeout), float(_MAX_TIMEOUT))
+        result_data: Optional[dict] = None
+        error_msg: Optional[str] = None
+        status = "completed"
+
+        try:
+            result_data = await asyncio.wait_for(
+                self._dispatch(tool, tool_call.parameters),
+                timeout=float(timeout),
+            )
+        except asyncio.TimeoutError:
+            error_msg = f"Tool execution timed out after {timeout}s"
+            status = "timeout"
+        except Exception as exc:
+            error_msg = str(exc)
+            status = "failed"
+            logger.error(
+                "tool_test_execution_error",
+                tool_name=tool.name,
+                tenant_id=tenant_id,
+                error=str(exc),
+            )
+
+        end_ms = int(time.time() * 1000)
+        duration_ms = end_ms - start_ms
+
+        logger.info(
+            "tool_test_executed",
+            tool_name=tool.name,
+            tenant_id=tenant_id,
+            status=status,
+            duration_ms=duration_ms,
+        )
+
+        return MCPToolResult(
+            tool_name=tool.name,
+            result=result_data,
+            error=error_msg,
+            duration_ms=duration_ms,
+            trace_id=tool_call.trace_id,
+            execution_id=None,
             status=status,
         )
 

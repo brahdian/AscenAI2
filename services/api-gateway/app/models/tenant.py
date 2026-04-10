@@ -48,8 +48,8 @@ class Tenant(Base):
 
     # Subscription
     plan: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="professional"
-    )  # "professional", "business", "enterprise"
+        String(50), nullable=False, default="starter"
+    )  # "starter", "growth", "business", "enterprise"
     plan_limits: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     subscription_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
@@ -107,9 +107,17 @@ class Tenant(Base):
 
     @property
     def plan_display_name(self) -> str:
-        if self.subscription_status != "active":
+        """Return a human-friendly plan name, including status if not active."""
+        if not self.plan or self.plan == "none":
             return "Not Subscribed"
-        return self.PLAN_DISPLAY_NAMES.get(self.plan, self.plan.replace("_", " ").title())
+            
+        base_name = self.PLAN_DISPLAY_NAMES.get(self.plan, self.plan.replace("_", " ").title())
+        
+        if self.subscription_status == "active":
+            return base_name
+        
+        status_label = (self.subscription_status or "inactive").title()
+        return f"{base_name} ({status_label})"
 
     def __repr__(self) -> str:
         return f"<Tenant slug={self.slug} plan={self.plan}>"

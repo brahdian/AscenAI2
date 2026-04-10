@@ -150,7 +150,7 @@ async def list_tenant_agents_for_console(
             if resp.status_code == 200:
                 data = resp.json()
                 agents = [{"id": str(a.get("id")), "name": a.get("name", "Unnamed")}
-                          for a in (data.get("agents") or data if isinstance(data, list) else [])]
+                          for a in (data if isinstance(data, list) else (data.get("agents", []) or []))]
                 return {"agents": agents}
     except Exception as exc:
         logger.warning("console_agents_fetch_failed", error=str(exc))

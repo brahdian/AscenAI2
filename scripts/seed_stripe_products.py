@@ -13,20 +13,20 @@ if not stripe.api_key:
 
 PLANS = [
     {
-        "name": "AscenAI Text Growth",
-        "plan_id": "text_growth",
+        "name": "AscenAI Starter",
+        "plan_id": "starter",
         "price": 4900,
         "interval": "month",
     },
     {
-        "name": "AscenAI Voice Growth",
-        "plan_id": "voice_growth",
+        "name": "AscenAI Growth",
+        "plan_id": "growth",
         "price": 9900,
         "interval": "month",
     },
     {
-        "name": "AscenAI Voice Business",
-        "plan_id": "voice_business",
+        "name": "AscenAI Business",
+        "plan_id": "business",
         "price": 19900,
         "interval": "month",
     },

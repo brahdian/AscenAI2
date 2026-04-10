@@ -100,7 +100,7 @@ services:
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       VOICE_PIPELINE_URL: http://voice-pipeline:8003
     command: >
-      sh -c "python -m app.scripts.seed_platform && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+      sh -c "python -m app.scripts.migrate && python -m app.scripts.seed_platform && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -222,6 +222,10 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       AI_ORCHESTRATOR_WS_URL: ws://ai-orchestrator:8002
+      TTS_PROVIDER: ${TTS_PROVIDER:-deepgram}
+      STT_PROVIDER: ${STT_PROVIDER:-deepgram}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID:-a0e99841-438c-4a64-b679-ae501e7d6091}
     depends_on:
       redis:
         condition: service_healthy
@@ -255,6 +259,7 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api.lvh.me:8000}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://api.lvh.me:8000}
         NEXT_PUBLIC_ROOT_DOMAIN: ${NEXT_PUBLIC_ROOT_DOMAIN:-lvh.me:3000}
+        NEXT_PUBLIC_APP_SUBDOMAIN: ${NEXT_PUBLIC_APP_SUBDOMAIN:-app.lvh.me:3000}
         NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
         NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
     restart: unless-stopped
@@ -264,13 +269,18 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api.lvh.me:8000}
       NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://api.lvh.me:8000}
       NEXT_PUBLIC_ROOT_DOMAIN: ${NEXT_PUBLIC_ROOT_DOMAIN:-lvh.me:3000}
+      NEXT_PUBLIC_APP_SUBDOMAIN: ${NEXT_PUBLIC_APP_SUBDOMAIN:-app.lvh.me:3000}
       NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
       NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
       ADMIN_SUBDOMAIN: ${ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+      APP_SUBDOMAIN: ${APP_SUBDOMAIN:-app.lvh.me:3000}
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
     depends_on:
       - api-gateway
     networks:
       - frontend-net
+      - backend-net
     deploy:
       resources:
         limits:

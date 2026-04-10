@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime, ForeignKey, func, Index
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import TYPE_CHECKING
@@ -21,7 +22,7 @@ class Agent(Base):
     __tablename__ = "agents"
     __table_args__ = (
         Index("ix_agents_tenant_id", "tenant_id"),
-        Index("ix_agents_tenant_active", "tenant_id", "is_active"),
+        Index("ix_agents_tenant_status", "tenant_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -32,29 +33,18 @@ class Agent(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     business_type: Mapped[str] = mapped_column(
         String(50), nullable=False, default="generic"
-    )  # "pizza_shop", "clinic", "salon", "generic"
+    )
     personality: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    agent_config: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), nullable=False, server_default='{}')
+
     voice_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     voice_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     language: Mapped[str] = mapped_column(String(10), default="en")
-    auto_detect_language: Mapped[bool] = mapped_column(Boolean, default=False)
-    supported_languages: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
-    # Greeting sent at the start of every new session (text + optional pre-recorded audio)
-    greeting_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    voice_greeting_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    voice_system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    voice_config: Mapped[Optional[dict]] = mapped_column(
-        JSONB, nullable=True, default=dict
-    )
-    tools: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=list)
-    knowledge_base_ids: Mapped[Optional[dict]] = mapped_column(
-        JSONB, nullable=True, default=list
-    )
-    llm_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=dict)
-    escalation_config: Mapped[Optional[dict]] = mapped_column(
-        JSONB, nullable=True, default=dict
-    )
+
+    extension_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+    is_available_as_tool: Mapped[bool] = mapped_column(Boolean, default=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # Lifecycle state machine — mirrors is_active but carries richer semantics.
     # Values: draft | pending_payment | active | grace | expired | archived
@@ -63,6 +53,9 @@ class Agent(Base):
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Agent subscription expiry - set when payment is made, checked before allowing agent usage
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    grace_period_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -99,20 +92,14 @@ class Agent(Base):
             "business_type": self.business_type,
             "personality": self.personality,
             "system_prompt": self.system_prompt,
+            "agent_config": self.agent_config or {},
             "voice_enabled": self.voice_enabled,
             "voice_id": self.voice_id,
             "language": self.language,
-            "auto_detect_language": self.auto_detect_language,
-            "supported_languages": self.supported_languages or [],
-            "greeting_message": self.greeting_message,
-            "voice_greeting_url": self.voice_greeting_url,
-            "voice_system_prompt": self.voice_system_prompt,
-            "voice_config": self.voice_config or {},
-            "tools": self.tools or [],
-            "knowledge_base_ids": self.knowledge_base_ids or [],
-            "llm_config": self.llm_config or {},
-            "escalation_config": self.escalation_config or {},
-            "is_active": self.is_active,
+            "extension_number": self.extension_number,
+            "is_available_as_tool": self.is_available_as_tool,
+            "status": self.status,
+            "stripe_subscription_id": self.stripe_subscription_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -163,7 +150,7 @@ class Session(Base):
     channel: Mapped[str] = mapped_column(String(20), default="text")
     status: Mapped[str] = mapped_column(String(20), default="active")
     metadata_: Mapped[Optional[dict]] = mapped_column(
-        "metadata", JSONB, nullable=True, default=dict
+        "metadata", MutableDict.as_mutable(JSONB), nullable=True, default=dict
     )
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -243,8 +230,8 @@ class Message(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    tool_calls: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    tool_results: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    tool_calls: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSONB), nullable=True)
+    tool_results: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSONB), nullable=True)
     tokens_used: Mapped[int] = mapped_column(Integer, default=0)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     is_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -350,7 +337,7 @@ class MessageFeedback(Base):
     # "positive" | "negative"
     rating: Mapped[str] = mapped_column(String(20), nullable=False)
     # e.g. ["helpful", "accurate"] or ["wrong", "off-topic", "inappropriate"]
-    labels: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    labels: Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSONB), nullable=True, default=list)
     comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # "user" (end-user) | "operator" (dashboard reviewer)
     feedback_source: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
@@ -365,10 +352,10 @@ class MessageFeedback(Base):
     correction_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Playbook correction: {"correct_playbook_id": str, "correct_playbook_name": str}
     # Set when the operator identifies a wrong playbook was triggered
-    playbook_correction: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    playbook_correction: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSONB), nullable=True)
     # Tool-call corrections: list of {tool_name, was_correct, correct_tool, reason}
     # Set per-tool when the operator marks incorrect tool calls
-    tool_corrections: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    tool_corrections: Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSONB), nullable=True)
 
     def to_dict(self) -> dict:
         return {
@@ -412,37 +399,10 @@ class AgentPlaybook(Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="Default")
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    intent_triggers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    intent_triggers: Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSONB), nullable=True, default=list)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # NOTE: greeting_message has been moved to Agent level (Agent.greeting_message
-    # + Agent.voice_greeting_url). This field is retained in DB for backward
-    # compatibility but is no longer read by the orchestrator.
-
-    # Detailed operator instructions injected into the system prompt
-    instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    # Tone style: "professional" | "friendly" | "casual" | "empathetic"
-    tone: Mapped[str] = mapped_column(String(50), nullable=False, default="professional")
-
-    # Things to always do / never do  (JSONB list[str])
-    dos: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-    donts: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-
-    # Scenario playbook: list of {trigger: str, response: str}
-    scenarios: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-
-    # Canned fallback responses
-    out_of_scope_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    fallback_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    custom_escalation_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    # Expected inputs to this playbook and data it outputs (for explicit variable passing)
-    input_schema: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    output_schema: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-
-    # Playbook-specific tools injected ONLY when this playbook is active (List[str] names)
-    tools: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    config: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), nullable=False, server_default='{}')
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -464,17 +424,7 @@ class AgentPlaybook(Base):
             "description": self.description,
             "intent_triggers": self.intent_triggers or [],
             "is_default": self.is_default,
-
-            "instructions": self.instructions,
-            "tone": self.tone,
-            "dos": self.dos or [],
-            "donts": self.donts or [],
-            "scenarios": self.scenarios or [],
-            "out_of_scope_response": self.out_of_scope_response,
-            "fallback_response": self.fallback_response,
-            "custom_escalation_message": self.custom_escalation_message,
-            "input_schema": self.input_schema,
-            "output_schema": self.output_schema,
+            "config": self.config or {},
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -498,7 +448,7 @@ class AgentDocument(Base):
 
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(768), nullable=True)
-    vector_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
+    vector_ids: Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSONB), nullable=True, default=list)
     status: Mapped[str] = mapped_column(String(20), default="processing")  # draft | published | processing | ready | failed
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -517,6 +467,8 @@ class AgentDocument(Base):
             "name": self.name,
             "file_type": self.file_type,
             "file_size_bytes": self.file_size_bytes,
+            "storage_path": self.storage_path,
+            "content": self.content,
             "chunk_count": self.chunk_count,
             "status": self.status,
             "error_message": self.error_message,
@@ -565,8 +517,8 @@ class PlaybookExecution(Base):
     )
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
     current_step_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    variables: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    history: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    variables: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), nullable=False, default=dict)
+    history: Mapped[list] = mapped_column(MutableList.as_mutable(JSONB), nullable=False, default=list)
     step_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -598,31 +550,8 @@ class AgentGuardrails(Base):
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
 
-    # Input checks
-    blocked_keywords: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-    blocked_topics: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-    allowed_topics: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True, default=list)
-    profanity_filter: Mapped[bool] = mapped_column(Boolean, default=True)
-
-    # Output checks
-    pii_redaction: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Reversible input pseudonymization — anonymize before LLM, restore in response
-    pii_pseudonymization: Mapped[bool] = mapped_column(Boolean, default=True)
-    max_response_length: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unlimited
-    require_disclaimer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    # Custom response messages
-    blocked_message: Mapped[str] = mapped_column(
-        Text, nullable=False, default="I'm sorry, I can't help with that."
-    )
-    off_topic_message: Mapped[str] = mapped_column(
-        Text, nullable=False, default="I'm only able to help with topics related to our service."
-    )
-
-    # Display level (for UI)
-    content_filter_level: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="medium"
-    )  # none | low | medium | strict
+    # Consolidate all toggles, messages, levels into a single config blob
+    config: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), nullable=False, server_default='{}')
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -640,17 +569,7 @@ class AgentGuardrails(Base):
             "id": str(self.id),
             "agent_id": str(self.agent_id),
             "tenant_id": str(self.tenant_id),
-            "blocked_keywords": self.blocked_keywords or [],
-            "blocked_topics": self.blocked_topics or [],
-            "allowed_topics": self.allowed_topics or [],
-            "profanity_filter": self.profanity_filter,
-            "pii_redaction": self.pii_redaction,
-            "pii_pseudonymization": self.pii_pseudonymization,
-            "max_response_length": self.max_response_length,
-            "require_disclaimer": self.require_disclaimer,
-            "blocked_message": self.blocked_message,
-            "off_topic_message": self.off_topic_message,
-            "content_filter_level": self.content_filter_level,
+            "config": self.config or {},
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -701,7 +620,7 @@ class EscalationAttempt(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Full payload snapshot for replay
-    payload_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    payload_snapshot: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSONB), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

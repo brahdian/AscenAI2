@@ -44,17 +44,17 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_OVERAGE_RATES: dict[str, dict[str, Decimal]] = {
-    "text_growth": {
+    "starter": {
         "per_chat": Decimal("0.002"),
         "per_voice_minute": Decimal("0.10"),
         "per_tool_call": Decimal("0.005"),
     },
-    "voice_growth": {
+    "growth": {
         "per_chat": Decimal("0.002"),
         "per_voice_minute": Decimal("0.10"),
         "per_tool_call": Decimal("0.005"),
     },
-    "voice_business": {
+    "business": {
         "per_chat": Decimal("0.002"),
         "per_voice_minute": Decimal("0.10"),
         "per_tool_call": Decimal("0.003"),
@@ -64,14 +64,7 @@ _DEFAULT_OVERAGE_RATES: dict[str, dict[str, Decimal]] = {
         "per_voice_minute": Decimal("0.00"),
         "per_tool_call": Decimal("0.00"),
     },
-    # Legacy aliases
-    "professional": None,  # filled in below
-    "business": None,
-    "starter": None,
 }
-_DEFAULT_OVERAGE_RATES["professional"] = _DEFAULT_OVERAGE_RATES["voice_growth"]
-_DEFAULT_OVERAGE_RATES["business"] = _DEFAULT_OVERAGE_RATES["voice_business"]
-_DEFAULT_OVERAGE_RATES["starter"] = _DEFAULT_OVERAGE_RATES["text_growth"]
 
 _SOFT_WARNING_PCT = settings.QUOTA_SOFT_WARNING_PCT  # configurable via env / admin
 
@@ -131,12 +124,8 @@ def _month_key() -> str:
 
 def _resolve_plan(plan: str) -> str:
     """Normalise plan aliases to canonical key used in PLAN_LIMITS."""
-    aliases = {
-        "starter": "text_growth",
-        "professional": "voice_growth",
-        "business": "voice_business",
-    }
-    return aliases.get(plan, plan)
+    # Standardized plans: starter, growth, business, enterprise
+    return plan
 
 
 def _quantize(value: Decimal) -> float:
@@ -382,7 +371,7 @@ class BillingService:
         overage_data = await self.calculate_overage(tenant_id, canonical)
 
         if base_price is None:
-            plan_config = _OVERAGE_RATES.get(canonical, {})
+            plan_config = _DEFAULT_OVERAGE_RATES.get(canonical, {})
             base_price = 0.0  # caller should supply from Tenant / Stripe
 
         total = round(base_price + overage_data["total_overage"], 2)
@@ -531,6 +520,7 @@ async def create_agent_checkout_session(
     db: AsyncSession,
     requested_plan: str = None,
     return_path: str = "/dashboard/agents",
+    frontend_url: str | None = None,
 ) -> str:
     """
     Create a Stripe checkout session for a specific agent.
@@ -585,8 +575,8 @@ async def create_agent_checkout_session(
                 }
             ],
             "mode": "subscription",
-            "success_url": f"{settings.FRONTEND_URL}{return_path}?success=true&agent_id={agent_id}",
-            "cancel_url": f"{settings.FRONTEND_URL}{return_path}?cancelled=true",
+            "success_url": f"{frontend_url or settings.FRONTEND_URL}/dashboard/agents/new?success=true&agent_id={agent_id}",
+            "cancel_url": f"{frontend_url or settings.FRONTEND_URL}/dashboard/agents/new?cancelled=true",
             "metadata": {
                 "tenant_id": str(tenant.id),
                 "agent_id": agent_id,

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
 import time
 import uuid
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import get_tenant_db, get_current_tenant, require_forwarded_role
-from app.models.agent import Agent, AgentPlaybook
+from app.models.agent import Agent, AgentPlaybook, AgentGuardrails
 from app.schemas.chat import (
     AgentCreate,
     AgentResponse,
@@ -23,6 +25,7 @@ from app.schemas.chat import (
     ChatResponse,
     ConnectorTestResult,
 )
+from app.services.agent_state_machine import AgentStateMachine
 from app.guardrails.voice_agent_guardrails import (
     get_dynamic_voice_protocol,
     generate_multilingual_greeting,
@@ -67,9 +70,9 @@ def _tenant_id(request: Request) -> str:
 
 
 async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
-    supported_langs = getattr(agent, 'supported_languages', None) or []
+    config = agent.agent_config or {}
+    supported_langs = config.get("supported_languages", [])
     
-    # Generate dynamic components from platform settings
     computed_greeting = await generate_multilingual_greeting(db, supported_langs)
     computed_protocol = await get_dynamic_voice_protocol(db, supported_langs)
     computed_fallback = await generate_multilingual_fallback(db, supported_langs)
@@ -82,27 +85,61 @@ async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
         business_type=agent.business_type,
         personality=agent.personality,
         system_prompt=agent.system_prompt,
+        agent_config=config,
         voice_enabled=agent.voice_enabled,
         voice_id=agent.voice_id,
         language=agent.language,
-        auto_detect_language=getattr(agent, 'auto_detect_language', False),
+        auto_detect_language=config.get("auto_detect_language", False),
         supported_languages=supported_langs,
-        greeting_message=agent.greeting_message,
-        voice_greeting_url=agent.voice_greeting_url,
-        voice_system_prompt=agent.voice_system_prompt,
+        greeting_message=config.get("greeting_message"),
+        voice_greeting_url=config.get("voice_greeting_url"),
+        voice_system_prompt=config.get("voice_system_prompt"),
         computed_greeting=computed_greeting,
         computed_protocol=computed_protocol,
         computed_fallback=computed_fallback,
-        tools=agent.tools or [],
-        knowledge_base_ids=agent.knowledge_base_ids or [],
-        llm_config=agent.llm_config or {},
-        escalation_config=agent.escalation_config or {},
+        tools=config.get("tools", []),
+        knowledge_base_ids=config.get("knowledge_base_ids", []),
+        llm_config=config.get("llm_config", {}),
+        escalation_config=config.get("escalation_config", {}),
+        extension_number=agent.extension_number,
+        is_available_as_tool=config.get("is_available_as_tool", True),
         is_active=agent.is_active,
         stripe_subscription_id=agent.stripe_subscription_id,
         deleted_at=agent.deleted_at.isoformat() if agent.deleted_at else None,
         created_at=agent.created_at.isoformat() if agent.created_at else None,
         updated_at=agent.updated_at.isoformat() if agent.updated_at else None,
     )
+
+
+@router.get("/platform/global-guardrails")
+async def get_platform_global_guardrails(
+    db: AsyncSession = Depends(get_db),
+):
+    """Get global guardrails from DB/Redis cache."""
+    from app.services.settings_service import SettingsService
+    guardrails = await SettingsService.get_setting(db, "global_guardrails", default=[])
+    return {"guardrails": guardrails}
+
+
+@router.put("/platform/global-guardrails")
+async def update_platform_global_guardrails(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update global guardrails (admin only). Writes to DB and updates Redis cache."""
+    from app.services.settings_service import SettingsService
+    guardrails = body.get("guardrails", [])
+
+    await db.execute(
+        text("INSERT INTO platform_settings (key, value) VALUES ('global_guardrails', :value) "
+             "ON CONFLICT (key) DO UPDATE SET value = :value"),
+        {"value": json.dumps(guardrails)}
+    )
+    await db.commit()
+
+    await SettingsService.invalidate_cache("global_guardrails")
+    logger.info("global_guardrails_updated", count=len(guardrails))
+    return {"guardrails": guardrails}
 
 
 @router.post("", response_model=AgentResponse, status_code=201)
@@ -114,6 +151,13 @@ async def create_agent(
     """Create a new AI agent for the tenant."""
     tenant_id = _tenant_id(request)
     _validate_system_prompt(body.system_prompt)
+
+    agent_config = body.agent_config.copy() if body.agent_config else {}
+    agent_config.setdefault("tone", body.personality or "professional")
+    if body.system_prompt:
+        agent_config.setdefault("instructions", body.system_prompt)
+    agent_config.setdefault("greeting_message", f"Hi! I'm {body.name}. How can I help you today?")
+    
     agent = Agent(
         id=uuid.uuid4(),
         tenant_id=uuid.UUID(tenant_id),
@@ -125,32 +169,33 @@ async def create_agent(
         voice_enabled=body.voice_enabled,
         voice_id=body.voice_id,
         language=body.language,
-        tools=body.tools,
-        knowledge_base_ids=body.knowledge_base_ids,
-        llm_config=body.llm_config.model_dump() if body.llm_config else {},
-        escalation_config=body.escalation_config.model_dump() if body.escalation_config else {},
-        greeting_message=f"Hi! I'm {body.name}. How can I help you today?",
-        voice_system_prompt=body.voice_system_prompt,
-        is_active=True,
+        extension_number=body.extension_number,
+        is_available_as_tool=body.is_available_as_tool if body.is_available_as_tool is not None else True,
+        is_active=body.is_active if body.is_active is not None else True,
+        agent_config=agent_config,
     )
     db.add(agent)
 
-    # Auto-create a default playbook so the agent is ready to use immediately
     tenant_uuid = uuid.UUID(tenant_id)
+    
     default_playbook = AgentPlaybook(
         id=uuid.uuid4(),
         agent_id=agent.id,
-        tenant_id=tenant_uuid,  # must be the TENANT's UUID, not the agent's
+        tenant_id=tenant_uuid,
         name="Default",
         description="Default playbook — edit to add instructions for your agent.",
         is_default=True,
         intent_triggers=[],
-        instructions=body.system_prompt or "",
-        tone=body.personality or "professional",
+        config={
+            "instructions": body.system_prompt or "",
+            "tone": body.personality or "professional",
+            "dos": [],
+            "donts": [],
+            "scenarios": [],
+        },
     )
     db.add(default_playbook)
 
-    # Auto-create a "General Chat" default playbook for handling unmatched messages
     general_chat_playbook = AgentPlaybook(
         id=uuid.uuid4(),
         agent_id=agent.id,
@@ -159,10 +204,29 @@ async def create_agent(
         description="Handle general conversations and questions not covered by other playbooks",
         is_active=True,
         intent_triggers=[],
-        instructions=body.system_prompt or "",
-        tone=body.personality or "professional",
+        config={
+            "instructions": body.system_prompt or "",
+            "tone": body.personality or "professional",
+            "dos": [],
+            "donts": [],
+            "scenarios": [],
+        },
     )
     db.add(general_chat_playbook)
+
+    default_guardrails = AgentGuardrails(
+        id=uuid.uuid4(),
+        agent_id=agent.id,
+        tenant_id=tenant_uuid,
+        config={
+            "profanity_filter": True,
+            "pii_redaction": False,
+            "pii_pseudonymization": True,
+            "is_active": True,
+        },
+        is_active=True,
+    )
+    db.add(default_guardrails)
 
     await db.commit()
     await db.refresh(agent)
@@ -244,14 +308,30 @@ async def update_agent(
         raise HTTPException(status_code=404, detail="Agent not found.")
 
     update_data = body.model_dump(exclude_unset=True)
-    # Safety guard: is_active must never be mutated directly via PATCH.
-    # Use DELETE /agents/{id} to deactivate or POST /agents/{id}/restore to reactivate.
-    update_data.pop("is_active", None)
+
+    if "agent_config" in update_data and update_data["agent_config"] is not None:
+        incoming_config = update_data.pop("agent_config")
+        current_config = copy.deepcopy(agent.agent_config) if agent.agent_config else {}
+        for key, value in incoming_config.items():
+            # Only merge dicts; treat escalation_config and similar blobs as atomic replacements
+            if isinstance(value, dict) and key in current_config and isinstance(current_config[key], dict) and key not in ["escalation_config"]:
+                current_config[key] = {**current_config[key], **value}
+            else:
+                current_config[key] = value
+        agent.agent_config = current_config
+
     for field, value in update_data.items():
-        # Serialize Pydantic sub-models to plain dicts for JSONB columns
-        if hasattr(value, "model_dump"):
-            value = value.model_dump()
-        setattr(agent, field, value)
+        if field == "is_active":
+            if value is True:
+                await AgentStateMachine.activate(
+                    agent, db=db, actor="user", reason="updated_via_api"
+                )
+            else:
+                await AgentStateMachine.archive(
+                    agent, db=db, actor="user", reason="deactivated_via_api"
+                )
+        elif field != "agent_config":
+            setattr(agent, field, value)
 
     await db.commit()
     await db.refresh(agent)
@@ -291,6 +371,8 @@ async def delete_agent(
     except AgentLifecycleError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
+    agent.deleted_at = datetime.now(timezone.utc)
+    await AgentStateMachine.archive(agent, db=db, actor="user", reason="deleted_via_api")
     await db.commit()
 
 
@@ -302,7 +384,15 @@ async def restore_agent(
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
-    """Restore an archived agent (transition back to ACTIVE state)."""
+    """
+    Restore an archived (soft-deleted) agent.
+
+    - Calls the API Gateway sync-subscription endpoint to verify the subscription status
+      with Stripe before activating the agent.
+    - If the subscription is valid (active/trialing), the agent is restored as active.
+    - If the subscription is invalid or missing, the agent is restored as INACTIVE
+      (is_active=False) so the user must complete payment.
+    """
     from app.services.agent_lifecycle import transition_agent, AgentLifecycleError
 
     result = await db.execute(
@@ -315,20 +405,55 @@ async def restore_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
-    try:
-        await transition_agent(
-            agent,
-            "active",
-            db,
-            actor_id=tenant_id,
-            reason="user_restore",
-            request_id=request.headers.get("X-Trace-ID"),
-        )
-    except AgentLifecycleError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    # Default: restore as inactive (requires payment validation)
+    has_paid_subscription = False
+
+    # Only check subscription if agent previously had a subscription ID
+    if agent.stripe_subscription_id:
+        try:
+            from app.core.config import settings
+            import httpx
+
+            # Call the API Gateway sync endpoint to verify subscription
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                sync_response = await client.post(
+                    f"{settings.API_GATEWAY_URL}/api/v1/billing/sync-subscription",
+                    headers={
+                        "X-Tenant-ID": tenant_id,
+                        "X-Internal-Key": settings.INTERNAL_API_KEY
+                    }
+                )
+                if sync_response.status_code == 200:
+                    sync_data = sync_response.json()
+                    # Agent is active only if subscription is confirmed active
+                    has_paid_subscription = sync_data.get("status") == "active"
+                else:
+                    logger.warning("subscription_sync_failed_on_restore",
+                                 agent_id=agent_id,
+                                 status=sync_response.status_code)
+        except Exception as e:
+            logger.warning("subscription_sync_error_on_restore",
+                         agent_id=agent_id,
+                         error=str(e))
+            # On error, be conservative: require payment
+            has_paid_subscription = False
+
+    agent.deleted_at = None
+    if has_paid_subscription:
+        await AgentStateMachine.activate(agent, db=db, actor="user", reason="restored_with_active_subscription")
+    else:
+        await AgentStateMachine.pending_payment(agent, db=db, actor="user", reason="restored_awaiting_payment")
 
     await db.commit()
     await db.refresh(agent)
+
+    logger.info(
+        "agent_restored",
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        is_active=agent.is_active,
+        has_paid_subscription=has_paid_subscription,
+    )
     return await _agent_to_response(agent, db)
 
 
@@ -452,7 +577,8 @@ async def test_escalation_connector(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
-    escalation_config = agent.escalation_config or {}
+    agent_cfg = agent.agent_config or {}
+    escalation_config = agent_cfg.get("escalation_config", {}) or {}
     connector_type = (escalation_config.get("connector_type") or "").strip()
     if not connector_type:
         raise HTTPException(status_code=400, detail="No connector_type configured for this agent.")

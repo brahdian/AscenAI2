@@ -13,8 +13,8 @@ logger = structlog.get_logger(__name__)
 
 # Plan limits definition — fallback default.
 DEFAULT_PLAN_LIMITS: dict[str, dict] = {
-    "text_growth": {
-        "chats_included": 1_500,
+    "starter": {
+        "chats_included": 20_000,
         "max_voice_minutes_per_month": 0,
         "max_agents": 5,
         "max_api_keys": 5,
@@ -23,28 +23,28 @@ DEFAULT_PLAN_LIMITS: dict[str, dict] = {
         "max_rag_documents": 50,
         "max_team_seats": 5,
     },
-    "voice_growth": {
-        "chats_included": 3_000,
-        "max_voice_minutes_per_month": 600,
-        "max_agents": 5,
-        "max_api_keys": 5,
-        "max_webhooks": 5,
-        "max_playbooks_per_agent": 5,
-        "max_rag_documents": 50,
-        "max_team_seats": 5,
-    },
-    "voice_business": {
-        "chats_included": 7_500,
+    "growth": {
+        "chats_included": 80_000,
         "max_voice_minutes_per_month": 1_500,
-        "max_agents": 20,
-        "max_api_keys": 20,
-        "max_webhooks": 20,
+        "max_agents": 10,
+        "max_api_keys": 10,
+        "max_webhooks": 10,
+        "max_playbooks_per_agent": 10,
+        "max_rag_documents": 100,
+        "max_team_seats": 10,
+    },
+    "business": {
+        "chats_included": 170_000,
+        "max_voice_minutes_per_month": 3_500,
+        "max_agents": 25,
+        "max_api_keys": 25,
+        "max_webhooks": 25,
         "max_playbooks_per_agent": 100,
-        "max_rag_documents": 200,
-        "max_team_seats": 20,
+        "max_rag_documents": 500,
+        "max_team_seats": 25,
     },
     "enterprise": {
-        "chats_included": 50_000,
+        "chats_included": 500_000,
         "max_voice_minutes_per_month": 10_000,
         "max_agents": 500,
         "max_api_keys": 500,
@@ -54,11 +54,6 @@ DEFAULT_PLAN_LIMITS: dict[str, dict] = {
         "max_team_seats": 500,
     },
 }
-
-# Aliases
-DEFAULT_PLAN_LIMITS["professional"] = DEFAULT_PLAN_LIMITS["voice_growth"]
-DEFAULT_PLAN_LIMITS["business"] = DEFAULT_PLAN_LIMITS["voice_business"]
-DEFAULT_PLAN_LIMITS["starter"] = DEFAULT_PLAN_LIMITS["text_growth"]
 
 
 async def get_all_plan_limits(db: AsyncSession) -> dict[str, dict]:

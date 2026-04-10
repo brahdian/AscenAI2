@@ -284,6 +284,70 @@ async def get_me(
     }
 
 
+@router.patch("/me", status_code=200)
+async def update_me(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the current user's profile (full_name)."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    from app.models.user import User
+    import uuid
+
+    body = await request.json()
+    user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = user_res.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if "full_name" in body:
+        full_name = str(body["full_name"]).strip()
+        if not full_name:
+            raise HTTPException(status_code=422, detail="full_name cannot be empty")
+        user.full_name = full_name
+
+    await db.commit()
+    return {"detail": "Profile updated", "full_name": user.full_name}
+
+
+@router.post("/change-password", status_code=200)
+async def change_password(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Change password for the authenticated user."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    from app.models.user import User
+    import uuid
+
+    body = await request.json()
+    current_password = body.get("current_password", "")
+    new_password = body.get("new_password", "")
+
+    if not current_password or not new_password:
+        raise HTTPException(status_code=422, detail="current_password and new_password are required")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=422, detail="new_password must be at least 8 characters")
+
+    user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = user_res.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not auth_service.verify_password(current_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    user.hashed_password = auth_service.hash_password(new_password)
+    await db.commit()
+    return {"detail": "Password changed successfully"}
+
+
 @router.post("/logout", status_code=204)
 async def logout(response: Response):
     """Clear auth cookies (browser logout)."""

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
@@ -30,6 +30,9 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Menu,
+  X,
+  User,
 } from 'lucide-react'
 import { agentsApi } from '@/lib/api'
 
@@ -50,16 +53,16 @@ const navItems = [
 
 const agentSubNav = [
   // Agent Configuration
-  { slug: '',            icon: Bot,          label: 'Overview' },
-  { slug: 'greeting',    icon: Mic,          label: 'Greeting & Voice' },
-  { slug: 'playbooks',   icon: BookOpen,     label: 'Playbooks' },
+  { slug: '', icon: Bot, label: 'Overview' },
+  { slug: 'greeting', icon: Mic, label: 'Greeting & Voice' },
+  { slug: 'playbooks', icon: BookOpen, label: 'Playbooks' },
   // Knowledge & Tools
-  { slug: 'documents',   icon: FileText,     label: 'Documents' },
-  { slug: 'tools',       icon: Wrench,       label: 'Tools' },
-  { slug: 'variables',   icon: Code2,        label: 'Variables' },
+  { slug: 'documents', icon: FileText, label: 'Documents' },
+  { slug: 'tools', icon: Wrench, label: 'Tools' },
+  { slug: 'variables', icon: Code2, label: 'Variables' },
   // Safety & Operations
-  { slug: 'guardrails',  icon: Shield,       label: 'Guardrails' },
-  { slug: 'escalation',  icon: PhoneCall,    label: 'Escalation' },
+  { slug: 'guardrails', icon: Shield, label: 'Guardrails' },
+  { slug: 'escalation', icon: PhoneCall, label: 'Escalation' },
 ]
 
 // Breadcrumb segment labels
@@ -83,18 +86,25 @@ const SEGMENT_LABELS: Record<string, string> = {
   billing: 'Billing',
   embed: 'Embed & SDK',
   settings: 'Settings',
+  profile: 'Profile',
 }
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const pathname = usePathname()
   const { isAuthenticated, _hasHydrated, user, logout } = useAuthStore()
+  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   useEffect(() => {
     if (_hasHydrated && !isAuthenticated) {
       router.replace('/login')
     }
   }, [isAuthenticated, _hasHydrated, router])
+
+  // Close sidebar on route change (mobile)
+  useEffect(() => {
+    setSidebarOpen(false)
+  }, [pathname])
 
   // Wait for store to hydrate from localStorage before deciding to redirect.
   // Without this, the layout briefly sees isAuthenticated=false on every page
@@ -108,8 +118,16 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-950">
+      {/* Mobile overlay */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-20 bg-black/40 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
       {/* Sidebar */}
-      <aside className="w-64 bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col">
+      <aside className={`fixed md:relative z-30 h-screen w-64 transition-transform duration-200 ease-in-out ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'} bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col`}>
         {/* Brand */}
         <div className="px-6 py-5 border-b border-gray-100 dark:border-gray-800">
           <Link href="/dashboard" className="flex items-center gap-2">
@@ -148,11 +166,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                   <Link
                     key={href}
                     href={href}
-                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                      active
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${active
                         ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
                         : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
-                    }`}
+                      }`}
                   >
                     <item.icon size={18} />
                     {item.label}
@@ -170,11 +187,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                     <Link
                       key={item.href}
                       href={item.href}
-                      className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
-                        active
+                      className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${active
                           ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
                           : 'text-gray-500 hover:bg-gray-100 dark:text-gray-500 dark:hover:bg-gray-800'
-                      }`}
+                        }`}
                     >
                       <item.icon size={16} />
                       {item.label}
@@ -191,11 +207,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                   <Link
                     key={item.href}
                     href={item.href}
-                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                      active
+                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${active
                         ? 'bg-violet-50 text-violet-700 dark:bg-violet-900/20 dark:text-violet-300'
                         : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'
-                    }`}
+                      }`}
                   >
                     <item.icon size={18} />
                     {item.label}
@@ -210,16 +225,22 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
         {/* User */}
         <div className="p-4 border-t border-gray-100 dark:border-gray-800">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-violet-400 to-blue-400 flex items-center justify-center text-white text-xs font-bold">
-              {user?.full_name?.charAt(0) || 'U'}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
-                {user?.full_name || 'User'}
-              </p>
-              <p className="text-xs text-gray-500 truncate">{user?.email}</p>
-            </div>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/dashboard/profile"
+              className="flex items-center gap-3 flex-1 min-w-0 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 p-1 -m-1 transition-colors"
+              title="View profile"
+            >
+              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-violet-400 to-blue-400 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+                {user?.full_name?.charAt(0) || 'U'}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                  {user?.full_name || 'User'}
+                </p>
+                <p className="text-xs text-gray-500 truncate">{user?.email}</p>
+              </div>
+            </Link>
             {/* Console link — discreet, not in main nav */}
             <Link
               href="/console"
@@ -243,7 +264,18 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       </aside>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto min-w-0">
+        {/* Mobile header with hamburger */}
+        <div className="md:hidden flex items-center gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900">
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="p-1.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+            aria-label="Open menu"
+          >
+            <Menu size={20} />
+          </button>
+          <span className="text-sm font-semibold text-gray-900 dark:text-white">AscenAI</span>
+        </div>
         <Breadcrumbs pathname={pathname} />
         {children}
       </main>
@@ -256,7 +288,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 // ---------------------------------------------------------------------------
 function Breadcrumbs({ pathname }: { pathname: string }) {
   // Don't show breadcrumbs on the root dashboard page or flow builder
-  if (pathname === '/dashboard' || pathname.includes('/workflows/') ) return null
+  if (pathname === '/dashboard' || pathname.includes('/workflows/')) return null
 
   const segments = pathname.replace(/^\/dashboard\/?/, '').split('/').filter(Boolean)
   if (segments.length === 0) return null

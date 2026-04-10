@@ -1,7 +1,7 @@
 'use client'
 
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -19,11 +19,15 @@ const schema = z.object({
 
 type FormData = z.infer<typeof schema>
 
-export default function RegisterPage() {
+function RegisterForm() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const emailParam = searchParams.get('email') || ''
+  const stepParam = searchParams.get('step')
+
   const [loading, setLoading] = useState(false)
-  const [step, setStep] = useState<'register' | 'verify'>('register')
-  const [registeredEmail, setRegisteredEmail] = useState('')
+  const [step, setStep] = useState<'register' | 'verify'>(stepParam === 'verify' ? 'verify' : 'register')
+  const [registeredEmail, setRegisteredEmail] = useState(emailParam)
   const [otp, setOtp] = useState('')
   const [verifying, setVerifying] = useState(false)
 
@@ -139,6 +143,16 @@ export default function RegisterPage() {
               <div className="text-center">
                 <p className="text-gray-300">We've sent a 6-digit code to</p>
                 <p className="text-white font-medium">{registeredEmail}</p>
+                {process.env.NODE_ENV === 'development' && (
+                  <a
+                    href="http://localhost:8025"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-block mt-2 text-xs text-yellow-400 hover:text-yellow-300 transition-colors border border-yellow-400/30 rounded px-2 py-1"
+                  >
+                    Dev mode: check Mailhog inbox →
+                  </a>
+                )}
               </div>
 
               <form onSubmit={handleVerify} className="space-y-4">
@@ -192,5 +206,13 @@ export default function RegisterPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+export default function RegisterPage() {
+  return (
+    <Suspense>
+      <RegisterForm />
+    </Suspense>
   )
 }

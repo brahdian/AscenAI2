@@ -40,18 +40,16 @@ function LoginForm() {
         tenantId: res.tenant_id,
         tokenLength: res.access_token?.length,
       })
-      
-      // Clear old cached session store to avoid hydration mismatches
-      localStorage.removeItem('ascenai-auth')
+
       setUser(res.user, res.tenant_id)
-      
+
       console.log('[LOGIN] Successful login, HttpOnly cookies set.')
-      
+
       toast.success('Welcome back!')
-      
+
       const hostname = typeof window !== 'undefined' ? window.location.hostname : ''
       const isAdminPortal = hostname === (process.env.NEXT_PUBLIC_ADMIN_SUBDOMAIN?.split(':')[0] || 'admin.lvh.me')
-      
+
       if (redirect) {
         router.push(redirect)
       } else if (isAdminPortal) {
@@ -68,10 +66,11 @@ function LoginForm() {
       })
       const detail = err?.response?.data?.detail
       const action = err?.response?.headers?.['x-action']
-      
+
       if (action === 'verify_email' || detail?.includes('verify') || detail?.includes('Email not verified')) {
         toast.error('Please verify your email first. Check your inbox for the verification code.')
-        router.push('/verify-email')
+        router.push(`/register?email=${encodeURIComponent(data.email)}&step=verify`)
+        // Note: 'data' here is the form data from onSubmit's closure
       } else if (detail?.includes('inactive') || detail?.includes('Subscription required')) {
         toast.error('Account is not active. Please complete payment to activate your account.')
         router.push('/pricing')
@@ -93,7 +92,7 @@ function LoginForm() {
             </div>
             <span className="text-2xl font-bold text-white">AscenAI</span>
           </Link>
-          <p className="text-gray-400 mt-3">Sign in to your account</p>
+          <p className="text-gray-400 mt-3">Sign in to your account TEST forgot password link below</p>
         </div>
 
         <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-8 backdrop-blur-sm">

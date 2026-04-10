@@ -158,7 +158,7 @@ class STTService:
         import websockets  # type: ignore
 
         api_key = getattr(settings, "CARTESIA_API_KEY", "")
-        url = f"wss://api.cartesia.ai/stt?api_key={api_key}&cartesia_version=2024-06-10"
+        url = f"wss://api.cartesia.ai/stt?api_key={api_key}&cartesia_version=2025-04-16"
 
         result_queue: asyncio.Queue[PartialTranscript | None] = asyncio.Queue()
 
@@ -166,7 +166,7 @@ class STTService:
             try:
                 # 1. Send Configuration Handshake
                 config = {
-                    "model": "ink-whisper",
+                    "model_id": "ink-whisper",
                     "language": language,
                     "encoding": "pcm_s16le",
                     "sample_rate": settings.SAMPLE_RATE

@@ -135,8 +135,6 @@ class SessionState:
     utterance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # VULN-032 FIX: Rate limiting on utterance processing
     utterance_timestamps: list[float] = field(default_factory=list)
-    # VULN-032 FIX: Rate limiting on utterance processing
-    utterance_timestamps: list[float] = field(default_factory=list)
 
     # Per-session agent configuration (persisted after first fetch)
     agent_config: Optional[dict] = None
@@ -152,6 +150,10 @@ class SessionState:
     # Twilio Telephony Integration ---------------------------------------------
     # Set to the StreamSid when a Twilio Media Stream connects.
     twilio_stream_sid: Optional[str] = None
+    # Twilio CallSid — populated from the 'start' event customParameters or accountSid field.
+    call_sid: Optional[str] = None
+    # Maps extension numbers (strings) to phone numbers or agent IDs for SIP REFER transfers.
+    extension_map: dict = field(default_factory=dict)
 
     # Derived timing helpers ---------------------------------------------------
 
@@ -308,7 +310,21 @@ class VoicePipeline:
                     if event_type == "start" and "streamSid" in ctrl.get("start", {}):
                         # Twilio setup: extract stream SID so we can target audio back
                         state.twilio_stream_sid = ctrl["start"]["streamSid"]
-                        logger.info("twilio_stream_started", stream_sid=state.twilio_stream_sid)
+                        start_data = ctrl["start"]
+                        # Capture CallSid from customParameters or directly from start payload
+                        state.call_sid = (
+                            start_data.get("customParameters", {}).get("callSid")
+                            or start_data.get("callSid")
+                            or ctrl.get("callSid")
+                        )
+                        # Populate extension map from agent config if available
+                        if state.agent_config:
+                            state.extension_map = state.agent_config.get("escalation_extensions", {})
+                        logger.info(
+                            "twilio_stream_started",
+                            stream_sid=state.twilio_stream_sid,
+                            call_sid=state.call_sid,
+                        )
                         continue
 
                     elif event_type == "media" and "payload" in ctrl.get("media", {}):
@@ -346,6 +362,12 @@ class VoicePipeline:
             if has_voice and state.is_speaking:
                 logger.info("barge_in_detected", session_id=state.session_id)
                 await self._handle_barge_in(state)
+                # For Twilio streams send a 'clear' event to stop queued audio playback
+                if state.twilio_stream_sid:
+                    await self._send_json(websocket, {
+                        "event": "clear",
+                        "streamSid": state.twilio_stream_sid,
+                    })
                 await self._send_json(websocket, {"type": "barge_in"})
 
             if state.is_listening:
@@ -681,7 +703,13 @@ class VoicePipeline:
             if fpath.exists():
                 continue  # already synthesised
             try:
-                audio = await self.tts.synthesize(phrase, voice_id="alloy", format="mp3")
+                provider = settings.TTS_PROVIDER.lower()
+                if provider == "cartesia":
+                    audio = await self.tts.synthesize_cartesia_to_bytes(phrase, voice_id=settings.CARTESIA_VOICE_ID)
+                elif provider == "deepgram":
+                    audio = await self.tts.synthesize_deepgram_to_bytes(phrase, voice_id="aura-asteria-en")
+                else:
+                    audio = await self.tts.synthesize(phrase, voice_id="alloy", format="mp3")
                 fpath.write_bytes(audio)
                 logger.info("backchannel_phrase_synthesised", phrase=phrase, path=str(fpath))
             except Exception as exc:
@@ -891,6 +919,15 @@ class VoicePipeline:
                 if state.interrupt_tts:
                     return
                 await self._emit_audio(websocket, audio_chunk, state)
+
+            # After all audio chunks are sent, emit a Twilio mark event so the
+            # caller knows exactly when playback of this response ended.
+            if state.twilio_stream_sid and not state.interrupt_tts:
+                await self._send_json(websocket, {
+                    "event": "mark",
+                    "streamSid": state.twilio_stream_sid,
+                    "mark": {"name": "end_of_response"},
+                })
         except Exception as exc:
             logger.error("tts_send_error", session_id=state.session_id, error=str(exc))
 
@@ -898,15 +935,31 @@ class VoicePipeline:
         """Helper to send audio correctly depending on the channel type (Browser PCM/MP3 vs Twilio base64 mu-law)."""
         if websocket.client_state != WebSocketState.CONNECTED:
             return
-            
+
         if state.twilio_stream_sid:
-            import base64
+            import audioop
+            # When the TTS provider returns raw PCM16 at 16kHz (e.g. openai pcm),
+            # we must downsample to 8kHz and encode as mu-law for Twilio.
+            # Providers configured with fmt_kwargs already return 8kHz mulaw raw bytes;
+            # for all others we perform the conversion here.
+            provider = settings.TTS_PROVIDER.lower()
+            if provider in ("cartesia", "deepgram"):
+                # These providers are configured to return raw mulaw 8kHz — use as-is.
+                mulaw_bytes = audio_chunk
+            else:
+                # Generic PCM16 at 16kHz → 8kHz → mu-law conversion
+                try:
+                    resampled, _ = audioop.ratecv(audio_chunk, 2, 1, 16000, 8000, None)
+                    mulaw_bytes = audioop.lin2ulaw(resampled, 2)
+                except Exception:
+                    mulaw_bytes = audio_chunk  # best-effort fallback
+
             # Twilio Media Streams require base64 encoded audio wrapped in JSON.
             payload = {
                 "event": "media",
                 "streamSid": state.twilio_stream_sid,
                 "media": {
-                    "payload": base64.b64encode(audio_chunk).decode("utf-8")
+                    "payload": base64.b64encode(mulaw_bytes).decode("utf-8")
                 }
             }
             await self._send_json(websocket, payload)
@@ -1097,6 +1150,98 @@ class VoicePipeline:
         state.is_listening = True
 
     # ------------------------------------------------------------------
+    # SIP REFER / Extension escalation
+    # ------------------------------------------------------------------
+
+    async def _handle_escalation_to_extension(
+        self,
+        websocket: WebSocket,
+        state: SessionState,
+        extension: str,
+    ) -> None:
+        """
+        Transfer a Twilio call to a target extension/phone number.
+
+        Looks up the extension in `state.extension_map` (populated from
+        agent config `escalation_extensions`).  If found, uses the Twilio
+        REST API to redirect the live call via a new TwiML <Dial> verb.
+        Also notifies the WebSocket client about the transfer.
+
+        Requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN to be configured.
+        """
+        extension_map: dict = state.extension_map or {}
+        # Refresh from agent config if map is empty
+        if not extension_map and state.agent_config:
+            extension_map = state.agent_config.get("escalation_extensions", {})
+
+        target = extension_map.get(str(extension))
+        if not target:
+            logger.warning(
+                "escalation_extension_not_found",
+                session_id=state.session_id,
+                extension=extension,
+            )
+            await self._tts_and_send(
+                "I'm sorry, I couldn't find an available agent for that extension.",
+                websocket,
+                state,
+            )
+            return
+
+        logger.info(
+            "escalation_to_extension",
+            session_id=state.session_id,
+            extension=extension,
+            target=target,
+        )
+
+        # Notify WebSocket client (useful for browser-based voice sessions)
+        await self._send_json(websocket, {
+            "type": "transfer",
+            "extension": extension,
+            "target": target,
+        })
+
+        # If this is a Twilio call, use the REST API to redirect it
+        if state.call_sid and settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN:
+            twiml = f"<Response><Dial>{target}</Dial></Response>"
+            url = (
+                f"https://api.twilio.com/2010-04-01/Accounts/"
+                f"{settings.TWILIO_ACCOUNT_SID}/Calls/{state.call_sid}.json"
+            )
+            try:
+                client = await self._get_http_client()
+                resp = await client.post(
+                    url,
+                    data={"Twiml": twiml},
+                    auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+                    timeout=10.0,
+                )
+                if resp.status_code in (200, 201, 204):
+                    logger.info(
+                        "twilio_call_redirected",
+                        session_id=state.session_id,
+                        call_sid=state.call_sid,
+                        target=target,
+                    )
+                else:
+                    logger.error(
+                        "twilio_redirect_failed",
+                        session_id=state.session_id,
+                        status=resp.status_code,
+                        body=resp.text[:200],
+                    )
+            except Exception as exc:
+                logger.error(
+                    "twilio_redirect_error",
+                    session_id=state.session_id,
+                    error=str(exc),
+                )
+        else:
+            if not state.call_sid:
+                logger.debug("escalation_no_call_sid_skipping_twilio_api", session_id=state.session_id)
+
+    # ------------------------------------------------------------------
     # Control messages
     # ------------------------------------------------------------------
 
@@ -1121,6 +1266,12 @@ class VoicePipeline:
             await self._send_json(websocket, {"type": "unmuted"})
         elif msg_type == "ping":
             await self._send_json(websocket, {"type": "pong"})
+        elif msg_type in ("transfer", "escalate"):
+            extension = msg.get("extension") or msg.get("target", "")
+            if extension:
+                await self._handle_escalation_to_extension(websocket, state, str(extension))
+            else:
+                logger.debug("transfer_missing_extension", msg=msg)
         else:
             logger.debug("unknown_control_message", type=msg_type)
 

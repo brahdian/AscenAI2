@@ -116,8 +116,9 @@ async def lifespan(app: FastAPI):
     await pii_service.warmup()
     logger.info("pii_service_ready")
 
-    # Initialize LLM client
-    _llm_client = create_llm_client()
+    # Initialize LLM client — pass redis_client so the circuit breaker has its
+    # shared Redis state store wired from the very first request (not lazily).
+    _llm_client = create_llm_client(redis=redis_client)
     app.state.llm_client = _llm_client
     logger.info("llm_client_ready", provider=settings.LLM_PROVIDER, model=settings.GEMINI_MODEL if settings.LLM_PROVIDER == "gemini" else settings.OPENAI_MODEL)
 
@@ -223,6 +224,10 @@ app.add_middleware(
 # W3C traceparent propagation
 app.add_middleware(TracingMiddleware)
 
+# Request/Response validation logging
+from app.core.validation_logging import ValidationLoggingMiddleware
+app.add_middleware(ValidationLoggingMiddleware)
+
 # Trusted internal headers from API Gateway
 import hmac
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -287,7 +292,6 @@ app.add_middleware(IdempotencyMiddleware)
 
 # Include routers
 app.include_router(chat_router.router, prefix="/api/v1", tags=["chat"])
-app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(sessions_router.router, prefix="/api/v1/sessions", tags=["sessions"])
 app.include_router(feedback_router.router, prefix="/api/v1/feedback", tags=["feedback"])
 app.include_router(analytics_router.router, prefix="/api/v1/analytics", tags=["analytics"])
@@ -295,12 +299,13 @@ app.include_router(playbook_router.router, prefix="/api/v1/agents", tags=["playb
 app.include_router(guardrails_router.router, prefix="/api/v1/agents", tags=["guardrails"])
 app.include_router(learning_router.router, prefix="/api/v1/agents", tags=["learning"])
 app.include_router(documents_router.router, prefix="/api/v1/agents", tags=["documents"])
-app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
-app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
 app.include_router(evals_router.router, prefix="/api/v1/agents", tags=["evals"])
 app.include_router(prompt_versions_router.router, prefix="/api/v1/agents", tags=["prompts"])
-app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
 app.include_router(variables_router.router, prefix="/api/v1/agents", tags=["variables"])
+app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"])
+app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
+app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
+app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

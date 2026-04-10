@@ -169,7 +169,7 @@ async def seed_platform():
                 key="system_defaults",
                 value={
                     "default_role": "viewer",
-                    "default_plan": "growth",
+                    "default_plan": "starter",
                     "app_name": "AscenAI",
                     "support_email": "support@ascenai.com"
                 },

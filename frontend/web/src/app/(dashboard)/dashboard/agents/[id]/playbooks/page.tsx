@@ -374,30 +374,25 @@ function PlaybookFormPanel({
   const qc = useQueryClient()
   const [form, setForm] = useState<PlaybookForm>(() => {
     if (initial) {
+      const cfg = (initial.config || {}) as Record<string, any>
       return {
         name: (initial.name as string) || '',
         description: (initial.description as string) || '',
         intent_triggers: Array.isArray(initial.intent_triggers)
           ? (initial.intent_triggers as string[]).join(', ')
           : (initial.intent_triggers as string) || '',
-        is_default: !!(initial.is_default),
-
-        instructions: (initial.instructions as string) || '',
-        tone: (initial.tone as string) || 'professional',
-        dos: Array.isArray(initial.dos) ? (initial.dos as string[]) : [],
-        donts: Array.isArray(initial.donts) ? (initial.donts as string[]) : [],
-        scenarios: Array.isArray(initial.scenarios)
-          ? (initial.scenarios as Scenario[])
-          : [],
-        out_of_scope_response: (initial.out_of_scope_response as string) || '',
-        fallback_response: (initial.fallback_response as string) || '',
-        escalation_message:
-          (initial.custom_escalation_message as string) ||
-          (initial.escalation_message as string) ||
-          '',
-        tools: Array.isArray(initial.tools) ? (initial.tools as string[]) : [],
-        input_schema: initial.input_schema ? JSON.stringify(initial.input_schema, null, 2) : '',
-        output_schema: initial.output_schema ? JSON.stringify(initial.output_schema, null, 2) : '',
+        is_default: !!initial.is_default,
+        instructions: (cfg.instructions as string) || (initial.instructions as string) || '',
+        tone: (cfg.tone as string) || (initial.tone as string) || 'professional',
+        dos: Array.isArray(cfg.dos) ? (cfg.dos as string[]) : Array.isArray(initial.dos) ? (initial.dos as string[]) : [],
+        donts: Array.isArray(cfg.donts) ? (cfg.donts as string[]) : Array.isArray(initial.donts) ? (initial.donts as string[]) : [],
+        scenarios: Array.isArray(cfg.scenarios) ? (cfg.scenarios as Scenario[]) : Array.isArray(initial.scenarios) ? (initial.scenarios as Scenario[]) : [],
+        out_of_scope_response: (cfg.out_of_scope_response as string) || (initial.out_of_scope_response as string) || '',
+        fallback_response: (cfg.fallback_response as string) || (initial.fallback_response as string) || '',
+        escalation_message: (cfg.custom_escalation_message as string) || (initial.custom_escalation_message as string) || (initial.escalation_message as string) || '',
+        tools: Array.isArray(cfg.tools) ? (cfg.tools as string[]) : Array.isArray(initial.tools) ? (initial.tools as string[]) : [],
+        input_schema: cfg.input_schema ? JSON.stringify(cfg.input_schema, null, 2) : initial.input_schema ? JSON.stringify(initial.input_schema as object, null, 2) : '',
+        output_schema: cfg.output_schema ? JSON.stringify(cfg.output_schema, null, 2) : initial.output_schema ? JSON.stringify(initial.output_schema as object, null, 2) : '',
       }
     }
     return EMPTY_FORM
@@ -454,19 +449,36 @@ function PlaybookFormPanel({
     let parsedInput = null
     let parsedOutput = null
     try {
-      if (form.input_schema) parsedInput = JSON.parse(form.input_schema)
-      if (form.output_schema) parsedOutput = JSON.parse(form.output_schema)
+      if (form.input_schema?.trim()) parsedInput = JSON.parse(form.input_schema.trim())
+      if (form.output_schema?.trim()) parsedOutput = JSON.parse(form.output_schema.trim())
     } catch (e) {
       toast.error("Invalid JSON inside Input or Output Schema")
       return
     }
 
-    saveMutation.mutate({
-      ...form,
-      intent_triggers: triggers,
+    // B7 FIX: Backend PlaybookUpsert reads content fields exclusively from the
+    // nested `config` object. Sending them flat causes silent data loss.
+    const config: Record<string, unknown> = {
+      instructions: form.instructions,
+      tone: form.tone,
+      dos: form.dos,
+      donts: form.donts,
+      scenarios: form.scenarios,
+      out_of_scope_response: form.out_of_scope_response,
+      fallback_response: form.fallback_response,
       custom_escalation_message: form.escalation_message,
-      input_schema: parsedInput,
-      output_schema: parsedOutput,
+      tools: form.tools,
+    }
+    if (parsedInput !== null) config.input_schema = parsedInput
+    if (parsedOutput !== null) config.output_schema = parsedOutput
+
+    saveMutation.mutate({
+      name: form.name,
+      description: form.description,
+      intent_triggers: triggers,
+      is_default: form.is_default,
+      is_active: true,
+      config,
     })
   }
 

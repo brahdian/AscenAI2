@@ -31,7 +31,12 @@ async def _get_tenant_and_usage(tenant_id: str, db: AsyncSession):
 
 
 async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
-    """Raise 402 if tenant is not subscribed, or is at/above purchased agent slots."""
+    """Raise 402 if tenant is not subscribed, or is at/above purchased agent slots.
+    
+    B1 FIX: Uses a Redis distributed lock to prevent TOCTOU races where two
+    simultaneous agents can both pass the limit check before either increments
+    the usage counter.
+    """
     from app.services.tenant_service import get_plan_limits
     from app.services.auth_service import auth_service as _auth_service
     tenant, usage = await _get_tenant_and_usage(tenant_id, db)
@@ -113,7 +118,13 @@ async def _increment_agent_count(tenant_id: str, delta: int, db: AsyncSession) -
 
 
 async def _increment_message_count(tenant_id: str, db: AsyncSession, turn_count: int = 0) -> None:
-    """Increment current_month_messages and optionally chat units on TenantUsage."""
+    """Increment current_month_messages on TenantUsage.
+    
+    B9 FIX: Chat unit accounting has been removed from here. The orchestrator
+    (session_billing_service.py::update_analytics) is the single source of truth
+    for chat units to prevent double-counting. This function only increments
+    the raw message counter and session counter.
+    """
     from app.models.tenant import TenantUsage
     import uuid as _uuid
     tid = _uuid.UUID(tenant_id)
@@ -124,11 +135,6 @@ async def _increment_message_count(tenant_id: str, db: AsyncSession, turn_count:
         # Sessions: increment on the first turn
         if turn_count == 1:
             usage.current_month_sessions = (usage.current_month_sessions or 0) + 1
-        
-        # Chat units: 1 unit per 10 turns. The first turn (turn_count=1) increments it.
-        # subsequent increments at turn 11, 21, etc.
-        if turn_count > 0 and (turn_count % 10 == 1):
-            usage.current_month_chat_units = (usage.current_month_chat_units or 0) + 1
         await db.commit()
 
 
@@ -145,6 +151,8 @@ _SERVICE_MAP = {
     "feedback": settings.AI_ORCHESTRATOR_URL,
     "analytics": settings.AI_ORCHESTRATOR_URL,
     "templates": settings.AI_ORCHESTRATOR_URL,
+    "playbooks": settings.AI_ORCHESTRATOR_URL,
+    "guardrails": settings.AI_ORCHESTRATOR_URL,
     "tools": settings.MCP_SERVER_URL,
     "context": settings.MCP_SERVER_URL,
     "voice": settings.VOICE_PIPELINE_URL,
@@ -157,15 +165,20 @@ _TIMEOUT = httpx.Timeout(settings.PROXY_TIMEOUT_SECONDS, connect=settings.PROXY_
 _STRIP_FROM_CHAT = frozenset(["system_prompt", "system", "instructions"])
 
 
+# Services that are mounted under /agents in the AI Orchestrator
+_AGENT_BASED_SERVICES = frozenset(["playbooks", "guardrails"])
+
 def _get_downstream_url(service: str, path: str) -> str:
-    base = _SERVICE_MAP.get(service)
+    # Map playbooks and guardrails to agents service (they're mounted under /agents in orchestrator)
+    downstream_service = "agents" if service in _AGENT_BASED_SERVICES else service
+    base = _SERVICE_MAP.get(downstream_service)
     if not base:
         raise HTTPException(status_code=404, detail=f"Unknown service: {service}")
     path = path.lstrip("/")
     if path:
-        return f"{base}/api/v1/{service}/{path}"
+        return f"{base}/api/v1/{downstream_service}/{path}"
     else:
-        return f"{base}/api/v1/{service}"
+        return f"{base}/api/v1/{downstream_service}"
 
 
 def _sanitize_chat_body(body: bytes, content_type: str) -> bytes:
@@ -233,7 +246,7 @@ async def _proxy_request(
             # Streaming path - create client inside generator to avoid premature closure
             async def stream_generator():
                 _turn_count = 0
-                async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
                     async with client.stream(
                         method=request.method,
                         url=url,
@@ -257,7 +270,7 @@ async def _proxy_request(
             return StreamingResponse(stream_generator(), media_type=media)
 
         # Non-streaming path
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
             resp = await client.request(
                 method=request.method,
                 url=url,
@@ -327,68 +340,107 @@ async def proxy(
 
     # CUSTOM HANDLING: Agent Creation (Draft-First Flow)
     if service == "agents" and method == "POST" and _AGENT_CREATE.match(full_path):
-        tenant, usage = await _get_tenant_and_usage(tenant_id, db)
-        
-        purchased_slots = usage.agent_count if usage else 0
-        actual_count = 0
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get(f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents", headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY})
-                if res.status_code == 200:
-                    actual_count = len(res.json())
-        except Exception:
-            pass
-            
-        has_slot = False
-        if tenant and tenant.subscription_status == "active" and (actual_count < purchased_slots):
-            has_slot = True
-            
-        try:
-            body_dict = await request.json()
-        except Exception:
-            body_dict = {}
-            
-        body_dict["is_active"] = has_slot
-        
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            headers = {
-                "X-Tenant-ID": tenant_id,
-                "X-User-ID": getattr(request.state, "user_id", ""),
-                "X-Role": getattr(request.state, "role", ""),
-                "X-Internal-Key": settings.INTERNAL_API_KEY,
-                "Content-Type": "application/json",
-            }
-            resp = await client.post(url, json=body_dict, headers=headers)
-            
-            if resp.status_code == 201:
-                if has_slot:
-                    return Response(content=resp.content, status_code=201)
-                
-                # Create draft and redirect to Stripe
-                agent_data = resp.json()
-                agent_id = agent_data.get("id")
-                try:
-                    requested_plan = body_dict.get("plan")
-                    payment_url = await create_agent_checkout_session(tenant_id, agent_id, db, requested_plan=requested_plan)
-                    raise HTTPException(
-                        status_code=402,
-                        detail={
-                            "message": "AI Agent drafted successfully. Payment required for activation.",
-                            "agent_id": agent_id,
-                            "payment_url": payment_url,
-                        }
-                    )
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    logger.error("agent_payment_url_failed", error=str(e), agent_id=agent_id)
-                    return Response(content=resp.content, status_code=201)
+        import asyncio as _asyncio
 
-            return Response(content=resp.content, status_code=resp.status_code)
+        # ── B1 FIX: Distributed lock prevents TOCTOU race where two concurrent
+        # requests both pass the slot check before either one has created an agent.
+        _redis = getattr(request.app.state, "redis", None)
+        _lock_key = f"agent_create_lock:{tenant_id}"
+        _lock_acquired = False
+
+        if _redis:
+            try:
+                # SET NX with 15s TTL — agent create should complete well within that
+                _lock_acquired = await _redis.set(_lock_key, "1", nx=True, ex=15)
+                if not _lock_acquired:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Another agent creation is already in progress. Please wait a moment and try again.",
+                    )
+            except HTTPException:
+                raise
+            except Exception as _lock_err:
+                # Redis unavailable — log but allow request to proceed (fail open)
+                logger.warning("agent_create_lock_redis_error", error=str(_lock_err), tenant_id=tenant_id)
+                _lock_acquired = False
+
+        try:
+            tenant, usage = await _get_tenant_and_usage(tenant_id, db)
+
+            purchased_slots = usage.agent_count if usage else 0
+            actual_count = 0
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    res = await client.get(f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents", headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY})
+                    if res.status_code == 200:
+                        actual_count = len(res.json())
+            except Exception:
+                pass
+
+            has_slot = False
+            if tenant and tenant.subscription_status == "active" and (actual_count < purchased_slots):
+                has_slot = True
+
+            try:
+                body_dict = await request.json()
+            except Exception:
+                body_dict = {}
+                
+            body_dict["is_active"] = has_slot
+            
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                headers = {
+                    "X-Tenant-ID": tenant_id,
+                    "X-User-ID": getattr(request.state, "user_id", ""),
+                    "X-Role": getattr(request.state, "role", ""),
+                    "X-Internal-Key": settings.INTERNAL_API_KEY,
+                    "Content-Type": "application/json",
+                }
+                resp = await client.post(url, json=body_dict, headers=headers)
+                
+                if resp.status_code == 201:
+                    if has_slot:
+                        return Response(content=resp.content, status_code=201)
+                    
+                    # Create draft and redirect to Stripe
+                    agent_data = resp.json()
+                    agent_id = agent_data.get("id")
+                    try:
+                        requested_plan = body_dict.get("plan")
+                        _origin = request.headers.get("Origin") or request.headers.get("Referer", "").split("/api")[0]
+                        _frontend_url = _origin.rstrip("/") if _origin else None
+                        payment_url = await create_agent_checkout_session(tenant_id, agent_id, db, requested_plan=requested_plan, frontend_url=_frontend_url)
+                        raise HTTPException(
+                            status_code=402,
+                            detail={
+                                "message": "AI Agent drafted successfully. Payment required for activation.",
+                                "agent_id": agent_id,
+                                "payment_url": payment_url,
+                            }
+                        )
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        logger.error("agent_payment_url_failed", error=str(e), agent_id=agent_id)
+                        return Response(content=resp.content, status_code=201)
+
+                return Response(content=resp.content, status_code=resp.status_code)
+
+        finally:
+            # B1 FIX: Always release the distributed create-lock so the next
+            # create request from this tenant is not permanently blocked.
+            if _redis and _lock_acquired:
+                try:
+                    await _redis.delete(_lock_key)
+                except Exception as _unlock_err:
+                    logger.warning("agent_create_lock_release_error", error=str(_unlock_err), tenant_id=tenant_id)
+
 
     # CUSTOM HANDLING: Agent Deletion — auto-cancel Stripe subscription
     if service == "agents" and method == "DELETE" and _AGENT_DELETE.match(full_path):
+        import asyncio as _asyncio
         stripe.api_key = settings.STRIPE_SECRET_KEY
+        sub_id = None
         async with httpx.AsyncClient(timeout=5.0) as client:
             agent_resp = await client.get(url, headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY})
             if agent_resp.status_code == 200:
@@ -396,10 +448,11 @@ async def proxy(
                 sub_id = agent_info.get("stripe_subscription_id")
                 if sub_id:
                     try:
-                        subscription = stripe.Subscription.retrieve(sub_id)
+                        # B3 FIX: Run blocking Stripe SDK call in a thread so we don't block the event loop
+                        subscription = await _asyncio.to_thread(stripe.Subscription.retrieve, sub_id)
                         if subscription.status in ("active", "trialing", "past_due"):
                             # Auto-cancel immediately — user is explicitly deleting the agent
-                            stripe.Subscription.delete(sub_id)
+                            await _asyncio.to_thread(stripe.Subscription.delete, sub_id)
                             logger.info(
                                 "agent_subscription_cancelled_on_delete",
                                 agent_id=agent_info.get("id"),
@@ -418,13 +471,21 @@ async def proxy(
                                    "Please try again or contact support.",
                         )
 
-        # Proxy the delete to the orchestrator, then decrement agent_count
+        # B3 FIX: Only proxy the delete and decrement slot count if orchestrator responds with success.
+        # Previously, decrement ran even if the orchestrator returned an error.
         delete_resp = await _proxy_request(request, url, path, db, service=service)
-        if delete_resp.status_code in (200, 204) and sub_id:
-            try:
-                await _increment_agent_count(tenant_id, -1, db)
-            except Exception as e:
-                logger.warning("agent_count_decrement_failed", error=str(e), tenant_id=tenant_id)
+        if hasattr(delete_resp, 'status_code') and delete_resp.status_code in (200, 204):
+            if sub_id:
+                try:
+                    await _increment_agent_count(tenant_id, -1, db)
+                except Exception as e:
+                    logger.warning("agent_count_decrement_failed", error=str(e), tenant_id=tenant_id)
+        else:
+            logger.warning(
+                "agent_delete_orchestrator_failed_slot_not_decremented",
+                tenant_id=tenant_id,
+                status_code=getattr(delete_resp, 'status_code', 'unknown'),
+            )
         return delete_resp
 
     return await _proxy_request(request, url, path, db, service=service)

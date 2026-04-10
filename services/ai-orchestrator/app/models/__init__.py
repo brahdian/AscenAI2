@@ -11,6 +11,8 @@ from app.models.agent import (  # noqa: F401
     PlaybookExecution,
     Session,
 )
+from app.models.agent_custom_guardrail import AgentCustomGuardrail  # noqa: F401
+from app.models.agent_transitions import AgentStateTransition  # noqa: F401
 from app.models.tool import AgentTool  # noqa: F401
 from app.models.variable import AgentVariable  # noqa: F401
 from app.models.trace import ConversationTrace  # noqa: F401

@@ -57,6 +57,16 @@ async def analytics_overview(
     result = await db.execute(query)
     rows: list[AgentAnalytics] = list(result.scalars().all())
 
+    # Query sessions directly to get accurate session count (needed for line below)
+    sessions_query = select(func.count(Session.id)).where(
+        Session.tenant_id == uuid.UUID(tenant_id),
+        Session.started_at >= datetime.combine(since, datetime.min.time()).replace(tzinfo=timezone.utc),
+    )
+    if agent_id:
+        sessions_query = sessions_query.where(Session.agent_id == uuid.UUID(agent_id))
+    sessions_result = await db.execute(sessions_query)
+    total_sessions = sessions_result.scalar() or 0
+
     # Aggregate totals
     total_messages = sum(r.total_messages for r in rows)
     # Floor: Every session counts as at least 1 chat unit in global total
@@ -70,16 +80,6 @@ async def analytics_overview(
 
     weighted_latency = sum(r.avg_response_latency_ms * r.total_messages for r in rows)
     avg_latency = round(weighted_latency / total_messages, 1) if total_messages else 0.0
-
-    # Query sessions directly to get accurate session count
-    sessions_query = select(func.count(Session.id)).where(
-        Session.tenant_id == uuid.UUID(tenant_id),
-        Session.started_at >= datetime.combine(since, datetime.min.time()).replace(tzinfo=timezone.utc),
-    )
-    if agent_id:
-        sessions_query = sessions_query.where(Session.agent_id == uuid.UUID(agent_id))
-    sessions_result = await db.execute(sessions_query)
-    total_sessions = sessions_result.scalar() or 0
 
     # Daily time series (sum across agents per day)
     daily_map: dict[str, dict] = {}

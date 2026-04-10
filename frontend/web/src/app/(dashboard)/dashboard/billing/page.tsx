@@ -34,14 +34,14 @@ const PLANS = {
     voice_minutes_included: 0,
     voice_enabled: false,
   },
-  voice_growth: {
+  growth: {
     display_name: "Growth",
     price_per_agent: 99.00,
     chat_equivalents_included: 80_000,
     voice_minutes_included: 1500,
     voice_enabled: true,
   },
-  voice_business: {
+  business: {
     display_name: "Business",
     price_per_agent: 199.00,
     chat_equivalents_included: 170_000,
@@ -57,7 +57,7 @@ const PLANS = {
   },
 }
 
-const PLAN_ORDER = ['starter', 'voice_growth', 'voice_business', 'enterprise']
+const PLAN_ORDER = ['starter', 'growth', 'business', 'enterprise']
 
 interface BillingOverview {
   plan: string
@@ -161,9 +161,14 @@ export default function BillingPage() {
     }
   }
 
-  const currentPlanKey = overview?.plan || 'starter'
+  // We show usage and per-agent stats if they have a plan selected, regardless of payment status
+  // This helps users see their usage during past-due periods.
+  const hasSelectedPlan = !!(overview?.plan && overview.plan !== 'none')
+  const isSubscribed = hasSelectedPlan && (overview?.subscription_status === 'active' || overview?.subscription_status === 'trialing')
+  
+  // Identifier for the tenant's current plan level
+  const currentPlanKey = overview?.plan || 'none'
   const currentPlanIndex = PLAN_ORDER.indexOf(currentPlanKey)
-  const isFreeTier = currentPlanKey === 'none'
 
   const handleUpgrade = async (newPlan: string) => {
     setChangingPlan(true)
@@ -195,7 +200,6 @@ export default function BillingPage() {
   const formatDate = (ts: number) => new Date(ts * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 
   const isOverage = (overview?.estimated_bill.overage || 0) > 0
-  const isSubscribed = overview?.plan && overview.plan !== 'none' && (overview.subscription_status === 'active' || overview.subscription_status === 'trialing')
 
   return (
     <div className="p-8 w-full max-w-6xl mx-auto">
@@ -248,7 +252,7 @@ export default function BillingPage() {
                     )}
                   </div>
                   <p className="text-3xl font-bold mb-1">
-                    {overview?.plan_display_name || 'Standard'}
+                    {overview?.plan_display_name || 'Not Subscribed'}
                   </p>
                   <p className="text-violet-100 text-sm opacity-80">
                     {fmt(overview?.price_per_agent || 0)} per active agent / month
@@ -296,7 +300,8 @@ export default function BillingPage() {
           </div>
 
           {/* Plan Progress - Only show if subscribed */}
-          {isSubscribed && (
+          {/* Per-agent usage carousel / resource utilization */}
+          {hasSelectedPlan && (
             <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-base font-bold text-gray-900 dark:text-white flex items-center gap-2">
@@ -489,8 +494,8 @@ export default function BillingPage() {
         </div>
       </div>
 
-      {/* Usage breakdown cards - Only show if subscribed */}
-      {isSubscribed && (
+      {/* Usage breakdown cards - show if plan is selected */}
+      {hasSelectedPlan && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
           {[
             { icon: Sparkles, label: 'Sessions', value: fmtNum(overview?.usage.sessions || 0), desc: 'Total conversations', color: 'bg-blue-50 text-blue-600 dark:bg-blue-900/20' },
@@ -510,7 +515,7 @@ export default function BillingPage() {
       )}
 
       {/* Per-agent breakdown table */}
-        {isSubscribed && (
+        {hasSelectedPlan && (
           <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 overflow-hidden shadow-sm">
             <div className="px-6 py-5 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
               <h2 className="text-base font-bold text-gray-900 dark:text-white">Active Agent Usage</h2>
@@ -589,10 +594,11 @@ export default function BillingPage() {
         
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
           {Object.entries(PLANS).map(([key, plan]) => {
-            const isCurrentPlan = key === currentPlanKey
+            // Only show "Current Plan" badge and state if the subscription is actually active/trialing
+            const isCurrentPlan = key === currentPlanKey && isSubscribed
             const planIndex = PLAN_ORDER.indexOf(key)
-            const isUpgrade = !isFreeTier && planIndex > currentPlanIndex
-            const isDowngrade = !isFreeTier && planIndex < currentPlanIndex && !isFreeTier
+            const isUpgrade = currentPlanKey !== 'none' && planIndex > currentPlanIndex
+            const isDowngrade = currentPlanKey !== 'none' && planIndex < currentPlanIndex
 
             return (
               <div
@@ -649,7 +655,7 @@ export default function BillingPage() {
                       <Loader2 className="w-4 h-4 animate-spin" />
                     ) : (
                       <>
-                        {isUpgrade ? 'Upgrade' : (isDowngrade ? 'Downgrade' : 'Talk to Sales')}
+                        {key === 'enterprise' ? 'Talk to Sales' : isUpgrade ? 'Upgrade' : (isDowngrade ? 'Downgrade' : 'Current')}
                       </>
                     )}
                   </button>

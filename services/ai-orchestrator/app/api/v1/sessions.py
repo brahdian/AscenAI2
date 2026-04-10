@@ -46,8 +46,14 @@ def _tenant_id(request: Request) -> str:
     SECURITY: We read from request.state (set by the hardened AuthMiddleware
     after full JWT/API-key validation) rather than directly from the
     X-Tenant-ID header, which can be spoofed by any caller.
+    
+    However, for internal proxy requests from the API Gateway, we also accept
+    the X-Tenant-ID header which is already validated by the gateway.
     """
     tid = getattr(request.state, "tenant_id", None)
+    if not tid:
+        # Fallback for internal proxy requests from API Gateway
+        tid = request.headers.get("X-Tenant-ID")
     if not tid:
         raise HTTPException(status_code=401, detail="Tenant ID required.")
     return tid

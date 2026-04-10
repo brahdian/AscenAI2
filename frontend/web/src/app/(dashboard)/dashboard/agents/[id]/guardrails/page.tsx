@@ -11,26 +11,27 @@ import {
   Lock, Send, Pencil, Globe, UserCheck, Eye, EyeOff, MessageSquareWarning,
 } from 'lucide-react'
 
-// ─── Global guardrails data (mirrors voice_agent_guardrails.py GLOBAL_GUARDRAILS) ──
+// ─── Fetch global guardrails from platform settings (admin-controlled) ──
 
-const GLOBAL_GUARDRAILS = [
-  { id: 'GG-01', category: 'Security', rule: 'Strip system_prompt / instructions fields from any client-sent request body before forwarding to the LLM (proxy.py). Code enforced.', fix_ref: 'TC-E04' },
-  { id: 'GG-02', category: 'Security', rule: 'Sanitise user messages for role-injection tokens ([SYSTEM], <system>, <<SYS>>, [INST], [ASSISTANT]) before adding to the message array. Code enforced.', fix_ref: 'TC-C01' },
-  { id: 'GG-03', category: 'Security', rule: 'Authentication and authorisation levels are derived ONLY from the verified JWT token (api-gateway). No code path may derive privilege from conversation history or user self-assertion.', fix_ref: 'TC-C01' },
-  { id: 'GG-04', category: 'Security', rule: 'Never include raw stack traces, internal service URLs, database IDs, or configuration values in any user-facing response.', fix_ref: 'TC-B03' },
-  { id: 'GG-05', category: 'Safety', rule: 'Emergency keyword check runs BEFORE the LLM pipeline for clinic/medical/health agents. Response is hardcoded — latency ~0 ms. Code enforced.', fix_ref: 'TC-E01' },
-  { id: 'GG-06', category: 'Safety', rule: 'The agent must never claim to be human, a licensed professional, or claim diagnostic/legal/financial authority.', fix_ref: 'TC-E02' },
-  { id: 'GG-07', category: 'Safety', rule: 'After 3 consecutive fallback / unknown responses in a session, escalate to human automatically.', fix_ref: 'TC-C03' },
-  { id: 'GG-08', category: 'Confirmation', rule: 'Tools in the HIGH_RISK_TOOLS set (Stripe, Twilio SMS, Gmail) require an explicit spoken confirmation before execution. Ambiguous replies are treated as cancellation. Code enforced.', fix_ref: 'TC-D02' },
-  { id: 'GG-09', category: 'Confirmation', rule: 'After a high-risk tool executes, the agent must read back a receipt summary including the action taken, amount/recipient, and reference ID.', fix_ref: 'TC-D03' },
-  { id: 'GG-10', category: 'Concurrency', rule: 'Each voice session processes at most ONE utterance through the STT→LLM→TTS pipeline at a time (per-session asyncio.Lock). Barge-in cancels TTS output but the next utterance waits for the lock. Code enforced.', fix_ref: 'TC-A02' },
-  { id: 'GG-11', category: 'Concurrency', rule: 'The MAX_TOOL_ITERATIONS cap (default 5) prevents infinite tool-call loops. On cap breach, return the last LLM content and log a warning.', fix_ref: 'TC-D04' },
-  { id: 'GG-12', category: 'Voice UX', rule: 'Responses destined for TTS must not contain markdown, bullet symbols, numbered lists, HTML, or table syntax.', fix_ref: 'TC-A03' },
-  { id: 'GG-13', category: 'Voice UX', rule: 'Every voice response must end with a clear spoken next-step or question so the caller knows when to speak.', fix_ref: 'TC-A04' },
-  { id: 'GG-14', category: 'Voice UX', rule: 'If STT transcription confidence < 0.6, the pipeline must ask the user to repeat rather than proceeding with a low-confidence transcript.', fix_ref: 'TC-A01' },
-  { id: 'GG-15', category: 'Privacy', rule: 'Output guardrails must redact PII (email, phone, card numbers) before including them in any response when pii_redaction is enabled.', fix_ref: 'TC-E03' },
-  { id: 'GG-16', category: 'Privacy', rule: 'Tool credentials (API keys) stored in tool.tool_metadata must never appear in LLM prompts or user-facing responses.', fix_ref: 'TC-E04' },
-]
+interface GlobalGuardrail {
+  id: string
+  category: string
+  rule: string
+  fix_ref: string
+}
+
+async function fetchPlatformGlobalGuardrails(): Promise<GlobalGuardrail[]> {
+  try {
+    const res = await fetch('/api/v1/proxy/agents/platform/global-guardrails')
+    if (res.ok) {
+      const data = await res.json()
+      return data.guardrails || []
+    }
+  } catch {
+    // fallback to empty
+  }
+  return []
+}
 
 const CATEGORY_COLORS: Record<string, string> = {
   Security: 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300',
@@ -481,23 +482,24 @@ export default function GuardrailsPage() {
   const [dirty, setDirty] = useState(false)
 
   // Modal state
-  const [changeRequestGuardrail, setChangeRequestGuardrail] = useState<typeof GLOBAL_GUARDRAILS[0] | null>(null)
+  const [changeRequestGuardrail, setChangeRequestGuardrail] = useState<GlobalGuardrail | null>(null)
   const [customFormModal, setCustomFormModal] = useState<{ guardrail?: typeof customGuardrails[0] } | null>(null)
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null)
 
   useEffect(() => {
     if (!existing) return
-    setFilterLevel(existing.content_filter_level ?? 'medium')
-    setBlockedKeywords(existing.blocked_keywords ?? [])
-    setBlockedTopics(existing.blocked_topics ?? [])
-    setAllowedTopics(existing.allowed_topics ?? [])
-    setProfanityFilter(existing.profanity_filter ?? true)
-    setPiiRedaction(existing.pii_redaction ?? false)
-    setPiiPseudonymization(existing.pii_pseudonymization ?? false)
-    setMaxLength(existing.max_response_length ?? 0)
-    setRequireDisclaimer(existing.require_disclaimer ?? '')
-    setBlockedMessage(existing.blocked_message ?? "I'm sorry, I can't help with that.")
-    setOffTopicMessage(existing.off_topic_message ?? "I'm only able to help with topics related to our service.")
+    const cfg = (existing.config || {}) as Record<string, unknown>
+    setFilterLevel((cfg.content_filter_level as string) || (existing.content_filter_level as string) || 'medium')
+    setBlockedKeywords((cfg.blocked_keywords as string[]) || (existing.blocked_keywords as string[]) || [])
+    setBlockedTopics((cfg.blocked_topics as string[]) || (existing.blocked_topics as string[]) || [])
+    setAllowedTopics((cfg.allowed_topics as string[]) || (existing.allowed_topics as string[]) || [])
+    setProfanityFilter((cfg.profanity_filter as boolean) ?? (existing.profanity_filter as boolean) ?? true)
+    setPiiRedaction((cfg.pii_redaction as boolean) ?? (existing.pii_redaction as boolean) ?? false)
+    setPiiPseudonymization((cfg.pii_pseudonymization as boolean) ?? (existing.pii_pseudonymization as boolean) ?? false)
+    setMaxLength((cfg.max_response_length as number) || (existing.max_response_length as number) || 0)
+    setRequireDisclaimer((cfg.require_disclaimer as string) || (existing.require_disclaimer as string) || '')
+    setBlockedMessage((cfg.blocked_message as string) || (existing.blocked_message as string) || "I'm sorry, I can't help with that.")
+    setOffTopicMessage((cfg.off_topic_message as string) || (existing.off_topic_message as string) || "I'm only able to help with topics related to our service.")
     setIsActive(existing.is_active ?? true)
     setDirty(false)
   }, [existing])
@@ -577,8 +579,16 @@ export default function GuardrailsPage() {
 
   const mark = () => setDirty(true)
 
+  // Fetch global guardrails from platform settings (admin-controlled)
+  const { data: platformData } = useQuery({
+    queryKey: ['platform', 'global-guardrails'],
+    queryFn: () => fetch('/api/v1/proxy/agents/platform/global-guardrails').then(r => r.json()),
+    staleTime: 5 * 60 * 1000, // 5 minutes
+  })
+  const globalGuardrails = (platformData?.guardrails || []) as GlobalGuardrail[]
+
   // Group global guardrails by category
-  const groupedGlobal = GLOBAL_GUARDRAILS.reduce<Record<string, typeof GLOBAL_GUARDRAILS>>((acc, g) => {
+  const groupedGlobal = globalGuardrails.reduce<Record<string, GlobalGuardrail[]>>((acc, g) => {
     if (!acc[g.category]) acc[g.category] = []
     acc[g.category].push(g)
     return acc

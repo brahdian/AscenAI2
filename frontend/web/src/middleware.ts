@@ -6,49 +6,63 @@ export function middleware(request: NextRequest) {
   const hostname = request.headers.get('host') || ''
 
   // Read domains from environment
-  // Next.js replaces NEXT_PUBLIC_* variables at build time. For middleware (Edge runtime),
-  // it's safer to read a non-public server-only variable if we want to change it at runtime without a rebuild.
   const adminSubdomain =
     process.env.ADMIN_SUBDOMAIN || process.env.NEXT_PUBLIC_ADMIN_SUBDOMAIN || 'admin.lvh.me:3000'
+  const appSubdomain =
+    process.env.APP_SUBDOMAIN || process.env.NEXT_PUBLIC_APP_SUBDOMAIN || 'app.lvh.me:3000'
+  const rootDomain =
+    process.env.ROOT_DOMAIN || process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'lvh.me:3000'
 
-  // Detect admin subdomain: exact match
   const isAdminSubdomain = hostname === adminSubdomain
+  const isAppSubdomain = hostname === appSubdomain
 
-  // Log for debugging (only in development if needed)
+  // Log for debugging
   if (process.env.NODE_ENV === 'development') {
-    console.log(`[Middleware] Host: ${hostname}, AdminSub: ${adminSubdomain}, Match: ${isAdminSubdomain}`)
+    console.log(`[Middleware] Host: ${hostname}, Admin: ${isAdminSubdomain}, App: ${isAppSubdomain}`)
   }
 
+  // 1. ADMIN SUBDOMAIN: admin.lvh.me:3000
   if (isAdminSubdomain) {
-    // 1. Root path on admin subdomain → rewrite to /admin/settings
     if (url.pathname === '/') {
       return NextResponse.rewrite(new URL('/admin/settings', request.url))
     }
-
-    // 2. EXCLUDE global paths (auth, etc.) from /admin rewrite
-    // These paths exist in the root but should be accessible from the admin subdomain
-    const commonPaths = ['/login', '/register', '/onboarding', '/api/auth']
-    const isCommon = commonPaths.some(p => url.pathname === p || url.pathname.startsWith(p + '/'))
-
-    if (isCommon) {
+    const commonPaths = ['/login', '/register', '/onboarding', '/forgot-password', '/reset-password', '/api/auth']
+    if (commonPaths.some(p => url.pathname === p || url.pathname.startsWith(p + '/'))) {
       return NextResponse.next()
     }
-
-    // 3. Rewrite all other paths to the /admin/ folder
     if (!url.pathname.startsWith('/admin')) {
       return NextResponse.rewrite(new URL(`/admin${url.pathname}`, request.url))
     }
   }
 
-  // Block direct /admin/* access from the main domain
-  if (url.pathname.startsWith('/admin')) {
-    return NextResponse.redirect(new URL('/', request.url))
+  // 2. APP SUBDOMAIN: app.lvh.me:3000
+  if (isAppSubdomain) {
+    // If root path on app subdomain → rewrite to /dashboard
+    if (url.pathname === '/') {
+      return NextResponse.rewrite(new URL('/dashboard', request.url))
+    }
+
+    // EXCLUDE common paths
+    const commonPaths = ['/login', '/register', '/onboarding', '/forgot-password', '/reset-password', '/api/auth', '/console', '/pricing', '/docs']
+    if (commonPaths.some(p => url.pathname === p || url.pathname.startsWith(p + '/'))) {
+      return NextResponse.next()
+    }
+
+    // TRANSPARENT REWRITE: /agents -> /dashboard/agents
+    if (!url.pathname.startsWith('/dashboard')) {
+      return NextResponse.rewrite(new URL(`/dashboard${url.pathname}`, request.url))
+    }
   }
 
-  // ── AUTH: Client-side handles auth via syncAuth + Zustand persist ──────────
-  // Cookie-based auth check removed — cookies from localhost:8000 are not
-  // available on localhost:3000 (cross-origin). Client-side auth store handles
-  // authentication state and redirects after hydration.
+  // 3. SECURITY: Block cross-access
+  // Block direct /admin/* access from main domain or app subdomain
+  if (url.pathname.startsWith('/admin') && !isAdminSubdomain) {
+    return NextResponse.redirect(new URL(`http://${adminSubdomain}/admin/settings`))
+  }
+  // Block direct /dashboard/* access from main domain or admin subdomain
+  if (url.pathname.startsWith('/dashboard') && !isAppSubdomain) {
+    return NextResponse.redirect(new URL(`http://${appSubdomain}/`))
+  }
 
   return NextResponse.next()
 }

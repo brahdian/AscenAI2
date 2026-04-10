@@ -1,4 +1,5 @@
 import time
+import json
 import asyncio
 import uuid
 import structlog
@@ -9,6 +10,7 @@ from sqlalchemy import select, func
 from app.models.agent import Agent, AgentPlaybook, Session as AgentSession, Message, PlaybookExecution
 from app.schemas.chat import ChatResponse
 from app.services.llm_client import LLMClient
+from app.services.session_state_machine import SessionStateMachine
 
 logger = structlog.get_logger(__name__)
 
@@ -26,25 +28,52 @@ class PlaybookHandler:
         self.redis = redis_client
 
     async def route_active_playbook(self, agent_id: str, user_message: str) -> Optional[AgentPlaybook]:
-        result = await self.db.execute(
-            select(AgentPlaybook).where(
-                AgentPlaybook.agent_id == agent_id,
-                AgentPlaybook.is_active.is_(True),
+        # Implementation of Redis-backed summary caching
+        cache_key = f"agent_playbook_summaries:{agent_id}"
+        playbook_summaries = []
+        
+        if self.redis:
+            try:
+                cached = await self.redis.get(cache_key)
+                if cached:
+                    playbook_summaries = json.loads(cached)
+            except Exception as e:
+                logger.warning("redis_playbook_summaries_load_failed", agent_id=agent_id, error=str(e))
+
+        if not playbook_summaries:
+            result = await self.db.execute(
+                select(AgentPlaybook).where(
+                    AgentPlaybook.agent_id == uuid.UUID(agent_id),
+                    AgentPlaybook.is_active.is_(True),
+                )
             )
-        )
-        playbooks = list(result.scalars().all())
-        if not playbooks:
-            return None
-        if len(playbooks) == 1:
-            return playbooks[0]
+            playbooks = list(result.scalars().all())
+            if not playbooks:
+                return None
+            
+            playbook_summaries = [
+                {"id": str(p.id), "name": p.name, "description": p.description or ""}
+                for p in playbooks
+            ]
+            
+            if self.redis:
+                try:
+                    await self.redis.setex(cache_key, 3600, json.dumps(playbook_summaries))
+                except Exception as e:
+                    logger.warning("redis_playbook_summaries_cache_failed", agent_id=agent_id, error=str(e))
+
+        if len(playbook_summaries) == 1:
+            # Still load the full object for the caller
+            result = await self.db.execute(select(AgentPlaybook).where(AgentPlaybook.id == uuid.UUID(playbook_summaries[0]["id"])))
+            return result.scalar_one_or_none()
 
         system_prompt = (
             "You are a strict semantic intent router. Analyze the user's message and select the single best playbook ID to handle it. "
             "Respond ONLY with the exact UUID of the winning playbook. If no playbook is a good match, respond ONLY with the word 'none'.\n\n"
             "AVAILABLE PLAYBOOKS:\n"
         )
-        for p in playbooks:
-            system_prompt += f"ID: {p.id}\nName: {p.name}\nDescription: {p.description or 'No description'}\n\n"
+        for p in playbook_summaries:
+            system_prompt += f"ID: {p['id']}\nName: {p['name']}\nDescription: {p['description']}\n\n"
             
         messages = [
             {"role": "system", "content": system_prompt},
@@ -55,10 +84,11 @@ class PlaybookHandler:
             response = await self.llm.complete(messages=messages, max_tokens=50, stream=False)
             content = response.content.strip()
             
-            for p in playbooks:
-                if str(p.id) in content:
-                    logger.info("intent_routed", playbook_id=str(p.id), playbook_name=p.name)
-                    return p
+            for p in playbook_summaries:
+                if p["id"] in content:
+                    logger.info("intent_routed", playbook_id=p["id"], playbook_name=p["name"])
+                    result = await self.db.execute(select(AgentPlaybook).where(AgentPlaybook.id == uuid.UUID(p["id"])))
+                    return result.scalar_one_or_none()
                     
             logger.info("intent_routed_none", raw_selection=content)
         except Exception as e:
@@ -67,9 +97,10 @@ class PlaybookHandler:
         return await self.get_default_playbook(agent_id)
 
     async def get_default_playbook(self, agent_id: str) -> Optional[AgentPlaybook]:
+        # Check cache/DB for "General Chat" or default flag
         result = await self.db.execute(
             select(AgentPlaybook).where(
-                AgentPlaybook.agent_id == agent_id,
+                AgentPlaybook.agent_id == uuid.UUID(agent_id),
                 AgentPlaybook.name == "General Chat",
                 AgentPlaybook.is_active.is_(True),
             )
@@ -81,8 +112,9 @@ class PlaybookHandler:
             
         result = await self.db.execute(
             select(AgentPlaybook).where(
-                AgentPlaybook.agent_id == agent_id,
+                AgentPlaybook.agent_id == uuid.UUID(agent_id),
                 AgentPlaybook.is_default.is_(True),
+                AgentPlaybook.is_active.is_(True),
             )
         )
         return result.scalar_one_or_none()
@@ -107,7 +139,8 @@ class PlaybookHandler:
                 session_id=session_id,
                 playbook_id=str(playbook.id),
                 tenant_id=tenant_id,
-                agent_id=agent_id,
+                # B15 FIX: PlaybookExecution.agent_id is UUID — must not pass string
+                agent_id=uuid.UUID(agent_id) if isinstance(agent_id, str) else agent_id,
                 status="active",
                 variables={}
             )
@@ -123,8 +156,10 @@ class PlaybookHandler:
         r = response.lower()
         if any(phrase in r for phrase in fallback_phrases):
             return True
-        if playbook and playbook.fallback_response:
-            if playbook.fallback_response.strip().lower() in r:
+        
+        if playbook and playbook.config:
+            fallback_res = playbook.config.get("fallback_response", "")
+            if fallback_res and fallback_res.strip().lower() in r:
                 return True
         return False
 
@@ -149,7 +184,7 @@ class PlaybookHandler:
             pass
 
     async def should_escalate(self, agent: Agent, response: str, messages: list) -> bool:
-        escalation_config = agent.escalation_config or {}
+        escalation_config = (agent.agent_config or {}).get("escalation_config", {}) or {}
         if not escalation_config.get("escalate_to_human", False):
             return False
 
@@ -179,7 +214,7 @@ class PlaybookHandler:
         user_message: str,
         start_time: float,
     ) -> ChatResponse:
-        escalation_config = agent.escalation_config or {}
+        escalation_config = (agent.agent_config or {}).get("escalation_config", {}) or {}
         escalation_number = escalation_config.get("escalation_number", "")
         chat_enabled = bool(escalation_config.get("chat_enabled", False))
         chat_agent_name = escalation_config.get("chat_agent_name", "our support team")
@@ -189,7 +224,7 @@ class PlaybookHandler:
             if escalation_number:
                 message = "Transferring you to a human agent now — please hold."
                 action = "phone_transfer"
-                session.status = "escalated"
+                SessionStateMachine.escalate(session, reason="voice_escalation_number")
             elif chat_enabled:
                 message = (
                     "I don't have a direct phone transfer set up, but I can switch you "
@@ -199,14 +234,14 @@ class PlaybookHandler:
             else:
                 message = "Connecting you with a human agent now — please hold."
                 action = "phone_transfer"
-                session.status = "escalated"
+                SessionStateMachine.escalate(session, reason="voice_escalation_no_number")
         elif chat_enabled:
             message = (
                 f"I'm transferring you to {chat_agent_name} right now. "
                 f"One of our agents will be with you shortly."
             )
             action = "chat_handoff"
-            session.status = "escalated"
+            SessionStateMachine.escalate(session, reason="chat_handoff")
             await self.fire_connector(
                 escalation_config=escalation_config,
                 agent=agent,
@@ -214,9 +249,10 @@ class PlaybookHandler:
                 trigger_message=user_message,
             )
         else:
-            metadata = dict(session.metadata or {})
+            # B2 FIX: Build a fresh dict so MutableDict tracker sees the change
+            metadata = dict(session.metadata_ or {})
             metadata["_escalation_state"] = "collecting_info"
-            session.metadata = metadata
+            session.metadata_ = metadata
             message = (
                 "I'd be happy to connect you with a human agent. "
                 "To arrange a callback, could you share your name and phone number?"
@@ -259,6 +295,8 @@ class PlaybookHandler:
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         action: Optional[str] = None
+        message: str = ""
+        confirmed: bool = False
 
         if state == "collecting_info":
             phone_match = re.search(r'(\+?[\d][\d\s\-\(\)\.]{5,}\d)', user_message)
@@ -268,9 +306,9 @@ class PlaybookHandler:
             name = raw_name if raw_name and 2 <= len(raw_name) <= 60 and not re.fullmatch(r'[\d\s\-\(\)\+]+', raw_name) else None
 
             if name and phone:
-                new_meta = {**metadata, "_escalation_state": "confirming_info",
+                # B2 FIX: Always assign a fresh dict so MutableDict registers the change
+                session.metadata_ = {**metadata, "_escalation_state": "confirming_info",
                             "_escalation_name": name, "_escalation_phone": phone}
-                session.metadata = new_meta
                 message = (
                     f"Got it! Just to confirm I have the right details:\n"
                     f"• Name: {name}\n"
@@ -279,13 +317,11 @@ class PlaybookHandler:
                 )
                 action = "confirm_info"
             elif phone and not name:
-                new_meta = {**metadata, "_escalation_phone": phone}
-                session.metadata = new_meta
+                session.metadata_ = {**metadata, "_escalation_phone": phone}
                 message = "Thanks! And could I get your name so the agent knows who they're calling?"
                 action = "collect_info"
             elif name and not phone:
-                new_meta = {**metadata, "_escalation_name": name}
-                session.metadata = new_meta
+                session.metadata_ = {**metadata, "_escalation_name": name}
                 message = f"Thanks, {name}! And what's the best phone number to reach you?"
                 action = "collect_info"
             else:
@@ -304,12 +340,13 @@ class PlaybookHandler:
             )
 
             if confirmed:
-                clean_meta = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
-                session.metadata = clean_meta
-                session.status = "escalated"
+                # B2 FIX: fresh dict assignment for MutableDict tracking
+                session.metadata_ = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
+                SessionStateMachine.escalate(session, reason="callback_confirmed")
 
-                escalation_config_ref = agent.escalation_config or {}
+                escalation_config_ref = (agent.agent_config or {}).get("escalation_config", {}) or {}
                 escalation_number = escalation_config_ref.get("escalation_number", "")
+                
                 message = (
                     f"Perfect — I've notified our team. An agent will call you "
                     f"at {phone} shortly, {name}."
@@ -327,14 +364,14 @@ class PlaybookHandler:
                     contact_phone=phone,
                 )
             else:
-                clean_meta = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
-                session.metadata = clean_meta
+                session.metadata_ = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
                 message = "No problem — I've cancelled that. Is there anything else I can help you with?"
                 action = None
 
-        else:
-            session.metadata = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
-            session.status = "escalated"
+        if not message:
+            # Fallback if somehow state is invalid or loop closed
+            session.metadata_ = {k: v for k, v in metadata.items() if not k.startswith("_escalation_")}
+            SessionStateMachine.escalate(session, reason="escalation_info_collection_fallback")
             message = "I'll connect you with a human agent right away. Please hold."
             action = "phone_transfer"
 
@@ -352,7 +389,7 @@ class PlaybookHandler:
             message=message,
             tool_calls_made=[],
             suggested_actions=[],
-            escalate_to_human=action == "phone_callback_scheduled",
+            escalate_to_human=action in ("phone_callback_scheduled", "phone_transfer", "chat_handoff"),
             escalation_action=action,
             latency_ms=latency_ms,
             tokens_used=0,

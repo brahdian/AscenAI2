@@ -105,8 +105,12 @@ class TemplatePlaybook(Base):
         UUID(as_uuid=True), ForeignKey("template_versions.id"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     trigger_condition: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    flow_definition: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Centralized behavioral content (tone, instructions, dos, donts, scenarios, fallback, tools, etc.)
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default='{}')
+
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
 
     version: Mapped["TemplateVersion"] = relationship("TemplateVersion", back_populates="playbooks")
 

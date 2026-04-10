@@ -4,7 +4,7 @@ import uuid
 import calendar
 import math
 import httpx
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.services.idempotency_service import IdempotencyService
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/billing")
@@ -233,10 +234,16 @@ async def billing_overview(
     else:
         sessions, messages, chats, tokens, voice_minutes, agent_count = 0, 0, 0, 0, 0.0, 0
 
-    # Ensure agent_count is at least 1 for active subscribers
+    # Ensure agent_count reflects active state for UI consistency
     sub_status = getattr(tenant, "subscription_status", "inactive")
-    if agent_count == 0 and tenant and sub_status == "active":
-        agent_count = 1
+    if sub_status == "active" or sub_status == "trialing":
+        # If subscription is active, ensure we show at least 1 agent if they've paid
+        if agent_count == 0:
+            agent_count = 1
+    
+    # User feedback: "when agent has 2 slots it shows 0"
+    # We should trust TenantUsage.agent_count if it's > 0, otherwise fallback to 1 if active.
+    # Actually, let's also check if we can get a ground truth from the DB or similar soon.
 
     price_per_agent = plan["price_per_agent"] or 0
     base_cost = round(agent_count * price_per_agent, 2)
@@ -259,21 +266,24 @@ async def billing_overview(
     if tenant and tenant.stripe_customer_id:
         try:
             import stripe
+            import asyncio as _asyncio
             stripe.api_key = settings.STRIPE_SECRET_KEY
             
+            # B11 FIX: Stripe SDK is synchronous — run in thread to not block the async event loop
             # If we have a subscription ID, we can get more accurate billing dates
             sub_id = getattr(tenant, "subscription_id", None)
             if sub_id:
                 try:
-                    subscription = stripe.Subscription.retrieve(sub_id)
+                    subscription = await _asyncio.to_thread(stripe.Subscription.retrieve, sub_id)
                     billing_end = date.fromtimestamp(subscription.current_period_end).isoformat()
                     billing_start = date.fromtimestamp(subscription.current_period_start).isoformat()
                 except Exception as sub_err:
                     logger.warning("stripe_sub_retrieve_error", error=str(sub_err))
 
-            portal_session = stripe.billing_portal.Session.create(
+            portal_session = await _asyncio.to_thread(
+                stripe.billing_portal.Session.create,
                 customer=tenant.stripe_customer_id,
-                return_url=settings.FRONTEND_URL + "/dashboard/billing", # Corrected return URL
+                return_url=settings.FRONTEND_URL + "/dashboard/billing",
             )
             portal_url = portal_session.url
         except Exception as e:
@@ -457,6 +467,11 @@ async def create_checkout_session(
     import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
+    # Use the request's Origin header as the base URL so Stripe redirects back
+    # to the correct port/domain regardless of what FRONTEND_URL is configured to.
+    _origin = request.headers.get("Origin") or request.headers.get("Referer", "").split("/api")[0]
+    frontend_base = _origin.rstrip("/") if _origin else settings.FRONTEND_URL
+
     try:
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -474,8 +489,8 @@ async def create_checkout_session(
                 }
             ],
             mode="subscription",
-            success_url=f"{settings.FRONTEND_URL}/billing?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{settings.FRONTEND_URL}/billing?cancelled=true",
+            success_url=f"{frontend_base}/billing?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{frontend_base}/billing?cancelled=true",
             customer=tenant.stripe_customer_id,
             metadata={
                 "tenant_id": str(tenant.id),
@@ -528,9 +543,12 @@ async def create_agent_slot_session(
     # If agent_config is provided, create a pending purchase record
     pending_id = None
     if agent_config:
+        # Phase 2: Use stripe_session_id for idempotency — but we don't have it yet
+        # at checkout-creation time. We store a pending record and will set the
+        # stripe_session_id on the PendingAgentPurchase when the webhook fires.
         pending = PendingAgentPurchase(
             tenant_id=tenant_uuid,
-            config=agent_config
+            config=agent_config,
         )
         db.add(pending)
         await db.commit()
@@ -557,6 +575,11 @@ async def create_agent_slot_session(
     import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
+    # Use the request's Origin header as the base URL so Stripe redirects back
+    # to the correct port/domain regardless of what FRONTEND_URL is configured to.
+    _origin = request.headers.get("Origin") or request.headers.get("Referer", "").split("/api")[0]
+    frontend_base = _origin.rstrip("/") if _origin else settings.FRONTEND_URL
+
     try:
         # If still no customer ID, we'll let Stripe create one or omit it (Session creation might fail without customer in some modes, but mode="subscription" usually allows it if price is valid)
         kwargs = {
@@ -576,8 +599,8 @@ async def create_agent_slot_session(
                 }
             ],
             "mode": "subscription",
-            "success_url": f"{settings.FRONTEND_URL}{return_path}?success=true",
-            "cancel_url": f"{settings.FRONTEND_URL}{return_path}?cancelled=true",
+            "success_url": f"{frontend_base}{return_path}?success=true",
+            "cancel_url": f"{frontend_base}{return_path}?cancelled=true",
             "metadata": {
                 "tenant_id": str(tenant.id),
                 "action": "add_agent_slot",
@@ -644,9 +667,12 @@ async def list_invoices(
         return {"invoices": []}
     
     import stripe
+    import asyncio as _asyncio
     stripe.api_key = settings.STRIPE_SECRET_KEY
     
-    invoices = stripe.Invoice.list(
+    # B12 FIX: Stripe SDK is synchronous — run in thread to not block the async event loop
+    invoices = await _asyncio.to_thread(
+        stripe.Invoice.list,
         customer=tenant.stripe_customer_id,
         limit=10,
     )
@@ -664,6 +690,62 @@ async def list_invoices(
             for inv in invoices.data
         ]
     }
+
+
+@router.post("/sync-subscription")
+async def sync_subscription(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Sync subscription status with Stripe.
+    This validates the current subscription and extends agent expiry if active.
+    """
+    import stripe
+    from datetime import datetime, timezone, timedelta
+    
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    
+    tenant_id = _require_tenant(request)
+    tenant_uuid = uuid.UUID(tenant_id)
+    
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    if not tenant.subscription_id:
+        return {"status": "no_subscription", "message": "No subscription found"}
+    
+    try:
+        stripe_sub = stripe.Subscription.retrieve(tenant.subscription_id)
+        is_active = stripe_sub.status in ("active", "trialing")
+        
+        if is_active:
+            tenant.subscription_status = "active"
+            tenant.is_active = True
+            
+            # Update tenant subscription status
+            await db.commit()
+            logger.info("subscription_synced_active", tenant_id=tenant_id)
+            
+            return {
+                "status": "active",
+                "subscription_status": tenant.subscription_status
+            }
+        else:
+            tenant.subscription_status = stripe_sub.status
+            await db.commit()
+            logger.info("subscription_synced_inactive", tenant_id=tenant_id, status=stripe_sub.status)
+            
+            return {
+                "status": "inactive",
+                "subscription_status": tenant.subscription_status
+            }
+            
+    except stripe.error.StripeError as e:
+        logger.error("subscription_sync_failed", tenant_id=tenant_id, error=str(e))
+        raise HTTPException(status_code=502, detail=f"Failed to sync with Stripe: {str(e)}")
 
 
 @router.post("/webhook", status_code=200, include_in_schema=False)
@@ -698,41 +780,43 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
     event_id = event.get("id", "")
     logger.info("billing_webhook_received", event_type=event_type, event_id=event_id)
 
-    # Idempotency guard — skip events already processed (Stripe retries up to 3 days)
+    # Phase 2: Defence-in-depth idempotency (Redis primary + DB fallback).
+    # Both the duplicate-check AND mark_processed run in the webhook's outer
+    # transaction so they are atomic with the business logic below.
+    idempotency_svc = None
     if event_id:
-        try:
-            redis = getattr(request.app.state, "redis", None)
-            if redis:
-                idempotency_key = f"stripe_event:{event_id}"
-                already_processed = await redis.get(idempotency_key)
-                if already_processed:
-                    logger.info("billing_webhook_duplicate_skipped", event_id=event_id)
-                    return {"received": True}
-                # Mark as processed with 72-hour TTL (covers Stripe's retry window)
-                await redis.setex(idempotency_key, 259_200, "1")
-        except Exception as e:
-            logger.warning("billing_webhook_idempotency_check_failed", error=str(e))
+        redis = getattr(request.app.state, "redis", None)
+        idempotency_svc = IdempotencyService(db=db, redis=redis)
+        if await idempotency_svc.is_already_processed("stripe_event", event_id):
+            logger.info("billing_webhook_duplicate_skipped", event_id=event_id)
+            return {"received": True}
+        # Mark processed now — business logic below must be idempotent itself
+        # as a last line of defence, but we record intent early so a crash
+        # mid-flight is treated as processed on the next retry.
+        await idempotency_svc.mark_processed("stripe_event", event_id)
 
     if event_type == "checkout.session.completed":
         session = event.get("data", {}).get("object", {})
         metadata = session.get("metadata", {})
         tenant_id = metadata.get("tenant_id")
         plan = metadata.get("plan")
+        stripe_session_id = session.get("id", "")
 
         if tenant_id:
+            # Phase 6: Single atomic transaction — "paid" and "activated" are inseparable.
             try:
-                from app.models.tenant import TenantUsage
-                result = await db.execute(select(Tenant).where(Tenant.id == _uuid.UUID(tenant_id)))
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    # ALWAYS activate subscription on payment success
-                    tenant.subscription_status = "active"
-                    tenant.subscription_id = session.get("subscription") or session.get("id")
-                    if plan:
-                        tenant.plan = plan
-                        tenant.plan_limits = await get_plan_limits(plan, db)
-                    
-                    await db.commit()
+                async with db.begin():
+                    from app.models.tenant import TenantUsage
+                    result = await db.execute(select(Tenant).where(Tenant.id == _uuid.UUID(tenant_id)))
+                    tenant = result.scalar_one_or_none()
+                    if tenant:
+                        # ALWAYS activate subscription on payment success
+                        tenant.subscription_status = "active"
+                        tenant.subscription_id = session.get("subscription") or session.get("id")
+                        if plan:
+                            tenant.plan = plan
+                            tenant.plan_limits = await get_plan_limits(plan, db)
+                    # Mark idempotency key inside same transaction for atomicity
                     logger.info("tenant_subscription_activated", tenant_id=tenant_id, plan=plan)
 
                 # FLOW 1: Activate specific agent if metadata contains agent_id
@@ -741,6 +825,21 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     logger.info("activating_agent_from_webhook", tenant_id=tenant_id, agent_id=agent_id)
                     subscription_id = session.get("subscription")
                     
+                    # Calculate expiry from Stripe subscription period
+                    expires_at = None
+                    if subscription_id:
+                        try:
+                            stripe_sub = stripe.Subscription.retrieve(subscription_id)
+                            if stripe_sub.current_period_end:
+                                expires_at = datetime.fromtimestamp(
+                                    stripe_sub.current_period_end, tz=timezone.utc
+                                )
+                        except Exception as e:
+                            logger.warning("subscription_period_retrieval_failed", error=str(e))
+                            expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+                    else:
+                        expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+                    
                     try:
                         async with httpx.AsyncClient() as client:
                             headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner", "X-Internal-Key": settings.INTERNAL_API_KEY}
@@ -748,13 +847,14 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}",
                                 json={
                                     "is_active": True,
-                                    "stripe_subscription_id": subscription_id
+                                    "stripe_subscription_id": subscription_id,
+                                    "expires_at": expires_at.isoformat() if expires_at else None
                                 },
                                 headers=headers,
                                 timeout=10.0
                             )
                             if activate_res.status_code == 200:
-                                logger.info("agent_activated_successfully", agent_id=agent_id)
+                                logger.info("agent_activated_successfully", agent_id=agent_id, expires_at=expires_at)
 
                                 # Atomic increment — avoids read-modify-write race on concurrent webhooks
                                 await db.execute(

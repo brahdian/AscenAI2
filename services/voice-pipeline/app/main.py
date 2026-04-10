@@ -323,3 +323,65 @@ async def voice_websocket(
     finally:
         await pipeline.on_disconnect()
         manager.disconnect(client_id)
+
+
+@app.websocket("/ws/voice/{agent_id}")
+async def voice_websocket_agent(
+    websocket: WebSocket,
+    agent_id: str,
+):
+    """
+    WebSocket endpoint for real-time voice — agent-scoped path used by
+    Twilio Media Streams and browser clients that embed agent_id in the path.
+
+    Twilio connects here when the TwiML ``<Stream>`` URL is:
+      ``wss://{host}/ws/voice/{agent_id}?tenant_id=...&session_id=...&token=...``
+
+    Browser clients can also use this endpoint to avoid encoding tenant/session
+    in the path (they pass them as query parameters instead).
+
+    Query parameters:
+      tenant_id  — required; must match the JWT claim
+      session_id — optional; auto-generated if absent
+      token      — required JWT access token
+    """
+    from app.services.voice_pipeline import VoicePipeline
+    from app.services.stt_service import STTService
+    from app.services.tts_service import TTSService
+
+    tenant_id = websocket.query_params.get("tenant_id", "")
+    session_id = websocket.query_params.get("session_id") or str(uuid.uuid4())
+    token = websocket.query_params.get("token", "")
+
+    if not tenant_id or not token:
+        await websocket.close(code=4401, reason="tenant_id and token are required")
+        return
+
+    redis = getattr(app.state, "redis", None)
+
+    pipeline = VoicePipeline(
+        stt=STTService(),
+        tts=TTSService(),
+        orchestrator_url=settings.AI_ORCHESTRATOR_URL,
+        redis=redis,
+    )
+
+    try:
+        await pipeline.handle_websocket(
+            websocket=websocket,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            token=token,
+        )
+    except Exception as exc:
+        logger.error("voice_ws_agent_error", agent_id=agent_id, error=str(exc))
+        try:
+            if websocket.client_state.value == 1:  # CONNECTED
+                await websocket.send_text(
+                    json.dumps({"type": "error", "message": "An internal error occurred"})
+                )
+        except Exception:
+            pass
+    finally:
+        await pipeline.close()

@@ -142,6 +142,14 @@ export const authApi = {
   resendOTP: (data: { email: string }) =>
     api.post('/auth/resend-otp', data).then((r) => r.data),
 
+  me: () => api.get('/auth/me').then((r) => r.data),
+
+  updateMe: (data: { full_name?: string }) =>
+    api.patch('/auth/me', data).then((r) => r.data),
+
+  changePassword: (data: { current_password: string; new_password: string }) =>
+    api.post('/auth/change-password', data).then((r) => r.data),
+
   forgotPassword: (data: { email: string }) =>
     api.post('/auth/forgot-password', data).then((r) => r.data),
 
@@ -169,12 +177,31 @@ export const tenantApi = {
 
 export const agentsApi = {
   list: (params?: { agent_id?: string; status?: string; limit?: number }) =>
-    api.get('/proxy/agents/', { params }).then((r) => r.data),
+    api.get('/proxy/agents', { params }).then((r) => r.data),
   get: (id: string) => api.get(`/proxy/agents/${id}`).then((r) => r.data),
   create: (data: Record<string, unknown>) =>
-    api.post('/proxy/agents/', data).then((r) => r.data),
-  update: (id: string, data: Record<string, unknown>) =>
-    api.patch(`/proxy/agents/${id}`, data).then((r) => r.data),
+    api.post('/proxy/agents', data).then((r) => r.data),
+  update: (id: string, data: Record<string, unknown>) => {
+    const {
+      auto_detect_language,
+      supported_languages,
+      greeting_message,
+      voice_system_prompt,
+      escalation_config,
+      ...rest
+    } = data as Record<string, unknown>
+    const payload: Record<string, unknown> = { ...rest }
+    const agentConfig: Record<string, unknown> = {}
+    if (auto_detect_language !== undefined) agentConfig.auto_detect_language = auto_detect_language
+    if (supported_languages !== undefined) agentConfig.supported_languages = supported_languages
+    if (greeting_message !== undefined) agentConfig.greeting_message = greeting_message
+    if (voice_system_prompt !== undefined) agentConfig.voice_system_prompt = voice_system_prompt
+    if (escalation_config !== undefined) agentConfig.escalation_config = escalation_config
+    if (Object.keys(agentConfig).length > 0) {
+      payload.agent_config = agentConfig
+    }
+    return api.patch(`/proxy/agents/${id}`, payload).then((r) => r.data)
+  },
   delete: (id: string) => api.delete(`/proxy/agents/${id}`),
   restore: (id: string) => api.post(`/proxy/agents/${id}/restore`).then((r) => r.data),
   test: (id: string, message: string) =>
@@ -205,7 +232,7 @@ export const agentsApi = {
 // ---------------------------------------------------------------------------
 
 export const templatesApi = {
-  list: () => api.get('/proxy/templates/').then((r) => r.data),
+  list: () => api.get('/proxy/templates').then((r) => r.data),
   get: (id: string) => api.get(`/proxy/templates/${id}`).then((r) => r.data),
   instantiate: (id: string, data: Record<string, unknown>) =>
     api.post(`/proxy/templates/${id}/instantiate`, data).then((r) => r.data),
@@ -227,6 +254,13 @@ export const chatApi = {
     session_id?: string
     channel?: string
   }) => api.post('/proxy/chat', data).then((r) => r.data),
+
+  agentCall: (data: {
+    agent_id: string
+    message: string
+    context?: string
+    tenant_id?: string
+  }) => api.post('/proxy/chat/agent-call', data).then((r) => r.data),
 
   stream: async (data: {
     agent_id: string
@@ -371,13 +405,15 @@ export const voiceApi = {
 
 export const sessionsApi = {
   list: (params?: { agent_id?: string; status?: string; limit?: number }) =>
-    api.get('/proxy/sessions/', { params }).then((r) => r.data),
+    api.get('/proxy/sessions', { params }).then((r) => r.data),
   get: (id: string, include_messages?: boolean) =>
     api
       .get(`/proxy/sessions/${id}`, {
         params: include_messages ? { include_messages: true } : undefined,
       })
       .then((r) => r.data),
+  end: (id: string) => api.post(`/proxy/sessions/${id}/end`).then((r) => r.data),
+  analytics: (id: string) => api.get(`/proxy/sessions/${id}/analytics`).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +444,7 @@ export const feedbackApi = {
     feedback_source?: string
     playbook_correction?: { correct_playbook_id: string; correct_playbook_name: string } | null
     tool_corrections?: Array<{ tool_name: string; was_correct: boolean; correct_tool?: string; reason?: string }>
-  }) => api.post('/proxy/feedback/', data).then((r) => r.data),
+  }) => api.post('/proxy/feedback', data).then((r) => r.data),
 
   list: (params?: {
     agent_id?: string
@@ -418,7 +454,7 @@ export const feedbackApi = {
     include_messages?: boolean
     limit?: number
     offset?: number
-  }) => api.get('/proxy/feedback/', { params }).then((r) => r.data),
+  }) => api.get('/proxy/feedback', { params }).then((r) => r.data),
 
   delete: (id: string) => api.delete(`/proxy/feedback/${id}`),
 
@@ -441,7 +477,7 @@ export const feedbackApi = {
 
 export const analyticsApi = {
   overview: (params?: { days?: number; agent_id?: string }) =>
-    api.get('/proxy/analytics/overview/', { params }).then((r) => r.data),
+    api.get('/proxy/analytics/overview', { params }).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +499,22 @@ export const playbookApi = {
     fallback_response?: string
     custom_escalation_message?: string
     is_active?: boolean
-  }) => api.put(`/proxy/agents/${agentId}/playbook`, data).then((r) => r.data),
+  }) => {
+    const payload = {
+      config: {
+        instructions: data.instructions,
+        tone: data.tone,
+        dos: data.dos,
+        donts: data.donts,
+        scenarios: data.scenarios,
+        out_of_scope_response: data.out_of_scope_response,
+        fallback_response: data.fallback_response,
+        custom_escalation_message: data.custom_escalation_message,
+      },
+      is_active: data.is_active,
+    }
+    return api.put(`/proxy/agents/${agentId}/playbook`, payload).then((r) => r.data)
+  },
 
   delete: (agentId: string) =>
     api.delete(`/proxy/agents/${agentId}/playbook`),
@@ -490,7 +541,25 @@ export const guardrailsApi = {
     off_topic_message?: string
     content_filter_level?: string
     is_active?: boolean
-  }) => api.put(`/proxy/agents/${agentId}/guardrails`, data).then((r) => r.data),
+  }) => {
+    const payload = {
+      config: {
+        blocked_keywords: data.blocked_keywords,
+        blocked_topics: data.blocked_topics,
+        allowed_topics: data.allowed_topics,
+        profanity_filter: data.profanity_filter,
+        pii_redaction: data.pii_redaction,
+        pii_pseudonymization: data.pii_pseudonymization,
+        max_response_length: data.max_response_length,
+        require_disclaimer: data.require_disclaimer,
+        blocked_message: data.blocked_message,
+        off_topic_message: data.off_topic_message,
+        content_filter_level: data.content_filter_level,
+      },
+      is_active: data.is_active,
+    }
+    return api.put(`/proxy/agents/${agentId}/guardrails`, payload).then((r) => r.data)
+  },
 
   delete: (agentId: string) =>
     api.delete(`/proxy/agents/${agentId}/guardrails`),
@@ -530,16 +599,50 @@ export const learningApi = {
 // ---------------------------------------------------------------------------
 
 export const playbooksApi = {
-  list: (agentId: string) =>
-    api.get(`/proxy/agents/${agentId}/playbooks`).then((r) => r.data),
-  validateSafety: (text: string) =>
-    api.post('/playbooks/validate-safety', { text }).then((r) => r.data),
-  create: (agentId: string, data: Record<string, unknown>) =>
-    api.post(`/proxy/agents/${agentId}/playbooks`, data).then((r) => r.data),
+  list: (agentId: string) => api.get(`/proxy/agents/${agentId}/playbooks`).then((r) => r.data),
+  validateSafety: (text: string) => api.post('/proxy/playbooks/validate-safety', { text }).then((r) => r.data),
+  create: (agentId: string, data: Record<string, unknown>) => {
+    const payload = {
+      name: data.name,
+      description: data.description,
+      intent_triggers: data.intent_triggers,
+      is_default: data.is_default,
+      config: {
+        instructions: data.instructions,
+        tone: data.tone || 'professional',
+        dos: data.dos || [],
+        donts: data.donts || [],
+        scenarios: data.scenarios || [],
+        out_of_scope_response: data.out_of_scope_response,
+        fallback_response: data.fallback_response,
+        custom_escalation_message: data.custom_escalation_message,
+      },
+      is_active: data.is_active ?? true,
+    }
+    return api.post(`/proxy/agents/${agentId}/playbooks`, payload).then((r) => r.data)
+  },
   get: (agentId: string, playbookId: string) =>
     api.get(`/proxy/agents/${agentId}/playbooks/${playbookId}`).then((r) => r.data),
-  update: (agentId: string, playbookId: string, data: Record<string, unknown>) =>
-    api.put(`/proxy/agents/${agentId}/playbooks/${playbookId}`, data).then((r) => r.data),
+  update: (agentId: string, playbookId: string, data: Record<string, unknown>) => {
+    const payload = {
+      name: data.name,
+      description: data.description,
+      intent_triggers: data.intent_triggers,
+      is_default: data.is_default,
+      config: {
+        instructions: data.instructions,
+        tone: data.tone || 'professional',
+        dos: data.dos || [],
+        donts: data.donts || [],
+        scenarios: data.scenarios || [],
+        out_of_scope_response: data.out_of_scope_response,
+        fallback_response: data.fallback_response,
+        custom_escalation_message: data.custom_escalation_message,
+      },
+      is_active: data.is_active,
+    }
+    return api.put(`/proxy/agents/${agentId}/playbooks/${playbookId}`, payload).then((r) => r.data)
+  },
   delete: (agentId: string, playbookId: string) =>
     api.delete(`/proxy/agents/${agentId}/playbooks/${playbookId}`),
   setDefault: (agentId: string, playbookId: string) =>
@@ -560,7 +663,7 @@ export const documentsApi = {
     // with the correct multipart boundary when given FormData
     return api.post(`/proxy/agents/${agentId}/documents`, form).then((r) => r.data)
   },
-  createText: (agentId: string, data: { name: string; content: string }) =>
+  createText: (agentId: string, data: { name: string; content: string; status?: 'draft' | 'published' }) =>
     api.post(`/proxy/agents/${agentId}/documents/text`, data).then((r) => r.data),
   updateText: (agentId: string, docId: string, data: { name?: string; content?: string; status?: 'draft' | 'published' }) =>
     api.put(`/proxy/agents/${agentId}/documents/${docId}`, data).then((r) => r.data),
@@ -573,14 +676,13 @@ export const documentsApi = {
 // ---------------------------------------------------------------------------
 
 export const variablesApi = {
-  list: (agentId: string) =>
-    api.get(`/proxy/agents/${agentId}/variables`).then((r) => r.data),
+  list: (agentId: string) => api.get(`/proxy/agents/${agentId}/variables`).then((r) => r.data),
   create: (agentId: string, data: Record<string, unknown>) =>
     api.post(`/proxy/agents/${agentId}/variables`, data).then((r) => r.data),
   update: (agentId: string, varId: string, data: Record<string, unknown>) =>
     api.put(`/proxy/agents/${agentId}/variables/${varId}`, data).then((r) => r.data),
   delete: (agentId: string, varId: string) =>
-    api.delete(`/proxy/agents/${agentId}/variables/${varId}`),
+    api.delete(`/proxy/agents/${agentId}/variables/${varId}`).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -612,10 +714,10 @@ export const billingApi = {
     api.post('/billing/create-agent-slot-session', { agent_config: agentConfig, return_path: returnPath, plan }).then((r) => r.data as { checkout_url: string }),
   getInvoices: () =>
     api.get('/billing/invoices').then((r) => r.data as { invoices: any[] }),
-  cancel: () =>
-    api.post('/billing/cancel').then((r) => r.data),
+  cancel: () => api.post('/billing/cancel').then((r) => r.data),
   toggleVoiceAddon: (enabled: boolean) =>
     api.post('/billing/voice-addon', { enabled }).then((r) => r.data),
+  syncSubscription: () => api.post('/billing/sync-subscription').then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +726,7 @@ export const billingApi = {
 
 export const toolsApi = {
   catalog: () => api.get('/proxy/tools/catalog').then((r) => r.data),
-  list: () => api.get('/proxy/tools').then((r) => r.data),
+  list: (agentId?: string) => api.get('/proxy/tools', { params: { agent_id: agentId } }).then((r) => r.data),
   get: (name: string) => api.get(`/proxy/tools/${name}`).then((r) => r.data),
   register: (data: {
     name: string
@@ -639,6 +741,8 @@ export const toolsApi = {
   }) => api.post('/proxy/tools', data).then((r) => r.data),
   update: (name: string, data: Record<string, unknown>) =>
     api.patch(`/proxy/tools/${name}`, data).then((r) => r.data),
+  testExecute: (data: { tool_config: Record<string, unknown>, parameters: Record<string, unknown> }) =>
+    api.post('/proxy/tools/test-execute', data).then((r) => r.data),
   delete: (name: string) => api.delete(`/proxy/tools/${name}`),
   /**
    * Verify tool credentials before saving.

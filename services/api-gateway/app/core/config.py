@@ -38,16 +38,28 @@ class Settings(BaseSettings):
     @field_validator("SECRET_KEY")
     @classmethod
     def validate_secret_key(cls, v: str) -> str:
+        import os
+        import warnings
         if len(v) < 32:
             raise ValueError("SECRET_KEY must be at least 32 characters long")
         if v in _WEAK_KEYS:
-            raise ValueError(
-                "SECRET_KEY is a known weak default. "
-                "Set a strong random value (e.g. openssl rand -hex 32)."
+            env = os.getenv("ENVIRONMENT", "production")
+            if env == "production":
+                raise ValueError(
+                    "SECRET_KEY is a known weak default. "
+                    "Set a strong random value (e.g. openssl rand -hex 32)."
+                )
+            # In development/staging, emit a warning instead of failing so the
+            # service still starts with the default key.
+            warnings.warn(
+                "SECRET_KEY is a known weak default — do NOT use this in production. "
+                "Generate a strong key with: openssl rand -hex 32",
+                UserWarning,
+                stacklevel=2,
             )
         return v
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30         # 30 min — short-lived; refresh via cookie
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60         # 60 min — access token lifetime; refresh via cookie
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     # Internal service URLs

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import copy
 import uuid
-
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
@@ -23,6 +23,7 @@ def _tenant_id(request: Request) -> str:
 
 
 def _to_response(pb: AgentPlaybook) -> PlaybookResponse:
+    config = pb.config or {}
     return PlaybookResponse(
         id=str(pb.id),
         agent_id=str(pb.agent_id),
@@ -31,17 +32,18 @@ def _to_response(pb: AgentPlaybook) -> PlaybookResponse:
         description=pb.description,
         intent_triggers=pb.intent_triggers or [],
         is_default=pb.is_default,
-        instructions=pb.instructions,
-        tone=pb.tone,
-        dos=pb.dos or [],
-        donts=pb.donts or [],
-        scenarios=pb.scenarios or [],
-        out_of_scope_response=pb.out_of_scope_response,
-        fallback_response=pb.fallback_response,
-        custom_escalation_message=pb.custom_escalation_message,
+        instructions=config.get("instructions"),
+        tone=config.get("tone", "professional"),
+        dos=config.get("dos", []),
+        donts=config.get("donts", []),
+        scenarios=config.get("scenarios", []),
+        out_of_scope_response=config.get("out_of_scope_response"),
+        fallback_response=config.get("fallback_response"),
+        custom_escalation_message=config.get("custom_escalation_message"),
         is_active=pb.is_active,
         created_at=pb.created_at.isoformat() if pb.created_at else "",
         updated_at=pb.updated_at.isoformat() if pb.updated_at else "",
+        config=config,
     )
 
 
@@ -87,7 +89,6 @@ async def create_playbook(
     tenant_id = _tenant_id(request)
     agent = await _verify_agent(agent_id, tenant_id, db)
 
-    # If is_default is True, unset any existing defaults
     if body.is_default:
         existing_defaults = await db.execute(
             select(AgentPlaybook).where(
@@ -98,6 +99,10 @@ async def create_playbook(
         for pb in existing_defaults.scalars().all():
             pb.is_default = False
 
+    incoming = body.config.copy() if body.config else {}
+    if not incoming:
+        incoming = {"tone": "professional", "dos": [], "donts": [], "scenarios": []}
+
     pb = AgentPlaybook(
         agent_id=agent.id,
         tenant_id=agent.tenant_id,
@@ -105,14 +110,7 @@ async def create_playbook(
         description=body.description,
         intent_triggers=body.intent_triggers,
         is_default=body.is_default,
-        instructions=body.instructions,
-        tone=body.tone,
-        dos=body.dos,
-        donts=body.donts,
-        scenarios=[s.model_dump() for s in body.scenarios],
-        out_of_scope_response=body.out_of_scope_response,
-        fallback_response=body.fallback_response,
-        custom_escalation_message=body.custom_escalation_message,
+        config=incoming,
         is_active=body.is_active,
     )
     db.add(pb)
@@ -167,7 +165,6 @@ async def update_playbook(
     if not pb:
         raise HTTPException(status_code=404, detail="Playbook not found.")
 
-    # If setting this as default, unset others
     if body.is_default and not pb.is_default:
         existing_defaults = await db.execute(
             select(AgentPlaybook).where(
@@ -182,15 +179,9 @@ async def update_playbook(
     pb.description = body.description
     pb.intent_triggers = body.intent_triggers
     pb.is_default = body.is_default
-    pb.instructions = body.instructions
-    pb.tone = body.tone
-    pb.dos = body.dos
-    pb.donts = body.donts
-    pb.scenarios = [s.model_dump() for s in body.scenarios]
-    pb.out_of_scope_response = body.out_of_scope_response
-    pb.fallback_response = body.fallback_response
-    pb.custom_escalation_message = body.custom_escalation_message
     pb.is_active = body.is_active
+
+    pb.config = copy.deepcopy(body.config) if body.config else {}
 
     await db.commit()
     await db.refresh(pb)
@@ -233,7 +224,6 @@ async def set_default_playbook(
     tenant_id = _tenant_id(request)
     agent = await _verify_agent(agent_id, tenant_id, db)
 
-    # Unset all defaults for this agent
     all_pbs = await db.execute(
         select(AgentPlaybook).where(
             AgentPlaybook.agent_id == agent.id,
@@ -243,7 +233,6 @@ async def set_default_playbook(
     for existing in all_pbs.scalars().all():
         existing.is_default = False
 
-    # Set the target playbook as default
     result = await db.execute(
         select(AgentPlaybook).where(
             AgentPlaybook.id == uuid.UUID(playbook_id),
@@ -259,3 +248,34 @@ async def set_default_playbook(
     await db.refresh(pb)
     logger.info("playbook_set_default", agent_id=agent_id, playbook_id=playbook_id)
     return _to_response(pb)
+
+
+@router.post("/validate-safety")
+async def validate_playbook_safety(
+    body: dict,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate that playbook text content is safe (no blocked keywords or PII)."""
+    from app.services.moderation_service import ModerationService
+    
+    text = body.get("text", "")
+    if not text:
+        return {"valid": True, "issues": []}
+    
+    moderation_service = getattr(request.app.state, "moderation_service", None)
+    if not moderation_service:
+        moderation_service = ModerationService()
+    
+    try:
+        result = await moderation_service.check_input(text)
+        issues = []
+        if result.flagged:
+            issues = result.categories or []
+        return {
+            "valid": not result.flagged,
+            "issues": issues
+        }
+    except Exception as e:
+        logger.warning("playbook_safety_validation_error", error=str(e))
+        return {"valid": True, "issues": []}

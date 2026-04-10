@@ -264,7 +264,7 @@ class TTSService:
         url = "https://api.cartesia.ai/tts/bytes"
         headers = {
             "X-API-Key": settings.CARTESIA_API_KEY,
-            "Cartesia-Version": "2024-06-10",
+            "Cartesia-Version": "2025-04-16",
             "Content-Type": "application/json",
         }
         payload = {
@@ -296,6 +296,110 @@ class TTSService:
             raise
 
     # ------------------------------------------------------------------
+    # Cartesia WebSocket streaming synthesis (lowest latency)
+    # ------------------------------------------------------------------
+
+    async def synthesize_cartesia_ws_stream(
+        self,
+        text: str,
+        voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091",
+        model_id: str = "sonic-3",
+        output_format: dict = None,
+    ):
+        """
+        Cartesia TTS via WebSocket API for minimum latency.
+
+        Connects to ``wss://api.cartesia.ai/tts/websocket`` and streams audio
+        chunks as they are generated.  First audio byte typically arrives in
+        <80 ms.
+
+        Yields raw audio bytes chunks as they arrive from the WebSocket.
+        Falls back to HTTP streaming if ``websockets`` is unavailable.
+        """
+        if not settings.CARTESIA_API_KEY:
+            raise RuntimeError("CARTESIA_API_KEY is not configured.")
+
+        if not text.strip():
+            return
+
+        if output_format is None:
+            output_format = {
+                "container": "raw",
+                "encoding": "pcm_f32le",
+                "sample_rate": 44100,
+            }
+
+        import json as _json
+
+        try:
+            import websockets  # type: ignore
+        except ImportError:
+            logger.warning("websockets_not_installed_falling_back_to_http_cartesia")
+            async for chunk in self.synthesize_cartesia_stream(
+                text, voice_id=voice_id, model_id=model_id, output_format=output_format
+            ):
+                yield chunk
+            return
+
+        url = (
+            f"wss://api.cartesia.ai/tts/websocket"
+            f"?api_key={settings.CARTESIA_API_KEY}"
+            f"&cartesia_version=2025-04-16"
+        )
+
+        request_id = str(__import__("uuid").uuid4())
+        init_message = {
+            "model_id": model_id,
+            "transcript": text,
+            "voice": {"mode": "id", "id": voice_id},
+            "output_format": output_format,
+            "context_id": request_id,
+            "continue": False,
+        }
+
+        logger.info(
+            "cartesia_ws_tts_stream_start",
+            chars=len(text),
+            voice_id=voice_id,
+            model_id=model_id,
+        )
+
+        try:
+            async with websockets.connect(url) as ws:
+                await ws.send(_json.dumps(init_message))
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        # Binary frame — raw audio bytes
+                        if message:
+                            yield message
+                    else:
+                        # Text frame — JSON control/status message
+                        try:
+                            data = _json.loads(message)
+                        except Exception:
+                            continue
+                        msg_type = data.get("type", "")
+                        if msg_type == "chunk":
+                            # audio delivered as base64 within a JSON chunk message
+                            audio_b64 = data.get("data", "")
+                            if audio_b64:
+                                import base64 as _b64
+                                yield _b64.b64decode(audio_b64)
+                        elif msg_type in ("done", "end"):
+                            break
+                        elif msg_type == "error":
+                            logger.error(
+                                "cartesia_ws_tts_error",
+                                error=data.get("message", "unknown"),
+                            )
+                            break
+        except Exception as exc:
+            logger.error("cartesia_ws_tts_stream_error", error=str(exc))
+            raise
+
+        logger.info("cartesia_ws_tts_stream_complete", voice_id=voice_id)
+
+    # ------------------------------------------------------------------
     # Deepgram Aura streaming synthesis
     # ------------------------------------------------------------------
 
@@ -304,7 +408,7 @@ class TTSService:
         text: str,
         voice_id: str = "aura-asteria-en",
         encoding: str = "mp3",
-        sample_rate: int = 44100,
+        sample_rate: int = 48000,
     ) -> AsyncGenerator[bytes, None]:
         """
         Deepgram Aura streaming TTS — fastest and cheapest enterprise option (~$30/1M chars).
@@ -392,6 +496,74 @@ class TTSService:
             text=text, voice_id=voice_id, speed=speed, format=format
         )
         return await self.save_audio(audio_bytes, format=format)
+
+    async def synthesize_cartesia_to_bytes(
+        self,
+        text: str,
+        voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091",
+        model_id: str = "sonic-3",
+    ) -> bytes:
+        """Synthesize using Cartesia API and return audio bytes."""
+        if not settings.CARTESIA_API_KEY:
+            raise RuntimeError("CARTESIA_API_KEY is not configured.")
+
+        if not text.strip():
+            return b""
+
+        url = "https://api.cartesia.ai/tts/bytes"
+        headers = {
+            "X-API-Key": settings.CARTESIA_API_KEY,
+            "Cartesia-Version": "2025-04-16",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model_id": model_id,
+            "transcript": text,
+            "voice": {"mode": "id", "id": voice_id},
+            "output_format": {
+                "container": "mp3",
+                "encoding": "mp3",
+                "sample_rate": 44100,
+            },
+            "stream": False,
+        }
+
+        client = self._get_http_client()
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.content
+        except Exception as exc:
+            logger.error("cartesia_batch_tts_error", error=str(exc))
+            raise
+
+    async def synthesize_deepgram_to_bytes(
+        self,
+        text: str,
+        voice_id: str = "aura-asteria-en",
+    ) -> bytes:
+        """Synthesize using Deepgram API and return audio bytes."""
+        if not settings.DEEPGRAM_API_KEY:
+            raise RuntimeError("DEEPGRAM_API_KEY is not configured.")
+
+        if not text.strip():
+            return b""
+
+        url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding=mp3&sample_rate=48000"
+        headers = {
+            "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {"text": text}
+
+        client = self._get_http_client()
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.content
+        except Exception as exc:
+            logger.error("deepgram_batch_tts_error", error=str(exc))
+            raise
 
     async def close(self):
         """Clean up HTTP client resources."""

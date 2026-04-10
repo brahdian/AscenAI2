@@ -167,7 +167,7 @@ class AuthService:
         # 4. Generate OTP
         otp = self._generate_otp()
         if redis:
-            await redis.setex(f"otp:{normalized_email}", 600, otp) # 10 minute TTL
+            await redis.setex(f"otp:{normalized_email}", 1800, otp) # 30 minute TTL
 
         # 5. Store pending activation in Redis (30-min TTL)
         if redis:
@@ -319,7 +319,7 @@ class AuthService:
             return # Silent success to prevent email enumeration
             
         otp = self._generate_otp()
-        await redis.setex(f"otp:{normalized_email}", 600, otp)
+        await redis.setex(f"otp:{normalized_email}", 1800, otp)
         asyncio.create_task(self._send_otp_email(user.email, user.full_name, otp))
         logger.info("otp_resent", email=normalized_email)
 

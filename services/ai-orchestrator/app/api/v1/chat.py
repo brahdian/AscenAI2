@@ -173,6 +173,97 @@ async def chat(
     return response
 
 
+@router.post("/agent-call")
+async def agent_call(
+    body: dict,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Called by the MCP server (agent_call tool) to invoke an agent programmatically.
+
+    Accepts: agent_id, message, context, tenant_id
+    Returns: {"response": str}
+    """
+    agent_id = body.get("agent_id", "")
+    message = body.get("message", "")
+    context = body.get("context", "")
+    tenant_id = (
+        body.get("tenant_id")
+        or request.headers.get("X-Tenant-ID")
+        or getattr(request.state, "tenant_id", None)
+    )
+
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="Tenant ID required.")
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id is required.")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required.")
+
+    # Fetch and validate agent — must be active and available as a tool
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+            Agent.is_active.is_(True),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found or inactive.")
+
+    if not getattr(agent, "is_available_as_tool", True):
+        raise HTTPException(
+            status_code=403,
+            detail="This agent is not available for tool invocation.",
+        )
+
+    # Prepend context to message if provided
+    full_message = f"[Context: {context}]\n\n{message}" if context else message
+
+    # Create a transient session for this agent-to-agent call
+    redis_client = getattr(request.app.state, "redis", None)
+    llm_client = getattr(request.app.state, "llm_client", None)
+    mcp_client = getattr(request.app.state, "mcp_client", None)
+    moderation_service = getattr(request.app.state, "moderation_service", None)
+
+    session = await _get_or_create_session(
+        session_id=None,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        channel="agent_call",
+        customer_identifier="agent_caller",
+        db=db,
+    )
+
+    memory_manager = MemoryManager(redis_client=redis_client, db=db)
+    orchestrator = Orchestrator(
+        llm_client=llm_client,
+        mcp_client=mcp_client,
+        memory_manager=memory_manager,
+        db=db,
+        redis_client=redis_client,
+        moderation_service=moderation_service,
+    )
+
+    response = await orchestrator.process_message(
+        agent=agent,
+        session=session,
+        user_message=full_message,
+        stream=False,
+    )
+    await db.commit()
+
+    logger.info(
+        "agent_call_completed",
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        latency_ms=response.latency_ms,
+    )
+
+    return {"response": response.message, "agent_id": agent_id, "session_id": session.id}
+
+
 @router.post("/stream")
 async def chat_stream(
     body: ChatRequest,

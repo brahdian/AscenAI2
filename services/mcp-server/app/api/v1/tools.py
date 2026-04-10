@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.integrations.base import ACTION_REGISTRY
-from app.schemas.mcp import ToolAuthConfig, ToolRegistration, ToolResponse, ToolUpdate
+from app.schemas.mcp import ToolAuthConfig, ToolRegistration, ToolResponse, ToolUpdate, ToolTestExecutionRequest
 from app.services.tool_executor import SSRFError, _validate_tool_url
 from app.services.tool_registry import ToolRegistry
 
@@ -716,11 +716,67 @@ async def delete_tool(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete (deactivate) a tool."""
+    """Permanently delete a tool configuration."""
     tenant_id = _tenant_id(request)
     registry = ToolRegistry(db)
     try:
-        await registry.delete_tool(tenant_id, tool_name)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        await registry.hard_delete_tool(tenant_id, tool_name)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     await db.commit()
+
+
+@router.post("/test-execute")
+async def test_execute_tool(
+    body: ToolTestExecutionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Test execute a tool with the provided configuration and parameters."""
+    tenant_id = _tenant_id(request)
+    
+    # Need to simulate execution without saving to the DB
+    # We will build a dummy tool model instance from the registration payload
+    from app.models.tool import Tool
+    import uuid
+    from app.services.tool_executor import ToolExecutor
+    from app.schemas.mcp import MCPToolCall
+    
+    redis = getattr(request.app.state, "redis", None)
+    executor = ToolExecutor(db=db, redis=redis)
+    
+    # Build a transient tool object
+    tool = Tool(
+        id=uuid.uuid4(),
+        tenant_id=uuid.UUID(tenant_id),
+        name=body.tool_config.name,
+        description=body.tool_config.description,
+        category=body.tool_config.category,
+        input_schema=body.tool_config.input_schema,
+        output_schema=body.tool_config.output_schema,
+        endpoint_url=body.tool_config.endpoint_url,
+        auth_config=body.tool_config.auth_config,
+        rate_limit_per_minute=body.tool_config.rate_limit_per_minute,
+        timeout_seconds=body.tool_config.timeout_seconds,
+        is_active=True,
+        is_builtin=body.tool_config.is_builtin,
+        tool_metadata=body.tool_config.tool_metadata,
+    )
+    
+    # We shouldn't invoke the standard executor flow because it checks DB and writes history.
+    # Instead, we directly use the test_execute method we're about to add to ToolExecutor.
+    tool_call = MCPToolCall(
+        tool_name=tool.name,
+        parameters=body.parameters,
+        session_id="test_execution",
+        trace_id="test_trace"
+    )
+    
+    try:
+        result = await executor.test_execute(tenant_id, tool, tool_call)
+    except Exception as e:
+        logger.error("tool_test_execution_failed", error=str(e), exc_info=e)
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    return result.model_dump()
+

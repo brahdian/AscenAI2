@@ -41,30 +41,30 @@ const CATEGORY_ICONS: Record<string, any> = {
 }
 
 const LANGUAGES = [
-  { code: 'en',    label: 'English (Global)' },
+  { code: 'en', label: 'English (Global)' },
   { code: 'en-CA', label: 'English (Canada)' },
-  { code: 'fr',    label: 'French (France)' },
+  { code: 'fr', label: 'French (France)' },
   { code: 'fr-CA', label: 'French (Canada / Québec)' },
-  { code: 'es',    label: 'Spanish' },
+  { code: 'es', label: 'Spanish' },
   { code: 'es-MX', label: 'Spanish (Mexico)' },
-  { code: 'de',    label: 'German' },
-  { code: 'it',    label: 'Italian' },
-  { code: 'pt',    label: 'Portuguese' },
+  { code: 'de', label: 'German' },
+  { code: 'it', label: 'Italian' },
+  { code: 'pt', label: 'Portuguese' },
   { code: 'pt-BR', label: 'Portuguese (Brazil)' },
-  { code: 'nl',    label: 'Dutch' },
-  { code: 'pl',    label: 'Polish' },
-  { code: 'ru',    label: 'Russian' },
-  { code: 'zh',    label: 'Chinese (Mandarin)' },
-  { code: 'ja',    label: 'Japanese' },
-  { code: 'ko',    label: 'Korean' },
-  { code: 'hi',    label: 'Hindi' },
-  { code: 'pa',    label: 'Punjabi' },
-  { code: 'ar',    label: 'Arabic' },
-  { code: 'tr',    label: 'Turkish' },
-  { code: 'uk',    label: 'Ukrainian' },
-  { code: 'vi',    label: 'Vietnamese' },
-  { code: 'id',    label: 'Indonesian' },
-  { code: 'tl',    label: 'Tagalog / Filipino' },
+  { code: 'nl', label: 'Dutch' },
+  { code: 'pl', label: 'Polish' },
+  { code: 'ru', label: 'Russian' },
+  { code: 'zh', label: 'Chinese (Mandarin)' },
+  { code: 'ja', label: 'Japanese' },
+  { code: 'ko', label: 'Korean' },
+  { code: 'hi', label: 'Hindi' },
+  { code: 'pa', label: 'Punjabi' },
+  { code: 'ar', label: 'Arabic' },
+  { code: 'tr', label: 'Turkish' },
+  { code: 'uk', label: 'Ukrainian' },
+  { code: 'vi', label: 'Vietnamese' },
+  { code: 'id', label: 'Indonesian' },
+  { code: 'tl', label: 'Tagalog / Filipino' },
 ]
 
 type TabId = 'overview' | 'test'
@@ -96,7 +96,7 @@ export default function AgentDetailPage() {
   // Overview form state
   const [formData, setFormData] = useState<Record<string, unknown>>({})
   const [saving, setSaving] = useState(false)
-  
+
   // Template instance state
   const [variables, setVariables] = useState<Record<string, any>>({})
   const [savingInstance, setSavingInstance] = useState(false)
@@ -157,7 +157,7 @@ export default function AgentDetailPage() {
     const langMsg = channel === 'voice'
       ? "I'll be responding in English. Let me know if you'd prefer French or another language."
       : null
-    
+
     const messages: ChatMessage[] = [{ role: 'assistant', content: greeting }]
     if (langMsg) {
       messages.push({ role: 'assistant', content: langMsg })
@@ -189,7 +189,7 @@ export default function AgentDetailPage() {
 
   const handleChannelSwitch = (newChannel: 'voice' | 'chat') => {
     if (newChannel === selectedChannel || !selectedChannel) return
-    
+
     // Cancel any in-flight TTS
     if (ttsCancelRef.current) {
       ttsCancelRef.current()
@@ -199,11 +199,11 @@ export default function AgentDetailPage() {
     const langMsg = newChannel === 'voice'
       ? "I'll be responding in English. Let me know if you'd prefer French or another language."
       : null
-    
+
     const switchMsg = newChannel === 'voice'
       ? "Switched to Voice mode"
       : "Switched to Chat mode"
-    
+
     setSelectedChannel(newChannel)
     setMessages((prev) => {
       const newMessages: ChatMessage[] = [...prev, { role: 'system', content: switchMsg }]
@@ -274,7 +274,7 @@ export default function AgentDetailPage() {
     retry: 0,
   })
 
-  const selectedTemplate = templates?.find((t: any) => 
+  const selectedTemplate = templates?.find((t: any) =>
     t.versions?.some((v: any) => v.id === instance?.template_version_id)
   )
 
@@ -286,20 +286,23 @@ export default function AgentDetailPage() {
 
   useEffect(() => {
     if (agent) {
-      const voiceConfig = agent.voice_config || {}
+      const cfg = (agent.agent_config || {}) as Record<string, unknown>
+      const voiceConfig = (cfg.voice_config as Record<string, string>) || (agent.voice_config as Record<string, string>) || {}
       setFormData({
         name: agent.name || '',
         description: agent.description || '',
         business_type: agent.business_type || 'generic',
-        language: agent.language || 'en',
+        language: (cfg.language as string) || (agent.language as string) || 'en',
         personality: agent.personality || '',
         system_prompt: agent.system_prompt || '',
-        greeting_message: agent.greeting_message || '',
+        greeting_message: (cfg.greeting_message as string) || (agent.greeting_message as string) || '',
         voice_enabled: agent.voice_enabled ?? true,
+        extension_number: (agent as any).extension_number || '',
+        is_available_as_tool: (cfg.is_available_as_tool as boolean) ?? (agent as any).is_available_as_tool ?? true,
         voice_config: {
-          twilio_phone_number: voiceConfig.twilio_phone_number || '',
-          twilio_account_sid: voiceConfig.twilio_account_sid || '',
-          twilio_auth_token: voiceConfig.twilio_auth_token || '',
+          twilio_phone_number: (voiceConfig.twilio_phone_number as string) || '',
+          twilio_account_sid: (voiceConfig.twilio_account_sid as string) || '',
+          twilio_auth_token: (voiceConfig.twilio_auth_token as string) || '',
         },
       })
     }
@@ -348,7 +351,7 @@ export default function AgentDetailPage() {
       setSavingInstance(false)
     }
   }
-  
+
   const handleVariableChange = (key: string, value: any) => {
     setVariables(prev => ({ ...prev, [key]: value }))
   }
@@ -537,11 +540,10 @@ export default function AgentDetailPage() {
             <p className="text-xs font-mono text-gray-400 mt-0.5">ID: {agent.id}</p>
           </div>
           <span
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
-              agent.is_active
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${agent.is_active
                 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
                 : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
-            }`}
+              }`}
           >
             {agent.is_active ? <CheckCircle size={12} /> : <XCircle size={12} />}
             {agent.is_active ? 'Active' : 'Inactive'}
@@ -559,13 +561,13 @@ export default function AgentDetailPage() {
       {/* Quick nav to sub-pages */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         {[
+          { href: `/dashboard/agents/${id}/greeting`, icon: Mic, label: 'Greeting', desc: 'Voice greeting & language' },
           { href: `/dashboard/agents/${id}/playbooks`, icon: BookOpen, label: 'Playbooks', desc: 'Conversation playbooks' },
           { href: `/dashboard/agents/${id}/tools`, icon: Wrench, label: 'Tools', desc: 'Integrations & actions' },
           { href: `/dashboard/agents/${id}/variables`, icon: Settings, label: 'Variables', desc: 'Dynamic agent variables' },
           { href: `/dashboard/agents/${id}/documents`, icon: FileText, label: 'Documents', desc: 'RAG knowledge base files' },
           { href: `/dashboard/agents/${id}/guardrails`, icon: Shield, label: 'Guardrails', desc: 'Content filters & safety' },
           { href: `/dashboard/agents/${id}/escalation`, icon: PhoneCall, label: 'Escalation', desc: 'Human handoff & connectors' },
-          { href: `/dashboard/agents/${id}/greeting`, icon: Mic, label: 'Greeting', desc: 'Voice greeting & language' },
         ].map((item) => (
           <Link
             key={item.href}
@@ -593,11 +595,10 @@ export default function AgentDetailPage() {
           <button
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
-            className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
-              activeTab === tab.id
+            className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${activeTab === tab.id
                 ? 'border-violet-600 text-violet-700 dark:text-violet-400'
                 : 'border-transparent text-gray-500 hover:text-gray-900 dark:hover:text-white'
-            }`}
+              }`}
           >
             <tab.icon size={15} />
             {tab.label}
@@ -767,6 +768,42 @@ export default function AgentDetailPage() {
             </div>
           )}
 
+          {/* Extension Number & Agent-as-Tool */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                Extension Number
+              </label>
+              <input
+                value={(formData.extension_number as string) || ''}
+                onChange={(e) => setFormData((p) => ({ ...p, extension_number: e.target.value }))}
+                placeholder="e.g. 101"
+                maxLength={20}
+                className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                Assign a dial extension (e.g. 101) so callers can reach this agent directly
+              </p>
+            </div>
+            <div className="flex flex-col justify-center">
+              <div className="flex items-center gap-3 mt-4">
+                <input
+                  type="checkbox"
+                  id="is_available_as_tool"
+                  checked={!!(formData.is_available_as_tool)}
+                  onChange={(e) => setFormData((p) => ({ ...p, is_available_as_tool: e.target.checked }))}
+                  className="w-4 h-4 accent-violet-600"
+                />
+                <div>
+                  <label htmlFor="is_available_as_tool" className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    Available as Tool
+                  </label>
+                  <p className="text-xs text-gray-400">Allow other agents to invoke this agent</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div className="pt-2">
             <button
               onClick={handleSave}
@@ -791,11 +828,10 @@ export default function AgentDetailPage() {
               <div className="flex items-center gap-3 mt-0.5">
                 <p className="text-xs text-gray-500">Select a channel to start testing</p>
                 {selectedChannel && sessionStatus && (
-                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
-                    sessionStatus === 'active'
+                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${sessionStatus === 'active'
                       ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
                       : 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
-                  }`}>
+                    }`}>
                     {sessionStatus === 'active' ? <CheckCircle size={10} /> : <XCircle size={10} />}
                     {sessionStatus === 'active' ? 'Active' : sessionStatus === 'closed' ? 'Expired' : 'Ended'}
                   </span>
@@ -821,30 +857,28 @@ export default function AgentDetailPage() {
               )}
               {selectedChannel && (
                 <div className="flex items-center gap-2 bg-gray-100 dark:bg-gray-800 rounded-lg p-1">
-                <button
-                  onClick={() => handleChannelSwitch('chat')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
-                    selectedChannel === 'chat'
-                      ? 'bg-white dark:bg-gray-700 text-violet-700 dark:text-violet-300 shadow-sm'
-                      : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                  }`}
-                >
-                  <MessageCircle size={14} />
-                  Chat
-                </button>
-                <button
-                  onClick={() => handleChannelSwitch('voice')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
-                    selectedChannel === 'voice'
-                      ? 'bg-white dark:bg-gray-700 text-violet-700 dark:text-violet-300 shadow-sm'
-                      : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                  }`}
-                >
-                  <Phone size={14} />
-                  Voice
-                </button>
-              </div>
-            )}
+                  <button
+                    onClick={() => handleChannelSwitch('chat')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${selectedChannel === 'chat'
+                        ? 'bg-white dark:bg-gray-700 text-violet-700 dark:text-violet-300 shadow-sm'
+                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+                      }`}
+                  >
+                    <MessageCircle size={14} />
+                    Chat
+                  </button>
+                  <button
+                    onClick={() => handleChannelSwitch('voice')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${selectedChannel === 'voice'
+                        ? 'bg-white dark:bg-gray-700 text-violet-700 dark:text-violet-300 shadow-sm'
+                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+                      }`}
+                  >
+                    <Phone size={14} />
+                    Voice
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -914,13 +948,12 @@ export default function AgentDetailPage() {
                 >
                   <div className="max-w-[75%] flex flex-col gap-1">
                     <div
-                      className={`px-4 py-2.5 rounded-2xl text-sm ${
-                        msg.role === 'user'
+                      className={`px-4 py-2.5 rounded-2xl text-sm ${msg.role === 'user'
                           ? 'bg-gradient-to-r from-violet-600 to-blue-600 text-white rounded-tr-sm'
                           : msg.role === 'system'
-                          ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300 italic'
-                          : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white rounded-tl-sm'
-                      }`}
+                            ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300 italic'
+                            : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white rounded-tl-sm'
+                        }`}
                     >
                       {msg.content}
                       {streaming && msg.role === 'assistant' && i === messages.length - 1 && (
@@ -934,22 +967,20 @@ export default function AgentDetailPage() {
                           <>
                             <button
                               onClick={() => openFeedbackModal(i, 'rate')}
-                              className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-opacity hover:opacity-80 ${
-                                msg.feedback.rating === 'positive'
+                              className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-opacity hover:opacity-80 ${msg.feedback.rating === 'positive'
                                   ? 'bg-green-100 text-green-600 dark:bg-green-900/30'
                                   : 'bg-red-100 text-red-600 dark:bg-red-900/30'
-                              }`}
+                                }`}
                             >
                               {msg.feedback.rating === 'positive' ? <ThumbsUp size={11} /> : <ThumbsDown size={11} />}
                               {msg.feedback.rating}
                             </button>
                             <button
                               onClick={() => openFeedbackModal(i, 'correct')}
-                              className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-colors ${
-                                msg.feedback.ideal_response
+                              className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full transition-colors ${msg.feedback.ideal_response
                                   ? 'bg-violet-100 text-violet-600 dark:bg-violet-900/30 dark:text-violet-300'
                                   : 'text-gray-400 hover:text-violet-500 hover:bg-violet-50 dark:hover:bg-violet-900/20'
-                              }`}
+                                }`}
                             >
                               <PenLine size={11} />
                               {msg.feedback.ideal_response ? 'Corrected' : 'Add correction'}
@@ -1081,22 +1112,20 @@ function TestFeedbackModal({
         <div className="flex gap-3 mb-5">
           <button
             onClick={() => setRating('positive')}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border-2 text-sm font-medium transition-all ${
-              rating === 'positive'
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border-2 text-sm font-medium transition-all ${rating === 'positive'
                 ? 'border-green-500 bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300'
                 : 'border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-green-400'
-            }`}
+              }`}
           >
             <ThumbsUp size={16} />
             Positive
           </button>
           <button
             onClick={() => setRating('negative')}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border-2 text-sm font-medium transition-all ${
-              rating === 'negative'
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border-2 text-sm font-medium transition-all ${rating === 'negative'
                 ? 'border-red-500 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300'
                 : 'border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-red-400'
-            }`}
+              }`}
           >
             <ThumbsDown size={16} />
             Negative

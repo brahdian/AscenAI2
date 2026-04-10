@@ -1,5 +1,5 @@
 import uuid
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -39,7 +39,7 @@ class VariableCreate(BaseModel):
     description: Optional[str] = None
     scope: str = "global"  # 'global' or 'local'
     data_type: str = "string"  # 'string', 'number', 'boolean', 'object'
-    default_value: Optional[dict] = None
+    default_value: Optional[Any] = None
     playbook_id: Optional[str] = None
     is_secret: bool = False
 
@@ -49,7 +49,7 @@ class VariableUpdate(BaseModel):
     description: Optional[str] = None
     scope: Optional[str] = None
     data_type: Optional[str] = None
-    default_value: Optional[dict] = None
+    default_value: Optional[Any] = None
     playbook_id: Optional[str] = None
     is_secret: Optional[bool] = None
 

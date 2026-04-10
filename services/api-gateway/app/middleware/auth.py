@@ -17,6 +17,24 @@ from app.models.tenant import Tenant
 
 logger = structlog.get_logger(__name__)
 
+# Headers that must never appear in logs — always redact to "***".
+_REDACT_HEADERS: frozenset[str] = frozenset({
+    "authorization", "x-api-key", "cookie", "x-internal-key", "set-cookie",
+})
+
+
+def _sanitize_headers(headers) -> dict[str, str]:
+    """Return a copy of *headers* with sensitive values replaced by '***'.
+
+    Safe to pass to structlog — prevents credential leakage in access logs
+    and error reports.
+    """
+    return {
+        k: ("***" if k.lower() in _REDACT_HEADERS else v)
+        for k, v in headers.items()
+    }
+
+
 # JWT auth cache TTL: 5 minutes.  Balances security (stale sessions noticed
 # quickly) vs DB load (N requests per user only cost 1 DB round-trip per TTL).
 _AUTH_CACHE_TTL = 300
@@ -84,7 +102,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if not token:
             from fastapi.responses import JSONResponse
-            logger.info("auth_failed_missing_credentials", path=request.url.path)
+            logger.info("auth_failed_missing_credentials", path=request.url.path,
+                        headers=_sanitize_headers(request.headers))
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Authentication required."},
@@ -106,7 +125,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if not ok:
             from fastapi.responses import JSONResponse
-            logger.warning("auth_failed_invalid_credentials", path=request.url.path)
+            logger.warning("auth_failed_invalid_credentials", path=request.url.path,
+                           headers=_sanitize_headers(request.headers))
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or expired credentials."},

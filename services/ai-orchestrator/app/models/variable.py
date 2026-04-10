@@ -45,6 +45,10 @@ class AgentVariable(Base):
 
     default_value: Mapped[Optional[dict]] = mapped_column("default_value", JSONB, nullable=True)
 
+    # When True the value is treated as a secret: redacted in API responses,
+    # never logged. UI should render it as a password field.
+    is_secret: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -54,7 +58,7 @@ class AgentVariable(Base):
 
     agent: Mapped["Agent"] = relationship("Agent", back_populates="variables")
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, redact_secrets: bool = True) -> dict:
         return {
             "id": str(self.id),
             "agent_id": str(self.agent_id),
@@ -64,7 +68,9 @@ class AgentVariable(Base):
             "description": self.description,
             "scope": self.scope,
             "data_type": self.data_type,
-            "default_value": self.default_value,
+            # Redact the actual value for secret variables to prevent leakage
+            "default_value": "***" if (self.is_secret and redact_secrets) else self.default_value,
+            "is_secret": self.is_secret,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

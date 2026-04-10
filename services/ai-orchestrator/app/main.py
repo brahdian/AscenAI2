@@ -9,6 +9,7 @@ from typing import Optional
 import sentry_sdk
 import structlog
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,6 +61,7 @@ def _setup_opentelemetry() -> None:
 _setup_opentelemetry()
 
 from app.core.tracing import TracingMiddleware
+from app.middleware.idempotency import IdempotencyMiddleware
 from app.services.llm_client import create_llm_client
 from app.services.mcp_client import MCPClient
 from app.services.memory_manager import MemoryManager
@@ -168,6 +170,24 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(session_cleanup.start())
     logger.info("session_cleanup_worker_started")
 
+    # Start background queue depth metrics poller (every 30s)
+    from app.core.metrics import DOC_INDEX_QUEUE_DEPTH, DOC_INDEX_DLQ_DEPTH
+
+    async def _poll_queue_depths() -> None:
+        while True:
+            try:
+                r = app.state.redis
+                q = await r.llen("doc_index_queue") or 0
+                d = await r.llen("doc_index_dlq") or 0
+                DOC_INDEX_QUEUE_DEPTH.set(q)
+                DOC_INDEX_DLQ_DEPTH.set(d)
+            except Exception:
+                pass
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_poll_queue_depths())
+    logger.info("queue_depth_poller_started")
+
     app.state.startup_complete = True
     logger.info("ai_orchestrator_started")
     yield
@@ -262,6 +282,9 @@ class InternalAuthMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(InternalAuthMiddleware)
 
+# Framework-wide idempotency for mutation endpoints (24-h TTL, optional header)
+app.add_middleware(IdempotencyMiddleware)
+
 # Include routers
 app.include_router(chat_router.router, prefix="/api/v1", tags=["chat"])
 app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"])
@@ -290,6 +313,24 @@ app.mount(
 
 # Prometheus metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+
+# ── RequestValidationError handler ────────────────────────────────────────────
+# Logs 422 contract mismatches and increments the CONTRACT_VALIDATION_ERRORS
+# counter so dashboards can detect frontend/backend schema drift in real-time.
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    from app.core.metrics import CONTRACT_VALIDATION_ERRORS
+    path = request.url.path
+    tenant_id = getattr(request.state, "tenant_id", None)
+    logger.warning(
+        "request_validation_error",
+        path=path,
+        errors=exc.errors(),
+        tenant_id=tenant_id,
+    )
+    CONTRACT_VALIDATION_ERRORS.labels(path=path).inc()
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 @app.get("/health", tags=["health"])

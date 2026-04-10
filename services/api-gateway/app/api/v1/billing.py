@@ -9,7 +9,7 @@ from datetime import date
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select, update as _sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -497,6 +497,24 @@ async def create_agent_slot_session(
     """Create Stripe checkout session for a single new agent slot."""
     tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
+
+    # Prevent duplicate concurrent checkout sessions (e.g., double-click).
+    # Redis NX lock with 30-second TTL — a second request within the window returns 409.
+    try:
+        from app.core.redis_client import get_redis as _get_redis
+        _redis = await _get_redis()
+        if _redis:
+            lock_key = f"checkout_lock:{tenant_id}"
+            acquired = await _redis.set(lock_key, "1", nx=True, ex=30)
+            if not acquired:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A checkout session is already being created for this account. Please wait a moment.",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis unavailable — proceed without lock rather than blocking checkout
     
     agent_config = payload.agent_config if payload else None
     return_path = payload.return_path if payload else "/dashboard/billing"
@@ -737,13 +755,14 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                             )
                             if activate_res.status_code == 200:
                                 logger.info("agent_activated_successfully", agent_id=agent_id)
-                                
-                                # UI Alignment: Increment agent_count in TenantUsage
-                                usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
-                                usage = usage_res.scalar_one_or_none()
-                                if usage:
-                                    usage.agent_count += 1
-                                    await db.commit()
+
+                                # Atomic increment — avoids read-modify-write race on concurrent webhooks
+                                await db.execute(
+                                    _sa_update(TenantUsage)
+                                    .where(TenantUsage.tenant_id == tenant.id)
+                                    .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
+                                )
+                                await db.commit()
                             else:
                                 logger.error("agent_activation_failed_upstream", agent_id=agent_id, status=activate_res.status_code)
                                 # Failsafe: Agent missing or errored -> Issue refund/cancel to prevent unauthorized charge
@@ -784,11 +803,12 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 )
                                 if create_res.status_code in (200, 201):
                                     await db.delete(pending)
-                                    # Sync agent_count
-                                    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
-                                    usage = usage_res.scalar_one_or_none()
-                                    if usage:
-                                        usage.agent_count += 1
+                                    # Atomic increment — avoids race on concurrent webhooks
+                                    await db.execute(
+                                        _sa_update(TenantUsage)
+                                        .where(TenantUsage.tenant_id == tenant.id)
+                                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
+                                    )
                                     await db.commit()
                                     logger.info("pending_agent_created_and_cleaned_up", tenant_id=tenant_id)
                         except Exception as e:
@@ -797,12 +817,14 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 # FLOW 3: Generic Slot Increment
                 if metadata.get("action") == "add_agent_slot":
                     logger.info("adding_generic_agent_slot", tenant_id=tenant_id)
-                    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tenant.id))
-                    usage = usage_res.scalar_one_or_none()
-                    if usage:
-                        usage.agent_count += 1
-                        await db.commit()
-                        logger.info("generic_slot_added_successfully", tenant_id=tenant_id)
+                    # Atomic increment — avoids race on concurrent webhooks
+                    await db.execute(
+                        _sa_update(TenantUsage)
+                        .where(TenantUsage.tenant_id == tenant.id)
+                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
+                    )
+                    await db.commit()
+                    logger.info("generic_slot_added_successfully", tenant_id=tenant_id)
 
             except Exception as e:
                 logger.error("billing_webhook_checkout_error", error=str(e), tenant_id=tenant_id)
@@ -843,12 +865,13 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 )
                                 break
 
-                # Decrement agent_count
+                # Atomic decrement (floor at 0) — avoids race on concurrent cancellation webhooks
                 t_uuid = _uuid.UUID(tenant_id)
-                usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == t_uuid))
-                usage = usage_res.scalar_one_or_none()
-                if usage and usage.agent_count > 0:
-                    usage.agent_count -= 1
+                await db.execute(
+                    _sa_update(TenantUsage)
+                    .where(TenantUsage.tenant_id == t_uuid)
+                    .values(agent_count=func.greatest(0, TenantUsage.agent_count - 1))
+                )
 
                 # Update tenant subscription status
                 result = await db.execute(select(Tenant).where(Tenant.id == t_uuid))

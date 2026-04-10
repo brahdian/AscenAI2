@@ -156,6 +156,9 @@ def create_app() -> FastAPI:
     app.include_router(context_router, prefix="/api/v1", tags=["context"])
     app.include_router(streaming_router, tags=["streaming"])
 
+    from app.api.v1.webhooks import router as webhooks_router
+    app.include_router(webhooks_router, prefix="/api/v1", tags=["webhooks"])
+
     # ---- Health check ----
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health_check() -> HealthResponse:

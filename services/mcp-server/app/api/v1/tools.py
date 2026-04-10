@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import time
+from typing import Any, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -8,7 +9,9 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.schemas.mcp import ToolRegistration, ToolResponse, ToolUpdate
+from app.integrations.base import ACTION_REGISTRY
+from app.schemas.mcp import ToolAuthConfig, ToolRegistration, ToolResponse, ToolUpdate
+from app.services.tool_executor import SSRFError, _validate_tool_url
 from app.services.tool_registry import ToolRegistry
 
 logger = structlog.get_logger(__name__)
@@ -535,6 +538,103 @@ async def get_catalog() -> list[dict[str, Any]]:
     return INTEGRATION_CATALOG
 
 
+# ---------------------------------------------------------------------------
+# Tool config verification (pre-save credential test)
+# ---------------------------------------------------------------------------
+
+class VerifyRequest(BaseModel):
+    """Inline tool config to verify — no DB write, no side effects."""
+    provider: str                        # e.g. "stripe", "twilio", "google_calendar"
+    config: dict                         # Decrypted credentials to test
+    endpoint_url: Optional[str] = None  # For HTTP tools — SSRF-checked before test
+
+
+class VerifyResponse(BaseModel):
+    ok: bool
+    latency_ms: int
+    error: Optional[str] = None
+    details: dict = {}
+
+
+@router.post("/verify", response_model=VerifyResponse)
+async def verify_tool_config(
+    body: VerifyRequest,
+    request: Request,
+) -> VerifyResponse:
+    """Verify tool credentials before saving.
+
+    Calls the provider's lightest read-only API endpoint to confirm the
+    supplied credentials are valid.  No data is stored.
+
+    For HTTP tools with an endpoint_url, the SSRF guard is enforced first.
+    For known providers (stripe, twilio, google_calendar, etc.) the adapter's
+    verify_config() is called which makes a cheap provider API call.
+    """
+    start = time.monotonic()
+
+    # ── SSRF guard for HTTP tools ──────────────────────────────────────
+    if body.endpoint_url:
+        try:
+            _validate_tool_url(body.endpoint_url)
+        except SSRFError as exc:
+            return VerifyResponse(ok=False, latency_ms=0, error=f"Invalid endpoint URL: {exc}")
+
+        # For generic HTTP tools: make a lightweight OPTIONS/GET to check reachability
+        import httpx
+        try:
+            # Build auth headers from the supplied auth_config
+            auth_headers: dict = {}
+            if body.config.get("type") == "api_key":
+                header_name = body.config.get("header", "X-API-Key")
+                auth_headers[header_name] = body.config.get("value", "")
+            elif body.config.get("type") == "bearer":
+                auth_headers["Authorization"] = f"Bearer {body.config.get('value', '')}"
+            elif body.config.get("type") == "basic":
+                import base64
+                creds = base64.b64encode(
+                    f"{body.config.get('username','')}:{body.config.get('password','')}".encode()
+                ).decode()
+                auth_headers["Authorization"] = f"Basic {creds}"
+
+            t0 = time.monotonic()
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.request("HEAD", body.endpoint_url, headers=auth_headers)
+            latency = int((time.monotonic() - t0) * 1000)
+
+            auth_ok = resp.status_code not in (401, 403)
+            return VerifyResponse(
+                ok=resp.status_code < 500,
+                latency_ms=latency,
+                error=None if resp.status_code < 400 else f"HTTP {resp.status_code}",
+                details={"http_status": resp.status_code, "auth_ok": auth_ok},
+            )
+        except httpx.ConnectError as exc:
+            return VerifyResponse(ok=False, latency_ms=int((time.monotonic() - start) * 1000),
+                                  error=f"Connection failed: {exc}")
+        except httpx.TimeoutException:
+            return VerifyResponse(ok=False, latency_ms=10000, error="Connection timed out after 10s")
+        except Exception as exc:
+            return VerifyResponse(ok=False, latency_ms=int((time.monotonic() - start) * 1000),
+                                  error=str(exc))
+
+    # ── Provider-aware verification via adapter ────────────────────────
+    adapter = ACTION_REGISTRY.get_adapter(body.provider)
+    if adapter is None:
+        return VerifyResponse(
+            ok=False,
+            latency_ms=0,
+            error=f"Unknown provider '{body.provider}'. Supported: {', '.join(ACTION_REGISTRY.list_providers())}",
+        )
+
+    result = await adapter.verify_config(body.config)
+    return VerifyResponse(
+        ok=result.ok,
+        latency_ms=result.latency_ms,
+        error=result.error,
+        details=result.details,
+    )
+
+
 @router.post("", response_model=ToolResponse, status_code=201)
 async def register_tool(
     body: ToolRegistration,
@@ -543,6 +643,12 @@ async def register_tool(
 ):
     """Register a new tool for the tenant."""
     tenant_id = _tenant_id(request)
+    # SSRF guard: validate endpoint_url before writing to the database
+    if body.endpoint_url:
+        try:
+            _validate_tool_url(body.endpoint_url)
+        except SSRFError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid endpoint_url: {exc}")
     registry = ToolRegistry(db)
     try:
         tool = await registry.register_tool(tenant_id, body)
@@ -589,6 +695,11 @@ async def update_tool(
 ):
     """Update a tool's configuration."""
     tenant_id = _tenant_id(request)
+    if body.endpoint_url:
+        try:
+            _validate_tool_url(body.endpoint_url)
+        except SSRFError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid endpoint_url: {exc}")
     registry = ToolRegistry(db)
     try:
         tool = await registry.update_tool(tenant_id, tool_name, body)

@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
+from app.core.security import get_tenant_db, get_current_tenant, require_forwarded_role
 from app.models.agent import Agent, AgentPlaybook
 from app.schemas.chat import (
     AgentCreate,
@@ -127,11 +127,11 @@ async def create_agent(
         language=body.language,
         tools=body.tools,
         knowledge_base_ids=body.knowledge_base_ids,
-        llm_config=body.llm_config,
-        escalation_config=body.escalation_config,
+        llm_config=body.llm_config.model_dump() if body.llm_config else {},
+        escalation_config=body.escalation_config.model_dump() if body.escalation_config else {},
         greeting_message=f"Hi! I'm {body.name}. How can I help you today?",
         voice_system_prompt=body.voice_system_prompt,
-        is_active=body.is_active if body.is_active is not None else True,
+        is_active=True,
     )
     db.add(agent)
 
@@ -173,23 +173,31 @@ async def create_agent(
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(
     status: str = "active",  # active, archived, all
+    page: int = 1,
+    limit: int = 50,
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
     """
-    List agents for the tenant.
+    List agents for the tenant (paginated).
     - status=active (default): is_active=True
     - status=archived: is_active=False AND deleted_at IS NOT NULL
     - status=all: everything
     """
+    page = max(1, page)
+    limit = min(max(1, limit), 200)
+    offset = (page - 1) * limit
+
     query = select(Agent).where(Agent.tenant_id == uuid.UUID(tenant_id))
-    
+
     if status == "active":
         query = query.where(Agent.is_active.is_(True))
     elif status == "archived":
         query = query.where(Agent.is_active.is_(False), Agent.deleted_at.is_not(None))
-    
-    result = await db.execute(query.order_by(Agent.created_at.desc()))
+
+    result = await db.execute(
+        query.order_by(Agent.created_at.desc()).limit(limit).offset(offset)
+    )
     agents = result.scalars().all()
     return [await _agent_to_response(a, db) for a in agents]
 
@@ -235,7 +243,14 @@ async def update_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    update_data = body.model_dump(exclude_unset=True)
+    # Safety guard: is_active must never be mutated directly via PATCH.
+    # Use DELETE /agents/{id} to deactivate or POST /agents/{id}/restore to reactivate.
+    update_data.pop("is_active", None)
+    for field, value in update_data.items():
+        # Serialize Pydantic sub-models to plain dicts for JSONB columns
+        if hasattr(value, "model_dump"):
+            value = value.model_dump()
         setattr(agent, field, value)
 
     await db.commit()
@@ -246,10 +261,14 @@ async def update_agent(
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agent(
     agent_id: str,
+    request: Request,
+    _role: str = require_forwarded_role("admin"),
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
-    """Deactivate an agent."""
+    """Deactivate an agent (transition to ARCHIVED state)."""
+    from app.services.agent_lifecycle import transition_agent, AgentLifecycleError
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -259,19 +278,33 @@ async def delete_agent(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
-    
-    agent.is_active = False
-    agent.deleted_at = datetime.now(timezone.utc)
+
+    try:
+        await transition_agent(
+            agent,
+            "archived",
+            db,
+            actor_id=tenant_id,
+            reason="user_delete",
+            request_id=request.headers.get("X-Trace-ID"),
+        )
+    except AgentLifecycleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
     await db.commit()
 
 
 @router.post("/{agent_id}/restore", response_model=AgentResponse)
 async def restore_agent(
     agent_id: str,
+    request: Request,
+    _role: str = require_forwarded_role("admin"),
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
-    """Restore an archived agent."""
+    """Restore an archived agent (transition back to ACTIVE state)."""
+    from app.services.agent_lifecycle import transition_agent, AgentLifecycleError
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -281,9 +314,19 @@ async def restore_agent(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
-    
-    agent.is_active = True
-    agent.deleted_at = None
+
+    try:
+        await transition_agent(
+            agent,
+            "active",
+            db,
+            actor_id=tenant_id,
+            reason="user_restore",
+            request_id=request.headers.get("X-Trace-ID"),
+        )
+    except AgentLifecycleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
     await db.commit()
     await db.refresh(agent)
     return await _agent_to_response(agent, db)

@@ -56,6 +56,11 @@ class Agent(Base):
         JSONB, nullable=True, default=dict
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Lifecycle state machine — mirrors is_active but carries richer semantics.
+    # Values: draft | pending_payment | active | grace | expired | archived
+    # Use app.services.agent_lifecycle.transition_agent() to change this field;
+    # never mutate it directly outside of that service.
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -111,6 +116,32 @@ class Agent(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class AgentLifecycleAudit(Base):
+    """Immutable audit trail of every agent lifecycle state transition."""
+
+    __tablename__ = "agent_lifecycle_audit"
+    __table_args__ = (
+        Index("ix_alc_audit_agent_id", "agent_id"),
+        Index("ix_alc_audit_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    from_state: Mapped[str] = mapped_column(String(30), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(30), nullable=False)
+    actor_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class Session(Base):

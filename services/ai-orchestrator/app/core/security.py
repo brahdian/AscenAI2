@@ -131,6 +131,42 @@ async def get_optional_tenant(
     return getattr(request.state, "tenant_id", None)
 
 
+_ROLE_LEVELS: dict[str, int] = {
+    "viewer":      0,
+    "developer":   1,
+    "admin":       2,
+    "owner":       3,
+    "super_admin": 4,
+}
+
+
+def require_forwarded_role(minimum_role: str):
+    """FastAPI dependency for the AI Orchestrator.
+
+    The orchestrator receives requests forwarded from the API Gateway.
+    The caller's role is available in the ``X-Role`` header (set by the
+    API Gateway after JWT/API-key verification and before proxying).
+
+    Raises HTTP 403 if the role is insufficient.
+    """
+    from fastapi import Depends, HTTPException
+
+    def _check(request: Request) -> str:
+        role: str = (
+            request.headers.get("X-Role")
+            or getattr(request.state, "role", None)
+            or "viewer"
+        )
+        if _ROLE_LEVELS.get(role, -1) < _ROLE_LEVELS.get(minimum_role, 999):
+            raise HTTPException(
+                status_code=403,
+                detail=f"This action requires '{minimum_role}' role or higher. Current role: '{role}'.",
+            )
+        return role
+
+    return Depends(_check)
+
+
 async def get_tenant_db(
     tenant_id: str = Depends(get_current_tenant),
 ) -> AsyncGenerator[AsyncSession, None]:

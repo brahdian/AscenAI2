@@ -123,7 +123,9 @@ class MemoryManager:
         """
         key = self._session_key(session_id)
         try:
-            raw_messages = await self.redis.lrange(key, 0, -1)
+            # Cap at the 50 most-recent messages to prevent large session histories
+            # from bloating the LLM context window (list is stored oldest→newest).
+            raw_messages = await self.redis.lrange(key, -50, -1)
             messages = []
             for raw in raw_messages:
                 try:

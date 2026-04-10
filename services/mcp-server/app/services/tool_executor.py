@@ -370,16 +370,37 @@ class ToolExecutor:
     async def _execute_builtin_tool(self, tool: Tool, parameters: dict) -> dict:
         """Execute a platform built-in tool handler.
 
+        Dispatch order:
+          1. Try the new MCP adapter registry (provider-isolated, SDK-backed).
+          2. Fall back to the legacy handler dict for tools not yet migrated.
+
         Integration tools (calendar, Stripe, etc.) read their credentials from
         tool.tool_metadata, which is set per-tenant via the tools UI.
         """
+        from app.integrations.base import ACTION_REGISTRY
+        from app.integrations.errors import IntegrationException
+
+        # Decrypt credentials stored in tool_metadata before passing to handler
+        decrypted_metadata = decrypt_sensitive_fields(tool.tool_metadata or {})
+        config = {**self.tenant_config, **decrypted_metadata}
+
+        # ── Try new adapter registry first ─────────────────────────────
+        canonical_action = ACTION_REGISTRY.resolve_action(tool.name)
+        if canonical_action:
+            provider = ACTION_REGISTRY.provider_for_tool_name(tool.name)
+            adapter = ACTION_REGISTRY.get_adapter(provider) if provider else None
+            if adapter and canonical_action in adapter.supported_actions:
+                try:
+                    return await adapter.execute(canonical_action, parameters, config)
+                except IntegrationException as exc:
+                    # Surface normalized error to the tool result
+                    raise ValueError(str(exc.error))
+
+        # ── Legacy handler fallback ────────────────────────────────────
         handlers = await _get_builtin_handlers()
         handler = handlers.get(tool.name)
         if not handler:
             raise ValueError(f"No built-in handler registered for tool '{tool.name}'")
-        # Decrypt credentials stored in tool_metadata before passing to handler
-        decrypted_metadata = decrypt_sensitive_fields(tool.tool_metadata or {})
-        config = {**self.tenant_config, **decrypted_metadata}
         return await handler(parameters, config)
 
     # ------------------------------------------------------------------

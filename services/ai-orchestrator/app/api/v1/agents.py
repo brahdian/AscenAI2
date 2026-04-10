@@ -405,56 +405,120 @@ async def restore_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
-    # Default: restore as inactive (requires payment validation)
-    has_paid_subscription = False
+    from app.core.config import settings
+    import httpx
+    from datetime import datetime, timezone
 
-    # Only check subscription if agent previously had a subscription ID
+    now = datetime.now(timezone.utc)
+
+    # ── CASE 1: Remaining paid time ────────────────────────────────────────
+    # The user already paid through expires_at. Restore immediately — no new
+    # payment needed. The existing Stripe subscription (if any) keeps running
+    # and will bill normally at the next period end.
+    if agent.expires_at and agent.expires_at.replace(tzinfo=timezone.utc) > now:
+        days_remaining = (agent.expires_at.replace(tzinfo=timezone.utc) - now).days
+        agent.deleted_at = None
+        await AgentStateMachine.activate(
+            agent, db=db, actor="user",
+            reason="restored_within_paid_period"
+        )
+        await db.commit()
+        await db.refresh(agent)
+        logger.info(
+            "agent_restored_within_paid_period",
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            expires_at=str(agent.expires_at),
+            days_remaining=days_remaining,
+        )
+        response = await _agent_to_response(agent, db)
+        response["days_remaining"] = days_remaining
+        return response
+
+    # ── CASE 2: Check whether the Stripe subscription is still active ──────
+    has_paid_subscription = False
     if agent.stripe_subscription_id:
         try:
-            from app.core.config import settings
-            import httpx
-
-            # Call the API Gateway sync endpoint to verify subscription
             async with httpx.AsyncClient(timeout=10.0) as client:
                 sync_response = await client.post(
                     f"{settings.API_GATEWAY_URL}/api/v1/billing/sync-subscription",
                     headers={
                         "X-Tenant-ID": tenant_id,
-                        "X-Internal-Key": settings.INTERNAL_API_KEY
-                    }
+                        "X-Internal-Key": settings.INTERNAL_API_KEY,
+                    },
                 )
                 if sync_response.status_code == 200:
                     sync_data = sync_response.json()
-                    # Agent is active only if subscription is confirmed active
                     has_paid_subscription = sync_data.get("status") == "active"
                 else:
                     logger.warning("subscription_sync_failed_on_restore",
-                                 agent_id=agent_id,
-                                 status=sync_response.status_code)
+                                   agent_id=agent_id, status=sync_response.status_code)
         except Exception as e:
             logger.warning("subscription_sync_error_on_restore",
-                         agent_id=agent_id,
-                         error=str(e))
-            # On error, be conservative: require payment
-            has_paid_subscription = False
+                           agent_id=agent_id, error=str(e))
 
-    agent.deleted_at = None
     if has_paid_subscription:
-        await AgentStateMachine.activate(agent, db=db, actor="user", reason="restored_with_active_subscription")
-    else:
-        await AgentStateMachine.pending_payment(agent, db=db, actor="user", reason="restored_awaiting_payment")
+        agent.deleted_at = None
+        await AgentStateMachine.activate(
+            agent, db=db, actor="user",
+            reason="restored_with_active_subscription"
+        )
+        await db.commit()
+        await db.refresh(agent)
+        logger.info("agent_restored", agent_id=agent_id, tenant_id=tenant_id,
+                    is_active=True)
+        return await _agent_to_response(agent, db)
 
+    # ── CASE 3: Payment required — get a reactivation checkout URL ─────────
+    # Ask the API Gateway to create a Stripe checkout for this specific agent.
+    # The checkout metadata carries agent_id so the webhook activates it on
+    # success without charging for any days already covered by expires_at.
+    checkout_url: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            reactivation_payload: dict = {
+                "agent_id": agent_id,
+                "return_path": f"/dashboard/agents",
+            }
+            # If the old subscription covered future time (edge case: Stripe
+            # cancelled mid-cycle), pass paid_through so Stripe sets trial_end.
+            if agent.expires_at:
+                reactivation_payload["paid_through"] = agent.expires_at.isoformat()
+
+            resp = await client.post(
+                f"{settings.API_GATEWAY_URL}/api/v1/billing/reactivation-session",
+                json=reactivation_payload,
+                headers={
+                    "X-Tenant-ID": tenant_id,
+                    "X-Internal-Key": settings.INTERNAL_API_KEY,
+                },
+            )
+            if resp.status_code == 200:
+                checkout_url = resp.json().get("checkout_url")
+    except Exception as e:
+        logger.warning("reactivation_checkout_error", agent_id=agent_id, error=str(e))
+
+    # Mark the agent as pending payment (but keep it soft-restored so it shows
+    # in the list with a "complete payment" call-to-action).
+    agent.deleted_at = None
+    await AgentStateMachine.pending_payment(
+        agent, db=db, actor="user",
+        reason="restored_awaiting_payment"
+    )
     await db.commit()
     await db.refresh(agent)
 
-    logger.info(
-        "agent_restored",
-        agent_id=agent_id,
-        tenant_id=tenant_id,
-        is_active=agent.is_active,
-        has_paid_subscription=has_paid_subscription,
+    logger.info("agent_restore_payment_required", agent_id=agent_id,
+                tenant_id=tenant_id, checkout_url=bool(checkout_url))
+
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "message": "Payment required to reactivate this agent.",
+            "checkout_url": checkout_url,
+            "agent_id": agent_id,
+        },
     )
-    return await _agent_to_response(agent, db)
 
 
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

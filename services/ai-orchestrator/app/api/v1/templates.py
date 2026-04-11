@@ -302,6 +302,8 @@ async def instantiate_template(
                 if "instruction" in step:
                     instructions_parts.append(step["instruction"])
         instructions = _render("\n\n".join(instructions_parts))
+        if not instructions:
+            instructions = _render(pbook.get("description") or "")
 
         description = _render(pbook.get("description") or "")
         tone = pbook.get("tone") or "professional"

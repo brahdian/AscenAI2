@@ -19,8 +19,10 @@ class TemplateVariableSchema(BaseModel):
 class TemplatePlaybookSchema(BaseModel):
     id: uuid.UUID
     name: str
+    description: Optional[str] = None
     trigger_condition: Optional[Dict[str, Any]] = None
-    flow_definition: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
+    is_default: bool = False
 
     class Config:
         from_attributes = True

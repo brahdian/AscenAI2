@@ -59,7 +59,20 @@ class SessionBillingService:
         if msg_count > 0:
             return None
 
-        greeting = getattr(agent, "greeting_message", None)
+        agent_cfg = agent.agent_config or {}
+        is_voice = (
+            getattr(agent, "channel", None) == "voice"
+            or (agent_cfg.get("channel") == "voice")
+        )
+
+        if is_voice:
+            # For voice agents the opening is delivered verbatim by the client TTS engine.
+            # Use the cached value when available (computed once and stored in agent_config).
+            from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
+            greeting, _, _ = await get_or_compute_voice_strings(self.db, agent)
+        else:
+            greeting = agent_cfg.get("greeting_message") or getattr(agent, "greeting_message", None)
+
         if not greeting:
             return None
 
@@ -74,6 +87,15 @@ class SessionBillingService:
         await self.memory.add_to_short_term_memory(
             session.id, {"role": "assistant", "content": greeting}
         )
+
+        # Mark session as greeting-only until the first real user message arrives.
+        # If the caller disconnects before sending a message, turn_count stays 0
+        # and update_analytics is never called — so no billing occurs.
+        # This flag is read by the orchestrator to gate the is_new_session flag.
+        new_meta = dict(session.metadata_ or {})
+        new_meta["_greeting_only"] = True
+        session.metadata_ = new_meta
+
         return greeting
 
     async def update_analytics(

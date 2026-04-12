@@ -121,7 +121,12 @@ class Orchestrator:
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), str(session.id), playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
-        await self.billing_service.maybe_send_greeting(agent, session, playbook)
+        voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
+        if voice_opening and "_voice_opening" not in session_meta:
+            new_meta = dict(session_meta)
+            new_meta["_voice_opening"] = voice_opening
+            session.metadata_ = new_meta
+            session_meta = new_meta
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
         custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
@@ -336,6 +341,15 @@ class Orchestrator:
 
         is_new = (session.turn_count == 0)
 
+        # Clear the greeting-only flag now that a real user turn has completed.
+        # Sessions that disconnect after only the greeting never reach this point,
+        # so they remain turn_count==0 and update_analytics is never called for them.
+        if session_meta.get("_greeting_only"):
+            cleared_meta = dict(session_meta)
+            cleared_meta.pop("_greeting_only", None)
+            session.metadata_ = cleared_meta
+            session_meta = cleared_meta
+
         chat_unit_increment = 0
         if is_new:
             chat_unit_increment = 1
@@ -417,7 +431,12 @@ class Orchestrator:
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
-        await self.billing_service.maybe_send_greeting(agent, session, playbook)
+        voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
+        if voice_opening and "_voice_opening" not in session_meta:
+            new_meta = dict(session_meta)
+            new_meta["_voice_opening"] = voice_opening
+            session.metadata_ = new_meta
+            session_meta = new_meta
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
         custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
@@ -627,6 +646,13 @@ class Orchestrator:
         self.db.add(user_msg)
         self.db.add(assistant_msg)
 
+        # Clear greeting-only flag on first real user turn.
+        if session_meta.get("_greeting_only"):
+            cleared_meta = dict(session_meta)
+            cleared_meta.pop("_greeting_only", None)
+            session.metadata_ = cleared_meta
+            session_meta = cleared_meta
+
         session.turn_count += 1
         await self.billing_service.update_analytics(
             tenant_id=session.tenant_id,
@@ -693,7 +719,12 @@ class Orchestrator:
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
-        await self.billing_service.maybe_send_greeting(agent, session, playbook)
+        voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
+        if voice_opening and "_voice_opening" not in session_meta:
+            new_meta = dict(session_meta)
+            new_meta["_voice_opening"] = voice_opening
+            session.metadata_ = new_meta
+            session_meta = new_meta
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
         custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
@@ -873,8 +904,21 @@ class Orchestrator:
         self.db.add(user_msg)
         self.db.add(assistant_msg)
 
+        # Clear greeting-only flag on first real user turn.
+        if session_meta.get("_greeting_only"):
+            cleared_meta = dict(session_meta)
+            cleared_meta.pop("_greeting_only", None)
+            session.metadata_ = cleared_meta
+            session_meta = cleared_meta
+
+        is_new = (session.turn_count == 0)
+        chat_unit_increment = 1 if is_new else (1 if session.turn_count > 0 and (session.turn_count + 1) % 10 == 0 else 0)
         session.turn_count += 1
-        await self.billing_service.update_analytics(tenant_id=session.tenant_id, agent_id=session.agent_id, tokens=total_tokens, latency_ms=latency_ms, tool_count=len(tool_calls_made))
+        await self.billing_service.update_analytics(
+            tenant_id=session.tenant_id, agent_id=session.agent_id,
+            tokens=total_tokens, latency_ms=latency_ms, tool_count=len(tool_calls_made),
+            is_new_session=is_new, chat_units=chat_unit_increment,
+        )
         await self.billing_service.record_token_usage(tenant_id, total_tokens)
 
         should_escalate = await self.playbook_handler.should_escalate(agent, full_response_text, messages)

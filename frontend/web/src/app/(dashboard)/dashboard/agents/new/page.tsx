@@ -130,12 +130,8 @@ export default function NewAgentPage() {
                 await templatesApi.instantiate(template_id, {
                   agent_id: agent.id,
                   template_version_id,
-                  variable_values: {
-                    ...pendingVars,
-                    business_name: agentConfig.name,
-                    business_type: agentConfig.business_type,
-                    language: agentConfig.language,
-                  },
+                  // pendingVars is the pre-resolved buildVariableValues() output
+                  variable_values: pendingVars || {},
                   tool_configs: {},
                 })
               } catch (err) {
@@ -225,6 +221,30 @@ export default function NewAgentPage() {
     return matchSearch && matchCat
   })
 
+  // Keys across all templates that represent the primary business / org name.
+  // When none of these is explicitly filled by the user, agentName is used as fallback.
+  const NAME_LIKE_KEYS = ['business_name', 'company_name', 'practice_name', 'firm_name', 'clinic_name', 'agent_name']
+
+  /**
+   * Build the final variable_values payload sent to templatesApi.instantiate.
+   * 1. Seed every "name-like" key with agentName so no {{placeholder}} goes unrendered.
+   * 2. Spread user-filled values on top — skip empty strings so fallbacks still apply.
+   * 3. Always include business_type and language for context.
+   */
+  const buildVariableValues = (sourceVars: Record<string, any> = variables) => {
+    const filledVars = Object.fromEntries(
+      Object.entries(sourceVars).filter(([, v]) => v !== '' && v !== null && v !== undefined)
+    )
+    const fallbacks: Record<string, string> = {}
+    NAME_LIKE_KEYS.forEach(k => { fallbacks[k] = agentName })
+    return {
+      ...fallbacks,
+      ...filledVars,
+      business_type: selectedTemplate?.category || 'generic',
+      language,
+    }
+  }
+
   // Create mutation
   const createMutation = useMutation({
     mutationFn: async () => {
@@ -243,12 +263,7 @@ export default function NewAgentPage() {
           await templatesApi.instantiate(selectedTemplate.id, {
             agent_id: agent.id,
             template_version_id: latestVersion.id,
-            variable_values: {
-              ...variables,
-              business_name: agentName,
-              business_type: selectedTemplate?.category || 'generic',
-              language: language,
-            },
+            variable_values: buildVariableValues(),
             tool_configs: {},
           })
         } catch (err) {
@@ -278,12 +293,7 @@ export default function NewAgentPage() {
             await templatesApi.instantiate(selectedTemplate.id, {
               agent_id: draftAgentId,
               template_version_id: latestVersion.id,
-              variable_values: {
-                ...variables,
-                business_name: agentName,
-                business_type: selectedTemplate?.category || 'generic',
-                language: language,
-              },
+              variable_values: buildVariableValues(),
               tool_configs: {},
             })
           } catch (instantiateErr) {
@@ -308,7 +318,8 @@ export default function NewAgentPage() {
           pendingConfig.template_version_id = selectedTemplate.versions?.length
             ? [...selectedTemplate.versions].sort((a: any, b: any) => b.version - a.version)[0]?.id
             : null
-          pendingConfig.variables = variables
+          // Store the fully-resolved variable values so PATH B uses them correctly
+          pendingConfig.variables = buildVariableValues()
         }
         sessionStorage.setItem('ascenai_pending_agent', JSON.stringify(pendingConfig))
         toast.loading('Redirecting to Stripe for payment...', { duration: 2000 })
@@ -323,10 +334,18 @@ export default function NewAgentPage() {
   const handleSelectTemplate = (tpl: any | null) => {
     setSelectedTemplate(tpl)
     if (tpl) {
+      const initialName = `My ${tpl.name}`
       const defaults: Record<string, any> = {}
-      tpl.variables?.forEach((v: any) => { if (v.default_value?.value) defaults[v.key] = v.default_value.value })
+      tpl.variables?.forEach((v: any) => {
+        if (v.default_value?.value) {
+          defaults[v.key] = v.default_value.value
+        } else if (NAME_LIKE_KEYS.includes(v.key)) {
+          // Pre-fill every name-like variable so the form isn't blank
+          defaults[v.key] = initialName
+        }
+      })
       setVariables(defaults)
-      setAgentName(`My ${tpl.name}`)
+      setAgentName(initialName)
     } else {
       setVariables({})
       setAgentName('')

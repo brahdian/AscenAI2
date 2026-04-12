@@ -30,6 +30,7 @@ from app.guardrails.voice_agent_guardrails import (
     get_dynamic_voice_protocol,
     generate_multilingual_greeting,
     generate_multilingual_fallback,
+    get_or_compute_voice_strings,
 )
 
 logger = structlog.get_logger(__name__)
@@ -72,10 +73,10 @@ def _tenant_id(request: Request) -> str:
 async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
     config = agent.agent_config or {}
     supported_langs = config.get("supported_languages", [])
-    
-    computed_greeting = await generate_multilingual_greeting(db, supported_langs)
-    computed_protocol = await get_dynamic_voice_protocol(db, supported_langs)
-    computed_fallback = await generate_multilingual_fallback(db, supported_langs)
+
+    # Use cached values when available; compute and persist on first call.
+    computed_greeting, computed_protocol, computed_fallback = await get_or_compute_voice_strings(db, agent)
+    config = agent.agent_config or {}  # re-read after possible cache write
 
     return AgentResponse(
         id=str(agent.id),

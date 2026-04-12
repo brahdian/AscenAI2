@@ -16,6 +16,7 @@ from app.core.database import get_db, get_db_no_rls, AsyncSessionLocal
 from app.core.config import settings
 from app.core.security import get_tenant_db, get_current_tenant
 from app.models.agent import Agent, AgentPlaybook, AgentGuardrails, AgentDocument
+from app.models.variable import AgentVariable
 from app.models.template import (
     AgentTemplate,
     TemplateVersion,
@@ -203,6 +204,7 @@ async def instantiate_template(
     system_prompt_template: str | None = None
     playbooks_data: list[dict] = []
     tools_data: list[dict] = []
+    var_defs: dict[str, dict] = {}   # keyed by variable key, holds label/type
 
     async with AsyncSessionLocal() as catalog_db:
         version_res = await catalog_db.execute(
@@ -221,6 +223,18 @@ async def instantiate_template(
         # Snapshot everything into plain Python structures while session is open
         system_prompt_template = version.system_prompt_template
         version_id = version.id
+
+        # Snapshot template variable definitions for use as AgentVariable labels
+        from app.models.template import TemplateVariable
+        tvar_res = await catalog_db.execute(
+            select(TemplateVariable).where(TemplateVariable.template_id == t_uuid)
+        )
+        for tvar in tvar_res.scalars().all():
+            var_defs[tvar.key] = {
+                "label": tvar.label,
+                "type": tvar.type,
+                "required": tvar.is_required,
+            }
 
         for pbook in version.playbooks:
             playbook_config = dict(pbook.config) if pbook.config else {}
@@ -384,6 +398,59 @@ async def instantiate_template(
         tool_configs=body.tool_configs,
     )
     db.add(instance)
+
+    # ------------------------------------------------------------------
+    # Sync template variable_values → agent_variables table so they are
+    # visible and editable on the Variables page in the UI.
+    # Skip internal routing keys that have no meaning as runtime variables.
+    # var_defs was populated inside the catalog_db block above.
+    # ------------------------------------------------------------------
+    _SKIP_VARIABLE_KEYS = {"business_type", "language"}
+
+    # Delete any existing template-sourced variables before re-seeding so
+    # re-instantiation (e.g., after variable edit) doesn't create duplicates.
+    existing_vars_res = await db.execute(
+        select(AgentVariable).where(AgentVariable.agent_id == agent.id)
+    )
+    existing_var_names = {v.name: v for v in existing_vars_res.scalars().all()}
+
+    for key, value in body.variable_values.items():
+        if key in _SKIP_VARIABLE_KEYS or key.lower() == "faqs":
+            continue  # FAQs become documents; routing keys are noise
+
+        # Infer data type
+        if isinstance(value, bool):
+            dtype = "boolean"
+        elif isinstance(value, (int, float)):
+            dtype = "number"
+        elif isinstance(value, (dict, list)):
+            dtype = "object"
+        else:
+            dtype = "string"
+
+        # Use the template definition label as description if available
+        tvar_meta = var_defs.get(key, {})
+        description = tvar_meta.get("label") or key.replace("_", " ").title()
+
+        if key in existing_var_names:
+            # Update existing — preserve scope/secret settings
+            ev = existing_var_names[key]
+            ev.default_value = value
+            ev.description = description
+            ev.data_type = dtype
+        else:
+            av = AgentVariable(
+                id=uuid.uuid4(),
+                agent_id=agent.id,
+                tenant_id=uuid.UUID(tenant),
+                name=key,
+                description=description,
+                scope="global",
+                data_type=dtype,
+                default_value=value,
+                is_secret=False,
+            )
+            db.add(av)
 
     # Handle RAG Documents (FAQs) — index FAQ content for retrieval
     # Collect pending background tasks; they are scheduled AFTER commit to ensure

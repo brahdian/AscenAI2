@@ -737,6 +737,436 @@ class PlaybookAdvanceResult(BaseModel):
     current_step_id: Optional[str] = None
 
 
+LEAD_QUALIFICATION_PLAYBOOK = PlaybookDefinition(
+    id="lead_qualification_v1",
+    name="Lead Qualification",
+    description=(
+        "Qualifies an inbound lead by collecting their name, contact, and interest, "
+        "then routes them to the right next step (demo, callback, or self-serve)."
+    ),
+    version="1.0.0",
+    trigger_keywords=["book a demo", "pricing", "interested", "learn more", "how does it work", "tell me more"],
+    initial_step_id="collect_name",
+    steps={
+        "collect_name": WaitInputStep(
+            id="collect_name",
+            type="wait_input",
+            description="Ask for the lead's full name.",
+            prompt_to_user="Hi! I'd love to learn more about what you're looking for. May I have your full name?",
+            variable_to_store="lead_name",
+            validation_regex=r"^[A-Za-z\s'\-]{2,100}$",
+            error_message="Please enter your full name (letters only).",
+            next_step_id="collect_email",
+        ),
+        "collect_email": WaitInputStep(
+            id="collect_email",
+            type="wait_input",
+            description="Collect the lead's email address.",
+            prompt_to_user="Thanks, {{lead_name}}! What's the best email address to reach you?",
+            variable_to_store="lead_email",
+            validation_regex=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+            error_message="Please enter a valid email address (e.g. name@company.com).",
+            next_step_id="collect_interest",
+        ),
+        "collect_interest": WaitInputStep(
+            id="collect_interest",
+            type="wait_input",
+            description="Ask what they are primarily interested in.",
+            prompt_to_user=(
+                "Perfect! What are you most interested in — a live demo, a pricing quote, "
+                "or general information? Just reply with 'demo', 'pricing', or 'info'."
+            ),
+            variable_to_store="lead_interest",
+            validation_regex=r"^(demo|pricing|info)$",
+            error_message="Please reply with 'demo', 'pricing', or 'info'.",
+            next_step_id="route_interest",
+        ),
+        "route_interest": ConditionStep(
+            id="route_interest",
+            type="condition",
+            description="Route to the appropriate next step based on interest.",
+            expression="lead_interest.lower() == 'demo'",
+            then_step_id="book_demo",
+            else_step_id="capture_lead_end",
+        ),
+        "book_demo": ToolStep(
+            id="book_demo",
+            type="tool",
+            description="Create a demo booking for the lead.",
+            tool_name="create_demo_booking",
+            argument_mapping={"name": "{{lead_name}}", "email": "{{lead_email}}"},
+            output_variable="demo_result",
+            on_error="continue",
+            next_step_id="demo_booked_end",
+        ),
+        "demo_booked_end": EndStep(
+            id="demo_booked_end",
+            type="end",
+            description="Confirm the demo booking.",
+            final_message_template=(
+                "Great news, {{lead_name}}! A demo has been scheduled and a confirmation "
+                "will be sent to {{lead_email}}. Our team looks forward to speaking with you!"
+            ),
+            status="completed",
+        ),
+        "capture_lead_end": EndStep(
+            id="capture_lead_end",
+            type="end",
+            description="Capture lead and close with a follow-up promise.",
+            final_message_template=(
+                "Thanks, {{lead_name}}! We've saved your details and someone from our team "
+                "will follow up at {{lead_email}} with {{lead_interest}} information shortly. "
+                "Is there anything else I can help you with today?"
+            ),
+            status="completed",
+        ),
+    },
+)
+
+
+ORDER_HANDLING_PLAYBOOK = PlaybookDefinition(
+    id="order_handling_v1",
+    name="Order Handling",
+    description=(
+        "Guides a customer through placing an order: collects item and quantity, "
+        "confirms details, processes the order, and provides a reference number."
+    ),
+    version="1.0.0",
+    trigger_keywords=["order", "buy", "purchase", "add to cart", "i want", "i'd like to get"],
+    initial_step_id="collect_item",
+    steps={
+        "collect_item": WaitInputStep(
+            id="collect_item",
+            type="wait_input",
+            description="Ask the customer what they would like to order.",
+            prompt_to_user="I'd be happy to help you place an order! What would you like to order today?",
+            variable_to_store="order_item",
+            validation_regex=r"^.{2,200}$",
+            error_message="Please tell me what you'd like to order.",
+            next_step_id="collect_quantity",
+        ),
+        "collect_quantity": WaitInputStep(
+            id="collect_quantity",
+            type="wait_input",
+            description="Ask for the quantity.",
+            prompt_to_user="How many would you like? (Enter a number, e.g. 2)",
+            variable_to_store="order_quantity",
+            validation_regex=r"^[1-9][0-9]?$",
+            error_message="Please enter a valid quantity between 1 and 99.",
+            next_step_id="confirm_order",
+        ),
+        "confirm_order": WaitInputStep(
+            id="confirm_order",
+            type="wait_input",
+            description="Confirm the order details with the customer.",
+            prompt_to_user=(
+                "To confirm: {{order_quantity}} x {{order_item}}. "
+                "Shall I place this order? (yes / no)"
+            ),
+            variable_to_store="order_confirmed",
+            validation_regex=r"^(yes|no|y|n)$",
+            error_message="Please reply with 'yes' or 'no'.",
+            next_step_id="route_order_confirm",
+        ),
+        "route_order_confirm": ConditionStep(
+            id="route_order_confirm",
+            type="condition",
+            description="Branch on confirmation.",
+            expression="order_confirmed.lower() in ('yes', 'y')",
+            then_step_id="place_order",
+            else_step_id="order_cancelled_end",
+        ),
+        "place_order": ToolStep(
+            id="place_order",
+            type="tool",
+            description="Submit the order to the backend.",
+            tool_name="create_order",
+            argument_mapping={
+                "item": "{{order_item}}",
+                "quantity": "{{order_quantity}}",
+            },
+            output_variable="order_result",
+            on_error="retry",
+            retry_attempts=2,
+            retry_delay_seconds=1.0,
+            on_retry_exhausted="fail",
+            next_step_id="order_success_end",
+        ),
+        "order_success_end": EndStep(
+            id="order_success_end",
+            type="end",
+            description="Confirm the order was placed.",
+            final_message_template=(
+                "Your order for {{order_quantity}} x {{order_item}} has been placed! "
+                "Your order reference is {{order_result.order_id}}. "
+                "Is there anything else I can help you with?"
+            ),
+            status="completed",
+        ),
+        "order_cancelled_end": EndStep(
+            id="order_cancelled_end",
+            type="end",
+            description="Order cancelled by customer.",
+            final_message_template=(
+                "No problem — your order has been cancelled. "
+                "Let me know if you'd like to order something else!"
+            ),
+            status="completed",
+        ),
+    },
+)
+
+
+CUSTOMER_SUPPORT_PLAYBOOK = PlaybookDefinition(
+    id="customer_support_v1",
+    name="Customer Support",
+    description=(
+        "Handles general customer support inquiries: collects the issue, "
+        "searches the knowledge base, and escalates to a human if unresolved."
+    ),
+    version="1.0.0",
+    trigger_keywords=["help", "issue", "problem", "complaint", "question", "not working", "broken", "wrong"],
+    initial_step_id="collect_issue",
+    steps={
+        "collect_issue": WaitInputStep(
+            id="collect_issue",
+            type="wait_input",
+            description="Ask the customer to describe their issue.",
+            prompt_to_user=(
+                "I'm here to help! Could you briefly describe what's going on "
+                "so I can find the best solution for you?"
+            ),
+            variable_to_store="customer_issue",
+            validation_regex=r"^.{5,1000}$",
+            error_message="Please describe your issue in a few words.",
+            next_step_id="search_knowledge",
+        ),
+        "search_knowledge": ToolStep(
+            id="search_knowledge",
+            type="tool",
+            description="Search the knowledge base for relevant answers.",
+            tool_name="search_knowledge_base",
+            argument_mapping={"query": "{{customer_issue}}"},
+            output_variable="kb_result",
+            on_error="continue",
+            next_step_id="route_kb_result",
+        ),
+        "route_kb_result": ConditionStep(
+            id="route_kb_result",
+            type="condition",
+            description="Check if the knowledge base returned a useful answer.",
+            expression="bool(kb_result.get('answer'))",
+            then_step_id="present_answer",
+            else_step_id="escalate_to_human",
+        ),
+        "present_answer": LLMStep(
+            id="present_answer",
+            type="llm",
+            description="Present the knowledge base answer in a friendly way.",
+            prompt_template=(
+                "A customer asked: {{customer_issue}}\n"
+                "The knowledge base returned: {{kb_result.answer}}\n"
+                "Write a concise, friendly response (2-4 sentences) that addresses their issue directly. "
+                "End by asking if this resolved their problem."
+            ),
+            output_variable="support_response",
+            temperature=0.4,
+            max_tokens=300,
+            extract_json=False,
+            next_step_id="check_resolved",
+        ),
+        "check_resolved": WaitInputStep(
+            id="check_resolved",
+            type="wait_input",
+            description="Check if the answer resolved the customer's issue.",
+            prompt_to_user="{{support_response}}",
+            variable_to_store="issue_resolved",
+            validation_regex=r"^(yes|no|y|n)$",
+            error_message="Please reply with 'yes' if resolved or 'no' if you need more help.",
+            next_step_id="route_resolved",
+        ),
+        "route_resolved": ConditionStep(
+            id="route_resolved",
+            type="condition",
+            description="Escalate if not resolved.",
+            expression="issue_resolved.lower() in ('yes', 'y')",
+            then_step_id="support_resolved_end",
+            else_step_id="escalate_to_human",
+        ),
+        "escalate_to_human": ToolStep(
+            id="escalate_to_human",
+            type="tool",
+            description="Escalate to a human support agent.",
+            tool_name="escalate_to_human",
+            argument_mapping={"issue_summary": "{{customer_issue}}"},
+            output_variable="escalation_result",
+            on_error="continue",
+            next_step_id="escalation_end",
+        ),
+        "support_resolved_end": EndStep(
+            id="support_resolved_end",
+            type="end",
+            description="Issue resolved successfully.",
+            final_message_template=(
+                "I'm glad that helped! Is there anything else I can assist you with today?"
+            ),
+            status="completed",
+        ),
+        "escalation_end": EndStep(
+            id="escalation_end",
+            type="end",
+            description="Inform customer of escalation.",
+            final_message_template=(
+                "I've connected you with our support team who will follow up shortly. "
+                "Your reference number is {{escalation_result.ticket_id}}. "
+                "Thank you for your patience!"
+            ),
+            status="escalated",
+        ),
+    },
+)
+
+
+PAYMENT_CHECKOUT_PLAYBOOK = PlaybookDefinition(
+    id="payment_checkout_v1",
+    name="Payment & Checkout",
+    description=(
+        "Handles payment and checkout: confirms the amount, collects explicit "
+        "user authorization, processes payment via Stripe, and provides a receipt."
+    ),
+    version="1.0.0",
+    trigger_keywords=["pay", "checkout", "card", "billing", "payment", "charge", "invoice"],
+    initial_step_id="confirm_amount",
+    steps={
+        "confirm_amount": WaitInputStep(
+            id="confirm_amount",
+            type="wait_input",
+            description="Confirm the payment amount with the customer.",
+            prompt_to_user=(
+                "I can help you complete your payment. "
+                "The amount due is {{payment_amount}} {{payment_currency}}. "
+                "Would you like to proceed? (yes / no)"
+            ),
+            variable_to_store="payment_confirmed",
+            validation_regex=r"^(yes|no|y|n)$",
+            error_message="Please reply with 'yes' to proceed or 'no' to cancel.",
+            next_step_id="route_payment_confirm",
+        ),
+        "route_payment_confirm": ConditionStep(
+            id="route_payment_confirm",
+            type="condition",
+            description="Branch on payment confirmation.",
+            expression="payment_confirmed.lower() in ('yes', 'y')",
+            then_step_id="process_payment",
+            else_step_id="payment_cancelled_end",
+        ),
+        "process_payment": ToolStep(
+            id="process_payment",
+            type="tool",
+            description="Process payment via Stripe.",
+            tool_name="stripe_create_payment",
+            argument_mapping={
+                "amount": "{{payment_amount}}",
+                "currency": "{{payment_currency}}",
+                "customer_id": "{{customer_id}}",
+            },
+            output_variable="payment_result",
+            on_error="fail",
+            next_step_id="route_payment_result",
+        ),
+        "route_payment_result": ConditionStep(
+            id="route_payment_result",
+            type="condition",
+            description="Branch on payment success or failure.",
+            expression="payment_result.get('status') == 'succeeded'",
+            then_step_id="payment_success_end",
+            else_step_id="payment_failed_end",
+        ),
+        "payment_success_end": EndStep(
+            id="payment_success_end",
+            type="end",
+            description="Payment successful.",
+            final_message_template=(
+                "Payment of {{payment_amount}} {{payment_currency}} was successful! "
+                "Your confirmation code is {{payment_result.confirmation_code}}. "
+                "A receipt has been sent to your email. Is there anything else I can help with?"
+            ),
+            status="completed",
+        ),
+        "payment_cancelled_end": EndStep(
+            id="payment_cancelled_end",
+            type="end",
+            description="Payment cancelled by customer.",
+            final_message_template=(
+                "No problem — your payment has been cancelled. "
+                "Let me know if you'd like to try again or need any help."
+            ),
+            status="completed",
+        ),
+        "payment_failed_end": EndStep(
+            id="payment_failed_end",
+            type="end",
+            description="Payment failed.",
+            final_message_template=(
+                "I'm sorry, the payment could not be processed. "
+                "Please try a different card or contact your bank. "
+                "Would you like to try again or speak with a support agent?"
+            ),
+            status="failed",
+        ),
+    },
+)
+
+
+ESCALATION_HANDOFF_PLAYBOOK = PlaybookDefinition(
+    id="escalation_handoff_v1",
+    name="Escalation to Human",
+    description=(
+        "Handles explicit customer requests to speak with a human agent: "
+        "collects a brief reason, initiates the handoff, and provides a ticket reference."
+    ),
+    version="1.0.0",
+    trigger_keywords=["speak to agent", "talk to human", "real person", "manager", "escalate", "human", "representative"],
+    initial_step_id="acknowledge_request",
+    steps={
+        "acknowledge_request": WaitInputStep(
+            id="acknowledge_request",
+            type="wait_input",
+            description="Acknowledge the request and collect a brief reason.",
+            prompt_to_user=(
+                "Of course! I'll connect you with a member of our team right away. "
+                "Could you briefly tell me what this is about so they're prepared to help you?"
+            ),
+            variable_to_store="escalation_reason",
+            validation_regex=r"^.{2,500}$",
+            error_message="Please provide a brief description (at least 2 characters).",
+            next_step_id="initiate_escalation",
+        ),
+        "initiate_escalation": ToolStep(
+            id="initiate_escalation",
+            type="tool",
+            description="Create a support ticket and notify a human agent.",
+            tool_name="escalate_to_human",
+            argument_mapping={"issue_summary": "{{escalation_reason}}"},
+            output_variable="escalation_result",
+            on_error="continue",
+            next_step_id="escalation_confirmed_end",
+        ),
+        "escalation_confirmed_end": EndStep(
+            id="escalation_confirmed_end",
+            type="end",
+            description="Confirm the handoff to the customer.",
+            final_message_template=(
+                "You've been connected to our support team. "
+                "Your reference number is {{escalation_result.ticket_id}}. "
+                "An agent will be with you shortly. Thank you for your patience!"
+            ),
+            status="escalated",
+        ),
+    },
+)
+
+
 # ---------------------------------------------------------------------------
 # Registry of built-in playbooks (used by the engine for quick lookup)
 # ---------------------------------------------------------------------------
@@ -744,4 +1174,9 @@ class PlaybookAdvanceResult(BaseModel):
 BUILTIN_PLAYBOOKS: dict[str, PlaybookDefinition] = {
     REFUND_PLAYBOOK.id: REFUND_PLAYBOOK,
     BOOKING_PLAYBOOK.id: BOOKING_PLAYBOOK,
+    LEAD_QUALIFICATION_PLAYBOOK.id: LEAD_QUALIFICATION_PLAYBOOK,
+    ORDER_HANDLING_PLAYBOOK.id: ORDER_HANDLING_PLAYBOOK,
+    CUSTOMER_SUPPORT_PLAYBOOK.id: CUSTOMER_SUPPORT_PLAYBOOK,
+    PAYMENT_CHECKOUT_PLAYBOOK.id: PAYMENT_CHECKOUT_PLAYBOOK,
+    ESCALATION_HANDOFF_PLAYBOOK.id: ESCALATION_HANDOFF_PLAYBOOK,
 }

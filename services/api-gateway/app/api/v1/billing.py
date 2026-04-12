@@ -623,6 +623,127 @@ async def create_agent_slot_session(
         raise HTTPException(status_code=500, detail="An unexpected error occurred while initiating purchase.")
 
 
+class ReactivationSessionRequest(BaseModel):
+    agent_id: str = Field(..., description="ID of the archived agent to reactivate")
+    return_path: str = Field("/dashboard/agents", description="Frontend path to redirect after checkout")
+    paid_through: str | None = Field(None, description="ISO timestamp of original expiry — if in future, used as Stripe trial_end to avoid double-charging")
+
+
+@router.post("/reactivation-session")
+async def create_reactivation_session(
+    request: Request,
+    payload: ReactivationSessionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a Stripe checkout session to reactivate a specific archived agent.
+
+    The checkout session embeds `agent_id` in Stripe metadata so that the
+    existing `checkout.session.completed` webhook (Flow 1) automatically
+    sets is_active=True, stores stripe_subscription_id, and sets expires_at
+    — no extra webhook handling needed.
+
+    If `paid_through` is in the future (user had remaining days when they
+    cancelled), Stripe trial_end is set to that timestamp so the user is not
+    charged for days they already paid for. Billing resumes normally after
+    trial_end.
+    """
+    from app.models.tenant import Tenant
+    from app.models.user import User
+    from app.services.auth_service import _create_stripe_customer
+    import stripe
+
+    tenant_id = _require_tenant(request)
+    tenant_uuid = uuid.UUID(tenant_id)
+
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+    tenant = tenant_result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Self-heal: ensure stripe customer exists
+    if not tenant.stripe_customer_id:
+        user_res = await db.execute(
+            select(User).where(User.tenant_id == tenant.id, User.role == "owner")
+        )
+        owner = user_res.scalar_one_or_none()
+        if owner:
+            stripe_customer_id = await _create_stripe_customer(tenant, owner)
+            if stripe_customer_id:
+                tenant.stripe_customer_id = stripe_customer_id
+                await db.commit()
+
+    plan_data = await _get_plan(tenant.plan or "growth", db)
+    price = plan_data.get("price_per_agent") or 99.00
+
+    _origin = request.headers.get("Origin") or request.headers.get("Referer", "").split("/api")[0]
+    frontend_base = _origin.rstrip("/") if _origin else settings.FRONTEND_URL
+
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+
+    # Determine whether to set a trial period (no double-charge for remaining days)
+    trial_end: int | None = None
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if payload.paid_through:
+        try:
+            paid_through_dt = datetime.fromisoformat(payload.paid_through.replace("Z", "+00:00"))
+            paid_through_ts = int(paid_through_dt.timestamp())
+            if paid_through_ts > now_ts + 86400:  # at least 1 day remaining
+                trial_end = paid_through_ts
+        except (ValueError, OSError):
+            pass
+
+    kwargs: dict = {
+        "payment_method_types": ["card"],
+        "mode": "subscription",
+        "success_url": f"{frontend_base}{payload.return_path}?reactivated=true",
+        "cancel_url": f"{frontend_base}{payload.return_path}?cancelled=true",
+        "metadata": {
+            "tenant_id": str(tenant.id),
+            "action": "reactivate_agent",
+            "agent_id": payload.agent_id,
+        },
+        "line_items": [
+            {
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": int(price * 100),
+                    "recurring": {"interval": "month"},
+                    "product_data": {
+                        "name": "Agent Reactivation",
+                        "description": (
+                            f"Reactivate agent slot ({plan_data['display_name']})"
+                        ),
+                    },
+                },
+                "quantity": 1,
+            }
+        ],
+    }
+
+    if trial_end:
+        kwargs["subscription_data"] = {"trial_end": trial_end}
+
+    if tenant.stripe_customer_id:
+        kwargs["customer"] = tenant.stripe_customer_id
+    else:
+        kwargs["customer_email"] = tenant.email
+
+    try:
+        checkout_session = stripe.checkout.Session.create(**kwargs)
+        logger.info(
+            "reactivation_checkout_created",
+            tenant_id=tenant_id,
+            agent_id=payload.agent_id,
+            trial_end=trial_end,
+            session_id=checkout_session.id,
+        )
+        return {"checkout_url": checkout_session.url, "session_id": checkout_session.id}
+    except stripe.error.StripeError as e:
+        logger.error("reactivation_checkout_stripe_error", error=str(e), tenant_id=tenant_id)
+        raise HTTPException(status_code=500, detail="Failed to create reactivation checkout session")
+
+
 @router.post("/portal-session")
 async def create_portal_session(
     request: Request,
@@ -820,7 +941,10 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     logger.info("tenant_subscription_activated", tenant_id=tenant_id, plan=plan)
 
                 # FLOW 1: Activate specific agent if metadata contains agent_id
+                # action="reactivate_agent" → restore archived agent, do NOT bump agent_count
+                # action="add_agent_slot" / missing → new slot, bump agent_count
                 agent_id = metadata.get("agent_id")
+                is_reactivation = metadata.get("action") == "reactivate_agent"
                 if agent_id:
                     logger.info("activating_agent_from_webhook", tenant_id=tenant_id, agent_id=agent_id)
                     subscription_id = session.get("subscription")
@@ -854,15 +978,18 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 timeout=10.0
                             )
                             if activate_res.status_code == 200:
-                                logger.info("agent_activated_successfully", agent_id=agent_id, expires_at=expires_at)
+                                logger.info("agent_activated_successfully", agent_id=agent_id,
+                                            expires_at=expires_at, reactivation=is_reactivation)
 
-                                # Atomic increment — avoids read-modify-write race on concurrent webhooks
-                                await db.execute(
-                                    _sa_update(TenantUsage)
-                                    .where(TenantUsage.tenant_id == tenant.id)
-                                    .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
-                                )
-                                await db.commit()
+                                # Only bump agent_count for NEW slots, not reactivations
+                                # (the slot was already counted when the agent was first created)
+                                if not is_reactivation:
+                                    await db.execute(
+                                        _sa_update(TenantUsage)
+                                        .where(TenantUsage.tenant_id == tenant.id)
+                                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
+                                    )
+                                    await db.commit()
                             else:
                                 logger.error("agent_activation_failed_upstream", agent_id=agent_id, status=activate_res.status_code)
                                 # Failsafe: Agent missing or errored -> Issue refund/cancel to prevent unauthorized charge

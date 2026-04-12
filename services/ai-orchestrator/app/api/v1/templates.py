@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 import structlog
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -92,8 +92,8 @@ async def update_instance(
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
 
-    # Update variable values
-    current_vars = instance.variable_values or {}
+    # Update variable values — use a new dict so SQLAlchemy detects the assignment
+    current_vars = dict(instance.variable_values or {})
     current_vars.update(body.variable_values)
     instance.variable_values = current_vars
 
@@ -282,7 +282,6 @@ async def instantiate_template(
     # -----------------------------------------------------------------------
     # Delete the auto-generated default playbooks so template ones replace them
     # -----------------------------------------------------------------------
-    from sqlalchemy import delete
     await db.execute(
         delete(AgentPlaybook).where(
             AgentPlaybook.agent_id == agent.id,
@@ -306,9 +305,9 @@ async def instantiate_template(
             instructions = _render(pbook.get("description") or "")
 
         description = _render(pbook.get("description") or "")
-        tone = pbook.get("tone") or "professional"
-        dos = pbook.get("dos") or []
-        donts = pbook.get("donts") or []
+        tone = _render(pbook.get("tone") or "professional")
+        dos = [_render(str(item)) for item in (pbook.get("dos") or [])]
+        donts = [_render(str(item)) for item in (pbook.get("donts") or [])]
         scenarios_raw = pbook.get("scenarios") or []
         out_of_scope_response = _render(pbook.get("out_of_scope_response") or "")
         fallback_response = _render(pbook.get("fallback_response") or "")
@@ -322,6 +321,10 @@ async def instantiate_template(
             }
             for s in scenarios_raw
         ]
+
+        # Render all {{variables}} inside flow_definition (step instructions, labels, etc.)
+        import json as _json
+        rendered_flow = _json.loads(_render(_json.dumps(flow))) if flow else flow
 
         mark_default = is_default or first_playbook
         first_playbook = False
@@ -341,7 +344,7 @@ async def instantiate_template(
                 "out_of_scope_response": out_of_scope_response or None,
                 "fallback_response": fallback_response or None,
                 "custom_escalation_message": custom_escalation_message or None,
-                "flow_definition": flow,
+                "flow_definition": rendered_flow,
             },
             is_active=True,
             is_default=mark_default,
@@ -350,7 +353,6 @@ async def instantiate_template(
         logger.info("template_playbook_added", name=pbook["name"], agent_id=str(agent.id))
 
     # Update existing Guardrails, or create if missing
-    from sqlalchemy import select
     gr_res = await db.execute(select(AgentGuardrails).where(AgentGuardrails.agent_id == agent.id))
     guardrails = gr_res.scalar_one_or_none()
     

@@ -1,7 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams, useRouter } from 'next/navigation'
 import { agentsApi } from '@/lib/api'
 import Link from 'next/link'
 import toast from 'react-hot-toast'
@@ -9,10 +10,21 @@ import { Bot, Plus, Trash2, Edit2, Mic, MicOff, TestTube, BookOpen, Shield } fro
 
 export default function AgentsPage() {
   const qc = useQueryClient()
+  const searchParams = useSearchParams()
+  const router = useRouter()
   const [testingId, setTestingId] = useState<string | null>(null)
   const [testMsg, setTestMsg] = useState('')
   const [testResult, setTestResult] = useState<string | null>(null)
   const [showArchived, setShowArchived] = useState(false)
+
+  // Handle Stripe return after reactivation checkout
+  useEffect(() => {
+    if (searchParams.get('reactivated') === 'true') {
+      toast.success('Agent reactivated — your subscription is now active!')
+      qc.invalidateQueries({ queryKey: ['agents'] })
+      router.replace('/dashboard/agents')
+    }
+  }, [searchParams, qc, router])
 
   const { data: agents, isLoading } = useQuery({
     queryKey: ['agents', showArchived],
@@ -37,10 +49,33 @@ export default function AgentsPage() {
   })
 
   const restoreMutation = useMutation({
-    mutationFn: (id: string) => agentsApi.restore(id),
-    onSuccess: () => {
+    mutationFn: async (id: string) => {
+      try {
+        return await agentsApi.restore(id)
+      } catch (err: any) {
+        // 402 = payment required — backend returns checkout_url
+        if (err?.response?.status === 402) {
+          return { payment_required: true, ...err.response.data.detail }
+        }
+        throw err
+      }
+    },
+    onSuccess: (data: any) => {
+      if (data?.payment_required) {
+        if (data.checkout_url) {
+          toast.loading('Redirecting to payment…', { duration: 3000 })
+          window.location.href = data.checkout_url
+        } else {
+          toast.error('Payment required but no checkout URL available. Contact support.')
+        }
+        return
+      }
       qc.invalidateQueries({ queryKey: ['agents'] })
-      toast.success('Agent restored')
+      if (data?.days_remaining != null && data.days_remaining > 0) {
+        toast.success(`Agent restored — ${data.days_remaining} day${data.days_remaining !== 1 ? 's' : ''} of paid time remaining`)
+      } else {
+        toast.success('Agent restored')
+      }
     },
     onError: () => toast.error('Failed to restore agent'),
   })

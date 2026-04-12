@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     MCP_SERVER_URL: str = "http://mcp-server:8001"
     MCP_WS_URL: str = "ws://mcp-server:8001"
+    # Voice pipeline service URL — used for pre-generating greeting / IVR audio
+    VOICE_PIPELINE_URL: str = "http://voice-pipeline:8003"
 
     # LLM config
     LLM_PROVIDER: str = "gemini"  # "gemini" | "openai" | "vertex"

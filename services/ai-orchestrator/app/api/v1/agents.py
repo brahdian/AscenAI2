@@ -32,9 +32,18 @@ from app.guardrails.voice_agent_guardrails import (
     generate_multilingual_fallback,
     get_or_compute_voice_strings,
 )
+from app.services.tts_generation_service import TTSGenerationService
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+
+# Module-level TTS generation service — shared across all agent endpoints.
+# Uses settings defaults; storage path and CDN base reuse the same directory
+# as the manual voice-greeting upload endpoint below.
+_tts_service = TTSGenerationService(
+    storage_path=os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"),
+    cdn_base=os.environ.get("GREETING_CDN_BASE", "/agent-greetings"),
+)
 
 # Patterns that indicate prompt injection attempts in stored system prompts
 _PROMPT_INJECTION_RE = re.compile(
@@ -93,7 +102,9 @@ async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
         auto_detect_language=config.get("auto_detect_language", False),
         supported_languages=supported_langs,
         greeting_message=config.get("greeting_message"),
+        ivr_language_prompt=config.get("ivr_language_prompt"),
         voice_greeting_url=config.get("voice_greeting_url"),
+        ivr_language_url=config.get("ivr_language_url"),
         voice_system_prompt=config.get("voice_system_prompt"),
         computed_greeting=computed_greeting,
         computed_protocol=computed_protocol,
@@ -231,6 +242,46 @@ async def create_agent(
 
     await db.commit()
     await db.refresh(agent)
+
+    # Auto-generate TTS audio for voice agents when greeting text is provided.
+    # This runs after commit so the agent already has a stable ID in the DB.
+    if agent.voice_enabled:
+        cfg = agent.agent_config or {}
+        voice_id = agent.voice_id or "alloy"
+        tts_updated = False
+
+        greeting_text = cfg.get("greeting_message")
+        if greeting_text and not cfg.get("voice_greeting_url"):
+            url = await _tts_service.generate_greeting(
+                text=greeting_text,
+                voice_id=voice_id,
+                agent_id=str(agent.id),
+            )
+            if url:
+                new_cfg = dict(agent.agent_config)
+                new_cfg["voice_greeting_url"] = url
+                agent.agent_config = new_cfg
+                tts_updated = True
+                logger.info("voice_greeting_generated", agent_id=str(agent.id), url=url)
+
+        ivr_text = cfg.get("ivr_language_prompt")
+        if ivr_text and not cfg.get("ivr_language_url"):
+            url = await _tts_service.generate_ivr_prompt(
+                text=ivr_text,
+                voice_id=voice_id,
+                agent_id=str(agent.id),
+            )
+            if url:
+                new_cfg = dict(agent.agent_config)
+                new_cfg["ivr_language_url"] = url
+                agent.agent_config = new_cfg
+                tts_updated = True
+                logger.info("ivr_prompt_generated", agent_id=str(agent.id), url=url)
+
+        if tts_updated:
+            await db.commit()
+            await db.refresh(agent)
+
     logger.info("agent_created", agent_id=str(agent.id), tenant_id=tenant_id)
     return await _agent_to_response(agent, db)
 
@@ -336,6 +387,55 @@ async def update_agent(
 
     await db.commit()
     await db.refresh(agent)
+
+    # Re-generate TTS audio whenever greeting or IVR prompt text changes.
+    if agent.voice_enabled:
+        cfg = agent.agent_config or {}
+        voice_id = agent.voice_id or "alloy"
+        tts_updated = False
+
+        # Regenerate greeting audio when greeting_message changed
+        if "greeting_message" in update_data or (
+            "agent_config" in body.model_dump(exclude_unset=True)
+            and "greeting_message" in (body.agent_config or {})
+        ):
+            greeting_text = cfg.get("greeting_message")
+            if greeting_text:
+                url = await _tts_service.generate_greeting(
+                    text=greeting_text,
+                    voice_id=voice_id,
+                    agent_id=str(agent.id),
+                )
+                if url:
+                    new_cfg = dict(agent.agent_config)
+                    new_cfg["voice_greeting_url"] = url
+                    agent.agent_config = new_cfg
+                    tts_updated = True
+                    logger.info("voice_greeting_regenerated", agent_id=str(agent.id), url=url)
+
+        # Regenerate IVR audio when ivr_language_prompt changed
+        if "ivr_language_prompt" in update_data or (
+            "agent_config" in body.model_dump(exclude_unset=True)
+            and "ivr_language_prompt" in (body.agent_config or {})
+        ):
+            ivr_text = cfg.get("ivr_language_prompt")
+            if ivr_text:
+                url = await _tts_service.generate_ivr_prompt(
+                    text=ivr_text,
+                    voice_id=voice_id,
+                    agent_id=str(agent.id),
+                )
+                if url:
+                    new_cfg = dict(agent.agent_config)
+                    new_cfg["ivr_language_url"] = url
+                    agent.agent_config = new_cfg
+                    tts_updated = True
+                    logger.info("ivr_prompt_regenerated", agent_id=str(agent.id), url=url)
+
+        if tts_updated:
+            await db.commit()
+            await db.refresh(agent)
+
     return await _agent_to_response(agent, db)
 
 

@@ -204,6 +204,7 @@ async def instantiate_template(
     system_prompt_template: str | None = None
     playbooks_data: list[dict] = []
     tools_data: list[dict] = []
+    var_defs: dict[str, dict] = {}   # keyed by variable key, holds label/type
 
     async with AsyncSessionLocal() as catalog_db:
         version_res = await catalog_db.execute(
@@ -222,6 +223,18 @@ async def instantiate_template(
         # Snapshot everything into plain Python structures while session is open
         system_prompt_template = version.system_prompt_template
         version_id = version.id
+
+        # Snapshot template variable definitions for use as AgentVariable labels
+        from app.models.template import TemplateVariable
+        tvar_res = await catalog_db.execute(
+            select(TemplateVariable).where(TemplateVariable.template_id == t_uuid)
+        )
+        for tvar in tvar_res.scalars().all():
+            var_defs[tvar.key] = {
+                "label": tvar.label,
+                "type": tvar.type,
+                "required": tvar.is_required,
+            }
 
         for pbook in version.playbooks:
             playbook_config = dict(pbook.config) if pbook.config else {}
@@ -390,20 +403,9 @@ async def instantiate_template(
     # Sync template variable_values → agent_variables table so they are
     # visible and editable on the Variables page in the UI.
     # Skip internal routing keys that have no meaning as runtime variables.
+    # var_defs was populated inside the catalog_db block above.
     # ------------------------------------------------------------------
     _SKIP_VARIABLE_KEYS = {"business_type", "language"}
-
-    # Fetch the template's variable definitions so we can copy labels/types
-    var_defs: dict[str, dict] = {}
-    for ver_data in playbooks_data:  # reuse already-loaded catalog data
-        break  # just need the version; template vars are in version.variables
-    # Re-query from the already-detached template_vars_data (stored earlier)
-    for tvar in getattr(version, "variables", []) if hasattr(version, "variables") else []:
-        var_defs[tvar.key] = {
-            "label": tvar.label,
-            "type": tvar.type,
-            "required": tvar.is_required,
-        }
 
     # Delete any existing template-sourced variables before re-seeding so
     # re-instantiation (e.g., after variable edit) doesn't create duplicates.

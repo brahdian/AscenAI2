@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 import structlog
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -282,7 +282,6 @@ async def instantiate_template(
     # -----------------------------------------------------------------------
     # Delete the auto-generated default playbooks so template ones replace them
     # -----------------------------------------------------------------------
-    from sqlalchemy import delete
     await db.execute(
         delete(AgentPlaybook).where(
             AgentPlaybook.agent_id == agent.id,
@@ -350,7 +349,6 @@ async def instantiate_template(
         logger.info("template_playbook_added", name=pbook["name"], agent_id=str(agent.id))
 
     # Update existing Guardrails, or create if missing
-    from sqlalchemy import select
     gr_res = await db.execute(select(AgentGuardrails).where(AgentGuardrails.agent_id == agent.id))
     guardrails = gr_res.scalar_one_or_none()
     

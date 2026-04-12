@@ -61,15 +61,47 @@ class SessionBillingService:
 
         agent_cfg = agent.agent_config or {}
         is_voice = (
-            getattr(agent, "channel", None) == "voice"
-            or (agent_cfg.get("channel") == "voice")
+            agent.voice_enabled
+            or getattr(agent, "channel", None) == "voice"
+            or agent_cfg.get("channel") == "voice"
         )
 
         if is_voice:
-            # For voice agents the opening is delivered verbatim by the client TTS engine.
-            # Use the cached value when available (computed once and stored in agent_config).
-            from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
-            greeting, _, _ = await get_or_compute_voice_strings(self.db, agent)
+            # For voice agents:
+            # 1. Prefer a pre-generated audio URL (voice_greeting_url) — the client
+            #    plays the file directly without any new TTS call.
+            # 2. Fall back to the cached text greeting (computed from supported_languages).
+            #    The client TTS engine speaks it verbatim.
+            # 3. If neither is set, fall back to a generic default greeting.
+            voice_greeting_url = agent_cfg.get("voice_greeting_url")
+            if voice_greeting_url:
+                # Use the greeting_message text as the conversation record, but tag
+                # it with the pre-generated audio URL so the client can play the file.
+                greeting_text = agent_cfg.get("greeting_message") or ""
+                # Store the audio URL in session metadata so the voice client knows
+                # to play the pre-generated file instead of running live TTS.
+                new_meta = dict(session.metadata_ or {})
+                new_meta["_voice_greeting_url"] = voice_greeting_url
+                if agent_cfg.get("ivr_language_url"):
+                    new_meta["_ivr_language_url"] = agent_cfg["ivr_language_url"]
+                session.metadata_ = new_meta
+
+                if not greeting_text:
+                    # No text for context — derive a generic placeholder
+                    greeting_text = f"[Pre-generated greeting audio: {voice_greeting_url}]"
+                greeting = greeting_text
+            else:
+                # No pre-generated file — use cached text computed from supported_languages.
+                from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
+                greeting, _, _ = await get_or_compute_voice_strings(self.db, agent)
+
+            # Ensure voice agents always have a greeting (platform requirement).
+            if not greeting:
+                greeting = f"Thank you for calling. How can I assist you today?"
+                logger.warning(
+                    "voice_agent_missing_greeting_fallback",
+                    agent_id=str(agent.id),
+                )
         else:
             greeting = agent_cfg.get("greeting_message") or getattr(agent, "greeting_message", None)
 

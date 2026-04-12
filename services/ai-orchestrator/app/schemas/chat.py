@@ -9,10 +9,22 @@ MAX_LIST_ITEMS = 500
 
 class StrictAgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    
+
     tone: Optional[str] = None
     instructions: Optional[str] = None
     greeting_message: Optional[str] = None
+    # IVR language-selection prompt: text shown in the UI and used to generate
+    # the ivr_language_url audio file.  E.g. "For English press 1, pour le
+    # français appuyez sur 2."
+    ivr_language_prompt: Optional[str] = Field(
+        default=None,
+        description="Text for the IVR language-selection prompt. Auto-generates ivr_language_url on save.",
+    )
+    # CDN URL for the pre-generated IVR language-selection audio file.
+    ivr_language_url: Optional[str] = Field(
+        default=None,
+        description="CDN URL for the TTS-generated IVR language prompt audio.",
+    )
     supported_languages: Optional[list[str]] = Field(default_factory=list)
     auto_detect_language: Optional[bool] = False
     voice_greeting_url: Optional[str] = None
@@ -142,7 +154,14 @@ class AgentCreate(BaseModel):
     auto_detect_language: bool = False
     supported_languages: list[str] = Field(default_factory=list)
     greeting_message: Optional[str] = Field(None, max_length=1000)
+    # IVR language-selection prompt text (auto-generates ivr_language_url on save)
+    ivr_language_prompt: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="IVR language-selection prompt. TTS audio is auto-generated on create/update.",
+    )
     voice_greeting_url: Optional[str] = None
+    ivr_language_url: Optional[str] = None
     voice_system_prompt: Optional[str] = None
     tools: list[str] = Field(default_factory=list)
     knowledge_base_ids: list[str] = Field(default_factory=list)
@@ -159,13 +178,13 @@ class AgentCreate(BaseModel):
             return {}
         if not isinstance(v, dict):
             raise ValueError("agent_config must be a dictionary")
-        
+
         # Phase 6: Strict JSONB schema validation
         try:
             validated = StrictAgentConfig(**v)
         except ValidationError as e:
             raise ValueError(f"Strict agent_config validation failed: {e}")
-            
+
         return validated.model_dump(exclude_unset=True)
 
 
@@ -185,7 +204,14 @@ class AgentUpdate(BaseModel):
     auto_detect_language: Optional[bool] = None
     supported_languages: Optional[list[str]] = None
     greeting_message: Optional[str] = Field(None, max_length=1000)
+    # IVR language-selection prompt text (auto-generates ivr_language_url on save)
+    ivr_language_prompt: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="IVR language-selection prompt. TTS audio is auto-generated on create/update.",
+    )
     voice_greeting_url: Optional[str] = None
+    ivr_language_url: Optional[str] = None
     voice_system_prompt: Optional[str] = None
     tools: Optional[list[str]] = None
     knowledge_base_ids: Optional[list[str]] = None
@@ -202,13 +228,13 @@ class AgentUpdate(BaseModel):
             return None
         if not isinstance(v, dict):
             raise ValueError("agent_config must be a dictionary")
-            
+
         # Phase 6: Strict JSONB schema validation
         try:
             validated = StrictAgentConfig(**v)
         except ValidationError as e:
             raise ValueError(f"Strict agent_config validation failed: {e}")
-            
+
         return validated.model_dump(exclude_unset=True)
 
 
@@ -227,7 +253,10 @@ class AgentResponse(BaseModel):
     auto_detect_language: bool = False
     supported_languages: list[str] = []
     greeting_message: Optional[str] = None
+    # IVR language-selection prompt text and its pre-generated TTS audio URL
+    ivr_language_prompt: Optional[str] = None
     voice_greeting_url: Optional[str] = None
+    ivr_language_url: Optional[str] = None
     voice_system_prompt: Optional[str] = None
     computed_greeting: Optional[str] = None
     computed_protocol: Optional[str] = None

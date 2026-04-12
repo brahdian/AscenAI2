@@ -89,44 +89,14 @@ export default function NewAgentPage() {
     const agentIdParam = searchParams.get('agent_id')
 
     if (agentIdParam) {
-      // PATH A: Agent was created as an inactive draft before Stripe redirect.
-      // The webhook (checkout.session.completed) will activate it via the
-      // orchestrator, but as a UI fallback we also PATCH is_active=true here.
-      // IMPORTANT: also consume any pending template from sessionStorage so
-      // the template is instantiated even when payment is required.
+      // PATH A: Draft agent was created before the Stripe redirect; template was
+      // instantiated before the redirect too (see onError handler). All that's left
+      // is to mark the agent active and navigate to it.
       toast.loading('Payment confirmed! Activating your agent...', { id: 'post-payment' })
-
-      // Consume pending template config before any async work
-      let pendingTemplate: { template_id?: string; template_version_id?: string; variables?: Record<string, any>; name?: string; business_type?: string; language?: string } | null = null
-      const pendingRawA = sessionStorage.getItem('ascenai_pending_agent')
-      if (pendingRawA) {
-        try {
-          pendingTemplate = JSON.parse(pendingRawA)
-        } catch { /* ignore malformed data */ }
-        sessionStorage.removeItem('ascenai_pending_agent')
-      }
+      sessionStorage.removeItem('ascenai_pending_agent')
 
       agentsApi.update(agentIdParam, { is_active: true })
-        .then(async () => {
-          // Instantiate template if one was selected before the payment redirect
-          if (pendingTemplate?.template_id && pendingTemplate?.template_version_id) {
-            try {
-              await templatesApi.instantiate(pendingTemplate.template_id, {
-                agent_id: agentIdParam,
-                template_version_id: pendingTemplate.template_version_id,
-                variable_values: {
-                  ...(pendingTemplate.variables || {}),
-                  business_name: pendingTemplate.name || '',
-                  business_type: pendingTemplate.business_type || 'generic',
-                  language: pendingTemplate.language || 'en',
-                },
-                tool_configs: {},
-              })
-            } catch (err) {
-              // Template failed but agent is already active — log and continue
-              console.error('Template instantiation failed after payment activation', err)
-            }
-          }
+        .then(() => {
           toast.success('Agent is now active!', { id: 'post-payment' })
           qc.invalidateQueries({ queryKey: ['agents'] })
           qc.invalidateQueries({ queryKey: ['billing-overview'] })
@@ -293,27 +263,56 @@ export default function NewAgentPage() {
       toast.success('Agent deployed successfully!')
       router.push(`/dashboard/agents/${agent.id}`)
     },
-    onError: (err: any) => {
+    onError: async (err: any) => {
       if (err?.response?.status === 402 && err?.response?.data?.detail?.payment_url) {
-        // Store the pending agent config so we can create the agent after payment
-        const pendingConfig = {
+        const draftAgentId: string | undefined = err.response.data.detail.agent_id
+        const paymentUrl: string = err.response.data.detail.payment_url
+
+        if (draftAgentId && selectedTemplate && selectedTemplate.versions?.length > 0) {
+          // Draft agent already exists (Gate 2: slot limit). Instantiate the template
+          // NOW — before the Stripe redirect — so playbooks are set up regardless of
+          // what happens on return. PATH A only needs to activate the agent.
+          const latestVersion = [...selectedTemplate.versions].sort((a: any, b: any) => b.version - a.version)[0]
+          try {
+            toast.loading('Setting up your agent...', { id: 'pre-payment-setup' })
+            await templatesApi.instantiate(selectedTemplate.id, {
+              agent_id: draftAgentId,
+              template_version_id: latestVersion.id,
+              variable_values: {
+                ...variables,
+                business_name: agentName,
+                business_type: selectedTemplate?.category || 'generic',
+                language: language,
+              },
+              tool_configs: {},
+            })
+          } catch (instantiateErr) {
+            console.error('Template instantiation failed before payment redirect', instantiateErr)
+          } finally {
+            toast.dismiss('pre-payment-setup')
+          }
+        }
+
+        // Save pending config for PATH B (Gate 1: no subscription — no draft agent yet).
+        // Only include template fields if there's no draft agent (template not yet applied).
+        const pendingConfig: Record<string, any> = {
           name: agentName,
           description,
           business_type: selectedTemplate?.category || 'generic',
           language,
           voice_enabled: voiceEnabled,
-          is_active: true, // Agent will be created active after payment is confirmed
-          
-          // Store template details so Path B can instantiate it
-          template_id: selectedTemplate?.id || null,
-          template_version_id: selectedTemplate?.versions?.length
+          is_active: true,
+        }
+        if (!draftAgentId && selectedTemplate) {
+          pendingConfig.template_id = selectedTemplate.id
+          pendingConfig.template_version_id = selectedTemplate.versions?.length
             ? [...selectedTemplate.versions].sort((a: any, b: any) => b.version - a.version)[0]?.id
-            : null,
-          variables: variables,
+            : null
+          pendingConfig.variables = variables
         }
         sessionStorage.setItem('ascenai_pending_agent', JSON.stringify(pendingConfig))
         toast.loading('Redirecting to Stripe for payment...', { duration: 2000 })
-        setTimeout(() => { window.location.href = err.response.data.detail.payment_url }, 1000)
+        setTimeout(() => { window.location.href = paymentUrl }, 1000)
         return
       }
       const detail = err?.response?.data?.detail

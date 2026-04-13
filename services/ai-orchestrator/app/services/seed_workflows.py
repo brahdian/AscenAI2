@@ -4,8 +4,8 @@ These are platform-level workflow templates stored as inactive workflows
 under a special system tenant. Operators can clone these, assign them to
 agents, and activate them.
 
-Idempotent — safe to call on every startup. Workflows are identified by slug;
-an existing row is updated if the definition has changed.
+Idempotent — safe to call on every startup. Each prebuilt has a fixed UUID
+that never changes across deployments; lookup is by that UUID, not by name.
 
 Prebuilt workflows
 ------------------
@@ -23,10 +23,18 @@ from app.core.database import AsyncSessionLocal
 
 logger = structlog.get_logger(__name__)
 
-# System tenant UUID — used for platform-level prebuilt workflows.
-# This UUID is fixed and never changes across deployments.
+# System tenant/agent UUIDs — fixed, never change across deployments.
 _SYSTEM_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 _SYSTEM_AGENT_ID  = "00000000-0000-0000-0000-000000000001"
+
+# Fixed UUIDs for each prebuilt workflow — used for idempotent upsert.
+# These never change; altering them would create duplicate rows on next boot.
+_PREBUILT_IDS = {
+    "appointment_payment": "10000000-0000-0000-0000-000000000001",
+    "lead_qualification":  "10000000-0000-0000-0000-000000000002",
+    "support_ticket":      "10000000-0000-0000-0000-000000000003",
+    "order_placement":     "10000000-0000-0000-0000-000000000004",
+}
 
 
 _PREBUILTS = [
@@ -34,7 +42,7 @@ _PREBUILTS = [
     # 1. Appointment Booking with Payment
     # ------------------------------------------------------------------
     {
-        "slug": "appointment_payment",
+        "prebuilt_key": "appointment_payment",
         "name": "Appointment Booking with Payment",
         "description": (
             "Books an appointment for a customer, collects payment via Stripe, "
@@ -181,7 +189,7 @@ _PREBUILTS = [
     # 2. Lead Qualification
     # ------------------------------------------------------------------
     {
-        "slug": "lead_qualification",
+        "prebuilt_key": "lead_qualification",
         "name": "Lead Qualification",
         "description": (
             "Qualifies a sales lead by collecting contact info, budget, and timeline. "
@@ -272,7 +280,7 @@ _PREBUILTS = [
     # 3. Support Ticket Creation
     # ------------------------------------------------------------------
     {
-        "slug": "support_ticket",
+        "prebuilt_key": "support_ticket",
         "name": "Support Ticket Creation",
         "description": (
             "Creates a support ticket when a customer reports an issue. "
@@ -351,7 +359,7 @@ _PREBUILTS = [
     # 4. Order Placement
     # ------------------------------------------------------------------
     {
-        "slug": "order_placement",
+        "prebuilt_key": "order_placement",
         "name": "Order Placement",
         "description": (
             "Collects customer order details (items, quantities, delivery address) "
@@ -450,11 +458,11 @@ async def seed_prebuilt_workflows() -> None:
     async with AsyncSessionLocal() as db:
         try:
             for defn in _PREBUILTS:
+                key = defn["prebuilt_key"]
+                fixed_id = _uuid.UUID(_PREBUILT_IDS[key])
+
                 existing = await db.scalar(
-                    select(Workflow).where(
-                        Workflow.tenant_id == system_tenant,
-                        Workflow.slug == defn["slug"],
-                    )
+                    select(Workflow).where(Workflow.id == fixed_id)
                 )
                 if existing:
                     # Update definition if it changed (version bump)
@@ -465,14 +473,14 @@ async def seed_prebuilt_workflows() -> None:
                     existing.output_schema= defn["output_schema"]
                     existing.tags         = defn["tags"]
                     existing.version     += 1
-                    logger.info("prebuilt_workflow_updated", slug=defn["slug"])
+                    logger.info("prebuilt_workflow_updated", workflow_id=str(fixed_id), key=key)
                 else:
                     wf = Workflow(
+                        id            = fixed_id,
                         agent_id      = system_agent,
                         tenant_id     = system_tenant,
                         name          = defn["name"],
                         description   = defn["description"],
-                        slug          = defn["slug"],
                         definition    = defn["definition"],
                         input_schema  = defn["input_schema"],
                         output_schema = defn["output_schema"],
@@ -481,7 +489,7 @@ async def seed_prebuilt_workflows() -> None:
                         version       = 1,
                     )
                     db.add(wf)
-                    logger.info("prebuilt_workflow_created", slug=defn["slug"])
+                    logger.info("prebuilt_workflow_created", workflow_id=str(fixed_id), key=key)
 
             await db.commit()
             logger.info("prebuilt_workflows_seeded", count=len(_PREBUILTS))

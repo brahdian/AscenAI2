@@ -104,7 +104,6 @@ class ExecutionStatusEnum(str, enum.Enum):
 class WorkflowCreate(BaseModel):
     name: str = Field(..., max_length=255)
     description: str = ""
-    slug: str = Field(..., max_length=255, pattern=r"^[a-z0-9_-]+$")
     definition: WorkflowDefinition
     input_schema: dict = Field(default_factory=dict)
     output_schema: dict = Field(default_factory=dict)
@@ -126,7 +125,6 @@ class WorkflowResponse(BaseModel):
     tenant_id: uuid.UUID
     name: str
     description: str
-    slug: str
     is_active: bool
     version: int
     definition: dict

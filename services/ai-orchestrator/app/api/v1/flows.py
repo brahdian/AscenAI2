@@ -111,22 +111,11 @@ async def create_workflow(
     try:
         await _get_agent_or_404(db, agent_id, tid)
 
-        # Validate slug uniqueness for this tenant
-        existing = await db.scalar(
-            select(Workflow).where(
-                Workflow.tenant_id == tid,
-                Workflow.slug == body.slug,
-            )
-        )
-        if existing:
-            raise HTTPException(status_code=409, detail=f"Slug '{body.slug}' already exists for this tenant.")
-
         wf = Workflow(
             agent_id=agent_id,
             tenant_id=tid,
             name=body.name,
             description=body.description,
-            slug=body.slug,
             definition=body.definition.model_dump(),
             input_schema=body.input_schema,
             output_schema=body.output_schema,

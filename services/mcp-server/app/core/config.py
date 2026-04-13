@@ -90,6 +90,10 @@ class Settings(BaseSettings):
             )
         return v
 
+    # Internal service URLs
+    AI_ORCHESTRATOR_URL: str = "http://ai-orchestrator:8000"
+    INTERNAL_API_KEY: str = ""
+
     # Observability
     PROMETHEUS_ENABLED: bool = True
     SENTRY_DSN: Optional[str] = None

@@ -22,10 +22,13 @@ import json
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_db
 from app.integrations.webhooks.bus import get_event_bus
 from app.integrations.webhooks.normalizer import (
+    EventType,
     normalize,
     verify_calendly_signature,
     verify_stripe_signature,
@@ -60,9 +63,21 @@ def _resolve_tenant_from_metadata(metadata: dict) -> Optional[str]:
 # Stripe
 # ---------------------------------------------------------------------------
 
+async def _load_tenant_config(tenant_id) -> dict:
+    """Load tenant config dict for a given tenant_id.
+
+    In production this would query the tenant's agent configuration from the DB.
+    We return an empty dict here so downstream code gracefully degrades; the
+    booking provider registry falls back to "builtin" for unknown providers.
+    """
+    # TODO: integrate with the actual tenant config store
+    return {}
+
+
 @router.post("/stripe", status_code=200)
 async def stripe_webhook(
     request: Request,
+    db: AsyncSession = Depends(get_db),
     stripe_signature: Optional[str] = Header(None, alias="stripe-signature"),
 ) -> dict:
     """Ingest a Stripe event, verify signature, normalize, publish to event bus."""
@@ -103,6 +118,18 @@ async def stripe_webhook(
     # ── 5. Publish to event bus ────────────────────────────────────────
     bus = get_event_bus(_get_redis(request))
     await bus.publish(internal_event)
+
+    # ── 6. Drive booking workflow on payment completion ────────────────
+    if internal_event.event_type == EventType.PAYMENT_COMPLETED:
+        payment_intent_id = internal_event.payload.get("payment_id")
+        if payment_intent_id:
+            from app.api.v1.payment_webhook_handler import handle_payment_completed
+            await handle_payment_completed(
+                db=db,
+                payment_intent_id=payment_intent_id,
+                stripe_event_id=internal_event.idempotency_key,
+                tenant_config_loader=_load_tenant_config,
+            )
 
     logger.info(
         "stripe_webhook_processed",

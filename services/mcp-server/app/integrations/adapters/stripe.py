@@ -108,17 +108,25 @@ class StripeAdapter(BaseAdapter):
         idempotency_key = params.get("idempotency_key")
 
         try:
+            # Build per-call idempotency keys so retries are safe.
+            # price key and link key must be different — they create different objects.
+            price_idem = f"{idempotency_key}:price" if idempotency_key else None
+            link_idem = f"{idempotency_key}:link" if idempotency_key else None
+
             # 1. Create an inline Price via a Product
+            price_kwargs: dict[str, Any] = {
+                "params": {
+                    "unit_amount": amount_cents,
+                    "currency": currency,
+                    "product_data": {"name": description},
+                },
+            }
+            if price_idem:
+                price_kwargs["options"] = {"idempotency_key": price_idem}
+
             price: dict = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: client.prices.create(
-                    params={
-                        "unit_amount": amount_cents,
-                        "currency": currency,
-                        "product_data": {"name": description},
-                    },
-                    **({"stripe_version": "2024-06-20"} if idempotency_key else {}),
-                ),
+                lambda: client.prices.create(**price_kwargs),
             )
 
             # 2. Create Payment Link
@@ -128,12 +136,17 @@ class StripeAdapter(BaseAdapter):
             if params.get("customer_email"):
                 # pre-fill customer email on checkout
                 link_params["customer_creation"] = "always"
+            # Store workflow metadata for webhook routing
+            if params.get("metadata"):
+                link_params["metadata"] = params["metadata"]
+
+            link_kwargs: dict[str, Any] = {"params": link_params}
+            if link_idem:
+                link_kwargs["options"] = {"idempotency_key": link_idem}
 
             payment_link: dict = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: client.payment_links.create(
-                    params=link_params,
-                ),
+                lambda: client.payment_links.create(**link_kwargs),
             )
 
         except Exception as exc:

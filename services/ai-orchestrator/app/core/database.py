@@ -206,6 +206,25 @@ async def init_db() -> None:
         await conn.execute(_t("ALTER TABLE messages ADD COLUMN IF NOT EXISTS playbook_name VARCHAR(255)"))
         await conn.execute(_t("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sources JSONB"))
 
+        # Workflow engine — create execution_status and step_status ENUM types
+        await conn.execute(_t("""
+            DO $$ BEGIN
+                CREATE TYPE execution_status AS ENUM (
+                    'RUNNING','AWAITING_INPUT','AWAITING_EVENT',
+                    'COMPLETED','FAILED','EXPIRED'
+                );
+            EXCEPTION WHEN duplicate_object THEN null;
+            END $$
+        """))
+        await conn.execute(_t("""
+            DO $$ BEGIN
+                CREATE TYPE step_status AS ENUM (
+                    'RUNNING','COMPLETED','FAILED','SKIPPED'
+                );
+            EXCEPTION WHEN duplicate_object THEN null;
+            END $$
+        """))
+
         # Agent lifecycle state machine — add status column if not present
         await conn.execute(_t(
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'active'"

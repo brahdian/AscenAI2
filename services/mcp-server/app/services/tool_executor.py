@@ -284,7 +284,12 @@ class ToolExecutor:
 
         try:
             result_data = await asyncio.wait_for(
-                self._dispatch(tool, tool_call.parameters),
+                self._dispatch(
+                    tool,
+                    tool_call.parameters,
+                    session_id=tool_call.session_id,
+                    tenant_id=tenant_id,
+                ),
                 timeout=float(timeout),
             )
         except asyncio.TimeoutError:
@@ -385,7 +390,12 @@ class ToolExecutor:
 
         try:
             result_data = await asyncio.wait_for(
-                self._dispatch(tool, tool_call.parameters),
+                self._dispatch(
+                    tool,
+                    tool_call.parameters,
+                    session_id=tool_call.session_id,
+                    tenant_id=tenant_id,
+                ),
                 timeout=float(timeout),
             )
         except asyncio.TimeoutError:
@@ -426,10 +436,18 @@ class ToolExecutor:
     # Dispatching
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, tool: Tool, parameters: dict) -> dict:
+    async def _dispatch(
+        self,
+        tool: Tool,
+        parameters: dict,
+        session_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> dict:
         """Route to built-in or HTTP executor based on tool type."""
         if tool.is_builtin:
-            return await self._execute_builtin_tool(tool, parameters)
+            return await self._execute_builtin_tool(
+                tool, parameters, session_id=session_id, tenant_id=tenant_id
+            )
         if tool.endpoint_url:
             return await self._execute_http_tool(tool, parameters)
         raise ValueError(
@@ -458,16 +476,35 @@ class ToolExecutor:
             response.raise_for_status()
             return response.json()
 
-    async def _execute_builtin_tool(self, tool: Tool, parameters: dict) -> dict:
+    async def _execute_builtin_tool(
+        self,
+        tool: Tool,
+        parameters: dict,
+        session_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> dict:
         """Execute a platform built-in tool handler.
 
         Dispatch order:
-          1. Try the new MCP adapter registry (provider-isolated, SDK-backed).
-          2. Fall back to the legacy handler dict for tools not yet migrated.
+          1. wf:* tool names → WorkflowExecutor (general-purpose workflow engine).
+          2. Try the new MCP adapter registry (provider-isolated, SDK-backed).
+          3. Fall back to the legacy handler dict for tools not yet migrated.
 
         Integration tools (calendar, Stripe, etc.) read their credentials from
         tool.tool_metadata, which is set per-tenant via the tools UI.
         """
+        # ── Workflow engine dispatch (wf:* tools) ──────────────────────
+        if tool.name.startswith("wf:"):
+            from app.services.workflow_executor import execute_workflow_tool
+            return await execute_workflow_tool(
+                tool_name=tool.name,
+                parameters=parameters,
+                tool_metadata=tool.tool_metadata or {},
+                session_id=session_id or "",
+                tenant_id=tenant_id or str(tool.tenant_id),
+                agent_id=(tool.tool_metadata or {}).get("agent_id"),
+            )
+
         from app.integrations.base import ACTION_REGISTRY
         from app.integrations.errors import IntegrationException
 

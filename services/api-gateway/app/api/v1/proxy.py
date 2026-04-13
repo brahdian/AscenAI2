@@ -153,6 +153,7 @@ _SERVICE_MAP = {
     "templates": settings.AI_ORCHESTRATOR_URL,
     "playbooks": settings.AI_ORCHESTRATOR_URL,
     "guardrails": settings.AI_ORCHESTRATOR_URL,
+    "flows": settings.AI_ORCHESTRATOR_URL,
     "tools": settings.MCP_SERVER_URL,
     "context": settings.MCP_SERVER_URL,
     "voice": settings.VOICE_PIPELINE_URL,
@@ -166,7 +167,7 @@ _STRIP_FROM_CHAT = frozenset(["system_prompt", "system", "instructions"])
 
 
 # Services that are mounted under /agents in the AI Orchestrator
-_AGENT_BASED_SERVICES = frozenset(["playbooks", "guardrails"])
+_AGENT_BASED_SERVICES = frozenset(["playbooks", "guardrails", "flows"])
 
 def _get_downstream_url(service: str, path: str) -> str:
     # Map playbooks and guardrails to agents service (they're mounted under /agents in orchestrator)

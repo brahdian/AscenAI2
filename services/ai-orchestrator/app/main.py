@@ -77,6 +77,7 @@ from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import internal as internal_router
 from app.api.v1 import replay as replay_router
+from app.api.v1 import flows as flows_router
 from app.api.v1 import evals as evals_router
 from app.api.v1 import prompt_versions as prompt_versions_router
 from app.api.v1 import templates as templates_router
@@ -106,6 +107,13 @@ async def lifespan(app: FastAPI):
         await seed_templates()
     except Exception as exc:
         logger.error("seed_templates_error", error=str(exc))
+
+    # Seed prebuilt workflow definitions (idempotent)
+    try:
+        from app.services.seed_workflows import seed_prebuilt_workflows
+        await seed_prebuilt_workflows()
+    except Exception as exc:
+        logger.error("seed_workflows_error", error=str(exc))
 
     # Initialize Redis
     redis_client = await init_redis()
@@ -306,6 +314,7 @@ app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"
 app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
 app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
+app.include_router(flows_router.router, prefix="/api/v1/agents", tags=["flows"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

@@ -2,7 +2,7 @@
 
 When an operator activates a workflow, this registry writes/updates a row in
 the mcp-server's `mcp_tools` table with:
-  name        = "wf:{workflow.slug}"
+  name        = "wf:{workflow.id}"
   description = workflow.description   (what the LLM sees as tool description)
   input_schema = workflow.input_schema
   is_builtin  = True
@@ -45,8 +45,8 @@ class WorkflowRegistry:
     # ------------------------------------------------------------------
 
     async def register(self, workflow: Workflow) -> None:
-        """Upsert the wf:<slug> tool entry in the mcp-server."""
-        tool_name = f"wf:{workflow.slug}"
+        """Upsert the wf:<id> tool entry in the mcp-server."""
+        tool_name = f"wf:{workflow.id}"
         payload = {
             "name": tool_name,
             "description": workflow.description or f"Workflow: {workflow.name}",
@@ -61,8 +61,8 @@ class WorkflowRegistry:
         logger.info("workflow_tool_registered", tool_name=tool_name, workflow_id=str(workflow.id))
 
     async def deregister(self, workflow: Workflow) -> None:
-        """Soft-deactivate the wf:<slug> tool entry in the mcp-server."""
-        tool_name = f"wf:{workflow.slug}"
+        """Soft-deactivate the wf:<id> tool entry in the mcp-server."""
+        tool_name = f"wf:{workflow.id}"
         payload = {
             "name": tool_name,
             "is_active": False,
@@ -85,7 +85,7 @@ class WorkflowRegistry:
         workflows = result.scalars().all()
         return [
             {
-                "name": f"wf:{wf.slug}",
+                "name": f"wf:{wf.id}",
                 "description": wf.description,
                 "category": "workflow",
                 "input_schema": wf.input_schema,

@@ -14,7 +14,9 @@ Design principles
   AWAITING_INPUT | AWAITING_EVENT → COMPLETED | FAILED | EXPIRED.
 * WorkflowStepExecution.idempotency_key (execution_id:node_id) makes
   every node execution idempotent — safe to re-run on crash/replay.
-* Active workflows auto-register as wf:<slug> MCP tools via WorkflowRegistry.
+* Active workflows auto-register as wf:<id> MCP tools via WorkflowRegistry.
+* The workflow UUID is the stable, immutable, globally-unique tool identifier.
+  MCP tool name = wf:{workflow.id}. No slug — use name/description for display.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
+    UniqueConstraint,  # still used by WorkflowStepExecution and WorkflowEvent
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -75,11 +77,11 @@ class StepStatus(str, enum.Enum):
 class Workflow(Base):
     """Immutable-ish workflow definition (bumps version on update).
 
-    Activate to register as an LLM-callable MCP tool: wf:<slug>.
+    Activate to register as an LLM-callable MCP tool: wf:<id>.
+    The UUID is the canonical, immutable, globally-unique tool identifier.
     """
     __tablename__ = "workflows"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "slug", name="uq_wf_tenant_slug"),
         Index("ix_wf_agent_active", "agent_id", "is_active"),
         Index("ix_wf_tenant_id", "tenant_id"),
     )
@@ -97,8 +99,6 @@ class Workflow(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # Shown to the LLM as the tool description when is_active=True
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # URL-safe identifier — becomes the MCP tool name: wf:<slug>
-    slug: Mapped[str] = mapped_column(String(255), nullable=False)
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Bumped on every PUT — executions pin to the version at creation time
@@ -129,7 +129,7 @@ class Workflow(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<Workflow id={self.id!s:.8} slug={self.slug} "
+            f"<Workflow id={self.id!s:.8} name={self.name!r} "
             f"active={self.is_active} v={self.version}>"
         )
 

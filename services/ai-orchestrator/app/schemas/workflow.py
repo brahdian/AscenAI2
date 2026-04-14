@@ -23,7 +23,9 @@ class NodeType(str, enum.Enum):
     INPUT          = "INPUT"           # Prompt user, collect variable
     SET_VARIABLE   = "SET_VARIABLE"    # Assign/transform a variable
     VALIDATION     = "VALIDATION"      # Validate var against rule; branch pass/fail
-    CONDITION      = "CONDITION"       # Boolean branch (if/else)
+    CONDITION      = "CONDITION"       # Boolean if/else branch
+    SWITCH         = "SWITCH"          # N-way branch on variable value (like match/case)
+    FOR_EACH       = "FOR_EACH"        # Iterate over a list; run body nodes per item
     TOOL_CALL      = "TOOL_CALL"       # Execute any registered MCP tool
     LLM_CALL       = "LLM_CALL"        # Call LLM with prompt template
     ACTION         = "ACTION"          # HTTP API call to external endpoint
@@ -108,6 +110,11 @@ class WorkflowCreate(BaseModel):
     input_schema: dict = Field(default_factory=dict)
     output_schema: dict = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
+    trigger_type: str = Field(
+        default="none",
+        description="none | cron | webhook | event",
+    )
+    trigger_config: dict = Field(default_factory=dict)
 
 
 class WorkflowUpdate(BaseModel):
@@ -117,6 +124,8 @@ class WorkflowUpdate(BaseModel):
     input_schema: Optional[dict] = None
     output_schema: Optional[dict] = None
     tags: Optional[list[str]] = None
+    trigger_type: Optional[str] = None
+    trigger_config: Optional[dict] = None
 
 
 class WorkflowResponse(BaseModel):
@@ -125,6 +134,8 @@ class WorkflowResponse(BaseModel):
     tenant_id: uuid.UUID
     name: str
     description: str
+    trigger_type: str
+    trigger_config: dict
     is_active: bool
     version: int
     definition: dict

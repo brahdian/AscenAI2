@@ -131,6 +131,23 @@ async def stripe_webhook(
                 tenant_config_loader=_load_tenant_config,
             )
 
+    # ── 7. Forward to shared event bus (ai-orchestrator workflow triggers) ──
+    # Both services share Redis — publish to the cross-service event channel so
+    # automation workflows subscribed to e.g. "payment.completed" can react.
+    try:
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        _redis = _get_redis(request)
+        _msg = _json.dumps({
+            "event_type":    internal_event.event_type,
+            "tenant_id":     str(tenant_id) if tenant_id else "",
+            "payload":       internal_event.payload,
+            "published_at":  _dt.now(_tz.utc).isoformat(),
+        })
+        await _redis.publish("ascenai:events", _msg)
+    except Exception:
+        pass  # Never crash the webhook handler on bus failure
+
     logger.info(
         "stripe_webhook_processed",
         event_id=event.get("id"),

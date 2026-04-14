@@ -225,6 +225,14 @@ async def init_db() -> None:
             END $$
         """))
 
+        # Agent mode — "conversational" | "automation" | "hybrid"
+        await conn.execute(_t(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_mode VARCHAR(20) NOT NULL DEFAULT 'conversational'"
+        ))
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_agents_agent_mode ON agents (agent_mode)"
+        ))
+
         # Agent lifecycle state machine — add status column if not present
         await conn.execute(_t(
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'active'"

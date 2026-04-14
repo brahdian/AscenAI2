@@ -120,6 +120,8 @@ async def create_workflow(
             input_schema=body.input_schema,
             output_schema=body.output_schema,
             tags=body.tags,
+            trigger_type=body.trigger_type,
+            trigger_config=body.trigger_config,
             is_active=False,
             version=1,
         )
@@ -219,6 +221,10 @@ async def update_workflow(
             wf.output_schema = body.output_schema
         if body.tags is not None:
             wf.tags = body.tags
+        if body.trigger_type is not None:
+            wf.trigger_type = body.trigger_type
+        if body.trigger_config is not None:
+            wf.trigger_config = body.trigger_config
 
         wf.version += 1
 

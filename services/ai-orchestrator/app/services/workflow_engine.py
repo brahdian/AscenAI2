@@ -358,6 +358,8 @@ class WorkflowEngine:
             NodeType.SET_VARIABLE:  self._exec_set_variable,
             NodeType.VALIDATION:    self._exec_validation,
             NodeType.CONDITION:     self._exec_condition,
+            NodeType.SWITCH:        self._exec_switch,
+            NodeType.FOR_EACH:      self._exec_for_each,
             NodeType.TOOL_CALL:     self._exec_tool_call,
             NodeType.LLM_CALL:      self._exec_llm_call,
             NodeType.ACTION:        self._exec_action,
@@ -491,6 +493,135 @@ class WorkflowEngine:
         return NodeResult(
             output={"_condition_result": result_bool},
             next_node_id=self._resolve_next(edge_map, node.id, handle),
+        )
+
+    # -- SWITCH ---------------------------------------------------------------
+
+    async def _exec_switch(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+        edge_map: dict,
+        user_input: Optional[str],
+    ) -> NodeResult:
+        """N-way branch based on a variable value (match/case style).
+
+        Config
+        ------
+        variable      : context key to match against
+        cases         : [{"value": "book", "handle": "book"},
+                         {"value": "cancel", "handle": "cancel"}]
+        default_handle: edge handle used when no case matches (default: "default")
+
+        Edge convention — edges out of a SWITCH node use source_handle = the
+        case "handle" string, e.g. "book", "cancel", "reschedule", "default".
+        """
+        cfg = node.config
+        variable = cfg.get("variable", "")
+        value = str(execution.context.get(variable, "")).strip().lower()
+        cases: list[dict] = cfg.get("cases", [])
+        default_handle: str = cfg.get("default_handle", "default")
+
+        matched_handle = default_handle
+        for case in cases:
+            case_value = str(case.get("value", "")).strip().lower()
+            # Support exact match, list-of-values, or simple regex
+            case_match = case.get("match", "exact")
+            if case_match == "exact" and value == case_value:
+                matched_handle = case["handle"]
+                break
+            elif case_match == "contains" and case_value in value:
+                matched_handle = case["handle"]
+                break
+            elif case_match == "regex":
+                if re.search(case_value, value):
+                    matched_handle = case["handle"]
+                    break
+
+        return NodeResult(
+            output={"_switch_matched": matched_handle},
+            next_node_id=self._resolve_next(edge_map, node.id, matched_handle),
+        )
+
+    # -- FOR_EACH -------------------------------------------------------------
+
+    async def _exec_for_each(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+        edge_map: dict,
+        user_input: Optional[str],
+    ) -> NodeResult:
+        """Iterate over a list stored in context; run body nodes per item.
+
+        Config
+        ------
+        items_variable  : context key that holds the list to iterate
+        item_variable   : context key to inject per-iteration (default: "item")
+        index_variable  : context key to inject iteration index (default: "loop_index")
+        body_entry_node : first node ID of the loop body (must be in same workflow)
+        max_iterations  : safety cap (default: 50)
+
+        Execution model
+        ---------------
+        FOR_EACH is a meta-node: on each call it pops the next item off a
+        internal queue stored in context["_foreach_{node_id}_queue"], injects
+        item + index into context, and routes to body_entry_node. When the
+        queue is empty it routes to the "done" handle (post-loop edge).
+
+        The loop body eventually routes back to this FOR_EACH node via a
+        "loop_back" edge, which re-enters the handler for the next iteration.
+        This creates a cycle: FOR_EACH → body → ... → FOR_EACH → done.
+
+        Example edges:
+          {source: "for_each_1", target: "send_sms", source_handle: "body"}
+          {source: "for_each_1", target: "summarise", source_handle: "done"}
+        """
+        cfg = node.config
+        items_variable  = cfg.get("items_variable", "items")
+        item_variable   = cfg.get("item_variable", "item")
+        index_variable  = cfg.get("index_variable", "loop_index")
+        max_iterations  = int(cfg.get("max_iterations", 50))
+
+        queue_key   = f"_foreach_{node.id}_queue"
+        counter_key = f"_foreach_{node.id}_index"
+
+        # Initialise queue on first entry (queue_key not yet in context)
+        if queue_key not in execution.context:
+            items = execution.context.get(items_variable, [])
+            if not isinstance(items, list):
+                # Gracefully handle non-list (wrap scalar in list)
+                items = [items] if items else []
+            # Cap iterations for safety
+            items = items[:max_iterations]
+            execution.context = {
+                **execution.context,
+                queue_key:   list(items),   # mutable copy
+                counter_key: 0,
+            }
+
+        queue: list = list(execution.context.get(queue_key, []))
+        index: int  = int(execution.context.get(counter_key, 0))
+
+        if not queue:
+            # Queue exhausted — route to "done" handle
+            cleanup = {queue_key: [], counter_key: 0}
+            return NodeResult(
+                output=cleanup,
+                next_node_id=self._resolve_next(edge_map, node.id, "done"),
+            )
+
+        # Pop next item and inject into context
+        current_item = queue.pop(0)
+        updates = {
+            queue_key:    queue,
+            counter_key:  index + 1,
+            item_variable:  current_item,
+            index_variable: index,
+        }
+        return NodeResult(
+            output=updates,
+            next_node_id=self._resolve_next(edge_map, node.id, "body"),
         )
 
     # -- TOOL_CALL ------------------------------------------------------------

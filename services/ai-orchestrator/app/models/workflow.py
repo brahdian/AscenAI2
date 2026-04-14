@@ -115,6 +115,25 @@ class Workflow(Base):
     # Arbitrary tags for filtering: ["booking", "payment"]
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
 
+    # ── Trigger configuration ────────────────────────────────────────────────
+    # "none"    — triggered only by LLM tool call (default conversational flow)
+    # "cron"    — fired by WorkflowTriggerWorker on a schedule
+    # "webhook" — fired by POST /flows/{id}/trigger (HMAC-verified)
+    # "event"   — fired by internal event bus (e.g. "payment.completed")
+    trigger_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="none"
+    )
+    # {"schedule": "0 9 * * *", "timezone": "UTC"}         for cron
+    # {"webhook_secret": "whsec_..."}                       for webhook
+    # {"event": "payment.completed", "filter": {...}}       for event
+    trigger_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # ── Execution provenance (set on WorkflowExecution, mirrored here) ───────
+    # Informational: last_triggered_at for monitoring dashboards
+    last_triggered_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -178,6 +197,18 @@ class WorkflowExecution(Base):
 
     # Customer contact — stored for post-disconnect SMS automation
     customer_phone: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+
+    # How this execution was started
+    # "llm_tool_call" | "cron" | "webhook" | "event" | "manual_api"
+    trigger_source: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="llm_tool_call"
+    )
+
+    # Short opaque token for resuming AWAITING_EVENT executions from SMS replies.
+    # Format: "r-{8 random chars}". Stored in Redis: phone → execution_id (TTL).
+    resumption_token: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True, index=True
+    )
 
     # Current position in the DAG
     current_node_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

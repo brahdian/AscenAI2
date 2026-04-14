@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
-import secrets
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -35,54 +33,50 @@ logger = structlog.get_logger(__name__)
 
 _CRON_POLL_INTERVAL = 60       # seconds between cron checks
 _EVENT_CHANNEL      = "ascenai:events"   # Redis pub/sub channel
-_RESUME_TOKEN_TTL   = 86_400   # 24 hours default resumption token TTL (seconds)
-_RESUME_KEY_PREFIX  = "wf_resume:"
+_PHONE_KEY_TTL      = 86_400   # 24 hours — how long phone→execution mapping lives
 _CRON_KEY_PREFIX    = "wf_cron:"
+_PHONE_KEY_PREFIX   = "wf_phone:"
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _generate_resumption_token() -> str:
-    return f"r-{secrets.token_urlsafe(6)}"
+def _normalise_phone(phone: str) -> str:
+    """Strip spaces/dashes so +1-416-555-0123 and +14165550123 both match."""
+    return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
 
 
 # ---------------------------------------------------------------------------
-# Public helpers — used by workflow_engine.py SEND_SMS and external handlers
+# Public helpers — called by SEND_SMS node handler and inbound SMS webhook
 # ---------------------------------------------------------------------------
-
-async def store_resumption_token(
-    redis,
-    token: str,
-    execution_id: str,
-    ttl_seconds: int = _RESUME_TOKEN_TTL,
-) -> None:
-    """Store token → execution_id mapping in Redis with TTL."""
-    await redis.setex(f"{_RESUME_KEY_PREFIX}{token}", ttl_seconds, execution_id)
-
-
-async def resolve_resumption_token(redis, token: str) -> Optional[str]:
-    """Return execution_id for a token, or None if expired/unknown."""
-    val = await redis.get(f"{_RESUME_KEY_PREFIX}{token}")
-    return val.decode() if val else None
-
 
 async def store_phone_execution(
     redis,
     phone: str,
     execution_id: str,
-    ttl_seconds: int = _RESUME_TOKEN_TTL,
+    ttl_seconds: int = _PHONE_KEY_TTL,
 ) -> None:
-    """Secondary lookup: phone → most-recent AWAITING_EVENT execution_id."""
-    key = f"wf_phone:{phone.strip().replace(' ', '')}"
+    """Map the customer's phone number → execution_id in Redis with TTL.
+
+    Called when a SEND_SMS node sets await_reply=True. The phone number IS
+    the identity — no token required.
+    """
+    key = f"{_PHONE_KEY_PREFIX}{_normalise_phone(phone)}"
     await redis.setex(key, ttl_seconds, execution_id)
 
 
 async def resolve_phone_execution(redis, phone: str) -> Optional[str]:
-    key = f"wf_phone:{phone.strip().replace(' ', '')}"
+    """Return execution_id for this phone, or None if no waiting execution."""
+    key = f"{_PHONE_KEY_PREFIX}{_normalise_phone(phone)}"
     val = await redis.get(key)
     return val.decode() if val else None
+
+
+async def clear_phone_execution(redis, phone: str) -> None:
+    """Remove the mapping once the execution is resumed or expired."""
+    key = f"{_PHONE_KEY_PREFIX}{_normalise_phone(phone)}"
+    await redis.delete(key)
 
 
 # ---------------------------------------------------------------------------
@@ -259,23 +253,13 @@ class WorkflowTriggerWorker:
         message_body: str,
         tenant_id: str,
     ) -> bool:
-        """Route an inbound SMS reply to a waiting workflow execution.
+        """Route an inbound SMS reply to the waiting workflow execution for this phone.
 
-        Called by the mcp-server Twilio webhook handler.
-        Returns True if a workflow was resumed, False if no match found.
+        The phone number is the sole identity — no token involved.
+        If the sender's phone is not mapped to any waiting execution, returns False
+        so the mcp-server can fall back to normal conversational handling.
         """
-        # Try resumption token first (token embedded in original SMS text)
-        token_match = re.search(r"\br-[A-Za-z0-9_-]{6,10}\b", message_body)
-        execution_id_str: Optional[str] = None
-
-        if token_match:
-            token = token_match.group(0)
-            execution_id_str = await resolve_resumption_token(self.redis, token)
-
-        # Fallback: phone → execution lookup
-        if not execution_id_str:
-            execution_id_str = await resolve_phone_execution(self.redis, from_phone)
-
+        execution_id_str = await resolve_phone_execution(self.redis, from_phone)
         if not execution_id_str:
             return False
 
@@ -295,12 +279,16 @@ class WorkflowTriggerWorker:
             try:
                 from app.services.workflow_engine import WorkflowEngine
                 engine = WorkflowEngine(db=db)
-                await engine.advance(
+                result = await engine.advance(
                     execution_id=execution_id,
                     user_input=message_body,
                     event_payload={"sms_reply": message_body, "from_phone": from_phone},
                 )
                 await db.commit()
+
+                # Clear the phone mapping — execution has been resumed.
+                # If the workflow sends another await_reply SMS it will re-register.
+                await clear_phone_execution(self.redis, from_phone)
                 return True
             except Exception as exc:
                 await db.rollback()
@@ -319,7 +307,6 @@ class WorkflowTriggerWorker:
         trigger_source: str,
         initial_context: dict,
     ) -> None:
-        import uuid as _uuid
         import secrets as _secrets
 
         async with AsyncSessionLocal() as db:
@@ -341,14 +328,10 @@ class WorkflowTriggerWorker:
                     customer_phone=initial_context.get("customer_phone", ""),
                 )
                 execution.trigger_source = trigger_source
-
-                # Generate resumption token if execution may await SMS reply
-                token = _generate_resumption_token()
-                execution.resumption_token = token
                 await db.flush()
 
-                # Store Redis lookups
-                await store_resumption_token(self.redis, token, str(execution.id))
+                # Register phone → execution mapping for SMS reply routing.
+                # Phone number is the sole identity — no token needed.
                 if initial_context.get("customer_phone"):
                     await store_phone_execution(
                         self.redis,
@@ -356,10 +339,8 @@ class WorkflowTriggerWorker:
                         str(execution.id),
                     )
 
-                # Update last_triggered_at on the workflow
                 wf.last_triggered_at = _utcnow()
 
-                # Advance one step
                 await engine.advance(execution_id=execution.id)
                 await db.commit()
 

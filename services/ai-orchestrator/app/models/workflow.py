@@ -204,11 +204,9 @@ class WorkflowExecution(Base):
         String(30), nullable=False, default="llm_tool_call"
     )
 
-    # Short opaque token for resuming AWAITING_EVENT executions from SMS replies.
-    # Format: "r-{8 random chars}". Stored in Redis: phone → execution_id (TTL).
-    resumption_token: Mapped[Optional[str]] = mapped_column(
-        String(20), nullable=True, index=True
-    )
+    # SMS reply routing — the customer's phone number IS the identity.
+    # When SEND_SMS node awaits reply, worker stores phone→execution_id in Redis.
+    # Inbound SMS from that number resumes this execution. No token needed.
 
     # Current position in the DAG
     current_node_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

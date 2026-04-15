@@ -232,6 +232,11 @@ async def init_db() -> None:
         await conn.execute(_t(
             "CREATE INDEX IF NOT EXISTS ix_agents_agent_mode ON agents (agent_mode)"
         ))
+        
+        # Workflow execution customer_phone index for fast SMS lookup
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_workflow_executions_customer_phone ON workflow_executions (customer_phone)"
+        ))
 
         # Agent lifecycle state machine — add status column if not present
         await conn.execute(_t(

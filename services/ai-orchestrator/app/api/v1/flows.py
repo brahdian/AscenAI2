@@ -106,6 +106,17 @@ async def create_workflow(
 ):
     tid_str = _tenant_id(request)
     tid = uuid.UUID(tid_str)
+    
+    # Validate cron expression if trigger_type is cron
+    if body.trigger_type == "cron":
+        from croniter import croniter, CroniterBadCronError
+        schedule = body.trigger_config.get("schedule", "")
+        if not schedule:
+            raise HTTPException(status_code=422, detail="Cron schedule is required for cron trigger type")
+        try:
+            croniter(schedule)
+        except CroniterBadCronError:
+            raise HTTPException(status_code=422, detail=f"Invalid cron expression: {schedule}")
 
     db = await _get_db_session(tid_str)
     try:
@@ -208,6 +219,26 @@ async def update_workflow(
     db = await _get_db_session(tid_str)
     try:
         wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        
+        # Validate cron expression if trigger_type is cron (either updating type or config)
+        if (body.trigger_type == "cron" or 
+            (body.trigger_config is not None and 
+             (body.trigger_type is None and wf.trigger_type == "cron"))):
+            from croniter import croniter, CroniterBadCronError
+            # Determine which schedule to validate
+            if body.trigger_config and "schedule" in body.trigger_config:
+                schedule = body.trigger_config["schedule"]
+            elif body.trigger_config is None and wf.trigger_config:
+                schedule = wf.trigger_config.get("schedule", "")
+            else:
+                schedule = ""
+                
+            if not schedule:
+                raise HTTPException(status_code=422, detail="Cron schedule is required for cron trigger type")
+            try:
+                croniter(schedule)
+            except CroniterBadCronError:
+                raise HTTPException(status_code=422, detail=f"Invalid cron expression: {schedule}")
 
         if body.name is not None:
             wf.name = body.name
@@ -278,6 +309,52 @@ async def delete_workflow(
         await db.rollback()
         logger.error("delete_workflow_error", error=str(exc))
         raise HTTPException(status_code=500, detail="Failed to delete workflow.")
+    finally:
+        await db.close()
+
+
+@router.post("/{agent_id}/flows/{flow_id}/clone", response_model=WorkflowResponse, status_code=201)
+async def clone_workflow(
+    agent_id: uuid.UUID,
+    flow_id: uuid.UUID,
+    request: Request,
+):
+    """Clone an existing workflow into a new workflow."""
+    tid_str = _tenant_id(request)
+    tid = uuid.UUID(tid_str)
+
+    db = await _get_db_session(tid_str)
+    try:
+        original_wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        
+        # Create clone
+        cloned_wf = Workflow(
+            agent_id=agent_id,
+            tenant_id=tid,
+            name=f"{original_wf.name} (Copy)",
+            description=original_wf.description,
+            definition=original_wf.definition.copy(),
+            input_schema=original_wf.input_schema.copy() if original_wf.input_schema else None,
+            output_schema=original_wf.output_schema.copy() if original_wf.output_schema else None,
+            tags=original_wf.tags.copy(),
+            trigger_type=original_wf.trigger_type,
+            trigger_config=original_wf.trigger_config.copy() if original_wf.trigger_config else None,
+            is_active=False,
+            version=1,
+        )
+        
+        db.add(cloned_wf)
+        await db.commit()
+        await db.refresh(cloned_wf)
+        
+        return cloned_wf
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception as exc:
+        await db.rollback()
+        logger.error("clone_workflow_error", error=str(exc))
+        raise HTTPException(status_code=500, detail="Failed to clone workflow.")
     finally:
         await db.close()
 

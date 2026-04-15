@@ -97,6 +97,7 @@ class WorkflowTriggerWorker:
         self._tasks = [
             asyncio.create_task(self._cron_loop()),
             asyncio.create_task(self._event_loop()),
+            asyncio.create_task(self._expiry_sweep_loop()),
         ]
         logger.info("workflow_trigger_worker_started")
 
@@ -192,6 +193,48 @@ class WorkflowTriggerWorker:
             except Exception as exc:
                 logger.error("event_loop_error", error=str(exc))
                 await asyncio.sleep(5)  # back-off before reconnect
+
+    async def _expiry_sweep_loop(self) -> None:
+        """Sweep for expired AWAITING_EVENT executions every 60 seconds."""
+        while self._running:
+            try:
+                await self._sweep_expired_executions()
+            except Exception as exc:
+                logger.error("expiry_sweep_loop_error", error=str(exc))
+            await asyncio.sleep(self.interval)
+
+    async def _sweep_expired_executions(self) -> None:
+        """Find and mark AWAITING_EVENT executions as EXPIRED if past expiry_time."""
+        now = _utcnow()
+        
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(WorkflowExecution).where(
+                    WorkflowExecution.status == ExecutionStatus.AWAITING_EVENT,
+                    WorkflowExecution.expiry_time <= now,
+                )
+            )
+            expired_executions = result.scalars().all()
+            
+            for execution in expired_executions:
+                logger.info("workflow_execution_expired", execution_id=str(execution.id))
+                execution.status = ExecutionStatus.EXPIRED
+                execution.updated_at = now
+                
+                # Clear any phone mappings for this execution
+                if execution.customer_phone:
+                    await clear_phone_execution(self.redis, execution.customer_phone)
+                
+                await db.commit()
+                
+                # Record event
+                from app.services.workflow_engine import WorkflowEngine
+                engine = WorkflowEngine(db=db)
+                await engine._record_event(
+                    execution=execution,
+                    event_type="EXECUTION_EXPIRED",
+                    payload={"expiry_time": execution.expiry_time.isoformat()},
+                )
 
     async def _handle_event(self, event: dict) -> None:
         """Match inbound event to subscribed workflows and fire them."""

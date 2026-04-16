@@ -26,3 +26,9 @@ from app.models.template import (  # noqa: F401
     TemplateTool,
     AgentTemplateInstance,
 )
+from app.models.workflow import (  # noqa: F401
+    Workflow,
+    WorkflowExecution,
+    WorkflowStepExecution,
+    WorkflowEvent,
+)

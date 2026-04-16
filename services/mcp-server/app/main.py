@@ -77,6 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # --- Startup ---
     # 1. Initialize database tables
     try:
+        from app.models.booking import BookingWorkflow, BookingEvent  # noqa: F401
         await init_db()
         logger.info("database_initialized")
     except Exception as exc:
@@ -102,7 +103,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("redis_connect_failed", error=str(exc))
         raise
 
-    # 3. Warm up PII service (Presidio)
+    # 3. Start booking expiry worker
+    from app.workers.booking_expiry_worker import get_booking_expiry_worker
+    booking_worker = get_booking_expiry_worker()
+    booking_worker.start()
+    logger.info("booking_expiry_worker_registered")
+
+    # 4. Warm up PII service (Presidio)
     try:
         await pii_service.warmup()
         logger.info("pii_service_initialized")
@@ -115,6 +122,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # --- Shutdown ---
     logger.info("mcp_server_shutting_down")
+    from app.workers.booking_expiry_worker import get_booking_expiry_worker
+    await get_booking_expiry_worker().stop()
+
     if redis_client:
         await redis_client.aclose()
         logger.info("redis_disconnected")

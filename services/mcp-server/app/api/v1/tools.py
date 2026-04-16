@@ -659,6 +659,63 @@ async def register_tool(
     return tool
 
 
+@router.post("/upsert-builtin", response_model=ToolResponse, status_code=200)
+async def upsert_builtin_tool(
+    body: ToolRegistration,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create or update a built-in tool registration.
+
+    Called internally by ai-orchestrator's WorkflowRegistry when a workflow is
+    activated/deactivated. Uses the tenant id from X-Tenant-ID header and
+    requires the internal API key (X-Internal-Key header).
+
+    - If no tool with ``body.name`` exists for the tenant → creates it.
+    - If one already exists → updates description, schemas, metadata, and
+      is_active without changing the tool's UUID.
+    """
+    from app.core.config import settings as _cfg
+
+    # Internal callers must present the shared API key
+    internal_key = request.headers.get("X-Internal-Key", "")
+    if _cfg.INTERNAL_API_KEY and internal_key != _cfg.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid internal API key.")
+
+    tenant_id = _tenant_id(request)
+    registry = ToolRegistry(db)
+
+    existing = await registry.get_tool(tenant_id, body.name)
+    if existing is None:
+        # Create
+        if body.endpoint_url:
+            try:
+                _validate_tool_url(body.endpoint_url)
+            except SSRFError as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid endpoint_url: {exc}")
+        try:
+            tool = await registry.register_tool(tenant_id, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+    else:
+        # Update in-place (description, schemas, metadata, active flag)
+        update = ToolUpdate(
+            description=body.description,
+            input_schema=body.input_schema,
+            output_schema=body.output_schema,
+            is_active=body.tool_metadata.get("is_active", True),
+            tool_metadata=body.tool_metadata,
+        )
+        try:
+            tool = await registry.update_tool(tenant_id, body.name, update)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    await db.commit()
+    await db.refresh(tool)
+    return tool
+
+
 @router.get("", response_model=list[ToolResponse])
 async def list_tools(
     request: Request,

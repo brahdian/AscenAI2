@@ -77,6 +77,8 @@ from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import internal as internal_router
 from app.api.v1 import replay as replay_router
+from app.api.v1 import flows as flows_router
+from app.api.v1 import flow_triggers as flow_triggers_router
 from app.api.v1 import evals as evals_router
 from app.api.v1 import prompt_versions as prompt_versions_router
 from app.api.v1 import templates as templates_router
@@ -106,6 +108,13 @@ async def lifespan(app: FastAPI):
         await seed_templates()
     except Exception as exc:
         logger.error("seed_templates_error", error=str(exc))
+
+    # Seed prebuilt workflow definitions (idempotent)
+    try:
+        from app.services.seed_workflows import seed_prebuilt_workflows
+        await seed_prebuilt_workflows()
+    except Exception as exc:
+        logger.error("seed_workflows_error", error=str(exc))
 
     # Initialize Redis
     redis_client = await init_redis()
@@ -171,6 +180,13 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(session_cleanup.start())
     logger.info("session_cleanup_worker_started")
 
+    # Start workflow trigger worker (cron + event subscriptions + SMS resume)
+    from app.workers.workflow_trigger_worker import WorkflowTriggerWorker
+    workflow_trigger = WorkflowTriggerWorker(redis=redis_client)
+    app.state.workflow_trigger = workflow_trigger
+    asyncio.create_task(workflow_trigger.start())
+    logger.info("workflow_trigger_worker_started")
+
     # Start background queue depth metrics poller (every 30s)
     from app.core.metrics import DOC_INDEX_QUEUE_DEPTH, DOC_INDEX_DLQ_DEPTH
 
@@ -195,6 +211,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("ai_orchestrator_shutting_down")
+    if hasattr(app.state, "workflow_trigger"):
+        app.state.workflow_trigger.stop()
     if hasattr(app.state, "session_cleanup"):
         app.state.session_cleanup.stop()
     if hasattr(app.state, "document_indexer"):
@@ -306,6 +324,8 @@ app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"
 app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
 app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
+app.include_router(flows_router.router, prefix="/api/v1/agents", tags=["flows"])
+app.include_router(flow_triggers_router.router, prefix="/api/v1/agents", tags=["flow-triggers"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

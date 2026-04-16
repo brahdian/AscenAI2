@@ -87,7 +87,7 @@ async def update_instance(
             AgentTemplateInstance.id == i_uuid,
             AgentTemplateInstance.tenant_id == tenant
         )
-        .options(selectinload(AgentTemplateInstance.template_version))
+        .options(selectinload(AgentTemplateInstance.version))
     )
     instance = result.scalar_one_or_none()
     if not instance:
@@ -101,14 +101,35 @@ async def update_instance(
     # Re-apply to agent prompt
     agent_res = await db.execute(select(Agent).where(Agent.id == instance.agent_id))
     agent = agent_res.scalar_one_or_none()
-    
-    version = instance.template_version
-    if agent and version and version.system_prompt_template:
-        rendered_prompt = version.system_prompt_template
+
+    version = instance.version
+
+    def _render_str(text: str) -> str:
         for k, v in instance.variable_values.items():
-            rendered_prompt = rendered_prompt.replace(f"{{{{{k}}}}}", str(v))
-        agent.system_prompt = rendered_prompt
-        
+            text = text.replace("{{" + k + "}}", str(v))
+            text = text.replace("{" + k + "}", str(v))
+        return text
+
+    if agent and version and version.system_prompt_template:
+        agent.system_prompt = _render_str(version.system_prompt_template)
+
+    # Re-render all playbook config fields so {{variables}} stay current
+    if agent:
+        import json as _json
+        pb_res = await db.execute(
+            select(AgentPlaybook).where(AgentPlaybook.agent_id == agent.id)
+        )
+        for pb in pb_res.scalars().all():
+            if not pb.config:
+                continue
+            # Re-render entire config blob via JSON round-trip
+            try:
+                rendered_cfg = _json.loads(_render_str(_json.dumps(pb.config)))
+                pb.config = rendered_cfg
+                flag_modified(pb, "config")
+            except Exception:
+                pass  # leave unchanged if serialisation fails
+
     await db.commit()
     await db.refresh(instance)
     return instance

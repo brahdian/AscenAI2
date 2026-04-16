@@ -804,10 +804,20 @@ export const flowsApi = {
     api.delete(`/proxy/agents/${agentId}/flows/${flowId}`),
   activate: (agentId: string, flowId: string) =>
     api.post(`/proxy/agents/${agentId}/flows/${flowId}/activate`).then((r) => r.data),
+  deactivate: (agentId: string, flowId: string) =>
+    api.post(`/proxy/agents/${agentId}/flows/${flowId}/deactivate`).then((r) => r.data),
+  clone: (agentId: string, flowId: string) =>
+    api.post(`/proxy/agents/${agentId}/flows/${flowId}/clone`).then((r) => r.data),
+  listExecutions: (agentId: string, flowId: string, status?: string) =>
+    api
+      .get(`/proxy/agents/${agentId}/flows/${flowId}/executions`, { params: status ? { status } : {} })
+      .then((r) => r.data),
   getExecution: (agentId: string, flowId: string, sessionId: string) =>
     api
       .get(`/proxy/agents/${agentId}/flows/${flowId}/execution/${sessionId}`)
       .then((r) => r.data),
+  advance: (agentId: string, flowId: string, data: Record<string, unknown>) =>
+    api.post(`/proxy/agents/${agentId}/flows/${flowId}/advance`, data).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------

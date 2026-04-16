@@ -186,6 +186,7 @@ export const agentsApi = {
       auto_detect_language,
       supported_languages,
       greeting_message,
+      ivr_language_prompt,
       voice_system_prompt,
       escalation_config,
       ...rest
@@ -195,6 +196,7 @@ export const agentsApi = {
     if (auto_detect_language !== undefined) agentConfig.auto_detect_language = auto_detect_language
     if (supported_languages !== undefined) agentConfig.supported_languages = supported_languages
     if (greeting_message !== undefined) agentConfig.greeting_message = greeting_message
+    if (ivr_language_prompt !== undefined) agentConfig.ivr_language_prompt = ivr_language_prompt
     if (voice_system_prompt !== undefined) agentConfig.voice_system_prompt = voice_system_prompt
     if (escalation_config !== undefined) agentConfig.escalation_config = escalation_config
     if (Object.keys(agentConfig).length > 0) {

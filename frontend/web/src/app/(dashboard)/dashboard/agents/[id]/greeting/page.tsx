@@ -17,6 +17,9 @@ import {
   Volume2,
   Globe,
   Info,
+  CheckCircle2,
+  Loader2,
+  PhoneCall,
 } from 'lucide-react'
 
 // Languages supported by the voice pipeline (Gemini STT + Cartesia TTS)
@@ -59,6 +62,7 @@ export default function GreetingPage() {
   const [autoDetectLanguage, setAutoDetectLanguage] = useState(false)
   const [supportedLanguages, setSupportedLanguages] = useState<string[]>([])
   const [greetingText, setGreetingText] = useState('')
+  const [ivrLanguagePrompt, setIvrLanguagePrompt] = useState('')
   const [voiceSystemPrompt, setVoiceSystemPrompt] = useState('')
 
   // Voice recording state
@@ -89,6 +93,7 @@ export default function GreetingPage() {
       setAutoDetectLanguage((cfg.auto_detect_language as boolean) || (agent.auto_detect_language as boolean) || false)
       setSupportedLanguages((cfg.supported_languages as string[]) || (agent.supported_languages as string[]) || [])
       setGreetingText((cfg.greeting_message as string) || (agent.greeting_message as string) || '')
+      setIvrLanguagePrompt((cfg.ivr_language_prompt as string) || (agent.ivr_language_prompt as string) || '')
       setVoiceSystemPrompt((cfg.voice_system_prompt as string) || (agent.voice_system_prompt as string) || '')
       const voiceUrl = (cfg.voice_greeting_url as string) || (agent.voice_greeting_url as string)
       if (voiceUrl) {
@@ -247,15 +252,28 @@ export default function GreetingPage() {
   const saveSettings = async () => {
     setIsSaving(true)
     try {
+      const prevGreeting = (agent?.agent_config as Record<string, unknown>)?.greeting_message as string | undefined
+      const prevIvr = (agent?.agent_config as Record<string, unknown>)?.ivr_language_prompt as string | undefined
+      const greetingChanged = greetingText !== (prevGreeting || '')
+      const ivrChanged = ivrLanguagePrompt !== (prevIvr || '')
+
       await agentsApi.update(id, {
         language,
         auto_detect_language: autoDetectLanguage,
         supported_languages: supportedLanguages,
         greeting_message: greetingText || null,
+        ivr_language_prompt: ivrLanguagePrompt || null,
         voice_system_prompt: voiceSystemPrompt || null,
       })
       qc.invalidateQueries({ queryKey: ['agent', id] })
-      toast.success('Greeting settings saved.')
+
+      if (greetingChanged && greetingText) {
+        toast.success('Settings saved — generating greeting audio in background…')
+      } else if (ivrChanged && ivrLanguagePrompt) {
+        toast.success('Settings saved — generating IVR prompt audio in background…')
+      } else {
+        toast.success('Greeting settings saved.')
+      }
     } catch {
       toast.error('Save failed. Please try again.')
     } finally {
@@ -332,6 +350,7 @@ export default function GreetingPage() {
   }
 
   const savedGreetingUrl = agent.voice_greeting_url
+  const savedIvrUrl = (agent.agent_config as Record<string, unknown>)?.ivr_language_url as string | undefined
   const hasPendingUpload = !!audioBlob
 
   return (
@@ -445,8 +464,25 @@ export default function GreetingPage() {
           <h2 className="text-base font-semibold text-gray-900 dark:text-white">Text Greeting</h2>
         </div>
         <p className="text-sm text-gray-500">
-          Used as a fallback when no voice recording is saved, or in chat/text channels.
+          The greeting spoken to callers when a new call connects. Saving this text
+          automatically generates a high-quality TTS audio file — no manual recording required.
         </p>
+
+        {/* Auto-generated audio status */}
+        {savedGreetingUrl && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-sm">
+            <CheckCircle2 size={14} className="text-green-600 dark:text-green-400 flex-shrink-0" />
+            <span className="text-green-700 dark:text-green-300 flex-1">TTS audio generated</span>
+            <audio src={savedGreetingUrl} controls className="h-7" preload="none" />
+          </div>
+        )}
+        {!savedGreetingUrl && greetingText && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg text-sm text-amber-700 dark:text-amber-300">
+            <Loader2 size={14} className="flex-shrink-0" />
+            Save to auto-generate TTS audio for this greeting.
+          </div>
+        )}
+
         <div>
           <textarea
             value={greetingText}
@@ -463,8 +499,61 @@ export default function GreetingPage() {
           disabled={isSaving}
           className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
         >
-          <Save size={14} />
+          {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
           {isSaving ? 'Saving…' : 'Save Greeting Settings'}
+        </button>
+      </div>
+
+      {/* IVR Language Prompt */}
+      <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 space-y-4">
+        <div className="flex items-center gap-2 mb-1">
+          <PhoneCall size={18} className="text-violet-600 dark:text-violet-400" />
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white">IVR Language Prompt</h2>
+        </div>
+        <p className="text-sm text-gray-500">
+          Optional prompt played immediately after the greeting to offer callers a language choice.
+          Saving auto-generates a TTS audio file. Leave blank to skip.
+        </p>
+        <div className="flex gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg text-xs text-gray-500 items-start">
+          <Info size={13} className="flex-shrink-0 mt-0.5" />
+          <span>
+            Example: <em>"For English, press 1. Pour le français, appuyez sur 2. Para español, presione 3."</em>
+          </span>
+        </div>
+
+        {/* Auto-generated IVR audio status */}
+        {savedIvrUrl && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-sm">
+            <CheckCircle2 size={14} className="text-green-600 dark:text-green-400 flex-shrink-0" />
+            <span className="text-green-700 dark:text-green-300 flex-1">IVR audio generated</span>
+            <audio src={savedIvrUrl} controls className="h-7" preload="none" />
+          </div>
+        )}
+        {!savedIvrUrl && ivrLanguagePrompt && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg text-sm text-amber-700 dark:text-amber-300">
+            <Loader2 size={14} className="flex-shrink-0" />
+            Save to auto-generate TTS audio for this IVR prompt.
+          </div>
+        )}
+
+        <div>
+          <textarea
+            value={ivrLanguagePrompt}
+            onChange={(e) => setIvrLanguagePrompt(e.target.value)}
+            maxLength={500}
+            rows={3}
+            placeholder="For English, press 1. Pour le français, appuyez sur 2."
+            className="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-none"
+          />
+          <p className="text-xs text-gray-400 mt-1 text-right">{ivrLanguagePrompt.length}/500</p>
+        </div>
+        <button
+          onClick={saveSettings}
+          disabled={isSaving}
+          className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+        >
+          {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+          {isSaving ? 'Saving…' : 'Save IVR Prompt'}
         </button>
       </div>
 
@@ -506,7 +595,7 @@ export default function GreetingPage() {
             disabled={isSaving}
             className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
           >
-            <Save size={14} />
+            {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
             {isSaving ? 'Saving…' : 'Save Voice Protocol'}
           </button>
         </div>

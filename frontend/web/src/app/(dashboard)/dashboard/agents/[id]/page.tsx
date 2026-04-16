@@ -30,6 +30,7 @@ import {
   ThumbsDown,
   PenLine,
   X,
+  Zap,
 } from 'lucide-react'
 
 // Map known icons
@@ -563,6 +564,7 @@ export default function AgentDetailPage() {
         {[
           { href: `/dashboard/agents/${id}/greeting`, icon: Mic, label: 'Greeting', desc: 'Voice greeting & language' },
           { href: `/dashboard/agents/${id}/playbooks`, icon: BookOpen, label: 'Playbooks', desc: 'Conversation playbooks' },
+          { href: `/dashboard/agents/${id}/flows`, icon: Zap, label: 'Flows', desc: 'Automated workflows & triggers' },
           { href: `/dashboard/agents/${id}/tools`, icon: Wrench, label: 'Tools', desc: 'Integrations & actions' },
           { href: `/dashboard/agents/${id}/variables`, icon: Settings, label: 'Variables', desc: 'Dynamic agent variables' },
           { href: `/dashboard/agents/${id}/documents`, icon: FileText, label: 'Documents', desc: 'RAG knowledge base files' },

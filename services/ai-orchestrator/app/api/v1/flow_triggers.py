@@ -262,6 +262,17 @@ async def _start_execution(
     )
     # Stamp trigger_source (field added in previous step)
     execution.trigger_source = trigger_source
+    
+    # Register phone → execution mapping for SMS reply routing if customer_phone is present
+    if initial_context.get("customer_phone"):
+        from app.workers.workflow_trigger_worker import store_phone_execution
+        from app.core.redis_client import get_redis
+        redis = await get_redis()
+        await store_phone_execution(
+            redis,
+            initial_context["customer_phone"],
+            str(execution.id),
+        )
 
     # Update last_triggered_at on the workflow definition
     from datetime import datetime, timezone

@@ -107,14 +107,22 @@ def _resolve_template_dict(d: dict, context: dict) -> dict:
 def _eval_expression(expr: str, context: dict) -> bool:
     """Evaluate a simple boolean expression against context.
 
-    Uses a restricted eval with only context variables in scope.
+    Uses simpleeval for safe expression evaluation.
     Falls back to False on any error to fail safely.
     """
     try:
-        # Provide safe builtins + context variables
-        safe_builtins = {"int": int, "float": float, "str": str, "bool": bool,
-                         "len": len, "True": True, "False": False, "None": None}
-        return bool(eval(expr, {"__builtins__": safe_builtins}, dict(context)))  # noqa: S307
+        from simpleeval import simple_eval
+        return bool(simple_eval(
+            expr,
+            names=dict(context),
+            functions={
+                "int": int,
+                "float": float,
+                "str": str,
+                "bool": bool,
+                "len": len,
+            }
+        ))
     except Exception as exc:
         logger.warning("workflow_expression_eval_failed", expr=expr, error=str(exc))
         return False
@@ -135,9 +143,13 @@ class WorkflowEngine:
         self,
         db: AsyncSession,
         mcp_client=None,
+        llm_client=None,
+        redis=None,
     ) -> None:
         self.db = db
         self.mcp_client = mcp_client
+        self._llm_client = llm_client
+        self._redis = redis
 
     # ------------------------------------------------------------------
     # Public API
@@ -277,6 +289,13 @@ class WorkflowEngine:
             # Merge node outputs into context
             if node_result.output:
                 execution.context = {**execution.context, **node_result.output}
+                # Guard against runaway context growth (1 MB limit)
+                import json as _json
+                if len(_json.dumps(execution.context)) > 1_000_000:
+                    execution.status = ExecutionStatus.FAILED
+                    execution.error_message = "Execution context exceeded 1 MB limit"
+                    await self._checkpoint(execution)
+                    break
 
             if node_result.message:
                 last_message = node_result.message
@@ -336,7 +355,13 @@ class WorkflowEngine:
         user_input: Optional[str],
     ) -> NodeResult:
         """Check idempotency cache, then dispatch to node-type handler."""
-        idem_key = f"{execution.id}:{node.id}"
+        # FOR_EACH visits the same node_id on every iteration — include the
+        # iteration counter so each loop pass gets its own idempotency slot.
+        if node.type == NodeType.FOR_EACH:
+            iteration = int(execution.context.get(f"_foreach_{node.id}_index", 0))
+            idem_key = f"{execution.id}:{node.id}:{iteration}"
+        else:
+            idem_key = f"{execution.id}:{node.id}"
 
         # Check for a previously completed step (crash replay safety)
         existing = await self.db.scalar(
@@ -679,21 +704,36 @@ class WorkflowEngine:
         output_variable = cfg.get("output_variable", "llm_result")
         extract_json = cfg.get("extract_json", False)
 
+        system_prompt = _substitute_vars(cfg.get("system_prompt", ""), execution.context)
         prompt = _substitute_vars(prompt_template, execution.context)
+        model = cfg.get("model")
+        temperature = float(cfg.get("temperature", 0.7))
+        max_tokens = int(cfg.get("max_tokens", 1000))
 
-        # Delegate to LLM client if available via mcp_client or app state
+        if self._llm_client is None:
+            raise RuntimeError("LLM client not injected into WorkflowEngine")
+
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         try:
-            llm_client = getattr(self, "_llm_client", None)
-            if llm_client is None:
-                raise RuntimeError("LLM client not available in workflow engine")
-            response = await llm_client.complete(prompt)
-            output_value = response
+            response = await self._llm_client.complete(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                session_id=execution.session_id,
+            )
+            # LLMResponse has a .content attribute (or .text); fall back gracefully
+            raw = getattr(response, "content", None) or getattr(response, "text", str(response))
+            output_value = raw
             if extract_json:
                 import json
                 try:
-                    output_value = json.loads(response)
+                    output_value = json.loads(raw)
                 except Exception:
-                    output_value = response
+                    output_value = raw
         except Exception as exc:
             raise RuntimeError(f"LLM call failed: {exc}") from exc
 
@@ -747,10 +787,13 @@ class WorkflowEngine:
         await_reply = cfg.get("await_reply", False)
         reply_ttl_seconds = int(cfg.get("reply_ttl_seconds", 900))
 
-        # Fire-and-forget SMS; errors are logged but do not fail the workflow
+        # Send SMS via mcp_client (routes to Twilio tool in mcp-server).
+        # Fire-and-forget — failures are warned but do not abort the workflow.
         try:
-            from app.services.sms_simple import send_sms_simple
-            await send_sms_simple(to_phone, message)
+            if self.mcp_client is not None:
+                await self.mcp_client.call_tool("send_sms", {"to": to_phone, "message": message})
+            else:
+                logger.warning("workflow_sms_no_client", node_id=node.id, to=to_phone)
         except Exception as exc:
             logger.warning("workflow_sms_failed", node_id=node.id, error=str(exc))
 
@@ -761,6 +804,15 @@ class WorkflowEngine:
         )
 
         if await_reply:
+            # Store phone → execution mapping so the SMS reply handler can resume
+            if self._redis is not None and to_phone:
+                from app.workers.workflow_trigger_worker import store_phone_execution
+                await store_phone_execution(
+                    self._redis,
+                    to_phone,
+                    str(execution.id),
+                    ttl_seconds=reply_ttl_seconds,
+                )
             return NodeResult(
                 awaiting_event=True,
                 event_ttl_seconds=reply_ttl_seconds,

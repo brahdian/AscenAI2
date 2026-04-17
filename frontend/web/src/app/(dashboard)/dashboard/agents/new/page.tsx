@@ -95,20 +95,34 @@ export default function NewAgentPage() {
       toast.loading('Payment confirmed! Activating your agent...', { id: 'post-payment' })
       sessionStorage.removeItem('ascenai_pending_agent')
 
-      agentsApi.update(agentIdParam, { is_active: true })
-        .then(() => {
-          toast.success('Agent is now active!', { id: 'post-payment' })
-          qc.invalidateQueries({ queryKey: ['agents'] })
-          qc.invalidateQueries({ queryKey: ['billing-overview'] })
-          router.push(`/dashboard/agents/${agentIdParam}`)
-        })
-        .catch(() => {
-          // Webhook will handle activation — just redirect to agents list
-          toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
-          qc.invalidateQueries({ queryKey: ['agents'] })
-          qc.invalidateQueries({ queryKey: ['billing-overview'] })
-          router.push('/dashboard/agents')
-        })
+      // Zero-trust: the backend blocks direct activation of PENDING_PAYMENT agents.
+      // Poll for the Stripe webhook to fire (which activates the agent) instead of
+      // trying to activate optimistically via the frontend.
+      const pollForActivation = async () => {
+        const MAX_ATTEMPTS = 12
+        const POLL_INTERVAL_MS = 2500
+        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
+          try {
+            const agent = await agentsApi.get(agentIdParam)
+            if (agent?.is_active || agent?.status === 'ACTIVE') {
+              toast.success('Agent is now active!', { id: 'post-payment' })
+              qc.invalidateQueries({ queryKey: ['agents'] })
+              qc.invalidateQueries({ queryKey: ['billing-overview'] })
+              router.push(`/dashboard/agents/${agentIdParam}`)
+              return
+            }
+          } catch {
+            // ignore transient errors and keep polling
+          }
+        }
+        // Webhook took longer than ~30s — redirect anyway, agent will appear active soon
+        toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
+        qc.invalidateQueries({ queryKey: ['agents'] })
+        qc.invalidateQueries({ queryKey: ['billing-overview'] })
+        router.push('/dashboard/agents')
+      }
+      pollForActivation()
       return
     }
 

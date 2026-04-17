@@ -60,9 +60,11 @@ PUBLIC_PATHS = {
     "/api/v1/auth/verify-email",
     "/api/v1/auth/resend-otp",
     "/api/v1/auth/subscribe",
+    "/api/v1/auth/me",
     "/api/v1/auth/refresh",
     "/api/v1/auth/forgot-password",
     "/api/v1/auth/reset-password",
+    "/api/v1/billing/plans",
     "/api/v1/billing/webhook",
     "/api/v1/playbooks/validate-safety",
 }

@@ -8,6 +8,7 @@ import uuid
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, List
 
 import structlog
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
@@ -106,6 +107,7 @@ async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
         ivr_language_prompt=config.get("ivr_language_prompt"),
         voice_greeting_url=config.get("voice_greeting_url"),
         ivr_language_url=config.get("ivr_language_url"),
+        opening_audio_url=config.get("opening_audio_url"),
         voice_system_prompt=config.get("voice_system_prompt"),
         computed_greeting=computed_greeting,
         computed_protocol=computed_protocol,
@@ -132,6 +134,42 @@ async def get_platform_global_guardrails(
     from app.services.settings_service import SettingsService
     guardrails = await SettingsService.get_setting(db, "global_guardrails", default=[])
     return {"guardrails": guardrails}
+
+
+@router.get("/{agent_id}/opening-preview")
+async def get_agent_opening_preview(
+    agent_id: str,
+    request: Request,
+    language: Optional[str] = None,
+    supported_languages: Optional[str] = None,  # comma-separated
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """
+    Get the full mandatory opening text (Greeting + Language Assistance).
+    Used by the dashboard to show an accurate preview of the agent's entrance.
+    Supports previewing un-saved changes via query parameters.
+    """
+    tenant_id = _tenant_id(request)
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    # Override with provided query params if any
+    active_lang = language or agent.language
+    if supported_languages:
+        supported_langs = [l.strip() for l in supported_languages.split(",") if l.strip()]
+    else:
+        supported_langs = (agent.agent_config or {}).get("supported_languages", [])
+    
+    full_text = await generate_multilingual_greeting(db, active_lang, supported_langs)
+    
+    return {"text": full_text}
 
 
 @router.put("/platform/global-guardrails")
@@ -283,6 +321,24 @@ async def create_agent(
             await db.commit()
             await db.refresh(agent)
 
+        # Generate mandatory opening audio
+        # (Greeting + Language Assistance)
+        supported_langs = cfg.get("supported_languages", [])
+        opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs)
+        if opening_text:
+            url = await _tts_service.generate_opening(
+                text=opening_text,
+                voice_id=voice_id,
+                agent_id=str(agent.id),
+            )
+            if url:
+                new_cfg = dict(agent.agent_config)
+                new_cfg["opening_audio_url"] = url
+                agent.agent_config = new_cfg
+                await db.commit()
+                await db.refresh(agent)
+                logger.info("voice_opening_generated", agent_id=str(agent.id), url=url)
+
     logger.info("agent_created", agent_id=str(agent.id), tenant_id=tenant_id)
     return await _agent_to_response(agent, db)
 
@@ -383,6 +439,23 @@ async def update_agent(
                 await AgentStateMachine.archive(
                     agent, db=db, actor="user", reason="deactivated_via_api"
                 )
+        elif field == "expires_at":
+            # expires_at arrives as an ISO-format string from the billing webhook;
+            # parse it into a timezone-aware datetime before writing to the DB column.
+            if value is None:
+                agent.expires_at = None
+            elif isinstance(value, str):
+                from datetime import datetime, timezone
+                try:
+                    # Python 3.11+ fromisoformat handles 'Z'; replace for 3.10 compat
+                    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    agent.expires_at = dt
+                except ValueError:
+                    logger.warning("expires_at_parse_failed", value=value, agent_id=agent_id)
+            else:
+                agent.expires_at = value
         elif field != "agent_config":
             setattr(agent, field, value)
 
@@ -432,6 +505,26 @@ async def update_agent(
                     agent.agent_config = new_cfg
                     tts_updated = True
                     logger.info("ivr_prompt_regenerated", agent_id=str(agent.id), url=url)
+
+        # Regenerate mandatory opening audio when languages or voice changes
+        if any(f in update_data for f in ["language", "supported_languages", "voice_id"]) or (
+            "agent_config" in body.model_dump(exclude_unset=True)
+            and any(f in (body.agent_config or {}) for f in ["supported_languages"])
+        ):
+            supported_langs = cfg.get("supported_languages", [])
+            opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs)
+            if opening_text:
+                url = await _tts_service.generate_opening(
+                    text=opening_text,
+                    voice_id=voice_id,
+                    agent_id=str(agent.id),
+                )
+                if url:
+                    new_cfg = dict(agent.agent_config)
+                    new_cfg["opening_audio_url"] = url
+                    agent.agent_config = new_cfg
+                    tts_updated = True
+                    logger.info("voice_opening_regenerated", agent_id=str(agent.id), url=url)
 
         if tts_updated:
             await db.commit()

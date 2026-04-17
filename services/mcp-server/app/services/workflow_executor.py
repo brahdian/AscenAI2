@@ -9,7 +9,7 @@ When the LLM calls a tool whose name starts with "wf:", this module:
 Communication pattern
 ---------------------
 The mcp-server calls the ai-orchestrator's internal HTTP API:
-  POST {AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}/flows/{flow_id}/advance
+  POST {AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}/workflows/{flow_id}/advance
 
 This keeps the execution engine in the ai-orchestrator (which owns the DB
 sessions, LLM client, and MCP client) while the mcp-server routes tool calls.
@@ -73,7 +73,7 @@ async def execute_workflow_tool(
         "event_payload": parameters,  # LLM inputs become initial context
     }
 
-    url = f"{_ORCHESTRATOR_URL}/api/v1/agents/{resolved_agent_id}/flows/{workflow_id}/advance"
+    url = f"{_ORCHESTRATOR_URL}/api/v1/agents/{resolved_agent_id}/workflows/{workflow_id}/advance"
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

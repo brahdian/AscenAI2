@@ -807,10 +807,31 @@ class VoicePipeline:
             agent_data = resp.json()
             state.agent_config = agent_data
 
+            opening_audio_url: str = agent_data.get("opening_audio_url") or ""
             voice_greeting_url: str = agent_data.get("voice_greeting_url") or ""
             greeting_text: str = agent_data.get("greeting_message") or ""
             computed_greeting: str = agent_data.get("computed_greeting") or ""
 
+            # 1. Play mandatory opening (if pre-rendered and no full greeting exists)
+            # If voice_greeting_url exists, we assume it already includes the opening or
+            # the user wants to override everything with their manual recording.
+            if opening_audio_url and not voice_greeting_url:
+                if opening_audio_url.startswith("/"):
+                    open_url = f"{self.orchestrator_url}{opening_audio_url}"
+                else:
+                    open_url = opening_audio_url
+                
+                logger.info("playing_preformatted_opening", session_id=state.session_id, url=open_url)
+                state.is_speaking = True
+                try:
+                    async with client.stream("GET", open_url, timeout=10.0) as audio_resp:
+                        async for chunk in audio_resp.aiter_bytes(4096):
+                            if websocket.client_state == WebSocketState.CONNECTED:
+                                await websocket.send_bytes(chunk)
+                finally:
+                    state.is_speaking = False
+
+            # 2. Play custom greeting (Audio or TTS)
             if voice_greeting_url:
                 # Resolve relative URL against orchestrator base
                 if voice_greeting_url.startswith("/"):
@@ -833,16 +854,24 @@ class VoicePipeline:
                     state.is_speaking = False
                 await self._send_json(websocket, {"type": "greeting_complete"})
 
-            elif greeting_text or computed_greeting:
-                text_to_speak = greeting_text or computed_greeting
+            elif greeting_text:
                 logger.info(
                     "synthesising_greeting",
                     session_id=state.session_id,
-                    use_computed=not bool(greeting_text)
                 )
                 state.is_speaking = True
                 try:
-                    await self._tts_and_send(text_to_speak, websocket, state)
+                    await self._tts_and_send(greeting_text, websocket, state)
+                finally:
+                    state.is_speaking = False
+                await self._send_json(websocket, {"type": "greeting_complete"})
+            
+            elif not opening_audio_url and computed_greeting:
+                # Last resort: compute greeting in real-time (highest cost)
+                logger.info("synthesising_computed_greeting", session_id=state.session_id)
+                state.is_speaking = True
+                try:
+                    await self._tts_and_send(computed_greeting, websocket, state)
                 finally:
                     state.is_speaking = False
                 await self._send_json(websocket, {"type": "greeting_complete"})

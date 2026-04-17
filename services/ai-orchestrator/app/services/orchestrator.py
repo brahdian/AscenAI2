@@ -114,11 +114,20 @@ class Orchestrator:
             latency_ms = int((time.monotonic() - start_time) * 1000)
             return ChatResponse(session_id=session_id, message=jailbreak_response, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=latency_ms, tokens_used=0)
 
-        intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
             return await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
 
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
+
+        # Derive intent from the routed playbook name (free — no extra I/O).
+        # Fall back to keyword scoring across all active playbooks only when
+        # routing returns None (agent has no active playbooks).
+        if playbook:
+            intent = playbook.name
+        else:
+            _fallback_playbooks = await self.playbook_handler.get_active_playbooks(str(agent.id))
+            intent = self.intent_detector.classify_from_playbooks(user_message, _fallback_playbooks)
+
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), str(session.id), playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
         voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
@@ -421,7 +430,6 @@ class Orchestrator:
             yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "escalate_to_human": False}, session_id=session_id)
             return
 
-        intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
             escalation_response = await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
             yield StreamChatEvent(type="text_delta", data=escalation_response.message, session_id=session_id)
@@ -429,6 +437,14 @@ class Orchestrator:
             return
 
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
+
+        # Derive intent from the routed playbook name (free — no extra I/O).
+        if playbook:
+            intent = playbook.name
+        else:
+            _fallback_playbooks = await self.playbook_handler.get_active_playbooks(str(agent.id))
+            intent = self.intent_detector.classify_from_playbooks(user_message, _fallback_playbooks)
+
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
         voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
@@ -712,11 +728,18 @@ class Orchestrator:
             latency_ms = int((time.monotonic() - start_time) * 1000)
             return ChatResponse(session_id=session_id, message=jailbreak_response, tool_calls_made=[], suggested_actions=[], escalate_to_human=False, latency_ms=latency_ms, tokens_used=0)
 
-        intent = self.intent_detector.detect_intent(user_message)
         if self.intent_detector.should_escalate_immediately(user_message):
             return await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
 
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
+
+        # Derive intent from the routed playbook name (free — no extra I/O).
+        if playbook:
+            intent = playbook.name
+        else:
+            _fallback_playbooks = await self.playbook_handler.get_active_playbooks(str(agent.id))
+            intent = self.intent_detector.classify_from_playbooks(user_message, _fallback_playbooks)
+
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
         voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)

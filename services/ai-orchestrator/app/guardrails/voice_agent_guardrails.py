@@ -92,30 +92,45 @@ async def generate_multilingual_greeting(
     """
     Generate the audible MANDATORY OPENING string based on selected languages and platform settings.
     """
-    # 1. Fetch maps from Platform Settings (with cache)
-    greeting_map = await SettingsService.get_setting(db, "language_greeting_map", {})
+    # 1. Fetch config from Platform Settings (with cache in SettingsService)
+    lang_config = await SettingsService.get_setting(db, "global_language_config", {})
     
     langs = supported_languages or ["en"]
     if not isinstance(langs, list):
         langs = ["en"]
     
     # 2. Filter out languages we don't have phrases for
+    greeting_map = lang_config.get("greetings", {})
+    prefix_map = lang_config.get("assist_prefixes", {})
+    lang_data = lang_config.get("languages", [])
+    
     active_langs = [l for l in langs if l in greeting_map]
     if not active_langs:
         active_langs = ["en"]
 
-    lang_names_map = {
-        "en": "English", "fr": "French", "zh": "Chinese", "es": "Spanish",
-        "de": "German", "it": "Italian", "pt": "Portuguese",
-    }
+    # Map codes to labels (e.g. "hi" -> "Hindi")
+    lang_labels = {item["code"]: item["label"] for item in lang_data}
     
-    names = [lang_names_map.get(l, l) for l in active_langs]
+    # Generate the assistant string (localized if prefix exists)
+    names = []
+    for l in active_langs:
+        label = lang_labels.get(l, l)
+        # Strip parentheticals like "English (Global)" -> "English" for cleaner TTS
+        clean_label = label.split("(")[0].strip()
+        names.append(clean_label)
+
+    # Use localized prefix if available, otherwise fallback to English
+    # We use the prefix of the FIRST language as the lead-in
+    primary_lang = active_langs[0]
+    assist_prefix = prefix_map.get(primary_lang, prefix_map.get("en", "I can assist you in"))
+    
     if len(names) == 1:
-        assist_str = f"I can assist you in {names[0]}."
+        assist_str = f"{assist_prefix} {names[0]}."
     elif len(names) == 2:
-        assist_str = f"I can assist you in {names[0]} or {names[1]}."
+        # Note: we keep the joiner "or" in English for now or could further localise
+        assist_str = f"{assist_prefix} {names[0]} or {names[1]}."
     else:
-        assist_str = f"I can assist you in {', '.join(names[:-1])}, and {names[-1]}."
+        assist_str = f"{assist_prefix} {', '.join(names[:-1])}, and {names[-1]}."
 
     greeting = f"Thank you for calling. {assist_str} "
     
@@ -135,6 +150,8 @@ LANGUAGE_FALLBACK_MAP = {
     "de": "Entschuldigung, das habe ich nicht verstanden. Könnten Sie das bitte wiederholen?",
     "it": "Scusa, non ho capito bene. Potresti ripetere?",
     "pt": "Desculpe, não entendi bem. Você poderia repetir?",
+    "hi": "क्षमा करें, मुझे समझ नहीं आया। क्या आप फिर से कह सकते हैं?",
+    "tl": "Pasensya na, hindi ko nakuha iyon. Maaari mo bang sabihin muli?",
 }
 
 async def generate_multilingual_fallback(
@@ -144,17 +161,21 @@ async def generate_multilingual_fallback(
     """
     Generate the multilingual "I didn't catch that" message based on selected languages and platform settings.
     """
-    fallback_map = await SettingsService.get_setting(db, "language_fallback_map", {})
+    lang_config = await SettingsService.get_setting(db, "global_language_config", {})
+    fallback_map = lang_config.get("fallbacks", {})  # Check if in dynamic config first
     
     langs = supported_languages or ["en"]
     if not isinstance(langs, list):
         langs = ["en"]
     
-    active_langs = [l for l in langs if l in fallback_map]
+    # Merge with static map as safety
+    merged_map = {**LANGUAGE_FALLBACK_MAP, **fallback_map}
+    
+    active_langs = [l for l in langs if l in merged_map]
     if not active_langs:
         active_langs = ["en"]
 
-    phrases = [fallback_map[l] for l in active_langs if l in fallback_map]
+    phrases = [merged_map[l] for l in active_langs if l in merged_map]
     return " ".join(phrases)
 
 async def get_dynamic_voice_protocol(

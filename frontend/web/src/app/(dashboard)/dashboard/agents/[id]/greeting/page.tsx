@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi, voiceApi } from '@/lib/api'
+import { agentsApi, voiceApi, platformApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ArrowLeft,
@@ -22,34 +22,6 @@ import {
   PhoneCall,
 } from 'lucide-react'
 
-// Languages supported by the voice pipeline (Gemini STT + Cartesia TTS)
-const LANGUAGES = [
-  { code: 'en', label: 'English (Global)' },
-  { code: 'en-CA', label: 'English (Canada)' },
-  { code: 'fr', label: 'French (France)' },
-  { code: 'fr-CA', label: 'French (Canada / Québec)' },
-  { code: 'es', label: 'Spanish' },
-  { code: 'es-MX', label: 'Spanish (Mexico)' },
-  { code: 'de', label: 'German' },
-  { code: 'it', label: 'Italian' },
-  { code: 'pt', label: 'Portuguese' },
-  { code: 'pt-BR', label: 'Portuguese (Brazil)' },
-  { code: 'nl', label: 'Dutch' },
-  { code: 'pl', label: 'Polish' },
-  { code: 'ru', label: 'Russian' },
-  { code: 'zh', label: 'Chinese (Mandarin)' },
-  { code: 'ja', label: 'Japanese' },
-  { code: 'ko', label: 'Korean' },
-  { code: 'hi', label: 'Hindi' },
-  { code: 'pa', label: 'Punjabi' },
-  { code: 'ar', label: 'Arabic' },
-  { code: 'tr', label: 'Turkish' },
-  { code: 'uk', label: 'Ukrainian' },
-  { code: 'vi', label: 'Vietnamese' },
-  { code: 'id', label: 'Indonesian' },
-  { code: 'tl', label: 'Tagalog / Filipino' },
-]
-
 type RecordingState = 'idle' | 'recording' | 'recorded'
 
 export default function GreetingPage() {
@@ -57,12 +29,23 @@ export default function GreetingPage() {
   const qc = useQueryClient()
   const id = params.id as string
 
+  // Fetch platform language config
+  const { data: langConfig } = useQuery({
+    queryKey: ['platform-language-config'],
+    queryFn: () => platformApi.getLanguageConfig(),
+    staleTime: 1000 * 60 * 60, // 1 hour
+  })
+
+  // Aliases for convenience
+  const LANGUAGES = langConfig?.languages || []
+
   // Form state
   const [language, setLanguage] = useState('en')
   const [autoDetectLanguage, setAutoDetectLanguage] = useState(false)
   const [supportedLanguages, setSupportedLanguages] = useState<string[]>([])
   const [greetingText, setGreetingText] = useState('')
   const [ivrLanguagePrompt, setIvrLanguagePrompt] = useState('')
+  const [openingPreview, setOpeningPreview] = useState('')
   const [voiceSystemPrompt, setVoiceSystemPrompt] = useState('')
 
   // Voice recording state
@@ -73,6 +56,7 @@ export default function GreetingPage() {
   const [isUploading, setIsUploading] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [isGeneratingTts, setIsGeneratingTts] = useState(false)
+  const [isGeneratingIvrTts, setIsGeneratingIvrTts] = useState(false)
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<BlobPart[]>([])
@@ -100,8 +84,30 @@ export default function GreetingPage() {
         setAudioUrl(voiceUrl)
         setRecordingState('recorded')
       }
+      // Load opening preview text from agent if available or fetch it
+      if (agent.computed_greeting) {
+        setOpeningPreview(agent.computed_greeting)
+      }
     }
   }, [agent])
+
+  const fetchPreview = useCallback(async () => {
+    if (!id) return
+    try {
+      const { text } = await agentsApi.getOpeningPreview(id, language, supportedLanguages)
+      setOpeningPreview(text)
+    } catch {
+      // fallback
+    }
+  }, [id, language, supportedLanguages])
+
+  // Refresh preview on state change
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fetchPreview()
+    }, 300) // debounce 300ms
+    return () => clearTimeout(timer)
+  }, [language, supportedLanguages, fetchPreview])
 
   // Cleanup object URL on unmount
   useEffect(() => {
@@ -122,7 +128,9 @@ export default function GreetingPage() {
     }
     setIsGeneratingTts(true)
     try {
-      const stream = await voiceApi.streamTts(greetingText, agent?.voice_id || 'alloy')
+      // We synthesize the FULL entrance: Mandatory Opening + User Greeting
+      const fullText = `${openingPreview} ... ${greetingText}`
+      const stream = await voiceApi.streamTts(fullText, agent?.voice_id || 'alloy')
       if (!stream) throw new Error('Failed to start TTS stream')
       
       const reader = stream.getReader()
@@ -139,10 +147,45 @@ export default function GreetingPage() {
       setAudioUrl(url)
       setRecordingState('recorded')
       setRecordingSeconds(0)
+      toast.success('Preview generated! This combines the mandatory opening and your custom greeting.')
     } catch {
       toast.error('Failed to generate recording via TTS.')
     } finally {
       setIsGeneratingTts(false)
+    }
+  }
+
+  const generateIvrTts = async () => {
+    if (!ivrLanguagePrompt.trim()) {
+      toast.error('Please enter an IVR prompt first.')
+      return
+    }
+    setIsGeneratingIvrTts(true)
+    try {
+      // Use the stream api to preview it
+      const stream = await voiceApi.streamTts(ivrLanguagePrompt, agent?.voice_id || 'alloy')
+      if (!stream) throw new Error('Failed to start TTS stream')
+      
+      const reader = stream.getReader()
+      const chunks: Uint8Array[] = []
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) chunks.push(value)
+      }
+      
+      const blob = new Blob(chunks as BlobPart[], { type: 'audio/mpeg' })
+      const url = URL.createObjectURL(blob)
+      
+      // We don't save this to the main audioUrl state as that's for the greeting
+      // We'll just play it immediately to let the user hear it
+      const audio = new Audio(url)
+      audio.play()
+      toast.success('Playing IVR prompt preview...')
+    } catch {
+      toast.error('Failed to generate IVR preview.')
+    } finally {
+      setIsGeneratingIvrTts(false)
     }
   }
 
@@ -281,53 +324,7 @@ export default function GreetingPage() {
     }
   }
 
-  // ── Opening Preview ────────────────────────────────────────────────────────
-
-  const generateOpeningPreview = () => {
-    const langs = supportedLanguages.length > 0 ? supportedLanguages : [language]
-
-    // Map codes to human names (covers all in LANGUAGES constant)
-    const getLangName = (code: string) => {
-      const match = LANGUAGES.find(l => l.code === code)
-      if (match) return match.label.split(' (')[0] // 'French (Canada)' -> 'French'
-      
-      // Fallback: strip region (fr-CA -> fr) and try again
-      const baseCode = code.split('-')[0]
-      const baseMatch = LANGUAGES.find(l => l.code === baseCode)
-      if (baseMatch) return baseMatch.label.split(' (')[0]
-      
-      return code // Last resort
-    }
-
-    const phrases: Record<string, string> = {
-      en: 'For English, please continue.',
-      fr: 'Pour le français, parlez français s\'il vous plaît.',
-      zh: '对于中文请直接用中文交流。',
-      es: 'Para español, por favor hable en español.',
-      de: 'Für Deutsch sprechen Sie bitte Deutsch.',
-      it: 'Per l\'italiano, per favore parla in italiano.',
-      pt: 'Para português, por favor fale em português.',
-      ja: '日本語での対応をご希望の場合は、そのまま日本語でお話しください。',
-      ko: '한국어로 말씀하시려면 한국어로 계속해 주세요.',
-    }
-
-    const getPhrase = (code: string) => {
-      if (phrases[code]) return phrases[code]
-      const baseCode = code.split('-')[0]
-      return phrases[baseCode] || ''
-    }
-
-    const names = langs.map(l => getLangName(l))
-    let assistStr = ''
-    if (names.length === 1) assistStr = `I can assist you in ${names[0]}.`
-    else if (names.length === 2) assistStr = `I can assist you in ${names[0]} or ${names[1]}.`
-    else assistStr = `I can assist you in ${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}.`
-
-    const audibleLangs = langs.slice(0, 3)
-    const audiblePhrases = audibleLangs.map(l => getPhrase(l)).filter(Boolean)
-
-    return `Thank you for calling. ${assistStr} ${audiblePhrases.join(' ')}`
-  }
+  // ── Opening Preview Logic Removed (Backend Driven) ────────────────────────
 
   // ── Recording timer label ─────────────────────────────────────────────────
 
@@ -449,11 +446,22 @@ export default function GreetingPage() {
             <span className="text-xs font-bold text-violet-700 dark:text-violet-300 uppercase tracking-wider">Audible Opening Preview</span>
           </div>
           <p className="text-sm text-gray-700 dark:text-gray-300 italic font-medium leading-relaxed">
-            "{generateOpeningPreview()}"
+            "{openingPreview || 'Loading preview...'}"
           </p>
           <p className="text-[10px] text-gray-400 mt-2">
             * This is the exact phrase your agent will speak at the start of a voice call.
           </p>
+        </div>
+
+        <div className="pt-2">
+          <button
+            onClick={saveSettings}
+            disabled={isSaving}
+            className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+            {isSaving ? 'Saving…' : 'Save Language Settings'}
+          </button>
         </div>
       </div>
 
@@ -547,14 +555,22 @@ export default function GreetingPage() {
           />
           <p className="text-xs text-gray-400 mt-1 text-right">{ivrLanguagePrompt.length}/500</p>
         </div>
-        <button
-          onClick={saveSettings}
-          disabled={isSaving}
-          className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
-        >
-          {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-          {isSaving ? 'Saving…' : 'Save IVR Prompt'}
-        </button>
+          <button
+            onClick={generateIvrTts}
+            disabled={isGeneratingIvrTts}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 text-gray-700 dark:text-gray-300 rounded-lg text-sm font-medium transition-colors"
+          >
+            {isGeneratingIvrTts ? <Loader2 size={14} className="animate-spin" /> : <Volume2 size={14} />}
+            {isGeneratingIvrTts ? 'Generating Preview...' : 'Test with Agent Voice'}
+          </button>
+          <button
+            onClick={saveSettings}
+            disabled={isSaving}
+            className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+            {isSaving ? 'Saving…' : 'Save IVR Prompt'}
+          </button>
       </div>
 
       {/* Voice Protocol (System Prompt Extension) */}
@@ -578,7 +594,8 @@ export default function GreetingPage() {
             <button
               onClick={() => setVoiceSystemPrompt(`## Multi-lingual & IVR Operational Protocol
 - **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
-  "${generateOpeningPreview()}"
+- **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
+  "${openingPreview}"
 - **DYNAMIC LANGUAGE ADAPTATION**: You are globally configured to handle multiple languages.
 - **PROTOCOL**: Upon detecting ANY supported language, pivot your response language immediately to match the user without requesting procedural confirmation (e.g., avoid "Would you like to speak French?").
 - **CONTEXTUAL METADATA**: Ensure your response metadata accurately identifies the current communication language.`)}
@@ -589,7 +606,7 @@ export default function GreetingPage() {
             </button>
           )}
         </div>
-        <div className="flex justify-end">
+        <div className="flex justify-start">
           <button
             onClick={saveSettings}
             disabled={isSaving}

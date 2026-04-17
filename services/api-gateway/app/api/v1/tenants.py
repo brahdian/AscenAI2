@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.services.tenant_service import tenant_service
 
 router = APIRouter(prefix="/tenants")
@@ -68,9 +69,11 @@ def _require_owner_or_admin(request: Request) -> str:
 
 
 @router.get("/me", response_model=TenantResponse)
-async def get_my_tenant(request: Request, db: AsyncSession = Depends(get_db)):
+async def get_my_tenant(
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
     """Get current tenant details."""
-    tenant_id = _require_tenant(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")
@@ -95,7 +98,7 @@ async def get_my_tenant(request: Request, db: AsyncSession = Depends(get_db)):
 async def update_my_tenant(
     body: TenantUpdateRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Update current tenant details (owner/admin only)."""
     tenant_id = _require_owner_or_admin(request)
@@ -120,9 +123,11 @@ async def update_my_tenant(
 
 
 @router.get("/me/usage", response_model=TenantUsageResponse)
-async def get_my_usage(request: Request, db: AsyncSession = Depends(get_db)):
+async def get_my_usage(
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
     """Get current tenant usage statistics."""
-    tenant_id = _require_tenant(request)
     usage = await tenant_service.get_tenant_usage(tenant_id, db)
     if not usage:
         raise HTTPException(status_code=404, detail="Usage data not found.")

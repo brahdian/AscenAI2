@@ -37,7 +37,7 @@ if getattr(settings, "SENTRY_DSN", ""):
         traces_sample_rate=0.1,
         send_default_pii=False,
     )
-def _setup_opentelemetry() -> None:
+def _setup_opentelemetry(app: FastAPI) -> None:
     if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):
         return
     try:
@@ -52,13 +52,13 @@ def _setup_opentelemetry() -> None:
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_ENDPOINT)))
         trace.set_tracer_provider(provider)
-        FastAPIInstrumentor.instrument()
+        FastAPIInstrumentor().instrument_app(app)
         logger.info("opentelemetry_initialized", endpoint=settings.OTEL_ENDPOINT)
     except ImportError:
         logger.warning("opentelemetry_packages_missing")
 
 
-_setup_opentelemetry()
+
 
 from app.core.tracing import TracingMiddleware
 from app.middleware.idempotency import IdempotencyMiddleware
@@ -77,12 +77,13 @@ from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import internal as internal_router
 from app.api.v1 import replay as replay_router
-from app.api.v1 import flows as flows_router
-from app.api.v1 import flow_triggers as flow_triggers_router
+from app.api.v1 import workflows as workflows_router
+from app.api.v1 import workflow_triggers as workflow_triggers_router
 from app.api.v1 import evals as evals_router
 from app.api.v1 import prompt_versions as prompt_versions_router
 from app.api.v1 import templates as templates_router
 from app.api.v1 import variables as variables_router
+from app.api.v1 import platform as platform_router
 from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
@@ -230,6 +231,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_setup_opentelemetry(app)
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -320,12 +323,13 @@ app.include_router(documents_router.router, prefix="/api/v1/agents", tags=["docu
 app.include_router(evals_router.router, prefix="/api/v1/agents", tags=["evals"])
 app.include_router(prompt_versions_router.router, prefix="/api/v1/agents", tags=["prompts"])
 app.include_router(variables_router.router, prefix="/api/v1/agents", tags=["variables"])
+app.include_router(platform_router.router, prefix="/api/v1/platform", tags=["platform"])
 app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
 app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
-app.include_router(flows_router.router, prefix="/api/v1/agents", tags=["flows"])
-app.include_router(flow_triggers_router.router, prefix="/api/v1/agents", tags=["flow-triggers"])
+app.include_router(workflows_router.router, prefix="/api/v1/agents", tags=["workflows"])
+app.include_router(workflow_triggers_router.router, prefix="/api/v1/agents", tags=["workflow-triggers"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

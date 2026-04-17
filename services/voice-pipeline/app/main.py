@@ -37,7 +37,7 @@ if getattr(settings, "SENTRY_DSN", ""):
 logger = structlog.get_logger(__name__)
 
 
-def _setup_opentelemetry() -> None:
+def _setup_opentelemetry(app: FastAPI) -> None:
     if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):
         return
     try:
@@ -52,13 +52,13 @@ def _setup_opentelemetry() -> None:
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_ENDPOINT)))
         trace.set_tracer_provider(provider)
-        FastAPIInstrumentor.instrument()
+        FastAPIInstrumentor().instrument_app(app)
         logger.info("opentelemetry_initialized", endpoint=settings.OTEL_ENDPOINT)
     except ImportError:
         logger.warning("opentelemetry_packages_missing")
 
 
-_setup_opentelemetry()
+
 
 
 class ConnectionManager:
@@ -166,6 +166,8 @@ app = FastAPI(
     description="Real-time voice pipeline: STT → AI Orchestrator → TTS",
     lifespan=lifespan,
 )
+
+_setup_opentelemetry(app)
 
 app.add_middleware(
     CORSMiddleware,

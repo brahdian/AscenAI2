@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { flowsApi } from '@/lib/api'
+import { workflowsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ChevronLeft,
@@ -597,7 +597,7 @@ export default function FlowDetailPage() {
   // ── Fetch flow ────────
   const { data: flow, isLoading } = useQuery<Flow>({
     queryKey: ['flow', agentId, flowId],
-    queryFn: () => flowsApi.get(agentId, flowId),
+    queryFn: () => workflowsApi.get(agentId, flowId),
   })
 
   // Hydrate state from server data
@@ -623,7 +623,7 @@ export default function FlowDetailPage() {
   // ── Executions ───────
   const { data: executions = [], isLoading: execLoading } = useQuery<Execution[]>({
     queryKey: ['flow-executions', agentId, flowId],
-    queryFn: () => flowsApi.listExecutions(agentId, flowId),
+    queryFn: () => workflowsApi.listExecutions(agentId, flowId),
     enabled: tab === 'executions',
     refetchInterval: tab === 'executions' ? 5000 : false,
   })
@@ -631,7 +631,7 @@ export default function FlowDetailPage() {
   // ── Save ─────────────
   const saveMutation = useMutation({
     mutationFn: () =>
-      flowsApi.patch(agentId, flowId, {
+      workflowsApi.patch(agentId, flowId, {
         name,
         description,
         tags,
@@ -640,32 +640,32 @@ export default function FlowDetailPage() {
         definition,
       }),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['workflows', agentId] })
       qc.invalidateQueries({ queryKey: ['flow', agentId, flowId] })
-      qc.invalidateQueries({ queryKey: ['flows', agentId] })
-      toast.success('Flow saved')
+      toast.success('Workflow saved')
       setDirty(false)
     },
     onError: (e: any) => {
-      toast.error(e?.response?.data?.detail || 'Failed to save flow')
+      toast.error(e?.response?.data?.detail || 'Failed to save workflow')
     },
   })
 
   const toggleMutation = useMutation({
-    mutationFn: () => flow?.is_active ? flowsApi.deactivate(agentId, flowId) : flowsApi.activate(agentId, flowId),
+    mutationFn: () => flow?.is_active ? workflowsApi.deactivate(agentId, flowId) : workflowsApi.activate(agentId, flowId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['flow', agentId, flowId] })
-      toast.success(flow?.is_active ? 'Flow deactivated' : 'Flow activated')
+      toast.success(flow?.is_active ? 'Workflow deactivated' : 'Workflow activated')
     },
-    onError: () => toast.error('Failed to toggle flow'),
+    onError: () => toast.error('Failed to toggle workflow'),
   })
 
   const deleteMutation = useMutation({
-    mutationFn: () => flowsApi.delete(agentId, flowId),
+    mutationFn: () => workflowsApi.delete(agentId, flowId),
     onSuccess: () => {
-      toast.success('Flow deleted')
-      router.push(`/dashboard/agents/${agentId}/flows`)
+      toast.success('Workflow deleted')
+      router.push(`/dashboard/agents/${agentId}/workflows`)
     },
-    onError: () => toast.error('Failed to delete flow'),
+    onError: () => toast.error('Failed to delete workflow'),
   })
 
   // ── Definition helpers ────────────────────────────────────────────────────
@@ -760,10 +760,10 @@ export default function FlowDetailPage() {
       {/* Top bar */}
       <div className="sticky top-0 z-30 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center gap-4">
         <Link
-          href={`/dashboard/agents/${agentId}/flows`}
+          href={`/dashboard/agents/${agentId}/workflows`}
           className="flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-400 hover:text-violet-600 dark:hover:text-violet-400 shrink-0"
         >
-          <ChevronLeft size={16} /> Flows
+          <ChevronLeft size={16} /> Workflows
         </Link>
 
         <div className="flex-1 min-w-0">
@@ -795,7 +795,7 @@ export default function FlowDetailPage() {
 
           {/* Delete */}
           <button
-            onClick={() => confirm('Delete this flow?') && deleteMutation.mutate()}
+            onClick={() => confirm('Delete this workflow?') && deleteMutation.mutate()}
             className="p-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-500 hover:border-red-400 hover:text-red-500 transition-colors"
           >
             <Trash2 size={15} />

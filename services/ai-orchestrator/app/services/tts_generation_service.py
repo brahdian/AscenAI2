@@ -76,6 +76,24 @@ class TTSGenerationService:
     # Public helpers
     # ------------------------------------------------------------------
 
+    async def generate_opening(
+        self,
+        text: str,
+        voice_id: str = "alloy",
+        agent_id: str = "",
+        enrich: bool = True,
+    ) -> Optional[str]:
+        """
+        Generate and save TTS audio for the mandatory opening sequence.
+        (Greeting Prefix + Language Assistance phrases).
+        """
+        return await self._generate(
+            text=text,
+            voice_id=voice_id,
+            filename_hint=f"opening_{agent_id}",
+            enrich=enrich,
+        )
+
     async def generate_greeting(
         self,
         text: str,
@@ -84,16 +102,7 @@ class TTSGenerationService:
         enrich: bool = True,
     ) -> Optional[str]:
         """
-        Generate and save TTS audio for a voice greeting.
-
-        Args:
-            text:     Greeting text from the UI (greeting_message field).
-            voice_id: TTS voice identifier (provider-dependent).
-            agent_id: Agent UUID — embedded in the filename for traceability.
-            enrich:   When True, the LLM adds natural speech pauses before synthesis.
-
-        Returns:
-            CDN URL for the generated audio file, or None on failure.
+        Generate and save TTS audio for the custom user-defined voice greeting.
         """
         return await self._generate(
             text=text,
@@ -111,9 +120,6 @@ class TTSGenerationService:
     ) -> Optional[str]:
         """
         Generate and save TTS audio for an IVR language-selection prompt.
-
-        Returns:
-            CDN URL for the generated audio file, or None on failure.
         """
         return await self._generate(
             text=text,

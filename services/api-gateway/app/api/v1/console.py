@@ -20,8 +20,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import desc, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.services.audit_service import list_audit_logs
 
 logger = structlog.get_logger(__name__)
@@ -50,7 +50,8 @@ async def get_tenant_audit_logs(
     status: Optional[str] = Query(None, pattern="^(success|failure|)$"),
     since: Optional[str] = Query(None, description="ISO 8601 datetime"),
     until: Optional[str] = Query(None, description="ISO 8601 datetime"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """
     Return audit logs scoped to the requesting tenant.
@@ -83,7 +84,8 @@ async def get_tenant_activity(
     request: Request,
     agent_id: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """
     Aggregated recent activity for the tenant: recent sessions, message counts,
@@ -134,10 +136,10 @@ async def get_tenant_activity(
 @router.get("/agents")
 async def list_tenant_agents_for_console(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Return minimal agent list (id + name) for the console filter bar."""
-    tenant_id = _require_tenant(request)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(

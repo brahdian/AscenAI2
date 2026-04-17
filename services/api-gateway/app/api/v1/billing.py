@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.services.idempotency_service import IdempotencyService
 
 logger = structlog.get_logger(__name__)
@@ -190,9 +191,9 @@ async def list_plans(db: AsyncSession = Depends(get_db)) -> dict:
 @router.get("/overview")
 async def billing_overview(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> dict:
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
     from app.models.tenant import Tenant, TenantUsage
@@ -347,9 +348,9 @@ async def billing_overview(
 @router.get("/agents")
 async def billing_agents(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> list[dict]:
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
     from app.models.tenant import Tenant, TenantUsage
@@ -472,11 +473,10 @@ async def billing_agents(
 async def create_checkout_session(
     body: CheckoutSessionRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Create Stripe checkout session for subscription."""
-    plan = body.plan
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
     from app.models.tenant import Tenant
@@ -534,10 +534,10 @@ async def create_checkout_session(
 async def create_agent_slot_session(
     request: Request,
     payload: AgentSlotSessionRequest | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Create Stripe checkout session for a single new agent slot."""
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
     # Prevent duplicate concurrent checkout sessions (e.g., double-click).
@@ -660,7 +660,8 @@ class ReactivationSessionRequest(BaseModel):
 async def create_reactivation_session(
     request: Request,
     payload: ReactivationSessionRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """
     Create a Stripe checkout session to reactivate a specific archived agent.
@@ -680,7 +681,6 @@ async def create_reactivation_session(
     from app.services.auth_service import _create_stripe_customer
     import stripe
 
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
 
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
@@ -773,11 +773,10 @@ async def create_reactivation_session(
 
 @router.post("/portal-session")
 async def create_portal_session(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Create a Stripe customer portal session for managing billing."""
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
     
     from app.models.tenant import Tenant
@@ -801,11 +800,10 @@ async def create_portal_session(
 
 @router.get("/invoices")
 async def list_invoices(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """List recent invoices from Stripe."""
-    tenant_id = _require_tenant(request)
     tenant_uuid = uuid.UUID(tenant_id)
     
     from app.models.tenant import Tenant
@@ -842,55 +840,137 @@ async def list_invoices(
 
 @router.post("/sync-subscription")
 async def sync_subscription(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """
     Sync subscription status with Stripe.
-    This validates the current subscription and extends agent expiry if active.
+    - Validates the tenant's subscription with Stripe.
+    - Activates any inactive agents that already have a stripe_subscription_id
+      (self-healing for cases where the initial webhook failed to propagate).
     """
     import stripe
     from datetime import datetime, timezone, timedelta
-    
+
     stripe.api_key = settings.STRIPE_SECRET_KEY
-    
-    tenant_id = _require_tenant(request)
+
     tenant_uuid = uuid.UUID(tenant_id)
-    
+
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    
+
     if not tenant.subscription_id:
         return {"status": "no_subscription", "message": "No subscription found"}
-    
+
     try:
         stripe_sub = stripe.Subscription.retrieve(tenant.subscription_id)
         is_active = stripe_sub.status in ("active", "trialing")
-        
+
         if is_active:
             tenant.subscription_status = "active"
             tenant.is_active = True
-            
-            # Update tenant subscription status
             await db.commit()
             logger.info("subscription_synced_active", tenant_id=tenant_id)
-            
+
+            # --- Agent self-healing: re-activate any agent that still shows as
+            # inactive/payment-required despite the subscription being active.
+            agents_activated = 0
+            agents_skipped = 0
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    # Fetch ALL agents (active + inactive) from the orchestrator
+                    list_resp = await client.get(
+                        f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+                        params={"status": "all"},
+                        headers={
+                            "X-Tenant-ID": tenant_id,
+                            "X-Internal-Key": settings.INTERNAL_API_KEY,
+                        },
+                    )
+                    if list_resp.status_code == 200:
+                        agents = list_resp.json()
+
+                        # Calculate expiry from Stripe subscription period
+                        expires_at = None
+                        if stripe_sub.current_period_end:
+                            expires_at = datetime.fromtimestamp(
+                                stripe_sub.current_period_end, tz=timezone.utc
+                            ).isoformat()
+                        else:
+                            expires_at = (
+                                datetime.now(timezone.utc) + timedelta(days=30)
+                            ).isoformat()
+
+                        for agent in agents:
+                            agent_is_active = agent.get("is_active", False)
+                            agent_sub_id = agent.get("stripe_subscription_id")
+
+                            # Activate the agent if:
+                            #   (a) it already has a subscription ID (was paid, webhook partially failed), OR
+                            #   (b) the tenant subscription is active and agent is inactive
+                            #       (covers plans where subscription is per-tenant not per-agent)
+                            needs_activation = not agent_is_active and (
+                                agent_sub_id is not None or
+                                agent.get("deleted_at") is None  # not archived
+                            )
+
+                            if needs_activation:
+                                sub_id_to_set = agent_sub_id or tenant.subscription_id
+                                patch_resp = await client.patch(
+                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent['id']}",
+                                    json={
+                                        "is_active": True,
+                                        "stripe_subscription_id": sub_id_to_set,
+                                        "expires_at": expires_at,
+                                    },
+                                    headers={
+                                        "X-Tenant-ID": tenant_id,
+                                        "X-Internal-Key": settings.INTERNAL_API_KEY,
+                                    },
+                                )
+                                if patch_resp.status_code == 200:
+                                    agents_activated += 1
+                                    logger.info(
+                                        "agent_self_healed_on_sync",
+                                        agent_id=agent["id"],
+                                        tenant_id=tenant_id,
+                                        sub_id=sub_id_to_set,
+                                    )
+                                else:
+                                    agents_skipped += 1
+                                    logger.warning(
+                                        "agent_self_heal_failed",
+                                        agent_id=agent["id"],
+                                        status=patch_resp.status_code,
+                                        body=patch_resp.text[:200],
+                                    )
+                    else:
+                        logger.warning(
+                            "sync_subscription_agent_list_failed",
+                            status=list_resp.status_code,
+                            tenant_id=tenant_id,
+                        )
+            except Exception as heal_err:
+                logger.error("agent_self_heal_error", error=str(heal_err), tenant_id=tenant_id)
+
             return {
                 "status": "active",
-                "subscription_status": tenant.subscription_status
+                "subscription_status": tenant.subscription_status,
+                "agents_activated": agents_activated,
+                "agents_skipped": agents_skipped,
             }
         else:
             tenant.subscription_status = stripe_sub.status
             await db.commit()
             logger.info("subscription_synced_inactive", tenant_id=tenant_id, status=stripe_sub.status)
-            
+
             return {
                 "status": "inactive",
-                "subscription_status": tenant.subscription_status
+                "subscription_status": tenant.subscription_status,
             }
-            
+
     except stripe.error.StripeError as e:
         logger.error("subscription_sync_failed", tenant_id=tenant_id, error=str(e))
         raise HTTPException(status_code=502, detail=f"Failed to sync with Stripe: {str(e)}")

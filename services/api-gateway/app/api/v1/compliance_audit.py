@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.core.redis_client import get_redis
 from app.services.compliance_auditor import ComplianceAuditor
 
@@ -35,7 +36,9 @@ async def scan_for_pii(
     request: Request,
     tenant_id: str = "",
     limit: int = 1000,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    # Note: Using get_tenant_db for db, but tenant_id is passed as query param/arg here?
+    # Scanning for PII usually targets a specific tenant.
 ):
     """Scan messages for raw PII."""
     _require_admin(request)
@@ -47,7 +50,7 @@ async def scan_for_pii(
 @router.get("/scan/rls")
 async def verify_rls(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Verify RLS policies are active."""
     _require_admin(request)
@@ -59,7 +62,7 @@ async def verify_rls(
 @router.get("/scan/encryption")
 async def verify_encryption(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Verify encryption configuration."""
     _require_admin(request)
@@ -71,7 +74,7 @@ async def verify_encryption(
 @router.get("/report/pci")
 async def pci_dss_report(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Generate PCI-DSS compliance report."""
     _require_admin(request)
@@ -83,7 +86,7 @@ async def pci_dss_report(
 @router.get("/report/hipaa")
 async def hipaa_report(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Generate HIPAA compliance report."""
     _require_admin(request)
@@ -95,7 +98,7 @@ async def hipaa_report(
 @router.get("/report/gdpr")
 async def gdpr_report(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Generate GDPR compliance report."""
     _require_admin(request)
@@ -108,7 +111,7 @@ async def gdpr_report(
 async def full_compliance_report(
     request: Request,
     tenant_id: str = "",
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Generate comprehensive compliance report."""
     _require_admin(request)

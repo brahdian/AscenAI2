@@ -89,6 +89,102 @@ PLANS = {
     },
 }
 
+# global_language_config
+GLOBAL_LANGUAGE_CONFIG = {
+    "languages": [
+        {"code": "en", "label": "English (Global)"},
+        {"code": "en-CA", "label": "English (Canada)"},
+        {"code": "fr", "label": "French (France)"},
+        {"code": "fr-CA", "label": "French (Canada / Québec)"},
+        {"code": "es", "label": "Spanish"},
+        {"code": "es-MX", "label": "Spanish (Mexico)"},
+        {"code": "de", "label": "German"},
+        {"code": "it", "label": "Italian"},
+        {"code": "pt", "label": "Portuguese"},
+        {"code": "pt-BR", "label": "Portuguese (Brazil)"},
+        {"code": "nl", "label": "Dutch"},
+        {"code": "pl", "label": "Polish"},
+        {"code": "ru", "label": "Russian"},
+        {"code": "zh", "label": "Chinese (Mandarin)"},
+        {"code": "ja", "label": "Japanese"},
+        {"code": "ko", "label": "Korean"},
+        {"code": "hi", "label": "Hindi"},
+        {"code": "pa", "label": "Punjabi"},
+        {"code": "ar", "label": "Arabic"},
+        {"code": "tr", "label": "Turkish"},
+        {"code": "uk", "label": "Ukrainian"},
+        {"code": "vi", "label": "Vietnamese"},
+        {"code": "id", "label": "Indonesian"},
+        {"code": "tl", "label": "Tagalog / Filipino"},
+    ],
+    "greetings": {
+        "en": "Thank you for calling.",
+        "fr": "Merci de nous avoir contactés.",
+        "es": "Gracias por llamar.",
+        "de": "Danke für Ihren Anruf.",
+        "it": "Grazie per aver chiamato.",
+        "pt": "Obrigado por ligar.",
+        "ja": "お電話ありがとうございます。",
+        "ko": "전화해 주셔서 감사합니다.",
+        "zh": "感谢您的致电。",
+        "hi": "नमस्ते, कॉल करने के लिए धन्यवाद।",
+        "pa": "ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ, ਕਾਲ ਕਰਨ ਲਈ ਧੰਨਵਾਦ।",
+        "ar": "شكراً لاتصالك.",
+        "tr": "Aradığınız için teşekkür ederiz.",
+        "nl": "Bedankt voor uw oproep.",
+        "pl": "Dziękujemy za telefon.",
+        "ru": "Спасибо за ваш звонок.",
+        "vi": "Cảm ơn bạn đã gọi.",
+        "uk": "Дякуємо за дзвінок.",
+        "id": "Terima kasih telah menelepon.",
+        "tl": "Salamat sa pagtawag.",
+    },
+    "assist_prefixes": {
+        "en": "I can assist you in",
+        "fr": "Je peux vous aider en",
+        "es": "Puedo ayudarle en",
+        "de": "Ich kann Sie auf",
+        "it": "Posso assistervi in",
+        "pt": "Posso ajudá-lo em",
+        "ja": "対応可能言語:",
+        "ko": "지원 언어:",
+        "zh": "我可以提供以下语言的服务:",
+        "hi": "मैं आपकी सहायता कर सकता हूँ",
+        "pa": "ਮੈਂ ਤੁਹਾਡੀ ਮਦਦ ਕਰ ਸਕਦਾ ਹਾਂ",
+        "ar": "يمكنني مساعدتك في",
+        "tr": "Size şu dillerde yardımcı olabilirim:",
+        "nl": "Ik kan u helpen in het",
+        "pl": "Mogę pomóc w języku",
+        "ru": "Я могу помочь вам на",
+        "vi": "Tôi có thể hỗ trợ bạn bằng tiếng",
+        "uk": "Я можу допомогти вам",
+        "id": "Saya dapat membantu Anda dalam bahasa",
+        "tl": "Maaari kitang tulungan sa wikang",
+    },
+    "fallbacks": {
+        "en": "Sorry, I didn't quite catch that. Could you say that again?",
+        "fr": "Désolé, je n'ai pas bien compris. Pourriez-vous répéter?",
+        "zh": "对不起，我没听清。请再说一遍。",
+        "es": "Lo siento, no he entendido bien. ¿Probablemente repetir?",
+        "de": "Entschuldigung, das habe ich nicht verstanden. Könnten Sie das bitte wiederholen?",
+        "it": "Scusa, non ho capito bene. Potresti ripetere?",
+        "pt": "Desculpe, não entendi bem. Você poderia repetir?",
+        "ja": "すみません、聞き取れませんでした。もう一度おっしゃっていただけますか？",
+        "ko": "죄송합니다, 잘 못 들었습니다. 다시 말씀해 주시겠어요?",
+        "hi": "क्षमा करें, मुझे समझ नहीं आया। क्या आप फिर से कह सकते हैं?",
+        "pa": "ਮਾਫ ਕਰਨਾ, ਮੈਨੂੰ ਸਮਝ ਨਹੀਂ ਆਇਆ। ਕੀ ਤੁਸੀਂ ਫਿਰ ਤੋਂ ਕਹਿ ਸਕਦੇ ਹੋ?",
+        "ar": "عذراً، لم أفهم ذلك جيداً. هل يمكنك تكرار ذلك؟",
+        "tr": "Üzgünüm, tam olarak anlayamadım. Tekrar eder misiniz?",
+        "nl": "Sorry, ik heb het niet goed begrepen. Kunt u dat nog eens herhalen?",
+        "pl": "Przepraszam, nie zrozumiałem. Czy możesz powtórzyć?",
+        "ru": "Извините, я не совсем понял. Не могли бы вы повторить?",
+        "vi": "Xin lỗi, tôi không nghe rõ. Bạn có thể nói lại được không?",
+        "uk": "Вибачте, я не зовсім зрозумів. Чи могли б ви повторити?",
+        "id": "Maaf, saya kurang menangkap maksud Anda. Bisa diulangi?",
+        "tl": "Pasensya na, hindi ko nakuha iyon. Maaari mo bang sabihin muli?",
+    }
+}
+
 async def seed_platform():
     # Initialize DB tables before seeding since this runs before FastAPI startup
     await init_db()
@@ -163,8 +259,9 @@ async def seed_platform():
             print("'platform_guardrails' already exists")
 
         # 4. Seed System Defaults
-        defaults_setting = await db.execute(select(PlatformSetting).where(PlatformSetting.key == "system_defaults"))
-        if not defaults_setting.scalar_one_or_none():
+        defaults_setting_res = await db.execute(select(PlatformSetting).where(PlatformSetting.key == "system_defaults"))
+        defaults_setting = defaults_setting_res.scalar_one_or_none()
+        if not defaults_setting:
             db.add(PlatformSetting(
                 key="system_defaults",
                 value={
@@ -178,6 +275,22 @@ async def seed_platform():
             print("Seeded 'system_defaults'")
         else:
             print("'system_defaults' already exists")
+
+        # 5. Seed Language Config
+        lang_setting_res = await db.execute(select(PlatformSetting).where(PlatformSetting.key == "global_language_config"))
+        lang_setting = lang_setting_res.scalar_one_or_none()
+        if not lang_setting:
+            db.add(PlatformSetting(
+                key="global_language_config",
+                value=GLOBAL_LANGUAGE_CONFIG,
+                description="Global language list and localization strings"
+            ))
+            print("Seeded 'global_language_config'")
+        else:
+            from sqlalchemy.orm.attributes import flag_modified
+            lang_setting.value = GLOBAL_LANGUAGE_CONFIG
+            flag_modified(lang_setting, "value")
+            print("Updated 'global_language_config'")
 
         print("\n--- Seeding Super Admin ---")
         

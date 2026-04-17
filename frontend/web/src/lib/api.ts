@@ -56,7 +56,8 @@ function createApiClient(): AxiosInstance {
         status === 401 &&
         original &&
         !original._retry &&
-        !original.url?.includes('/auth/')
+        !original.url?.includes('/auth/') &&
+        !original.url?.includes('/billing/plans')
       ) {
         if (_isRefreshing) {
           // Queue the retry until the in-flight refresh completes
@@ -179,8 +180,14 @@ export const agentsApi = {
   list: (params?: { agent_id?: string; status?: string; limit?: number }) =>
     api.get('/proxy/agents', { params }).then((r) => r.data),
   get: (id: string) => api.get(`/proxy/agents/${id}`).then((r) => r.data),
-  create: (data: Record<string, unknown>) =>
-    api.post('/proxy/agents', data).then((r) => r.data),
+  create: (data: Record<string, unknown> & {
+    template_context?: {
+      template_id: string
+      template_version_id: string
+      variable_values?: Record<string, any>
+      tool_configs?: Record<string, any>
+    }
+  }) => api.post('/proxy/agents', data).then((r) => r.data),
   update: (id: string, data: Record<string, unknown>) => {
     const {
       auto_detect_language,
@@ -208,6 +215,12 @@ export const agentsApi = {
   restore: (id: string) => api.post(`/proxy/agents/${id}/restore`).then((r) => r.data),
   test: (id: string, message: string) =>
     api.post(`/proxy/agents/${id}/test`, { message }).then((r) => r.data),
+  getOpeningPreview: (id: string, language?: string, supportedLanguages?: string[]) => {
+    const params = new URLSearchParams()
+    if (language) params.append('language', language)
+    if (supportedLanguages?.length) params.append('supported_languages', supportedLanguages.join(','))
+    return api.get(`/proxy/agents/${id}/opening-preview?${params.toString()}`).then((r) => r.data as { text: string })
+  },
   uploadVoiceGreeting: (id: string, blob: Blob, ext: string) => {
     const form = new FormData()
     form.append('audio', blob, `greeting.${ext}`)
@@ -786,38 +799,38 @@ export const complianceApi = {
 }
 
 // ---------------------------------------------------------------------------
-// Flows (visual DAG workflow builder)
+// Workflows (visual DAG workflow builder)
 // ---------------------------------------------------------------------------
 
-export const flowsApi = {
+export const workflowsApi = {
   list: (agentId: string) =>
-    api.get(`/proxy/agents/${agentId}/flows`).then((r) => r.data),
+    api.get(`/proxy/agents/${agentId}/workflows`).then((r) => r.data),
   create: (agentId: string, data: Record<string, unknown>) =>
-    api.post(`/proxy/agents/${agentId}/flows`, data).then((r) => r.data),
+    api.post(`/proxy/agents/${agentId}/workflows`, data).then((r) => r.data),
   get: (agentId: string, flowId: string) =>
-    api.get(`/proxy/agents/${agentId}/flows/${flowId}`).then((r) => r.data),
+    api.get(`/proxy/agents/${agentId}/workflows/${flowId}`).then((r) => r.data),
   update: (agentId: string, flowId: string, data: Record<string, unknown>) =>
-    api.put(`/proxy/agents/${agentId}/flows/${flowId}`, data).then((r) => r.data),
+    api.put(`/proxy/agents/${agentId}/workflows/${flowId}`, data).then((r) => r.data),
   patch: (agentId: string, flowId: string, data: Record<string, unknown>) =>
-    api.patch(`/proxy/agents/${agentId}/flows/${flowId}`, data).then((r) => r.data),
+    api.patch(`/proxy/agents/${agentId}/workflows/${flowId}`, data).then((r) => r.data),
   delete: (agentId: string, flowId: string) =>
-    api.delete(`/proxy/agents/${agentId}/flows/${flowId}`),
+    api.delete(`/proxy/agents/${agentId}/workflows/${flowId}`),
   activate: (agentId: string, flowId: string) =>
-    api.post(`/proxy/agents/${agentId}/flows/${flowId}/activate`).then((r) => r.data),
+    api.post(`/proxy/agents/${agentId}/workflows/${flowId}/activate`).then((r) => r.data),
   deactivate: (agentId: string, flowId: string) =>
-    api.post(`/proxy/agents/${agentId}/flows/${flowId}/deactivate`).then((r) => r.data),
+    api.post(`/proxy/agents/${agentId}/workflows/${flowId}/deactivate`).then((r) => r.data),
   clone: (agentId: string, flowId: string) =>
-    api.post(`/proxy/agents/${agentId}/flows/${flowId}/clone`).then((r) => r.data),
+    api.post(`/proxy/agents/${agentId}/workflows/${flowId}/clone`).then((r) => r.data),
   listExecutions: (agentId: string, flowId: string, status?: string) =>
     api
-      .get(`/proxy/agents/${agentId}/flows/${flowId}/executions`, { params: status ? { status } : {} })
+      .get(`/proxy/agents/${agentId}/workflows/${flowId}/executions`, { params: status ? { status } : {} })
       .then((r) => r.data),
   getExecution: (agentId: string, flowId: string, sessionId: string) =>
     api
-      .get(`/proxy/agents/${agentId}/flows/${flowId}/execution/${sessionId}`)
+      .get(`/proxy/agents/${agentId}/workflows/${flowId}/execution/${sessionId}`)
       .then((r) => r.data),
   advance: (agentId: string, flowId: string, data: Record<string, unknown>) =>
-    api.post(`/proxy/agents/${agentId}/flows/${flowId}/advance`, data).then((r) => r.data),
+    api.post(`/proxy/agents/${agentId}/workflows/${flowId}/advance`, data).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -909,4 +922,16 @@ export const adminApi = {
   listGuardrails: () => api.get('/admin/guardrails').then((r) => r.data),
   updateGuardrail: (guardrailId: string, enabled: boolean) =>
     api.patch(`/admin/guardrails/${guardrailId}`, { enabled }).then((r) => r.data),
+}
+// ---------------------------------------------------------------------------
+// Platform Configuration
+// ---------------------------------------------------------------------------
+
+export const platformApi = {
+  getLanguageConfig: (): Promise<{
+    languages: Array<{ code: string; label: string }>
+    greetings: Record<string, string>
+    assist_prefixes: Record<string, string>
+    phrases: Record<string, string>
+  }> => api.get('/proxy/platform/language-config').then((r) => r.data),
 }

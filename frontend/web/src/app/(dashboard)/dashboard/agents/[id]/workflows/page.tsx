@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { flowsApi, agentsApi } from '@/lib/api'
+import { workflowsApi, agentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ChevronLeft,
@@ -84,13 +84,13 @@ function CreateFlowModal({
   const [triggerType, setTriggerType] = useState<'none' | 'cron' | 'webhook' | 'event'>('none')
 
   const mutation = useMutation({
-    mutationFn: (data: Record<string, unknown>) => flowsApi.create(agentId, data),
+    mutationFn: (data: Record<string, unknown>) => workflowsApi.create(agentId, data),
     onSuccess: (flow) => {
-      toast.success('Flow created')
+      toast.success('Workflow created')
       onCreated(flow)
     },
     onError: (e: any) => {
-      toast.error(e?.response?.data?.detail || 'Failed to create flow')
+      toast.error(e?.response?.data?.detail || 'Failed to create workflow')
     },
   })
 
@@ -117,7 +117,7 @@ function CreateFlowModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
       <div className="w-full max-w-md bg-white dark:bg-gray-900 rounded-2xl shadow-2xl p-6">
-        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">New Flow</h2>
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">New Workflow</h2>
         <form onSubmit={submit} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Name</label>
@@ -166,7 +166,7 @@ function CreateFlowModal({
               className="px-4 py-2 text-sm rounded-xl bg-violet-600 text-white font-medium disabled:opacity-50 hover:bg-violet-700 flex items-center gap-2"
             >
               {mutation.isPending && <Loader2 size={14} className="animate-spin" />}
-              Create Flow
+              Create Workflow
             </button>
           </div>
         </form>
@@ -199,7 +199,7 @@ function FlowCard({
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <Link
-            href={`/dashboard/agents/${agentId}/flows/${flow.id}`}
+            href={`/dashboard/agents/${agentId}/workflows/${flow.id}`}
             className="block font-semibold text-gray-900 dark:text-white hover:text-violet-600 dark:hover:text-violet-400 truncate"
           >
             {flow.name}
@@ -265,7 +265,7 @@ function FlowCard({
                 <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
                 <div className="absolute right-0 bottom-8 z-20 w-40 bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 shadow-lg py-1">
                   <Link
-                    href={`/dashboard/agents/${agentId}/flows/${flow.id}`}
+                    href={`/dashboard/agents/${agentId}/workflows/${flow.id}`}
                     className="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
                     onClick={() => setMenuOpen(false)}
                   >
@@ -307,33 +307,33 @@ export default function FlowsPage() {
   })
 
   const { data: flows = [], isLoading } = useQuery<Flow[]>({
-    queryKey: ['flows', id],
-    queryFn: () => flowsApi.list(id),
+    queryKey: ['workflows', id],
+    queryFn: () => workflowsApi.list(id),
   })
 
   const deleteMutation = useMutation({
-    mutationFn: (flowId: string) => flowsApi.delete(id, flowId),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['flows', id] }); toast.success('Flow deleted') },
-    onError: () => toast.error('Failed to delete flow'),
+    mutationFn: (flowId: string) => workflowsApi.delete(id, flowId),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['workflows', id] }); toast.success('Workflow deleted') },
+    onError: () => toast.error('Failed to delete workflow'),
   })
 
   const cloneMutation = useMutation({
-    mutationFn: (flowId: string) => flowsApi.clone(id, flowId),
+    mutationFn: (flowId: string) => workflowsApi.clone(id, flowId),
     onSuccess: (cloned: Flow) => {
-      qc.invalidateQueries({ queryKey: ['flows', id] })
+      qc.invalidateQueries({ queryKey: ['workflows', id] })
       toast.success(`Cloned as "${cloned.name}"`)
     },
-    onError: () => toast.error('Failed to clone flow'),
+    onError: () => toast.error('Failed to clone workflow'),
   })
 
   const toggleMutation = useMutation({
     mutationFn: (flow: Flow) =>
-      flow.is_active ? flowsApi.deactivate(id, flow.id) : flowsApi.activate(id, flow.id),
+      flow.is_active ? workflowsApi.deactivate(id, flow.id) : workflowsApi.activate(id, flow.id),
     onSuccess: (_data, flow) => {
-      qc.invalidateQueries({ queryKey: ['flows', id] })
-      toast.success(flow.is_active ? 'Flow deactivated' : 'Flow activated')
+      qc.invalidateQueries({ queryKey: ['workflows', id] })
+      toast.success(flow.is_active ? 'Workflow deactivated' : 'Workflow activated')
     },
-    onError: () => toast.error('Failed to toggle flow'),
+    onError: () => toast.error('Failed to toggle workflow'),
   })
 
   const confirmDelete = (flow: Flow) => {
@@ -356,7 +356,7 @@ export default function FlowsPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
-            <Zap className="text-violet-500" size={24} /> Flows
+            <Zap className="text-violet-500" size={24} /> Workflows
           </h1>
           <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
             Automated workflows triggered by schedule, webhook, event, or LLM tool call
@@ -366,7 +366,7 @@ export default function FlowsPage() {
           onClick={() => setShowCreate(true)}
           className="flex items-center gap-2 px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700 transition-colors"
         >
-          <Plus size={16} /> New Flow
+          <Plus size={16} /> New Workflow
         </button>
       </div>
 
@@ -378,15 +378,15 @@ export default function FlowsPage() {
       ) : flows.length === 0 ? (
         <div className="text-center py-20">
           <Zap size={40} className="text-gray-300 dark:text-gray-700 mx-auto mb-4" />
-          <p className="text-gray-500 dark:text-gray-400 font-medium mb-2">No flows yet</p>
+          <p className="text-gray-500 dark:text-gray-400 font-medium mb-2">No workflows yet</p>
           <p className="text-sm text-gray-400 dark:text-gray-500 mb-6">
-            Create a flow to automate actions — send SMS, call tools, run logic, and more.
+            Create a workflow to automate actions — send SMS, call tools, run logic, and more.
           </p>
           <button
             onClick={() => setShowCreate(true)}
             className="inline-flex items-center gap-2 px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700"
           >
-            <Plus size={16} /> Create your first flow
+            <Plus size={16} /> Create your first workflow
           </button>
         </div>
       ) : (
@@ -410,9 +410,9 @@ export default function FlowsPage() {
           agentId={id}
           onClose={() => setShowCreate(false)}
           onCreated={(flow) => {
-            qc.invalidateQueries({ queryKey: ['flows', id] })
+            qc.invalidateQueries({ queryKey: ['workflows', id] })
             setShowCreate(false)
-            router.push(`/dashboard/agents/${id}/flows/${flow.id}`)
+            router.push(`/dashboard/agents/${id}/workflows/${flow.id}`)
           }}
         />
       )}

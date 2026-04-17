@@ -28,6 +28,10 @@ class StrictAgentConfig(BaseModel):
     supported_languages: Optional[list[str]] = Field(default_factory=list)
     auto_detect_language: Optional[bool] = False
     voice_greeting_url: Optional[str] = None
+    opening_audio_url: Optional[str] = Field(
+        default=None,
+        description="CDN URL for the pre-rendered mandatory opening audio (Greeting + Language Assistance)."
+    )
     voice_system_prompt: Optional[str] = None
     tools: Optional[list[Any]] = Field(default_factory=list)
     knowledge_base_ids: Optional[list[str]] = Field(default_factory=list)
@@ -170,6 +174,8 @@ class AgentCreate(BaseModel):
     extension_number: Optional[str] = Field(None, max_length=20)
     is_available_as_tool: Optional[bool] = None
     is_active: Optional[bool] = None
+    stripe_subscription_id: Optional[str] = None
+    expires_at: Optional[str] = None
 
     @field_validator("agent_config", mode="before")
     @classmethod
@@ -220,6 +226,8 @@ class AgentUpdate(BaseModel):
     extension_number: Optional[str] = Field(None, max_length=20)
     is_available_as_tool: Optional[bool] = None
     is_active: Optional[bool] = None
+    stripe_subscription_id: Optional[str] = None
+    expires_at: Optional[str] = None
 
     @field_validator("agent_config", mode="before")
     @classmethod
@@ -257,6 +265,7 @@ class AgentResponse(BaseModel):
     ivr_language_prompt: Optional[str] = None
     voice_greeting_url: Optional[str] = None
     ivr_language_url: Optional[str] = None
+    opening_audio_url: Optional[str] = None
     voice_system_prompt: Optional[str] = None
     computed_greeting: Optional[str] = None
     computed_protocol: Optional[str] = None

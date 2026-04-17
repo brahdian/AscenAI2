@@ -395,6 +395,74 @@ async def get_agent(
     return await _agent_to_response(agent, db)
 
 
+@router.get("/{agent_id}/activation-stream")
+async def agent_activation_stream(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """
+    SSE stream that closes as soon as the agent transitions to ACTIVE.
+
+    The billing webhook publishes to Redis when it activates the agent.
+    The frontend subscribes here instead of polling GET /{agent_id} repeatedly.
+    Times out after 40 s and sends {"status":"timeout"} so the client can fall back.
+    """
+    import asyncio
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+    from app.core.redis_client import get_redis as _get_redis
+
+    tenant_id = _tenant_id(request)
+
+    # Verify the agent belongs to this tenant before opening the stream.
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    # If the webhook already fired before the browser opened this connection, close immediately.
+    if agent.is_active:
+        async def _already_active():
+            yield f"data: {json.dumps({'status': 'active', 'agent_id': agent_id})}\n\n"
+        return _StreamingResponse(_already_active(), media_type="text/event-stream")
+
+    channel = f"agent:activated:{agent_id}"
+
+    async def _event_stream():
+        redis = await _get_redis()
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(channel)
+        try:
+            deadline = asyncio.get_event_loop().time() + 40
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    yield f"data: {json.dumps({'status': 'timeout'})}\n\n"
+                    break
+                # Wait up to 1s for a message, then send a keepalive comment.
+                msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.0)
+                if msg and msg.get("type") == "message":
+                    yield f"data: {msg['data']}\n\n"
+                    break
+                else:
+                    # SSE comment — keeps the connection alive through proxies.
+                    yield ": keepalive\n\n"
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pubsub.aclose()
+
+    return _StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
 @router.patch("/{agent_id}", response_model=AgentResponse)
 async def update_agent(
     agent_id: str,
@@ -451,6 +519,17 @@ async def update_agent(
                 await AgentStateMachine.activate(
                     agent, db=db, actor=_actor, reason="updated_via_api"
                 )
+                # Notify any open activation-stream SSE connections for this agent.
+                if _is_internal_caller:
+                    try:
+                        from app.core.redis_client import get_redis as _get_redis
+                        _redis = await _get_redis()
+                        await _redis.publish(
+                            f"agent:activated:{agent_id}",
+                            json.dumps({"status": "active", "agent_id": agent_id}),
+                        )
+                    except Exception as _exc:
+                        logger.warning("activation_pubsub_publish_failed", error=str(_exc))
             else:
                 await AgentStateMachine.archive(
                     agent, db=db, actor="user", reason="deactivated_via_api"

@@ -429,11 +429,27 @@ async def update_agent(
                 current_config[key] = value
         agent.agent_config = current_config
 
+    # Zero-trust: activating a PENDING_PAYMENT agent requires the billing webhook's
+    # internal key — a regular user/frontend call must NOT bypass payment verification.
+    from app.core.config import settings as _settings
+    _is_internal_caller = (
+        request.headers.get("X-Internal-Key") == _settings.INTERNAL_API_KEY
+    )
+
     for field, value in update_data.items():
         if field == "is_active":
             if value is True:
+                if agent.status == "PENDING_PAYMENT" and not _is_internal_caller:
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "error": "payment_required",
+                            "message": "Agent activation requires payment confirmation.",
+                        },
+                    )
+                _actor = "billing_webhook" if _is_internal_caller else "user"
                 await AgentStateMachine.activate(
-                    agent, db=db, actor="user", reason="updated_via_api"
+                    agent, db=db, actor=_actor, reason="updated_via_api"
                 )
             else:
                 await AgentStateMachine.archive(

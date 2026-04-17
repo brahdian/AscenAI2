@@ -866,7 +866,12 @@ async def sync_subscription(
         return {"status": "no_subscription", "message": "No subscription found"}
     
     try:
-        stripe_sub = stripe.Subscription.retrieve(tenant.subscription_id)
+        # M-5 fix: stripe.Subscription.retrieve is a synchronous blocking call.
+        # Wrap in asyncio.to_thread so it doesn't block the event loop.
+        import asyncio as _asyncio
+        stripe_sub = await _asyncio.to_thread(
+            stripe.Subscription.retrieve, tenant.subscription_id
+        )
         is_active = stripe_sub.status in ("active", "trialing")
         
         if is_active:
@@ -938,11 +943,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
         if await idempotency_svc.is_already_processed("stripe_event", event_id):
             logger.info("billing_webhook_duplicate_skipped", event_id=event_id)
             return {"received": True}
-        # Mark processed now — business logic below must be idempotent itself
-        # as a last line of defence, but we record intent early so a crash
-        # mid-flight is treated as processed on the next retry.
-        await idempotency_svc.mark_processed("stripe_event", event_id)
-
     if event_type == "checkout.session.completed":
         session = event.get("data", {}).get("object", {})
         metadata = session.get("metadata", {})
@@ -964,12 +964,18 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                         if plan:
                             tenant.plan = plan
                             tenant.plan_limits = await get_plan_limits(plan, db)
-                    # Mark idempotency key inside same transaction for atomicity
+                    # Mark idempotency key inside same transaction for atomicity:
+                    # if the transaction rolls back, the idempotency record rolls back
+                    # too, so the next Stripe retry will succeed instead of being silently
+                    # swallowed as a duplicate.
+                    if idempotency_svc:
+                        await idempotency_svc.mark_processed("stripe_event", event_id)
                     logger.info("tenant_subscription_activated", tenant_id=tenant_id, plan=plan)
 
                 # FLOW 1: Activate specific agent if metadata contains agent_id
                 # action="reactivate_agent" → restore archived agent, do NOT bump agent_count
                 # action="add_agent_slot" / missing → new slot, bump agent_count
+                _slot_incremented = False  # guard: prevent FLOW 3 double-incrementing
                 agent_id = metadata.get("agent_id")
                 is_reactivation = metadata.get("action") == "reactivate_agent"
                 if agent_id:
@@ -1017,6 +1023,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                         .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
                                     )
                                     await db.commit()
+                                    _slot_incremented = True  # prevent FLOW 3 double-increment
                             else:
                                 logger.error("agent_activation_failed_upstream", agent_id=agent_id, status=activate_res.status_code)
                                 # Failsafe: Agent missing or errored -> Issue refund/cancel to prevent unauthorized charge
@@ -1069,7 +1076,10 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                             logger.error("pending_agent_creation_error", error=str(e))
 
                 # FLOW 3: Generic Slot Increment
-                if metadata.get("action") == "add_agent_slot":
+                # Guard: skip if FLOW 1 already incremented the count for this event.
+                # A checkout with both agent_id and action="add_agent_slot" must only
+                # increment once — the agent activation in FLOW 1 owns the slot.
+                if metadata.get("action") == "add_agent_slot" and not _slot_incremented:
                     logger.info("adding_generic_agent_slot", tenant_id=tenant_id)
                     # Atomic increment — avoids race on concurrent webhooks
                     await db.execute(

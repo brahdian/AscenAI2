@@ -759,6 +759,59 @@ class WorkflowEngine:
         output_variable = cfg.get("output_variable", "action_result")
         timeout = float(cfg.get("timeout_seconds", 10))
 
+        # ── BLOCKER-2: SSRF guard ────────────────────────────────────────────
+        # The ACTION node URL comes from the workflow definition (tenant-supplied).
+        # Without this check a tenant could point the URL at internal Docker
+        # network services (postgres, redis, metadata endpoints, etc.).
+        # We reuse the same guard that already protects HTTP tool execution.
+        try:
+            import ipaddress
+            import urllib.parse
+            import socket
+
+            _PRIVATE_NETS = [
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12"),
+                ipaddress.ip_network("192.168.0.0/16"),
+                ipaddress.ip_network("127.0.0.0/8"),
+                ipaddress.ip_network("169.254.0.0/16"),
+                ipaddress.ip_network("100.64.0.0/10"),
+                ipaddress.ip_network("::1/128"),
+                ipaddress.ip_network("fc00::/7"),
+                ipaddress.ip_network("fe80::/10"),
+            ]
+            _INTERNAL_HOSTS = frozenset({
+                "localhost", "127.0.0.1", "::1", "0.0.0.0",
+                "postgres", "redis", "db", "api-gateway", "ai-orchestrator",
+                "mcp-server", "voice-pipeline",
+            })
+
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError(f"ACTION node URL must use http or https scheme, got: {parsed.scheme!r}")
+            hostname = (parsed.hostname or "").lower()
+            if not hostname:
+                raise ValueError("ACTION node URL must include a hostname.")
+            if hostname in _INTERNAL_HOSTS:
+                raise ValueError(f"ACTION node URL targets internal host: {hostname!r}")
+            resolved = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+            for _fam, _type, _proto, _canon, sockaddr in resolved:
+                ip_str = sockaddr[0]
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    for net in _PRIVATE_NETS:
+                        if ip in net:
+                            raise ValueError(
+                                f"ACTION node URL resolves to private/reserved IP: {ip_str}"
+                            )
+                except ValueError as ip_exc:
+                    if "private" in str(ip_exc) or "reserved" in str(ip_exc):
+                        raise
+        except OSError as dns_exc:
+            raise RuntimeError(f"ACTION node URL hostname could not be resolved: {dns_exc}") from dns_exc
+        except ValueError as ssrf_exc:
+            raise RuntimeError(f"SSRF protection blocked ACTION node: {ssrf_exc}") from ssrf_exc
+
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(method, url, headers=headers, json=body)
             resp.raise_for_status()

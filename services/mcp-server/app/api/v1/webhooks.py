@@ -66,12 +66,49 @@ def _resolve_tenant_from_metadata(metadata: dict) -> Optional[str]:
 async def _load_tenant_config(tenant_id) -> dict:
     """Load tenant config dict for a given tenant_id.
 
-    In production this would query the tenant's agent configuration from the DB.
-    We return an empty dict here so downstream code gracefully degrades; the
-    booking provider registry falls back to "builtin" for unknown providers.
+    Queries the mcp_tools table for all active tools belonging to the tenant,
+    merges their tool_metadata dicts (with sensitive fields decrypted), and
+    returns the combined config dict consumed by SMSWorkflowEngine and
+    BookingProviderRegistry.
     """
-    # TODO: integrate with the actual tenant config store
-    return {}
+    from app.core.database import SessionLocal
+    from app.core.crypto import decrypt_sensitive_fields
+    from app.models.tool import Tool
+    from sqlalchemy import select
+
+    try:
+        async with SessionLocal() as session:
+            rows = await session.scalars(
+                select(Tool).where(
+                    Tool.tenant_id == tenant_id,
+                    Tool.is_active.is_(True),
+                )
+            )
+            config: dict = {}
+            for tool in rows:
+                metadata = tool.tool_metadata or {}
+                try:
+                    decrypted = decrypt_sensitive_fields(metadata) or {}
+                except Exception:
+                    # Decryption failure for one tool must not block the others
+                    logger.warning(
+                        "tenant_config_decrypt_failed",
+                        tenant_id=str(tenant_id),
+                        tool_name=tool.name,
+                    )
+                    decrypted = {
+                        k: v for k, v in metadata.items()
+                        if not isinstance(v, str) or not v.startswith("gAAAAA")
+                    }
+                config.update(decrypted)
+            return config
+    except Exception as exc:
+        logger.error(
+            "tenant_config_load_failed",
+            tenant_id=str(tenant_id),
+            error=str(exc),
+        )
+        return {}
 
 
 @router.post("/stripe", status_code=200)
@@ -91,8 +128,10 @@ async def stripe_webhook(
     webhook_secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "")
     if not webhook_secret:
         logger.error("stripe_webhook_secret_not_configured")
-        # Fail open with a warning rather than blocking all Stripe events in dev
-        # In production STRIPE_WEBHOOK_SECRET must be set.
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe webhook secret not configured — set STRIPE_WEBHOOK_SECRET",
+        )
     elif stripe_signature:
         if not verify_stripe_signature(raw, stripe_signature, webhook_secret):
             logger.warning("stripe_webhook_invalid_signature")

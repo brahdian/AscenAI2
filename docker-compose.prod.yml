@@ -30,7 +30,24 @@ services:
           cpus: "1.0"
 
   redis:
+    # HIGH-6/M-8: TLS-encrypted Redis connections.
+    # Mount TLS certificates at infrastructure/redis/tls/{ca.crt,redis.crt,redis.key}.
+    # Generate with: openssl req -x509 -newkey rsa:4096 -keyout redis.key -out redis.crt ...
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      --tls-port 6380
+      --port 0
+      --tls-cert-file /tls/redis.crt
+      --tls-key-file /tls/redis.key
+      --tls-ca-cert-file /tls/ca.crt
+      --tls-auth-clients no
+      --save ""
     ports: []
+    volumes:
+      - ./infrastructure/redis/tls:/tls:ro
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     deploy:
       resources:
         limits:
@@ -48,6 +65,8 @@ services:
     ports: []
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
+      # HIGH-6/M-8: use rediss:// (TLS) scheme now that Redis is TLS-only
+      REDIS_URL: rediss://:${REDIS_PASSWORD}@redis:6380/0
       ENVIRONMENT: production
       DEBUG: "false"
       COOKIE_DOMAIN: ${DOMAIN}
@@ -63,6 +82,7 @@ services:
     ports: []
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
+      REDIS_URL: rediss://:${REDIS_PASSWORD}@redis:6380/0
       ENVIRONMENT: production
     volumes:
       - document_storage:/data/documents
@@ -78,6 +98,7 @@ services:
     ports: []
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
+      REDIS_URL: rediss://:${REDIS_PASSWORD}@redis:6380/0
       ENVIRONMENT: production
     deploy:
       resources:
@@ -137,6 +158,42 @@ services:
           memory: 128M
           cpus: "0.25"
 
+  # -------------------------------------------------------------------------
+  # M-9: Automated daily Postgres backups
+  # Dumps the database every 24 h to /backups inside the container.
+  # Mount a host volume or object-storage fuse mount at that path.
+  # Retains the last 7 daily backups; older ones are pruned automatically.
+  # -------------------------------------------------------------------------
+  db-backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_USER: ${POSTGRES_USER:-ascenai}
+      POSTGRES_DB: ${POSTGRES_DB:-ascenai}
+      POSTGRES_HOST: postgres
+    volumes:
+      - db_backups:/backups
+    entrypoint: >
+      sh -c "
+        while true; do
+          BACKUP_FILE=/backups/ascenai_$$(date +%Y%m%d_%H%M%S).dump;
+          pg_dump -Fc -h $$POSTGRES_HOST -U $$POSTGRES_USER $$POSTGRES_DB > $$BACKUP_FILE
+          && echo \"Backup written: $$BACKUP_FILE\"
+          || echo \"Backup FAILED\";
+          find /backups -name '*.dump' -mtime +7 -delete;
+          sleep 86400;
+        done
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+
 volumes:
   document_storage:
   certbot_www:
+  db_backups:

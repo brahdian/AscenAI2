@@ -32,6 +32,24 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Sentry (initialized at module load so it captures startup errors too)
 # ---------------------------------------------------------------------------
+def _sentry_scrub_sql_params(event, hint):
+    """M-6: Strip SQL bound parameters from Sentry events to prevent PII leakage.
+
+    SqlalchemyIntegration captures full SQL statements including bound
+    parameters, which can contain PII (emails, tenant IDs, phone numbers).
+    This scrubber removes parameter values while preserving the query shape
+    for diagnostics.
+    """
+    for crumb in event.get("breadcrumbs", {}).get("values", []):
+        if crumb.get("category") in ("sqlalchemy.engine.Engine", "sqlalchemy"):
+            crumb.get("data", {}).pop("params", None)
+    for exc_val in event.get("exception", {}).get("values", []):
+        for frame in exc_val.get("stacktrace", {}).get("frames", []):
+            frame.get("vars", {}).pop("params", None)
+            frame.get("vars", {}).pop("bind_params", None)
+    return event
+
+
 if settings.SENTRY_DSN:
     sentry_sdk.init(
         dsn=settings.SENTRY_DSN,
@@ -45,6 +63,7 @@ if settings.SENTRY_DSN:
         traces_sample_rate=0.1,
         profiles_sample_rate=0.05,
         send_default_pii=False,
+        before_send=_sentry_scrub_sql_params,
     )
     logger.info("sentry_initialized", service="api-gateway")
 

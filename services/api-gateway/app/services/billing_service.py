@@ -20,16 +20,16 @@ Calculates:
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
+import stripe
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import uuid
-import stripe
 from app.core.config import settings
 from app.models.tenant import Tenant
 from app.services.tenant_service import get_plan_limits
@@ -143,6 +143,10 @@ class BillingService:
     def __init__(self, db: AsyncSession, redis_client) -> None:
         self.db = db
         self.redis = redis_client
+        # In-memory buffer for Redis increment operations that failed due to
+        # transient errors (HIGH-4 fix).  Flushed on the next successful write.
+        # This prevents quota counters from silently drifting during short outages.
+        self._pending_incr: list[tuple[str, float]] = []
 
     # ------------------------------------------------------------------
     # Usage recording
@@ -155,8 +159,10 @@ class BillingService:
         session_id: str = "",
     ) -> None:
         """Record LLM token usage for a tenant."""
-        key = f"billing:tokens:{tenant_id}:{_month_key()}"
+        month = _month_key()
+        key = f"billing:tokens:{tenant_id}:{month}"
         await self._incr(key, tokens)
+        await self._persist_event(tenant_id, "token", tokens, month, session_id)
         logger.info(
             "token_usage_recorded",
             tenant_id=tenant_id,
@@ -171,8 +177,10 @@ class BillingService:
         session_id: str = "",
     ) -> None:
         """Record chat-equivalent units for a tenant."""
-        key = f"billing:chats:{tenant_id}:{_month_key()}"
+        month = _month_key()
+        key = f"billing:chats:{tenant_id}:{month}"
         await self._incr(key, chat_units)
+        await self._persist_event(tenant_id, "chat", chat_units, month, session_id)
         logger.info(
             "chat_usage_recorded",
             tenant_id=tenant_id,
@@ -188,8 +196,10 @@ class BillingService:
     ) -> None:
         """Record voice call duration for a tenant."""
         minutes = seconds / 60.0
-        key = f"billing:minutes:{tenant_id}:{_month_key()}"
+        month = _month_key()
+        key = f"billing:minutes:{tenant_id}:{month}"
         await self._incr_float(key, minutes)
+        await self._persist_event(tenant_id, "voice_minute", minutes, month, session_id)
         logger.info(
             "voice_minutes_recorded",
             tenant_id=tenant_id,
@@ -204,8 +214,10 @@ class BillingService:
         success: bool = True,
     ) -> None:
         """Record tool call usage for a tenant."""
-        key = f"billing:tools:{tenant_id}:{_month_key()}"
+        month = _month_key()
+        key = f"billing:tools:{tenant_id}:{month}"
         await self._incr(key, 1)
+        await self._persist_event(tenant_id, "tool_call", 1, month)
         logger.info(
             "tool_usage_recorded",
             tenant_id=tenant_id,
@@ -222,13 +234,69 @@ class BillingService:
         tenant_id: str,
         month: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Get usage summary for a tenant for the current or specified month."""
+        """Get usage summary for a tenant for the current or specified month.
+
+        Read strategy (BLOCKER-3 fix):
+          1. Try Redis first (fast, real-time running totals).
+          2. If Redis returns zero for ALL metrics (cold cache after flush/restart),
+             fall back to summing the durable billing_events table in Postgres.
+          3. On fallback hit, back-fill Redis so subsequent calls are fast again.
+        """
         month = month or _month_key()
 
         tokens = await self._get_int(f"billing:tokens:{tenant_id}:{month}")
         chats = await self._get_int(f"billing:chats:{tenant_id}:{month}")
         minutes = await self._get_float(f"billing:minutes:{tenant_id}:{month}")
         tool_calls = await self._get_int(f"billing:tools:{tenant_id}:{month}")
+
+        # If all Redis values are zero AND a DB is available, check the durable log.
+        # A genuinely zero-usage tenant will re-query the DB each time, which is
+        # acceptable because the DB query is fast (indexed on tenant_id + month_key).
+        if tokens == 0 and chats == 0 and minutes == 0.0 and tool_calls == 0 and self.db is not None:
+            try:
+                result = await self.db.execute(
+                    text("""
+                        SELECT
+                            COALESCE(SUM(CASE WHEN event_type = 'token'        THEN amount ELSE 0 END), 0) AS tokens,
+                            COALESCE(SUM(CASE WHEN event_type = 'chat'         THEN amount ELSE 0 END), 0) AS chats,
+                            COALESCE(SUM(CASE WHEN event_type = 'voice_minute' THEN amount ELSE 0 END), 0) AS minutes,
+                            COALESCE(SUM(CASE WHEN event_type = 'tool_call'    THEN amount ELSE 0 END), 0) AS tool_calls
+                        FROM billing_events
+                        WHERE tenant_id = :tenant_id AND month_key = :month
+                    """),
+                    {"tenant_id": tenant_id, "month": month},
+                )
+                row = result.one()
+                db_tokens = int(row.tokens or 0)
+                db_chats = int(row.chats or 0)
+                db_minutes = float(row.minutes or 0.0)
+                db_tool_calls = int(row.tool_calls or 0)
+
+                if db_tokens or db_chats or db_minutes or db_tool_calls:
+                    # Back-fill Redis so quota enforcement is immediately accurate
+                    tokens, chats, minutes, tool_calls = db_tokens, db_chats, db_minutes, db_tool_calls
+                    _ttl = 86400 * 32
+                    if self.redis:
+                        try:
+                            pipe = self.redis.pipeline()
+                            if db_tokens:
+                                pipe.set(f"billing:tokens:{tenant_id}:{month}", db_tokens, ex=_ttl)
+                            if db_chats:
+                                pipe.set(f"billing:chats:{tenant_id}:{month}", db_chats, ex=_ttl)
+                            if db_minutes:
+                                pipe.set(f"billing:minutes:{tenant_id}:{month}", db_minutes, ex=_ttl)
+                            if db_tool_calls:
+                                pipe.set(f"billing:tools:{tenant_id}:{month}", db_tool_calls, ex=_ttl)
+                            await pipe.execute()
+                            logger.info(
+                                "billing_redis_backfilled_from_db",
+                                tenant_id=tenant_id,
+                                month=month,
+                            )
+                        except Exception as exc:
+                            logger.warning("billing_redis_backfill_failed", error=str(exc))
+            except Exception as exc:
+                logger.warning("billing_db_fallback_failed", tenant_id=tenant_id, error=str(exc))
 
         return {
             "tenant_id": tenant_id,
@@ -438,23 +506,44 @@ class BillingService:
     # Internal Redis helpers
     # ------------------------------------------------------------------
 
+    async def _flush_pending(self) -> None:
+        """Replay any buffered increments that failed during a previous Redis error."""
+        if not self._pending_incr or not self.redis:
+            return
+        flushed: list[tuple[str, float]] = []
+        still_pending: list[tuple[str, float]] = []
+        for pending_key, pending_amount in self._pending_incr:
+            try:
+                await self.redis.incrbyfloat(pending_key, pending_amount)
+                await self.redis.expire(pending_key, 86400 * 32)
+                flushed.append((pending_key, pending_amount))
+            except Exception:
+                still_pending.append((pending_key, pending_amount))
+        self._pending_incr = still_pending
+        if flushed:
+            logger.info("billing_redis_pending_flushed", count=len(flushed))
+
     async def _incr(self, key: str, amount: int) -> None:
         if not self.redis:
             return
+        await self._flush_pending()
         try:
             await self.redis.incrby(key, amount)
             await self.redis.expire(key, 86400 * 32)
         except Exception as exc:
-            logger.warning("billing_redis_error", key=key, error=str(exc))
+            logger.warning("billing_redis_error_buffered", key=key, error=str(exc))
+            self._pending_incr.append((key, float(amount)))
 
     async def _incr_float(self, key: str, amount: float) -> None:
         if not self.redis:
             return
+        await self._flush_pending()
         try:
             await self.redis.incrbyfloat(key, amount)
             await self.redis.expire(key, 86400 * 32)
         except Exception as exc:
-            logger.warning("billing_redis_error", key=key, error=str(exc))
+            logger.warning("billing_redis_error_buffered", key=key, error=str(exc))
+            self._pending_incr.append((key, amount))
 
     async def _get_int(self, key: str) -> int:
         if not self.redis:
@@ -473,6 +562,54 @@ class BillingService:
             return float(val) if val else 0.0
         except Exception:
             return 0.0
+
+    # ------------------------------------------------------------------
+    # BLOCKER-3: Durable Postgres event log
+    # ------------------------------------------------------------------
+
+    async def _persist_event(
+        self,
+        tenant_id: str,
+        event_type: str,
+        amount: float,
+        month_key: str,
+        session_id: str = "",
+    ) -> None:
+        """Write a durable billing event to Postgres.
+
+        This is the authoritative record used for reconciliation when Redis is
+        flushed, restarted, or evicted.  Failures are logged but never raised —
+        the Redis write already happened and blocking the caller would be worse.
+        """
+        if self.db is None:
+            return
+        try:
+            await self.db.execute(
+                text(
+                    "INSERT INTO billing_events "
+                    "(id, tenant_id, event_type, amount, month_key, session_id, created_at) "
+                    "VALUES (:id, :tenant_id, :event_type, :amount, :month_key, :session_id, :now)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "tenant_id": tenant_id,
+                    "event_type": event_type,
+                    "amount": amount,
+                    "month_key": month_key,
+                    "session_id": session_id or "",
+                    "now": datetime.now(timezone.utc),
+                },
+            )
+            # Flush (not commit) — outer request transaction commits later.
+            # If there is no outer transaction the autocommit mode handles it.
+            await self.db.flush()
+        except Exception as exc:
+            logger.warning(
+                "billing_event_db_persist_failed",
+                event_type=event_type,
+                tenant_id=tenant_id,
+                error=str(exc),
+            )
 
 
 # ---------------------------------------------------------------------------

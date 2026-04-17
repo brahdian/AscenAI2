@@ -25,6 +25,18 @@ from app.core.security import get_current_tenant
 # ---------------------------------------------------------------------------
 # Sentry
 # ---------------------------------------------------------------------------
+def _sentry_scrub_sql_params(event, hint):
+    """M-6: Strip SQL bound parameters from Sentry events to prevent PII leakage."""
+    for crumb in event.get("breadcrumbs", {}).get("values", []):
+        if crumb.get("category") in ("sqlalchemy.engine.Engine", "sqlalchemy"):
+            crumb.get("data", {}).pop("params", None)
+    for exc_val in event.get("exception", {}).get("values", []):
+        for frame in exc_val.get("stacktrace", {}).get("frames", []):
+            frame.get("vars", {}).pop("params", None)
+            frame.get("vars", {}).pop("bind_params", None)
+    return event
+
+
 if getattr(settings, "SENTRY_DSN", ""):
     sentry_sdk.init(
         dsn=settings.SENTRY_DSN,
@@ -36,6 +48,7 @@ if getattr(settings, "SENTRY_DSN", ""):
         ],
         traces_sample_rate=0.1,
         send_default_pii=False,
+        before_send=_sentry_scrub_sql_params,
     )
 def _setup_opentelemetry() -> None:
     if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):

@@ -1,11 +1,17 @@
 """
 Redis sliding-window rate limiter middleware for the API Gateway.
 =================================================================
-Implements the fixed-window-with-sliding-log algorithm:
-  - Each tenant gets RATE_LIMIT_REQUESTS requests per RATE_LIMIT_WINDOW_SECONDS.
-  - State is kept in Redis so all gateway replicas share counts.
-  - If Redis is unavailable, traffic is ALLOWED (fail-open) to avoid
-    blocking legitimate users during a Redis outage.
+Implements a true sliding-window algorithm using a Redis sorted set:
+  - Each request is recorded as a member with score = arrival timestamp.
+  - Members older than WINDOW_SECONDS are pruned with ZREMRANGEBYSCORE.
+  - The current count is ZCARD after pruning.
+  - The key expires automatically after WINDOW_SECONDS with no new traffic.
+
+M-2 fix: The previous implementation used INCR + EXPIREAT, which is a
+fixed-window algorithm.  At a window boundary a client could make 2×LIMIT
+requests in a short burst (LIMIT at the end of one window + LIMIT at the
+start of the next).  The sorted-set approach eliminates this vulnerability
+because the window always looks back exactly WINDOW_SECONDS from now.
 
 Configuration (env vars):
     RATE_LIMIT_REQUESTS  = 120   # requests per window (default: 120/min)
@@ -14,15 +20,15 @@ Configuration (env vars):
 Headers returned on every response:
     X-RateLimit-Limit     : configured limit
     X-RateLimit-Remaining : remaining requests in the current window
-    X-RateLimit-Reset     : epoch seconds when the window resets
+    X-RateLimit-Reset     : epoch seconds when the window will next reset
 
 Endpoints exempt from rate limiting (health probes, Stripe webhooks):
     /health* , /metrics , /api/v1/billing/webhook
 """
 from __future__ import annotations
 
-import math
 import time
+import uuid
 from typing import Optional
 
 import structlog
@@ -45,10 +51,34 @@ _EXEMPT_PREFIXES: tuple[str, ...] = (
 _DEFAULT_LIMIT: int = 120
 _DEFAULT_WINDOW: int = 60  # seconds
 
+# Lua script: atomic sliding-window check-and-record.
+# Returns {current_count, window_reset_epoch}
+_SLIDING_WINDOW_LUA = """
+local key        = KEYS[1]
+local now        = tonumber(ARGV[1])
+local window     = tonumber(ARGV[2])
+local member     = ARGV[3]
+local cutoff     = now - window
+
+-- Remove entries older than the window
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+
+-- Add current request
+redis.call('ZADD', key, now, member)
+
+-- Set TTL so the key auto-expires when idle
+redis.call('EXPIRE', key, window + 1)
+
+-- Count requests in current window
+local count = redis.call('ZCARD', key)
+
+return {count, math.ceil(now / window) * window}
+"""
+
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
-    Per-tenant (falling back to per-IP) sliding-window rate limiter.
+    Per-tenant (falling back to per-IP) true sliding-window rate limiter.
 
     Parameters
     ----------
@@ -57,7 +87,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     limit:
         Maximum number of requests per window.
     window_seconds:
-        Duration of the rate-limit window in seconds.
+        Duration of the sliding window in seconds.
     """
 
     def __init__(self, app, limit: int = _DEFAULT_LIMIT, window_seconds: int = _DEFAULT_WINDOW):
@@ -78,15 +108,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         identifier = self._get_identifier(request)
-        key = f"rate_limit:{identifier}"
-        window_end = math.ceil(time.time() / self.window) * self.window
+        key = f"rl_sw:{identifier}"
+        now = time.time()
+        # Unique member per request so simultaneous requests don't overwrite each other
+        member = f"{now:.6f}:{uuid.uuid4().hex[:8]}"
 
         try:
-            pipe = redis.pipeline()
-            pipe.incr(key)
-            pipe.expireat(key, int(window_end))
-            results = await pipe.execute()
-            current_count = int(results[0])
+            result = await redis.eval(
+                _SLIDING_WINDOW_LUA,
+                1,       # number of keys
+                key,
+                str(now),
+                str(self.window),
+                member,
+            )
+            current_count = int(result[0])
+            window_reset = int(result[1])
         except Exception as exc:
             logger.warning("rate_limit_redis_error", error=str(exc), path=path)
             # Fail open — don't block legitimate traffic during Redis outage
@@ -96,7 +133,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         headers = {
             "X-RateLimit-Limit": str(self.limit),
             "X-RateLimit-Remaining": str(remaining),
-            "X-RateLimit-Reset": str(int(window_end)),
+            "X-RateLimit-Reset": str(window_reset),
         }
 
         if current_count > self.limit:
@@ -111,7 +148,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 status_code=429,
                 content={
                     "detail": "Too many requests. Please slow down.",
-                    "retry_after": int(window_end - time.time()),
+                    "retry_after": max(1, window_reset - int(now)),
                 },
                 headers=headers,
             )

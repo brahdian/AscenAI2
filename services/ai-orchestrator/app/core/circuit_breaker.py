@@ -92,6 +92,14 @@ class CircuitBreaker:
         self._open_at_key = f"cb:{name}:open_at"
         self._half_open_calls_key = f"cb:{name}:half_open_calls"
 
+        # In-process fallback state — used when Redis is unavailable.
+        # Provides single-process protection during Redis outages so the
+        # circuit still trips instead of letting every LLM call time out.
+        self._local_lock: asyncio.Lock = asyncio.Lock()
+        self._local_failures: int = 0
+        self._local_open_until: float = 0.0  # epoch; 0 means CLOSED
+        self._local_window_start: float = time.time()
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -166,12 +174,25 @@ class CircuitBreaker:
 
     async def _get_state(self) -> str:
         if self.redis is None:
-            return _STATE_CLOSED
+            return await self._local_get_state()
         try:
             raw = await self.redis.get(self._state_key)
             return (raw or _STATE_CLOSED)
         except Exception:
-            return _STATE_CLOSED  # Fail-open when Redis is down
+            # Redis is down — fall back to in-process state so the breaker
+            # can still trip if the LLM is also degraded (cascade prevention).
+            return await self._local_get_state()
+
+    async def _local_get_state(self) -> str:
+        """Return circuit state from in-process counters (Redis-unavailable path)."""
+        async with self._local_lock:
+            if self._local_open_until > time.time():
+                return _STATE_OPEN
+            if self._local_open_until > 0:
+                # Recovery timeout elapsed → probe
+                self._local_open_until = 0.0
+                return _STATE_HALF_OPEN
+            return _STATE_CLOSED
 
     async def _set_state(self, state: str) -> None:
         if self.redis is None:
@@ -184,25 +205,28 @@ class CircuitBreaker:
             logger.warning("circuit_breaker_state_write_failed", name=self.name, error=str(exc))
 
     async def _on_success(self) -> None:
+        if self.redis is None:
+            await self._local_reset()
+            return
+
         state = await self._get_state()
         if state == _STATE_HALF_OPEN:
             # Probe succeeded → close circuit
             await self._set_state(_STATE_CLOSED)
-            if self.redis:
-                try:
-                    await self.redis.delete(
-                        self._fail_count_key,
-                        self._open_at_key,
-                        self._half_open_calls_key,
-                    )
-                except Exception:
-                    pass
-        elif state == _STATE_CLOSED and self.redis:
+            try:
+                await self.redis.delete(
+                    self._fail_count_key,
+                    self._open_at_key,
+                    self._half_open_calls_key,
+                )
+            except Exception:
+                pass
+        elif state == _STATE_CLOSED:
             # Success in CLOSED: reset failure counter incrementally
             try:
                 await self.redis.delete(self._fail_count_key)
             except Exception:
-                pass
+                await self._local_reset()
 
     async def _on_failure(self, error_type: str) -> None:
         logger.warning(
@@ -212,6 +236,7 @@ class CircuitBreaker:
         )
 
         if self.redis is None:
+            await self._local_record_failure()
             return
 
         state = await self._get_state()
@@ -243,6 +268,33 @@ class CircuitBreaker:
                 )
         except Exception as exc:
             logger.warning("circuit_breaker_failure_count_error", name=self.name, error=str(exc))
+            # Redis write failed — maintain local fallback counter
+            await self._local_record_failure()
+
+    async def _local_record_failure(self) -> None:
+        """Increment the in-process failure counter and trip if threshold reached."""
+        async with self._local_lock:
+            now = time.time()
+            # Reset window if expired
+            if now - self._local_window_start >= self.window_seconds:
+                self._local_failures = 0
+                self._local_window_start = now
+            self._local_failures += 1
+            if self._local_failures >= self.failure_threshold:
+                self._local_open_until = now + self.recovery_timeout
+                self._local_failures = 0
+                logger.error(
+                    "circuit_breaker_tripped_open_local",
+                    name=self.name,
+                    detail="Redis unavailable — in-process fallback tripped",
+                )
+
+    async def _local_reset(self) -> None:
+        """Reset in-process state on success (called when Redis is unavailable)."""
+        async with self._local_lock:
+            self._local_failures = 0
+            self._local_open_until = 0.0
+            self._local_window_start = time.time()
 
     async def _should_try_recovery(self) -> bool:
         if self.redis is None:

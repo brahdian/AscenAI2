@@ -24,10 +24,22 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|(?<=\n)")
 
 
 def _tenant_id(request: Request) -> str:
-    tid = request.headers.get("X-Tenant-ID") or getattr(request.state, "tenant_id", None)
+    """Extract and validate the tenant ID from the request.
+
+    M-4 fix: validate that the header value is a well-formed UUID so a
+    caller cannot inject arbitrary strings as a tenant identifier via the
+    X-Tenant-ID header.  The JWT-authenticated tenant_id on request.state
+    (set by upstream auth middleware) is always preferred over the raw header.
+    """
+    tid = getattr(request.state, "tenant_id", None) or request.headers.get("X-Tenant-ID")
     if not tid:
         raise HTTPException(status_code=401, detail="Tenant ID required.")
-    return tid
+    try:
+        import uuid as _uuid
+        _uuid.UUID(str(tid))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Tenant ID format.")
+    return str(tid)
 
 
 @router.post("/stt", response_model=STTResponse)
@@ -166,6 +178,49 @@ async def twilio_incoming_call(request: Request):
     Twilio can still establish a stream (the pipeline will reject the WS
     with 4401 if the token is invalid).
     """
+    # ── BLOCKER-1: Twilio signature verification ──────────────────────────
+    # Every Twilio webhook must have its X-Twilio-Signature validated before
+    # we respond with a TwiML payload. Without this check, anyone can POST
+    # to this endpoint, receive a valid WebSocket URL, and connect to the
+    # AI pipeline without a real Twilio call.
+    twilio_signature = request.headers.get("X-Twilio-Signature", "")
+    auth_token = getattr(settings, "TWILIO_AUTH_TOKEN", "")
+    if auth_token:
+        try:
+            from twilio.request_validator import RequestValidator
+            validator = RequestValidator(auth_token)
+            # Twilio signs over the full URL including query parameters.
+            # We must pass the form params (empty for incoming calls) and
+            # use the exact URL Twilio used — derived from the Host header.
+            form_params: dict = {}
+            try:
+                form_data = await request.form()
+                form_params = dict(form_data)
+            except Exception:
+                pass
+            url = str(request.url)
+            if not validator.validate(url, form_params, twilio_signature):
+                logger.warning(
+                    "twilio_incoming_invalid_signature",
+                    path=request.url.path,
+                    has_sig=bool(twilio_signature),
+                )
+                return Response(
+                    content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
+                    media_type="text/xml",
+                    status_code=403,
+                )
+        except ImportError:
+            logger.error("twilio_sdk_missing_cannot_validate_signature")
+            raise HTTPException(status_code=500, detail="Voice pipeline misconfigured: twilio SDK missing.")
+    else:
+        logger.error("twilio_auth_token_not_configured_rejecting_call")
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
+            media_type="text/xml",
+            status_code=403,
+        )
+
     params = dict(request.query_params)
     agent_id = params.get("agent_id", "default")
     tenant_id = params.get("tenant_id", "")

@@ -145,14 +145,18 @@ async def transition(
     wf.state = to_state
     wf.state_version += 1
 
-    # Write immutable audit event (idempotent via unique key)
+    # Write immutable audit event (idempotent via unique key).
+    # M-3 fix: include state_version in the idempotency key so the same
+    # from→to transition can occur again after re-entry (e.g.
+    # NEEDS_REBOOK → SLOT_HELD → FAILED on a retry attempt uses version N+1
+    # and will not be blocked by the version-N record already in the table).
     event = BookingEvent(
         workflow_id=workflow_id,
         event_type=f"STATE_{from_state.value}_TO_{to_state.value}",
         from_state=from_state.value,
         to_state=to_state.value,
         actor=actor,
-        idempotency_key=f"{workflow_id}:{from_state.value}:{to_state.value}",
+        idempotency_key=f"{workflow_id}:{from_state.value}:{to_state.value}:v{wf.state_version}",
         payload=payload or {},
     )
     db.add(event)

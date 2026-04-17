@@ -112,11 +112,41 @@ async def handle_payment_completed(
             "payment_webhook_invalid_state",
             state=wf.state.value,
         )
-        # Edge case: user paid after slot expired.  Send slot-lost SMS.
+        # BLOCKER-4: User paid after the slot expired (classic race: expiry worker
+        # fired between payment initiation and Stripe's webhook delivery).
+        # The card has already been charged — we MUST refund automatically or this
+        # becomes a chargeback and a consumer-protection violation.
         if wf.state == BookingState.EXPIRED:
             tenant_config = await tenant_config_loader(wf.tenant_id)
             sms = _make_sms_engine(db, tenant_config, sms_engine_factory)
             await sms.send_slot_lost_notification(wf)
+
+            # Automatic Stripe refund for the captured payment
+            if payment_intent_id:
+                try:
+                    import stripe as _stripe
+                    from app.core.config import settings as _settings
+                    _stripe.api_key = _settings.STRIPE_SECRET_KEY
+                    import asyncio as _asyncio
+                    refund = await _asyncio.to_thread(
+                        _stripe.Refund.create,
+                        payment_intent=payment_intent_id,
+                        reason="duplicate",
+                    )
+                    log.info(
+                        "stripe_refund_issued_expired_slot",
+                        payment_intent_id=payment_intent_id,
+                        refund_id=refund.id,
+                        refund_status=refund.status,
+                    )
+                except Exception as refund_exc:
+                    # Log loudly — ops must manually refund if this fails.
+                    log.error(
+                        "stripe_refund_failed_expired_slot_MANUAL_ACTION_REQUIRED",
+                        payment_intent_id=payment_intent_id,
+                        error=str(refund_exc),
+                    )
+
             await db.commit()
         return {"status": "invalid_state", "current_state": wf.state.value}
 
@@ -197,7 +227,13 @@ async def _handle_slot_lost(
     sms: SMSWorkflowEngine,
     log,
 ) -> None:
-    """Release the CRM hold and transition to NEEDS_REBOOK."""
+    """Release the CRM hold, transition to NEEDS_REBOOK, and refund the user.
+
+    The payment was captured but the slot is no longer available (either taken
+    by a concurrent booking or CRM confirm failed).  We MUST issue a Stripe
+    refund to avoid holding the user's money indefinitely while they wait for
+    a rebook that may never complete.
+    """
     if wf.external_reservation_id:
         try:
             await provider.release_slot(wf.external_reservation_id)
@@ -212,6 +248,33 @@ async def _handle_slot_lost(
         payload={"reason": "slot_unavailable_at_confirm_time"},
     )
     await sms.send_slot_lost_notification(wf)
+
+    # Refund the captured payment — user's money should not be held while we
+    # search for a replacement slot (HIGH-5 fix).
+    if wf.payment_intent_id:
+        try:
+            import stripe as _stripe
+            from app.core.config import settings as _settings
+            import asyncio as _asyncio
+            _stripe.api_key = _settings.STRIPE_SECRET_KEY
+            refund = await _asyncio.to_thread(
+                _stripe.Refund.create,
+                payment_intent=wf.payment_intent_id,
+                reason="duplicate",
+            )
+            log.info(
+                "stripe_refund_issued_slot_lost",
+                payment_intent_id=wf.payment_intent_id,
+                refund_id=refund.id,
+                refund_status=refund.status,
+            )
+        except Exception as refund_exc:
+            # Log loudly — ops must manually refund if this fails.
+            log.error(
+                "stripe_refund_failed_slot_lost_MANUAL_ACTION_REQUIRED",
+                payment_intent_id=wf.payment_intent_id,
+                error=str(refund_exc),
+            )
 
 
 def _make_sms_engine(db, tenant_config, factory=None) -> SMSWorkflowEngine:

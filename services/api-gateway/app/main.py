@@ -165,7 +165,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 
-def _setup_opentelemetry() -> None:
+def _setup_opentelemetry(app: FastAPI) -> None:
     """Wire OpenTelemetry tracing if enabled."""
     if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):
         return
@@ -181,13 +181,13 @@ def _setup_opentelemetry() -> None:
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_ENDPOINT)))
         trace.set_tracer_provider(provider)
-        FastAPIInstrumentor.instrument()
+        FastAPIInstrumentor().instrument_app(app)
         logger.info("opentelemetry_initialized", endpoint=settings.OTEL_ENDPOINT)
     except ImportError:
         logger.warning("opentelemetry_packages_missing")
 
 
-_setup_opentelemetry()
+
 
 
 @asynccontextmanager
@@ -225,6 +225,8 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+_setup_opentelemetry(app)
 
 # --- Middlewares (Added inside out: last added is outermost in execution) ---
 

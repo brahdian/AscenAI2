@@ -489,10 +489,25 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
 
 
 def _tenant_id(request: Request) -> str:
-    tid = request.headers.get("X-Tenant-ID") or getattr(request.state, "tenant_id", None)
+    tid = getattr(request.state, "tenant_id", None)
     if not tid:
         raise HTTPException(status_code=401, detail="Tenant ID required.")
     return tid
+
+
+async def _tenant_db(
+    tenant_id: str = Depends(_tenant_id),
+):
+    async for session in get_db(tenant_id):
+        yield session
+
+
+def _require_internal_key(request: Request) -> None:
+    internal_key = request.headers.get("X-Internal-Key", "")
+    from app.core.config import settings as _cfg
+
+    if not _cfg.INTERNAL_API_KEY or internal_key != _cfg.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid internal API key.")
 
 
 class SchemasRequest(BaseModel):
@@ -503,17 +518,20 @@ class SchemasRequest(BaseModel):
 @router.post("/schemas")
 async def get_tool_schemas(
     body: SchemasRequest,
-    db: AsyncSession = Depends(get_db),
+    request: Request,
+    db: AsyncSession = Depends(_tenant_db),
+    tenant_id: str = Depends(_tenant_id),
 ) -> list[dict[str, Any]]:
     """
     Return OpenAI function-calling schemas for the requested tools.
     The orchestrator calls this so Gemini knows which functions it can invoke.
     """
+    _require_internal_key(request)
     registry = ToolRegistry(db)
     schemas: list[dict[str, Any]] = []
 
     for tool_name in body.tool_names:
-        tool = await registry.get_tool(body.tenant_id, tool_name)
+        tool = await registry.get_tool(tenant_id, tool_name)
         if not tool:
             continue
 
@@ -639,7 +657,7 @@ async def verify_tool_config(
 async def register_tool(
     body: ToolRegistration,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Register a new tool for the tenant."""
     tenant_id = _tenant_id(request)
@@ -663,24 +681,19 @@ async def register_tool(
 async def upsert_builtin_tool(
     body: ToolRegistration,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Create or update a built-in tool registration.
 
     Called internally by ai-orchestrator's WorkflowRegistry when a workflow is
-    activated/deactivated. Uses the tenant id from X-Tenant-ID header and
-    requires the internal API key (X-Internal-Key header).
+    activated/deactivated. Uses the tenant identity resolved by middleware and
+    requires the internal API key.
 
     - If no tool with ``body.name`` exists for the tenant → creates it.
     - If one already exists → updates description, schemas, metadata, and
       is_active without changing the tool's UUID.
     """
-    from app.core.config import settings as _cfg
-
-    # Internal callers must present the shared API key
-    internal_key = request.headers.get("X-Internal-Key", "")
-    if _cfg.INTERNAL_API_KEY and internal_key != _cfg.INTERNAL_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid internal API key.")
+    _require_internal_key(request)
 
     tenant_id = _tenant_id(request)
     registry = ToolRegistry(db)
@@ -720,7 +733,7 @@ async def upsert_builtin_tool(
 async def list_tools(
     request: Request,
     category: str | None = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """List all active tools for the tenant."""
     tenant_id = _tenant_id(request)
@@ -732,7 +745,7 @@ async def list_tools(
 async def get_tool(
     tool_name: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Get a specific tool by name."""
     tenant_id = _tenant_id(request)
@@ -748,7 +761,7 @@ async def update_tool(
     tool_name: str,
     body: ToolUpdate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Update a tool's configuration."""
     tenant_id = _tenant_id(request)
@@ -771,7 +784,7 @@ async def update_tool(
 async def delete_tool(
     tool_name: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Permanently delete a tool configuration."""
     tenant_id = _tenant_id(request)
@@ -787,7 +800,7 @@ async def delete_tool(
 async def test_execute_tool(
     body: ToolTestExecutionRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(_tenant_db),
 ) -> dict[str, Any]:
     """Test execute a tool with the provided configuration and parameters."""
     tenant_id = _tenant_id(request)
@@ -836,4 +849,3 @@ async def test_execute_tool(
         raise HTTPException(status_code=400, detail=str(e))
         
     return result.model_dump()
-

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.services.billing_service import create_agent_checkout_session
 
 logger = structlog.get_logger(__name__)
@@ -152,8 +153,9 @@ _SERVICE_MAP = {
     "analytics": settings.AI_ORCHESTRATOR_URL,
     "templates": settings.AI_ORCHESTRATOR_URL,
     "playbooks": settings.AI_ORCHESTRATOR_URL,
-    "guardrails": settings.AI_ORCHESTRATOR_URL,
-    "flows": settings.AI_ORCHESTRATOR_URL,
+    "escalation": settings.AI_ORCHESTRATOR_URL,
+    "workflows": settings.AI_ORCHESTRATOR_URL,
+    "platform": settings.AI_ORCHESTRATOR_URL,
     "tools": settings.MCP_SERVER_URL,
     "context": settings.MCP_SERVER_URL,
     "voice": settings.VOICE_PIPELINE_URL,
@@ -167,7 +169,7 @@ _STRIP_FROM_CHAT = frozenset(["system_prompt", "system", "instructions"])
 
 
 # Services that are mounted under /agents in the AI Orchestrator
-_AGENT_BASED_SERVICES = frozenset(["playbooks", "guardrails", "flows"])
+_AGENT_BASED_SERVICES = frozenset(["playbooks", "guardrails", "workflows", "learning", "documents", "evals", "prompts", "variables"])
 
 def _get_downstream_url(service: str, path: str) -> str:
     # Map playbooks and guardrails to agents service (they're mounted under /agents in orchestrator)
@@ -320,13 +322,11 @@ async def proxy(
     service: str,
     path: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Generic reverse proxy with plan-limit enforcement and usage tracking."""
-    tenant_id: str = getattr(request.state, "tenant_id", "") or ""
-    if not tenant_id and request.url.path not in PUBLIC_PATHS:
-        logger.warning("proxy_auth_failed_no_tenant", path=request.url.path)
-        raise HTTPException(status_code=401, detail="Authentication required for proxy requests.")
+    # Auth is already enforced by the get_tenant_db dependency (TC-A01)
     
     method = request.method.upper()
     full_path = f"{service}/{path}".strip("/")
@@ -386,6 +386,9 @@ async def proxy(
                 body_dict = await request.json()
             except Exception:
                 body_dict = {}
+
+            # Extract template context for automatic instantiation
+            template_ctx = body_dict.pop("template_context", None)
                 
             body_dict["is_active"] = has_slot
             
@@ -400,12 +403,33 @@ async def proxy(
                 resp = await client.post(url, json=body_dict, headers=headers)
                 
                 if resp.status_code == 201:
+                    agent_data = resp.json()
+                    agent_id = agent_data.get("id")
+
+                    # AUTOMATIC INSTANTIATION: Trigger immediately after agent creation
+                    if template_ctx and agent_id:
+                        template_id = template_ctx.get("template_id")
+                        if template_id:
+                            instantiate_url = f"{settings.AI_ORCHESTRATOR_URL}/api/v1/templates/{template_id}/instantiate"
+                            instantiate_payload = {
+                                "agent_id": agent_id,
+                                "template_version_id": template_ctx.get("template_version_id"),
+                                "variable_values": template_ctx.get("variable_values", {}),
+                                "tool_configs": template_ctx.get("tool_configs", {}),
+                            }
+                            try:
+                                inst_resp = await client.post(instantiate_url, json=instantiate_payload, headers=headers)
+                                if inst_resp.status_code != 200:
+                                    logger.warning("gateway_auto_instantiation_failed", agent_id=agent_id, status_code=inst_resp.status_code, detail=inst_resp.text)
+                                else:
+                                    logger.info("gateway_auto_instantiation_success", agent_id=agent_id, template_id=template_id)
+                            except Exception as inst_err:
+                                logger.error("gateway_auto_instantiation_error", agent_id=agent_id, error=str(inst_err))
+
                     if has_slot:
                         return Response(content=resp.content, status_code=201)
                     
                     # Create draft and redirect to Stripe
-                    agent_data = resp.json()
-                    agent_id = agent_data.get("id")
                     try:
                         requested_plan = body_dict.get("plan")
                         _origin = request.headers.get("Origin") or request.headers.get("Referer", "").split("/api")[0]

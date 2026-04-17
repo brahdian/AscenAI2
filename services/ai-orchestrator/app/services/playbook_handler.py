@@ -119,6 +119,29 @@ class PlaybookHandler:
         )
         return result.scalar_one_or_none()
 
+    async def get_active_playbooks(self, agent_id: str) -> list[AgentPlaybook]:
+        """
+        Return all active AgentPlaybook objects for *agent_id*.
+
+        Tries to load full objects from the database directly.  The result is
+        used by ``IntentDetector.classify_from_playbooks`` when
+        ``route_active_playbook`` returned ``None`` (no winning playbook).
+        This path is uncommon; caching is intentionally skipped here so we
+        always get up-to-date trigger phrases without worrying about
+        invalidation.
+        """
+        try:
+            result = await self.db.execute(
+                select(AgentPlaybook).where(
+                    AgentPlaybook.agent_id == uuid.UUID(agent_id),
+                    AgentPlaybook.is_active.is_(True),
+                )
+            )
+            return list(result.scalars().all())
+        except Exception as exc:
+            logger.warning("get_active_playbooks_failed", agent_id=agent_id, error=str(exc))
+            return []
+
     async def ensure_playbook_execution(self, agent_id: str, session_id: str, playbook: Optional[AgentPlaybook]) -> Tuple[Optional[PlaybookExecution], dict]:
         if not playbook:
             return None, {}

@@ -35,6 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import SessionLocal
+from app.core.leadership import RedisLeaderLease
 from app.models.booking import BookingState, BookingWorkflow
 from app.services.booking_provider import BookingProviderRegistry
 from app.services.booking_state_machine import transition, record_event
@@ -53,10 +54,12 @@ def _utcnow() -> datetime:
 class BookingExpiryWorker:
     """Background worker that expires stale booking holds."""
 
-    def __init__(self, interval_seconds: int = _DEFAULT_INTERVAL_SECONDS) -> None:
+    def __init__(self, redis, interval_seconds: int = _DEFAULT_INTERVAL_SECONDS) -> None:
+        self.redis = redis
         self._interval = interval_seconds
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._lease = RedisLeaderLease(redis, "mcp-server:booking-expiry")
 
     def start(self) -> None:
         """Start the background task."""
@@ -79,6 +82,9 @@ class BookingExpiryWorker:
         """Main loop — runs indefinitely until stopped."""
         while self._running:
             try:
+                if not await self._lease.acquire_or_renew():
+                    await asyncio.sleep(self._interval)
+                    continue
                 await self._run_once()
             except Exception as exc:
                 logger.error("booking_expiry_worker_error", error=str(exc), exc_info=exc)
@@ -198,8 +204,10 @@ async def _load_tenant_config_safe(tenant_id) -> dict:
 _worker: Optional[BookingExpiryWorker] = None
 
 
-def get_booking_expiry_worker() -> BookingExpiryWorker:
+def get_booking_expiry_worker(redis=None) -> BookingExpiryWorker:
     global _worker
     if _worker is None:
-        _worker = BookingExpiryWorker()
+        if redis is None:
+            raise RuntimeError("Redis client required to initialize booking expiry worker")
+        _worker = BookingExpiryWorker(redis=redis)
     return _worker

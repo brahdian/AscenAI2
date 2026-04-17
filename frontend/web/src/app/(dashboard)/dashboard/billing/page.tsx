@@ -122,6 +122,7 @@ export default function BillingPage() {
   const [portalLoading, setPortalLoading] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string>('')
   const [changingPlan, setChangingPlan] = useState(false)
+  const [syncLoading, setSyncLoading] = useState(false)
 
   useEffect(() => {
     Promise.all([
@@ -183,6 +184,39 @@ export default function BillingPage() {
     }
   }
 
+  const handleSyncSubscription = async () => {
+    setSyncLoading(true)
+    try {
+      const result = await billingApi.syncSubscription()
+      if (result.status === 'active') {
+        const activated = result.agents_activated ?? 0
+        if (activated > 0) {
+          toast.success(`✅ Subscription synced! ${activated} agent${activated !== 1 ? 's' : ''} activated.`, { duration: 5000 })
+        } else {
+          toast.success('Subscription verified — all agents are already active.', { duration: 4000 })
+        }
+        // Reload billing data
+        const [ov, ag, inv] = await Promise.all([
+          billingApi.overview(),
+          billingApi.agents(),
+          billingApi.getInvoices().then(r => r.invoices).catch(() => []),
+        ])
+        setOverview(ov)
+        setAgents(ag)
+        setInvoices(inv)
+      } else if (result.status === 'no_subscription') {
+        toast.error('No active subscription found. Please subscribe first.')
+      } else {
+        toast.error(`Subscription status: ${result.subscription_status}. Please check your payment method.`)
+      }
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || 'Failed to sync subscription'
+      toast.error(msg)
+    } finally {
+      setSyncLoading(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="p-8 flex items-center justify-center min-h-[400px]">
@@ -213,18 +247,33 @@ export default function BillingPage() {
             Manage your subscription and track resource consumption
           </p>
         </div>
-        <button
-          onClick={handleManageBilling}
-          disabled={portalLoading}
-          className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 rounded-lg text-sm font-medium transition-colors"
-        >
-          {portalLoading ? (
-            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current" />
-          ) : (
-            <ExternalLink size={16} />
-          )}
-          Manage Billing in Stripe
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleSyncSubscription}
+            disabled={syncLoading}
+            title="Sync subscription and re-activate any agents marked 'Payment Required'"
+            className="flex items-center gap-2 px-4 py-2 bg-emerald-50 dark:bg-emerald-900/20 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 rounded-lg text-sm font-medium transition-colors"
+          >
+            {syncLoading ? (
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current" />
+            ) : (
+              <CheckCircle size={16} />
+            )}
+            Sync Agent Status
+          </button>
+          <button
+            onClick={handleManageBilling}
+            disabled={portalLoading}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 rounded-lg text-sm font-medium transition-colors"
+          >
+            {portalLoading ? (
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current" />
+            ) : (
+              <ExternalLink size={16} />
+            )}
+            Manage Billing in Stripe
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">

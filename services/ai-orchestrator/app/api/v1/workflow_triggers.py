@@ -1,14 +1,14 @@
 """External trigger endpoints for automation-mode workflows.
 
-POST /agents/{agent_id}/flows/{flow_id}/trigger
+POST /agents/{agent_id}/workflows/{flow_id}/trigger
   — HMAC-verified webhook endpoint.
   — Any external system (Shopify, Stripe, custom) can POST here to start or
     resume a workflow execution. Payload becomes the initial execution context.
 
-POST /agents/{agent_id}/flows/{flow_id}/trigger/test
+POST /agents/{agent_id}/workflows/{flow_id}/trigger/test
   — Unverified test endpoint (internal-key protected). For dashboard testing.
 
-GET  /agents/{agent_id}/flows/{flow_id}/executions
+GET  /agents/{agent_id}/workflows/{flow_id}/executions
   — List all executions for a workflow (for monitoring dashboards).
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.flows import _get_db_session, _get_workflow_or_404
+from app.api.v1.workflows import _get_db_session, _get_workflow_or_404
 from app.models.workflow import Workflow, WorkflowExecution
 from app.schemas.workflow import WorkflowAdvanceResult, WorkflowExecutionResponse
 from app.services.workflow_engine import WorkflowEngine
@@ -73,7 +73,7 @@ def _verify_webhook_hmac(
 # Webhook trigger — HMAC verified
 # ---------------------------------------------------------------------------
 
-@router.post("/{agent_id}/flows/{flow_id}/trigger", status_code=202)
+@router.post("/{agent_id}/workflows/{flow_id}/trigger", status_code=202)
 async def webhook_trigger(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -146,7 +146,7 @@ async def webhook_trigger(
 # Manual / test trigger (internal key protected, no HMAC required)
 # ---------------------------------------------------------------------------
 
-@router.post("/{agent_id}/flows/{flow_id}/trigger/test", status_code=202)
+@router.post("/{agent_id}/workflows/{flow_id}/trigger/test", status_code=202)
 async def test_trigger(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -199,7 +199,7 @@ async def test_trigger(
 # ---------------------------------------------------------------------------
 
 @router.get(
-    "/{agent_id}/flows/{flow_id}/executions",
+    "/{agent_id}/workflows/{flow_id}/executions",
     response_model=list[WorkflowExecutionResponse],
 )
 async def list_executions(

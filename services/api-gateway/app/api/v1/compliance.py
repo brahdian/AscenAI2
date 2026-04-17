@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.database import get_db, engine as _db_engine
+from app.core.security import get_tenant_db, get_current_tenant
 from app.services.tenant_service import tenant_service
 
 logger = structlog.get_logger(__name__)
@@ -115,11 +116,10 @@ class ErasureResponse(BaseModel):
 
 @router.get("/settings", response_model=ComplianceSettings)
 async def get_compliance_settings(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> ComplianceSettings:
     """Return current compliance/privacy settings for this tenant."""
-    tenant_id = _require_tenant(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")
@@ -133,11 +133,10 @@ async def get_compliance_settings(
 @router.patch("/settings", response_model=ComplianceSettings)
 async def update_compliance_settings(
     body: ComplianceSettings,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> ComplianceSettings:
     """Update compliance/privacy settings (owner/admin only)."""
-    tenant_id = _require_owner_or_admin(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")
@@ -208,9 +207,9 @@ async def _execute_erasure(
 @router.post("/erasure", response_model=ErasureResponse, status_code=202)
 async def request_erasure(
     body: ErasureRequest,
-    request: Request,
     background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> ErasureResponse:
     """
     Submit a right-to-erasure request (PIPEDA Principle 4.3.6 / GDPR Art. 17).
@@ -218,7 +217,6 @@ async def request_erasure(
     This logs the request and queues background deletion of all sessions, messages,
     and associated PII for the given contact identifier.
     """
-    tenant_id = _require_owner_or_admin(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")
@@ -273,11 +271,10 @@ async def request_erasure(
 
 @router.get("/erasure-log")
 async def get_erasure_log(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> list[dict]:
     """Return the audit log of erasure requests for this tenant (owner/admin only)."""
-    tenant_id = _require_owner_or_admin(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")
@@ -288,11 +285,10 @@ async def get_erasure_log(
 
 @router.get("/privacy-notice")
 async def get_privacy_notice(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ) -> dict:
     """Return a machine-readable summary of this tenant's privacy practices."""
-    tenant_id = _require_tenant(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")

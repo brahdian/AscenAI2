@@ -14,10 +14,17 @@ router = APIRouter(prefix="/execute")
 
 
 def _tenant_id(request: Request) -> str:
-    tid = request.headers.get("X-Tenant-ID") or getattr(request.state, "tenant_id", None)
+    tid = getattr(request.state, "tenant_id", None)
     if not tid:
         raise HTTPException(status_code=401, detail="Tenant ID required.")
     return tid
+
+
+async def _tenant_db(
+    tenant_id: str = Depends(_tenant_id),
+):
+    async for session in get_db(tenant_id):
+        yield session
 
 
 def _get_redis(request: Request):
@@ -28,10 +35,10 @@ def _get_redis(request: Request):
 async def execute_tool(
     body: MCPToolCall,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Execute a tool call and return the result."""
-    tenant_id = _tenant_id(request)
     redis = _get_redis(request)
     executor = ToolExecutor(db=db, redis=redis)
 
@@ -48,14 +55,14 @@ async def execution_history(
     request: Request,
     session_id: str | None = None,
     limit: int = 50,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Get tool execution history for the tenant."""
     from sqlalchemy import select
     from app.models.tool import ToolExecution
     import uuid
 
-    tenant_id = _tenant_id(request)
     query = (
         select(ToolExecution)
         .where(ToolExecution.tenant_id == uuid.UUID(tenant_id))

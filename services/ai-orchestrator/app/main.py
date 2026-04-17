@@ -19,6 +19,7 @@ from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
 from app.core.config import settings
 from app.core.database import init_db, close_db
+from app.core.leadership import RedisLeaderLease
 from app.core.redis_client import init_redis, close_redis, get_redis
 from app.core.security import get_current_tenant
 
@@ -37,7 +38,7 @@ if getattr(settings, "SENTRY_DSN", ""):
         traces_sample_rate=0.1,
         send_default_pii=False,
     )
-def _setup_opentelemetry() -> None:
+def _setup_opentelemetry(app: FastAPI) -> None:
     if not getattr(settings, "OTEL_ENABLED", False) or not getattr(settings, "OTEL_ENDPOINT", ""):
         return
     try:
@@ -52,13 +53,13 @@ def _setup_opentelemetry() -> None:
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_ENDPOINT)))
         trace.set_tracer_provider(provider)
-        FastAPIInstrumentor.instrument()
+        FastAPIInstrumentor().instrument_app(app)
         logger.info("opentelemetry_initialized", endpoint=settings.OTEL_ENDPOINT)
     except ImportError:
         logger.warning("opentelemetry_packages_missing")
 
 
-_setup_opentelemetry()
+
 
 from app.core.tracing import TracingMiddleware
 from app.middleware.idempotency import IdempotencyMiddleware
@@ -77,12 +78,13 @@ from app.api.v1 import learning as learning_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import internal as internal_router
 from app.api.v1 import replay as replay_router
-from app.api.v1 import flows as flows_router
-from app.api.v1 import flow_triggers as flow_triggers_router
+from app.api.v1 import workflows as workflows_router
+from app.api.v1 import workflow_triggers as workflow_triggers_router
 from app.api.v1 import evals as evals_router
 from app.api.v1 import prompt_versions as prompt_versions_router
 from app.api.v1 import templates as templates_router
 from app.api.v1 import variables as variables_router
+from app.api.v1 import platform as platform_router
 from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
@@ -175,7 +177,7 @@ async def lifespan(app: FastAPI):
 
     # Start background session cleanup worker
     from app.workers.session_cleanup import SessionCleanupWorker
-    session_cleanup = SessionCleanupWorker(db_factory=AsyncSessionLocal)
+    session_cleanup = SessionCleanupWorker(db_factory=AsyncSessionLocal, redis=redis_client)
     app.state.session_cleanup = session_cleanup
     asyncio.create_task(session_cleanup.start())
     logger.info("session_cleanup_worker_started")
@@ -191,8 +193,12 @@ async def lifespan(app: FastAPI):
     from app.core.metrics import DOC_INDEX_QUEUE_DEPTH, DOC_INDEX_DLQ_DEPTH
 
     async def _poll_queue_depths() -> None:
+        lease = RedisLeaderLease(redis_client, "ai-orchestrator:queue-depth-poller")
         while True:
             try:
+                if not await lease.acquire_or_renew():
+                    await asyncio.sleep(30)
+                    continue
                 r = app.state.redis
                 q = await r.llen("doc_index_queue") or 0
                 d = await r.llen("doc_index_dlq") or 0
@@ -229,6 +235,8 @@ app = FastAPI(
     description="AI Orchestrator: handles reasoning, intent detection, memory, and MCP coordination",
     lifespan=lifespan,
 )
+
+_setup_opentelemetry(app)
 
 # CORS
 app.add_middleware(
@@ -320,12 +328,13 @@ app.include_router(documents_router.router, prefix="/api/v1/agents", tags=["docu
 app.include_router(evals_router.router, prefix="/api/v1/agents", tags=["evals"])
 app.include_router(prompt_versions_router.router, prefix="/api/v1/agents", tags=["prompts"])
 app.include_router(variables_router.router, prefix="/api/v1/agents", tags=["variables"])
+app.include_router(platform_router.router, prefix="/api/v1/platform", tags=["platform"])
 app.include_router(agents_router.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(templates_router.router, prefix="/api/v1/templates", tags=["templates"])
 app.include_router(internal_router.router, prefix="/api/v1", tags=["internal"])
 app.include_router(replay_router.router, prefix="/api/v1", tags=["replay"])
-app.include_router(flows_router.router, prefix="/api/v1/agents", tags=["flows"])
-app.include_router(flow_triggers_router.router, prefix="/api/v1/agents", tags=["flow-triggers"])
+app.include_router(workflows_router.router, prefix="/api/v1/agents", tags=["workflows"])
+app.include_router(workflow_triggers_router.router, prefix="/api/v1/agents", tags=["workflow-triggers"])
 
 # Serve pre-recorded voice greetings (cost-free per-call playback)
 _GREETING_AUDIO_DIR = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))

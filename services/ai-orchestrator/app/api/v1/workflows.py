@@ -2,18 +2,18 @@
 
 Endpoints
 ---------
-POST   /{agent_id}/flows                            Create workflow
-GET    /{agent_id}/flows                            List workflows
-GET    /{agent_id}/flows/{flow_id}                  Get workflow definition
-PUT    /{agent_id}/flows/{flow_id}                  Update workflow (bumps version)
-DELETE /{agent_id}/flows/{flow_id}                  Deactivate workflow
-POST   /{agent_id}/flows/{flow_id}/activate         Activate → register as MCP tool
-POST   /{agent_id}/flows/{flow_id}/deactivate       Deactivate → deregister tool
-GET    /{agent_id}/flows/{flow_id}/executions/{session_id}  Get execution state
-POST   /{agent_id}/flows/{flow_id}/advance          Advance execution (testing)
+POST   /{agent_id}/workflows                            Create workflow
+GET    /{agent_id}/workflows                            List workflows
+GET    /{agent_id}/workflows/{flow_id}                  Get workflow definition
+PUT    /{agent_id}/workflows/{flow_id}                  Update workflow (bumps version)
+DELETE /{agent_id}/workflows/{flow_id}                  Deactivate workflow
+POST   /{agent_id}/workflows/{flow_id}/activate         Activate → register as MCP tool
+POST   /{agent_id}/workflows/{flow_id}/deactivate       Deactivate → deregister tool
+GET    /{agent_id}/workflows/{flow_id}/executions/{session_id}  Get execution state
+POST   /{agent_id}/workflows/{flow_id}/advance          Advance execution (testing)
 
 All routes are mounted under /api/v1/agents by main.py, so full paths are:
-  POST /api/v1/agents/{agent_id}/flows
+  POST /api/v1/agents/{agent_id}/workflows
   ...
 """
 from __future__ import annotations
@@ -41,7 +41,7 @@ from app.services.workflow_engine import WorkflowEngine, ExecutionNotFoundError,
 from app.services.workflow_registry import WorkflowRegistry
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+router = APIRouter(tags=["workflows"])
 
 
 def _tenant_id(request: Request) -> str:
@@ -68,7 +68,6 @@ async def _get_agent_or_404(db: AsyncSession, agent_id: uuid.UUID, tenant_id: uu
         select(Agent).where(
             Agent.id == agent_id,
             Agent.tenant_id == tenant_id,
-            Agent.is_active.is_(True),
         )
     )
     if not agent:
@@ -98,7 +97,7 @@ async def _get_workflow_or_404(
 # Create workflow
 # ---------------------------------------------------------------------------
 
-@router.post("/{agent_id}/flows", response_model=WorkflowResponse, status_code=201)
+@router.post("/{agent_id}/workflows", response_model=WorkflowResponse, status_code=201)
 async def create_workflow(
     agent_id: uuid.UUID,
     body: WorkflowCreate,
@@ -155,7 +154,7 @@ async def create_workflow(
 # List workflows
 # ---------------------------------------------------------------------------
 
-@router.get("/{agent_id}/flows", response_model=list[WorkflowResponse])
+@router.get("/{agent_id}/workflows", response_model=list[WorkflowResponse])
 async def list_workflows(
     agent_id: uuid.UUID,
     request: Request,
@@ -186,7 +185,7 @@ async def list_workflows(
 # Get workflow
 # ---------------------------------------------------------------------------
 
-@router.get("/{agent_id}/flows/{flow_id}", response_model=WorkflowResponse)
+@router.get("/{agent_id}/workflows/{flow_id}", response_model=WorkflowResponse)
 async def get_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -206,7 +205,7 @@ async def get_workflow(
 # Update workflow
 # ---------------------------------------------------------------------------
 
-@router.put("/{agent_id}/flows/{flow_id}", response_model=WorkflowResponse)
+@router.put("/{agent_id}/workflows/{flow_id}", response_model=WorkflowResponse)
 async def update_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -283,7 +282,7 @@ async def update_workflow(
 # Delete (deactivate) workflow
 # ---------------------------------------------------------------------------
 
-@router.delete("/{agent_id}/flows/{flow_id}", status_code=204)
+@router.delete("/{agent_id}/workflows/{flow_id}", status_code=204)
 async def delete_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -313,7 +312,7 @@ async def delete_workflow(
         await db.close()
 
 
-@router.post("/{agent_id}/flows/{flow_id}/clone", response_model=WorkflowResponse, status_code=201)
+@router.post("/{agent_id}/workflows/{flow_id}/clone", response_model=WorkflowResponse, status_code=201)
 async def clone_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -363,7 +362,7 @@ async def clone_workflow(
 # Activate workflow → register as MCP tool
 # ---------------------------------------------------------------------------
 
-@router.post("/{agent_id}/flows/{flow_id}/activate", response_model=WorkflowResponse)
+@router.post("/{agent_id}/workflows/{flow_id}/activate", response_model=WorkflowResponse)
 async def activate_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -398,7 +397,7 @@ async def activate_workflow(
 # Deactivate workflow → deregister MCP tool
 # ---------------------------------------------------------------------------
 
-@router.post("/{agent_id}/flows/{flow_id}/deactivate", response_model=WorkflowResponse)
+@router.post("/{agent_id}/workflows/{flow_id}/deactivate", response_model=WorkflowResponse)
 async def deactivate_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
@@ -434,7 +433,7 @@ async def deactivate_workflow(
 # ---------------------------------------------------------------------------
 
 @router.get(
-    "/{agent_id}/flows/{flow_id}/executions/{session_id}",
+    "/{agent_id}/workflows/{flow_id}/executions/{session_id}",
     response_model=Optional[WorkflowExecutionResponse],
 )
 async def get_execution(
@@ -468,7 +467,7 @@ async def get_execution(
 # Advance execution (manual / testing endpoint)
 # ---------------------------------------------------------------------------
 
-@router.post("/{agent_id}/flows/{flow_id}/advance", response_model=WorkflowAdvanceResult)
+@router.post("/{agent_id}/workflows/{flow_id}/advance", response_model=WorkflowAdvanceResult)
 async def advance_execution(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,

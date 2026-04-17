@@ -255,6 +255,7 @@ async def instantiate_template(
                 "label": tvar.label,
                 "type": tvar.type,
                 "required": tvar.is_required,
+                "default": tvar.default_value.get("value") if isinstance(tvar.default_value, dict) else tvar.default_value
             }
 
         for pbook in version.playbooks:

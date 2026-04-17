@@ -41,9 +41,9 @@ def _require_super_admin(request: Request) -> str:
 
 
 def _require_admin(request: Request) -> tuple[str, str]:
-    """Require admin or super_admin role."""
+    """Require tenant admin/owner or super_admin role."""
     role = getattr(request.state, "role", "")
-    if role not in ("super_admin", "tenant_owner", "tenant_admin"):
+    if role not in ("super_admin", "owner", "admin"):
         raise HTTPException(status_code=403, detail="Admin access required.")
     user_id = getattr(request.state, "user_id", "")
     tenant_id = getattr(request.state, "tenant_id", "")
@@ -590,7 +590,7 @@ async def list_audit_logs(
 
     if role != "super_admin":
         # Non-super-admin can only see their own tenant
-        if role not in ("tenant_owner", "tenant_admin"):
+        if role not in ("owner", "admin"):
             raise HTTPException(status_code=403, detail="Admin access required.")
         tenant_id = caller_tenant_id
 

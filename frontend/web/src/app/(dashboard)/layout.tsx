@@ -54,6 +54,7 @@ const agentSubNav = [
   { slug: '', icon: Bot, label: 'Overview' },
   { slug: 'greeting', icon: Mic, label: 'Greeting & Voice' },
   { slug: 'playbooks', icon: BookOpen, label: 'Playbooks' },
+  { slug: 'workflows', icon: GitBranch, label: 'Workflows' },
   // Knowledge & Tools
   { slug: 'documents', icon: FileText, label: 'Documents' },
   { slug: 'tools', icon: Wrench, label: 'Tools' },
@@ -61,8 +62,6 @@ const agentSubNav = [
   // Safety & Operations
   { slug: 'guardrails', icon: Shield, label: 'Guardrails' },
   { slug: 'escalation', icon: PhoneCall, label: 'Escalation' },
-  // Automation
-  { slug: 'flows', icon: GitBranch, label: 'Flows' },
 ]
 
 // Breadcrumb segment labels
@@ -75,7 +74,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   tools: 'Tools',
   variables: 'Variables',
   escalation: 'Escalation',
-  flows: 'Flows',
+  workflows: 'Workflows',
   greeting: 'Greeting & Voice',
   sessions: 'Chat History',
   analytics: 'Analytics',

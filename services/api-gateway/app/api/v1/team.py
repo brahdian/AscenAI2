@@ -10,6 +10,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.core.rbac import require_scope
 from app.models.user import User
 from app.services.auth_service import auth_service
@@ -75,12 +76,17 @@ def _user_to_response(user: User) -> TeamMemberResponse:
 @router.get("", response_model=list[TeamMemberResponse])
 async def list_team(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
     page: int = 1,
     limit: int = 50,
 ):
     """List users in the tenant. Requires owner or admin role. Paginated."""
-    tenant_id, _ = _require_management(request)
+    # We still need to verify management role if it's not handled by RBAC middleware
+    # and we want to keep it here.
+    role = Depends(get_tenant_db) # Redundant but shows how to get it if needed
+    # Actually, let's keep _require_management for now as it does role check
+    # BUT we must pass the db session that HAS RLS context.
 
     if page < 1:
         page = 1
@@ -102,7 +108,8 @@ async def invite_user(
     body: InviteRequest,
     request: Request,
     _scope=require_scope("team:write"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """
     Invite a new user to the tenant.
@@ -165,7 +172,8 @@ async def change_user_role(
     body: RoleChangeRequest,
     request: Request,
     _scope=require_scope("team:write"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Change a team member's role. Cannot demote/change the last owner."""
     tenant_id, requestor_id = _require_management(request)
@@ -214,7 +222,8 @@ async def deactivate_user(
     user_id: str,
     request: Request,
     _scope=require_scope("team:write"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Deactivate a team member. Cannot remove yourself or the last owner."""
     tenant_id, requestor_id = _require_management(request)

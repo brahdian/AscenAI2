@@ -37,13 +37,20 @@ export function middleware(request: NextRequest) {
 
   // 2. APP SUBDOMAIN: app.lvh.me:3000
   if (isAppSubdomain) {
-    // If root path on app subdomain → rewrite to /dashboard
+    const hasToken = request.cookies.has('access_token')
+
+    // If root path on app subdomain:
+    // - Logged in → /dashboard
+    // - Guest → Landing page (/)
     if (url.pathname === '/') {
-      return NextResponse.rewrite(new URL('/dashboard', request.url))
+      if (hasToken) {
+        return NextResponse.rewrite(new URL('/dashboard', request.url))
+      }
+      return NextResponse.next()
     }
 
     // EXCLUDE common paths
-    const commonPaths = ['/login', '/register', '/onboarding', '/forgot-password', '/reset-password', '/api/auth', '/console', '/pricing', '/docs']
+    const commonPaths = ['/', '/login', '/register', '/onboarding', '/forgot-password', '/reset-password', '/api/auth', '/console', '/pricing', '/docs']
     if (commonPaths.some(p => url.pathname === p || url.pathname.startsWith(p + '/'))) {
       return NextResponse.next()
     }

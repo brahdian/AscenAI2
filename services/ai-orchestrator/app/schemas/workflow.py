@@ -2,7 +2,7 @@
 
 Used for:
 - Validating workflow definitions stored in JSONB
-- API request/response serialization (flows.py)
+- API request/response serialization (workflows.py)
 - WorkflowEngine internal contracts
 """
 from __future__ import annotations
@@ -149,7 +149,7 @@ class WorkflowResponse(BaseModel):
 
 
 class WorkflowAdvanceRequest(BaseModel):
-    """Body for POST /flows/{flow_id}/advance — resume a paused execution."""
+    """Body for POST /workflows/{flow_id}/advance — resume a paused execution."""
     session_id: str
     user_input: Optional[str] = None
     event_payload: Optional[dict] = None

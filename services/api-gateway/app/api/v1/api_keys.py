@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant, get_current_user
 from app.models.user import APIKey
 from app.schemas.auth import APIKeyCreateRequest, APIKeyCreatedResponse, APIKeyResponse
 from app.services.auth_service import auth_service
@@ -33,13 +34,12 @@ def _require_tenant(request: Request) -> str:
 async def create_api_key(
     body: APIKeyCreateRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+    user_id: str = Depends(get_current_user),
 ):
     """Create a new API key. The raw key is shown only once."""
-    tenant_id = _require_tenant(request)
-    user_id = getattr(request.state, "user_id", None)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required.")
+    # Auth is handled by get_tenant_db dependency
 
     # Check plan limit: max_api_keys
     from app.models.tenant import Tenant, TenantUsage
@@ -109,13 +109,12 @@ async def create_api_key(
 
 @router.get("", response_model=list[APIKeyResponse])
 async def list_api_keys(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
     page: int = 1,
     limit: int = 50,
 ):
     """List all API keys for the current tenant. Paginated."""
-    tenant_id = _require_tenant(request)
     if page < 1:
         page = 1
     limit = min(max(limit, 1), 200)
@@ -150,11 +149,10 @@ async def list_api_keys(
 @router.delete("/{key_id}", status_code=204)
 async def revoke_api_key(
     key_id: str,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Revoke (soft-delete) an API key."""
-    tenant_id = _require_tenant(request)
     result = await db.execute(
         select(APIKey).where(
             APIKey.id == uuid.UUID(key_id),

@@ -26,6 +26,7 @@ import structlog
 from croniter import croniter
 from sqlalchemy import select
 
+from app.core.leadership import RedisLeaderLease
 from app.core.database import AsyncSessionLocal
 from app.models.workflow import Workflow, WorkflowExecution, ExecutionStatus
 
@@ -91,6 +92,7 @@ class WorkflowTriggerWorker:
         self.interval = interval_seconds
         self._running = False
         self._tasks: list[asyncio.Task] = []
+        self._lease = RedisLeaderLease(redis, "ai-orchestrator:workflow-trigger")
 
     async def start(self) -> None:
         self._running = True
@@ -114,6 +116,9 @@ class WorkflowTriggerWorker:
     async def _cron_loop(self) -> None:
         while self._running:
             try:
+                if not await self._lease.acquire_or_renew():
+                    await asyncio.sleep(self.interval)
+                    continue
                 await self._run_due_cron_workflows()
             except Exception as exc:
                 logger.error("cron_loop_error", error=str(exc))
@@ -175,11 +180,19 @@ class WorkflowTriggerWorker:
         """Subscribe to the internal event bus and route to matching workflows."""
         while self._running:
             try:
+                if not await self._lease.acquire_or_renew():
+                    await asyncio.sleep(5)
+                    continue
                 pubsub = self.redis.pubsub()
                 await pubsub.subscribe(_EVENT_CHANNEL)
                 logger.info("workflow_event_subscriber_ready", channel=_EVENT_CHANNEL)
 
-                async for message in pubsub.listen():
+                while self._running:
+                    if not await self._lease.acquire_or_renew():
+                        break
+                    message = await pubsub.get_message(ignore_subscribe_messages=False, timeout=1.0)
+                    if message is None:
+                        continue
                     if not self._running:
                         break
                     if message["type"] != "message":
@@ -189,6 +202,8 @@ class WorkflowTriggerWorker:
                         await self._handle_event(event)
                     except Exception as exc:
                         logger.error("event_handler_error", error=str(exc))
+                await pubsub.unsubscribe(_EVENT_CHANNEL)
+                await pubsub.aclose()
 
             except Exception as exc:
                 logger.error("event_loop_error", error=str(exc))
@@ -198,6 +213,9 @@ class WorkflowTriggerWorker:
         """Sweep for expired AWAITING_EVENT executions every 60 seconds."""
         while self._running:
             try:
+                if not await self._lease.acquire_or_renew():
+                    await asyncio.sleep(self.interval)
+                    continue
                 await self._sweep_expired_executions()
             except Exception as exc:
                 logger.error("expiry_sweep_loop_error", error=str(exc))

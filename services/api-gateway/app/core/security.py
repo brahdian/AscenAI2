@@ -122,6 +122,28 @@ async def get_current_tenant(
     )
 
 
+async def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> str:
+    """Extract user_id from a valid JWT or already-authenticated request state."""
+    if credentials:
+        payload = decode_access_token(credentials.credentials)
+        user_id = payload.get("sub")
+        if user_id:
+            return str(user_id)
+
+    state_user = getattr(request.state, "user_id", None)
+    if state_user:
+        return str(state_user)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 async def get_optional_tenant(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),

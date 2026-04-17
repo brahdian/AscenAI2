@@ -15,9 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog import get_logger
 
 from app.core.database import get_db
+from app.core.security import get_tenant_db, get_current_tenant
 from app.models.user import User, Webhook
 from app.schemas.auth import WebhookCreateRequest, WebhookCreatedResponse, WebhookResponse, WebhookUpdateRequest
-from app.services.auth_service import auth_service
 from app.services.auth_service import auth_service
 
 logger = get_logger(__name__)
@@ -85,15 +85,15 @@ def _require_tenant(request: Request) -> str:
 @router.post("", response_model=WebhookCreatedResponse, status_code=201)
 async def create_webhook(
     body: WebhookCreateRequest,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """
     Create a new webhook endpoint.
     The signing secret is returned ONCE in this response and never again.
     Store it securely — it cannot be recovered after creation.
     """
-    tenant_id = _require_tenant(request)
+    # Auth handled by get_tenant_db
 
     # SSRF guard
     _validate_webhook_url(body.url)
@@ -131,11 +131,10 @@ async def create_webhook(
 
 @router.get("", response_model=list[WebhookResponse])
 async def list_webhooks(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """List all webhooks for the current tenant."""
-    tenant_id = _require_tenant(request)
     result = await db.execute(
         select(Webhook).where(Webhook.tenant_id == uuid.UUID(tenant_id))
     )
@@ -157,11 +156,10 @@ async def list_webhooks(
 async def update_webhook(
     webhook_id: str,
     body: WebhookUpdateRequest,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Update a webhook."""
-    tenant_id = _require_tenant(request)
     result = await db.execute(
         select(Webhook).where(
             Webhook.id == uuid.UUID(webhook_id),
@@ -200,11 +198,10 @@ async def update_webhook(
 @router.delete("/{webhook_id}", status_code=204)
 async def delete_webhook(
     webhook_id: str,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
 ):
     """Delete a webhook."""
-    tenant_id = _require_tenant(request)
     result = await db.execute(
         select(Webhook).where(
             Webhook.id == uuid.UUID(webhook_id),

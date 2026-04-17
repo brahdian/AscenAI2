@@ -29,6 +29,8 @@ from typing import Any, Optional
 
 import structlog
 
+from app.core.leadership import RedisLeaderLease
+
 logger = structlog.get_logger(__name__)
 
 _QUEUE_KEY = "doc_index_queue"
@@ -58,6 +60,7 @@ class DocumentIndexer:
         self._db_factory = db_factory
         self._mcp = mcp_client
         self._running = False
+        self._lease = RedisLeaderLease(redis_client, "ai-orchestrator:document-indexer")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -97,6 +100,10 @@ class DocumentIndexer:
         """
         Blocking-pop one job from the queue (with timeout) and process it.
         """
+        if not await self._lease.acquire_or_renew():
+            await asyncio.sleep(_POLL_INTERVAL)
+            return
+
         raw = await self._redis.blpop(_QUEUE_KEY, timeout=int(_POLL_INTERVAL))
         if raw is None:
             return

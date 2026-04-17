@@ -118,7 +118,7 @@ class Workflow(Base):
     # ── Trigger configuration ────────────────────────────────────────────────
     # "none"    — triggered only by LLM tool call (default conversational flow)
     # "cron"    — fired by WorkflowTriggerWorker on a schedule
-    # "webhook" — fired by POST /flows/{id}/trigger (HMAC-verified)
+    # "webhook" — fired by POST /workflows/{id}/trigger (HMAC-verified)
     # "event"   — fired by internal event bus (e.g. "payment.completed")
     trigger_type: Mapped[str] = mapped_column(
         String(20), nullable=False, default="none"

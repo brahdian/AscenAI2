@@ -140,7 +140,8 @@ class ContextBuilderService:
         platform_guardrails: Optional[dict],
         variables: List[AgentVariable],
         session_meta: dict,
-        local_vars: dict
+        local_vars: dict,
+        voice_system_prompt_template: str = ""
     ) -> str:
         all_variables = {**session_meta.get("variables", {}), **local_vars}
 
@@ -163,6 +164,7 @@ class ContextBuilderService:
             guardrails=collated_guardrails,
             variables=variables,
             session_metadata={**session_meta, "variables": all_variables},
+            voice_system_prompt_template=voice_system_prompt_template,
         )
 
     async def get_agent_tools_schema(

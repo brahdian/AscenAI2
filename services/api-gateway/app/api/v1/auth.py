@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import get_tenant_db
 from app.schemas.auth import (
     ForgotPasswordRequest,
     LoginRequest,
@@ -253,7 +254,7 @@ async def refresh(
 @router.get("/me")
 async def get_me(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Get current user and tenant info (used for cross-subdomain auth sync)."""
     user_id = getattr(request.state, "user_id", None)
@@ -287,7 +288,7 @@ async def get_me(
 @router.patch("/me", status_code=200)
 async def update_me(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Update the current user's profile (full_name)."""
     user_id = getattr(request.state, "user_id", None)
@@ -316,7 +317,7 @@ async def update_me(
 @router.post("/change-password", status_code=200)
 async def change_password(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_tenant_db),
 ):
     """Change password for the authenticated user."""
     user_id = getattr(request.state, "user_id", None)

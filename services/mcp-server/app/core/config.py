@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     AI_ORCHESTRATOR_URL: str = "http://ai-orchestrator:8000"
     INTERNAL_API_KEY: str = ""
 
+    @field_validator("INTERNAL_API_KEY")
+    @classmethod
+    def validate_internal_api_key(cls, v: str) -> str:
+        import os
+        if os.getenv("ENVIRONMENT", "production") == "production" and not v:
+            raise ValueError(
+                "INTERNAL_API_KEY must be set in production. "
+                "Generate one with: openssl rand -hex 32"
+            )
+        return v
+
     # Observability
     PROMETHEUS_ENABLED: bool = True
     SENTRY_DSN: Optional[str] = None

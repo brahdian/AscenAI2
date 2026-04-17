@@ -13,6 +13,7 @@ import {
   RefreshCw, GitBranch, BookOpen, Wrench, CheckCircle2,
   Users, Briefcase, Scale, DollarSign, Monitor,
 } from 'lucide-react'
+import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 
 // ---------------------------------------------------------------------------
 // Template metadata (category icons, gradients, taglines)
@@ -89,9 +90,9 @@ export default function NewAgentPage() {
     const agentIdParam = searchParams.get('agent_id')
 
     if (agentIdParam) {
-      // PATH A: Draft agent was created before the Stripe redirect; template was
-      // instantiated before the redirect too (see onError handler). All that's left
-      // is to mark the agent active and navigate to it.
+      // PATH A: Draft agent exists. All logic (creation + template instantiation) 
+      // was already handled by the Gateway before the redirect.
+      // All that's left is to activate the agent.
       toast.loading('Payment confirmed! Activating your agent...', { id: 'post-payment' })
       sessionStorage.removeItem('ascenai_pending_agent')
 
@@ -146,34 +147,25 @@ export default function NewAgentPage() {
         sessionStorage.removeItem('ascenai_pending_agent')
         toast.loading('Payment successful! Creating your agent...', { id: 'post-payment' })
         
-        // Extract template context before creating agent
+        // Extract template context and include it in the creation payload
         const { template_id, template_version_id, variables: pendingVars, ...agentConfig } = pendingConfig
+        if (template_id) {
+          agentConfig.template_context = {
+            template_id,
+            template_version_id,
+            variable_values: pendingVars || {},
+          }
+        }
         
         agentsApi.create(agentConfig)
           .then(async (agent: any) => {
-            // Apply template if one was selected
-            if (template_id && template_version_id) {
-              try {
-                await templatesApi.instantiate(template_id, {
-                  agent_id: agent.id,
-                  template_version_id,
-                  // pendingVars is the pre-resolved buildVariableValues() output
-                  variable_values: pendingVars || {},
-                  tool_configs: {},
-                })
-              } catch (err) {
-                // If template instantiation fails, we delete the orphaned agent
-                await agentsApi.delete(agent.id)
-                throw err
-              }
-            }
             toast.success('Agent deployed successfully!', { id: 'post-payment' })
             qc.invalidateQueries({ queryKey: ['agents'] })
             router.push(`/dashboard/agents/${agent.id}`)
           })
           .catch((err: any) => {
             const detail = err?.response?.data?.detail
-            toast.error(typeof detail === 'string' ? detail : 'Agent creation failed after payment. Please contact support.', { id: 'post-payment' })
+            toast.error(typeof detail === 'string' ? detail : 'Agent creation failed. Please contact support.', { id: 'post-payment' })
             router.push('/dashboard/agents')
           })
       } catch {
@@ -275,7 +267,7 @@ export default function NewAgentPage() {
   // Create mutation
   const createMutation = useMutation({
     mutationFn: async () => {
-      const agentConfig = {
+      const agentConfig: any = {
         name: agentName,
         description,
         business_type: selectedTemplate?.category || 'generic',
@@ -283,22 +275,18 @@ export default function NewAgentPage() {
         voice_enabled: voiceEnabled,
         plan: selectedPlan,
       }
-      const agent = await agentsApi.create(agentConfig)
+
       if (selectedTemplate && selectedTemplate.versions?.length > 0) {
         const latestVersion = [...selectedTemplate.versions].sort((a: any, b: any) => b.version - a.version)[0]
-        try {
-          await templatesApi.instantiate(selectedTemplate.id, {
-            agent_id: agent.id,
-            template_version_id: latestVersion.id,
-            variable_values: buildVariableValues(),
-            tool_configs: {},
-          })
-        } catch (err) {
-          await agentsApi.delete(agent.id)
-          throw err
+        agentConfig.template_context = {
+          template_id: selectedTemplate.id,
+          template_version_id: latestVersion.id,
+          variable_values: buildVariableValues(),
+          tool_configs: {},
         }
       }
-      return agent
+
+      return await agentsApi.create(agentConfig)
     },
     onSuccess: (agent) => {
       qc.invalidateQueries({ queryKey: ['agents'] })
@@ -310,28 +298,7 @@ export default function NewAgentPage() {
         const draftAgentId: string | undefined = err.response.data.detail.agent_id
         const paymentUrl: string = err.response.data.detail.payment_url
 
-        if (draftAgentId && selectedTemplate && selectedTemplate.versions?.length > 0) {
-          // Draft agent already exists (Gate 2: slot limit). Instantiate the template
-          // NOW — before the Stripe redirect — so playbooks are set up regardless of
-          // what happens on return. PATH A only needs to activate the agent.
-          const latestVersion = [...selectedTemplate.versions].sort((a: any, b: any) => b.version - a.version)[0]
-          try {
-            toast.loading('Setting up your agent...', { id: 'pre-payment-setup' })
-            await templatesApi.instantiate(selectedTemplate.id, {
-              agent_id: draftAgentId,
-              template_version_id: latestVersion.id,
-              variable_values: buildVariableValues(),
-              tool_configs: {},
-            })
-          } catch (instantiateErr) {
-            console.error('Template instantiation failed before payment redirect', instantiateErr)
-          } finally {
-            toast.dismiss('pre-payment-setup')
-          }
-        }
-
-        // Save pending config for PATH B (Gate 1: no subscription — no draft agent yet).
-        // Only include template fields if there's no draft agent (template not yet applied).
+        // Save pending config for recovery if session expires or checkout is abandoned
         const pendingConfig: Record<string, any> = {
           name: agentName,
           description,
@@ -340,15 +307,15 @@ export default function NewAgentPage() {
           voice_enabled: voiceEnabled,
           is_active: true,
         }
-        if (!draftAgentId && selectedTemplate) {
+        if (selectedTemplate) {
           pendingConfig.template_id = selectedTemplate.id
           pendingConfig.template_version_id = selectedTemplate.versions?.length
             ? [...selectedTemplate.versions].sort((a: any, b: any) => b.version - a.version)[0]?.id
             : null
-          // Store the fully-resolved variable values so PATH B uses them correctly
           pendingConfig.variables = buildVariableValues()
         }
         sessionStorage.setItem('ascenai_pending_agent', JSON.stringify(pendingConfig))
+        
         toast.loading('Redirecting to Stripe for payment...', { duration: 2000 })
         setTimeout(() => { window.location.href = paymentUrl }, 1000)
         return
@@ -636,12 +603,18 @@ export default function NewAgentPage() {
                         <span className="text-xs text-gray-400 font-mono bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{vari.key}</span>
                       </label>
                       {vari.type === 'textarea' || vari.type === 'list' ? (
-                        <textarea
-                          value={variables[vari.key] || ''}
-                          onChange={(e) => setVariables(p => ({ ...p, [vari.key]: e.target.value }))}
-                          className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/30 min-h-[90px] text-sm"
-                          placeholder={`Enter ${vari.label.toLowerCase()}`}
-                        />
+                        <div className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden focus-within:ring-2 focus-within:ring-violet-500/30 transition-all">
+                          <PlaybookMentionsEditor
+                            value={variables[vari.key] || ''}
+                            onChange={(val) => setVariables(p => ({ ...p, [vari.key]: val }))}
+                            placeholder={`Enter ${vari.label.toLowerCase()}`}
+                            minHeight="120px"
+                            variables={selectedTemplate.variables.map((v: any) => ({
+                              name: v.key,
+                              description: v.label
+                            }))}
+                          />
+                        </div>
                       ) : (
                         <input
                           type={vari.type === 'number' ? 'number' : 'text'}

@@ -5,6 +5,7 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse
 
+from app.core.config import settings
 from app.core.security import extract_tenant_from_token, hash_api_key
 
 logger = structlog.get_logger(__name__)
@@ -23,7 +24,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
     """
     Extract tenant_id from one of three sources (in priority order):
     1. Authorization: Bearer <JWT>  —  reads 'tenant_id' or 'sub' claim
-    2. X-Tenant-ID header           —  direct tenant UUID header
+    2. X-Tenant-ID header           —  trusted internal caller only
     3. X-API-Key header             —  looks up the hashed key in the database
 
     Sets request.state.tenant_id (str UUID) on success.
@@ -49,10 +50,16 @@ class TenantMiddleware(BaseHTTPMiddleware):
             if tenant_id:
                 logger.debug("tenant_from_jwt", tenant_id=tenant_id, path=path)
 
-        # --- 2. X-Tenant-ID header (plain UUID or slug) ---
+        # --- 2. X-Tenant-ID header (trusted internal caller only) ---
         if not tenant_id:
-            tenant_id = request.headers.get("X-Tenant-ID")
-            if tenant_id:
+            internal_key = request.headers.get("X-Internal-Key", "")
+            candidate_tenant = request.headers.get("X-Tenant-ID")
+            if (
+                candidate_tenant
+                and settings.INTERNAL_API_KEY
+                and internal_key == settings.INTERNAL_API_KEY
+            ):
+                tenant_id = candidate_tenant
                 logger.debug("tenant_from_header", tenant_id=tenant_id, path=path)
 
         # --- 3. API Key lookup ---
@@ -89,7 +96,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 status_code=403,
                 content={
                     "detail": "Tenant identification required. "
-                              "Provide a Bearer token, X-Tenant-ID header, or X-API-Key."
+                              "Provide a Bearer token, trusted internal tenant header, or X-API-Key."
                 },
             )
 

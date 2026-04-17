@@ -107,7 +107,7 @@ export default function AgentDetailPage() {
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const [streaming, setStreaming] = useState(false)
-  const [selectedChannel, setSelectedChannel] = useState<'voice' | 'chat' | null>(null)
+  const [selectedChannel, setSelectedChannel] = useState<'voice' | 'chat' | null>('chat')
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [sessionStatus, setSessionStatus] = useState<'active' | 'closed' | 'ended'>('active')
   const [minutesUntilExpiry, setMinutesUntilExpiry] = useState<number | null>(null)

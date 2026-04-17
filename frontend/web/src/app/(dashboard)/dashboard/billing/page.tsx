@@ -552,12 +552,14 @@ export default function BillingPage() {
                             </div>
                             <div>
                               <p className="text-sm font-bold text-gray-900 dark:text-white">{a.agent_name}</p>
-                              <p className="text-[10px] text-gray-400">ID: {a.agent_id?.slice(0,8)}...</p>
+                              <p className="text-[10px] text-gray-400">
+                                {a.agent_id ? `ID: ${a.agent_id.slice(0, 8)}…` : 'Available slot'}
+                              </p>
                             </div>
                           </div>
                         </td>
-                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{fmtNum(a.messages)}</td>
-                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{a.voice_minutes.toFixed(1)}</td>
+                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{fmtNum(a.messages ?? 0)}</td>
+                        <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400">{(a.voice_minutes ?? 0).toFixed(1)}</td>
                         <td className="px-4 py-4 text-right text-sm font-mono text-gray-600 dark:text-gray-400 font-medium">{fmt(a.base_cost)}</td>
                         <td className="px-4 py-4 text-right text-sm font-mono text-amber-600 dark:text-amber-400 font-medium">{a.overage > 0 ? fmt(a.overage) : '—'}</td>
                         <td className="pr-6 py-4 text-right">

@@ -1,7 +1,7 @@
 'use client'
 
 import { useQuery } from '@tanstack/react-query'
-import { tenantApi, agentsApi, sessionsApi } from '@/lib/api'
+import { analyticsApi, agentsApi } from '@/lib/api'
 import { getPlanDisplayName } from '@/lib/plans'
 import { useAuthStore } from '@/store/auth'
 import { Bot, MessageSquare, Zap, TrendingUp, AlertCircle } from 'lucide-react'
@@ -36,19 +36,14 @@ function StatCard({
 export default function DashboardPage() {
   const { user } = useAuthStore()
 
-  const { data: usage } = useQuery({
-    queryKey: ['usage'],
-    queryFn: () => tenantApi.getUsage(),
+  const { data: analytics } = useQuery({
+    queryKey: ['analytics-overview', 30],
+    queryFn: () => analyticsApi.overview({ days: 30 }),
   })
 
   const { data: agents } = useQuery({
     queryKey: ['agents'],
     queryFn: () => agentsApi.list(),
-  })
-
-  const { data: tenant } = useQuery({
-    queryKey: ['tenant'],
-    queryFn: () => tenantApi.getMe(),
   })
 
   return (
@@ -68,21 +63,21 @@ export default function DashboardPage() {
         <StatCard
           icon={MessageSquare}
           label="Sessions"
-          value={usage?.current_month_sessions ?? '—'}
+          value={analytics?.total_sessions ?? 0}
           sub="Total conversations"
           color="bg-blue-500"
         />
         <StatCard
           icon={Bot}
           label="Chat Equivalents"
-          value={usage?.current_month_chat_units ?? '—'}
+          value={analytics?.total_chats ?? 0}
           sub="10 turns = 1 chat"
           color="bg-violet-500"
         />
         <StatCard
           icon={Zap}
           label="Voice Minutes"
-          value={usage?.current_month_voice_minutes !== undefined ? usage.current_month_voice_minutes.toFixed(1) + 'm' : '—'}
+          value={analytics?.total_voice_minutes !== undefined ? analytics.total_voice_minutes.toFixed(1) + 'm' : '0.0m'}
           sub="AI-user calls"
           color="bg-orange-500"
         />

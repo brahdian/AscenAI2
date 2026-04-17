@@ -13,6 +13,7 @@ import structlog
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import get_db
 from app.core.security import get_tenant_db, get_current_tenant, require_forwarded_role
@@ -686,7 +687,10 @@ async def upload_voice_greeting(
     filepath.write_bytes(data)
 
     url = f"{_GREETING_CDN_BASE}/{filename}"
-    agent.voice_greeting_url = url
+    new_cfg = dict(agent.agent_config or {})
+    new_cfg["voice_greeting_url"] = url
+    agent.agent_config = new_cfg
+    flag_modified(agent, "agent_config")
     await db.commit()
 
     logger.info("voice_greeting_uploaded", agent_id=agent_id, url=url)
@@ -712,12 +716,16 @@ async def delete_voice_greeting(
         raise HTTPException(status_code=404, detail="Agent not found.")
 
     # Delete file if present
-    if agent.voice_greeting_url:
-        filename = Path(agent.voice_greeting_url).name
+    existing_url = (agent.agent_config or {}).get("voice_greeting_url")
+    if existing_url:
+        filename = Path(existing_url).name
         filepath = _GREETING_AUDIO_DIR / filename
         if filepath.exists():
             filepath.unlink(missing_ok=True)
-    agent.voice_greeting_url = None
+    new_cfg = dict(agent.agent_config or {})
+    new_cfg.pop("voice_greeting_url", None)
+    agent.agent_config = new_cfg
+    flag_modified(agent, "agent_config")
     await db.commit()
     return {"ok": True}
 

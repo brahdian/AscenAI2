@@ -275,7 +275,16 @@ export default function AnalyticsPage() {
           {!data?.total_sessions && !isLoading && (
             <div className="text-center py-16 bg-white dark:bg-gray-900 rounded-xl border border-dashed border-gray-200 dark:border-gray-700">
               <TrendingUp size={40} className="mx-auto text-gray-300 dark:text-gray-600 mb-3" />
-              <p className="text-gray-500">No analytics data yet for this period.</p>
+              <p className="font-medium text-gray-700 dark:text-gray-300 mb-1">No conversations yet</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+                Start by testing your agent — data will appear here after the first session.
+              </p>
+              <a
+                href="/dashboard/agents"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-violet-600 text-white text-sm font-medium rounded-xl hover:bg-violet-700 transition-colors"
+              >
+                Go to Agents
+              </a>
             </div>
           )}
         </>

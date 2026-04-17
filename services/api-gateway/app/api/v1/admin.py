@@ -423,6 +423,42 @@ _DEFAULT_GUARDRAILS = [
         "severity": "medium",
         "toggleable": True,
     },
+    {
+        "id": "GG-13",
+        "name": "Voice response closure",
+        "description": "Every voice response must end with a clear spoken next-step or question so the caller knows when to speak.",
+        "category": "voice_ux",
+        "enabled": True,
+        "severity": "low",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-14",
+        "name": "Low-confidence STT rejection",
+        "description": "If STT transcription confidence is below 0.6, the pipeline asks the user to repeat rather than proceeding with an unreliable transcript.",
+        "category": "voice_ux",
+        "enabled": True,
+        "severity": "medium",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-15",
+        "name": "PII redaction",
+        "description": "Output guardrails redact PII (email, phone, card numbers) before including them in any response when pii_redaction is enabled for the agent.",
+        "category": "privacy",
+        "enabled": True,
+        "severity": "high",
+        "toggleable": True,
+    },
+    {
+        "id": "GG-16",
+        "name": "Credential isolation",
+        "description": "Tool API keys stored in tool metadata must never appear in LLM prompts or user-facing responses.",
+        "category": "privacy",
+        "enabled": True,
+        "severity": "critical",
+        "toggleable": False,
+    },
 ]
 
 

@@ -315,13 +315,16 @@ async def instantiate_template(
         agent.agent_config["tools"] = agent_tools
 
     # -----------------------------------------------------------------------
-    # Delete the auto-generated default playbooks so template ones replace them
+    # Delete the auto-generated default playbooks so template ones replace them.
+    # Only delete when the template actually provides playbooks; otherwise keep
+    # the default "General Chat" playbook so the agent is never left bare.
     # -----------------------------------------------------------------------
-    await db.execute(
-        delete(AgentPlaybook).where(
-            AgentPlaybook.agent_id == agent.id,
+    if playbooks_data:
+        await db.execute(
+            delete(AgentPlaybook).where(
+                AgentPlaybook.agent_id == agent.id,
+            )
         )
-    )
 
     # Copy template playbooks as AgentPlaybook rows
     first_playbook = True
@@ -435,9 +438,16 @@ async def instantiate_template(
     )
     existing_var_names = {v.name: v for v in existing_vars_res.scalars().all()}
 
-    for key, value in body.variable_values.items():
+    # Merge keys from both variable_values (user-supplied) and var_defs (template
+    # defaults) so variables are always seeded even when the user skipped the form.
+    all_var_keys = set(body.variable_values.keys()) | set(var_defs.keys())
+    for key in all_var_keys:
         if key in _SKIP_VARIABLE_KEYS or key.lower() == "faqs":
             continue  # FAQs become documents; routing keys are noise
+
+        # Prefer user-supplied value; fall back to template default
+        tvar_meta = var_defs.get(key, {})
+        value = body.variable_values.get(key, tvar_meta.get("default", ""))
 
         # Infer data type
         if isinstance(value, bool):
@@ -450,7 +460,6 @@ async def instantiate_template(
             dtype = "string"
 
         # Use the template definition label as description if available
-        tvar_meta = var_defs.get(key, {})
         description = tvar_meta.get("label") or key.replace("_", " ").title()
 
         if key in existing_var_names:

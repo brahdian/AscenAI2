@@ -106,6 +106,7 @@ export default function NewAgentPage() {
           // Webhook will handle activation — just redirect to agents list
           toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
           qc.invalidateQueries({ queryKey: ['agents'] })
+          qc.invalidateQueries({ queryKey: ['billing-overview'] })
           router.push('/dashboard/agents')
         })
       return

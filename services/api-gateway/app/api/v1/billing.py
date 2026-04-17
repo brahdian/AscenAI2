@@ -223,16 +223,34 @@ async def billing_overview(
         select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
     )
     usage_row = usage_result.scalar_one_or_none()
+    agent_count = usage_row.agent_count if usage_row else 0
 
-    if usage_row:
-        sessions = usage_row.current_month_sessions or 0
-        messages = usage_row.current_month_messages or 0
-        chats = usage_row.current_month_chat_units or 0
-        tokens = usage_row.current_month_tokens or 0
-        voice_minutes = float(usage_row.current_month_voice_minutes or 0)
-        agent_count = usage_row.agent_count or 0
-    else:
-        sessions, messages, chats, tokens, voice_minutes, agent_count = 0, 0, 0, 0, 0.0, 0
+    # TenantUsage.current_month_* counters are never written — read from
+    # agent_analytics (shared DB) for real usage figures, same as billing_agents.
+    from sqlalchemy import text as _text
+    billing_start, _ = _billing_period()
+    try:
+        analytics_res = await db.execute(
+            _text("""
+                SELECT COALESCE(SUM(total_sessions), 0)    AS sessions,
+                       COALESCE(SUM(total_messages), 0)    AS messages,
+                       COALESCE(SUM(total_chat_units), 0)  AS chats,
+                       COALESCE(SUM(total_tokens_used), 0) AS tokens,
+                       COALESCE(SUM(total_voice_minutes), 0.0) AS voice_minutes
+                FROM agent_analytics
+                WHERE tenant_id = :tenant_id AND date >= :start_date
+            """),
+            {"tenant_id": tenant_uuid, "start_date": billing_start},
+        )
+        ar = analytics_res.one()
+        sessions      = int(ar.sessions or 0)
+        messages      = int(ar.messages or 0)
+        chats         = int(ar.chats or 0)
+        tokens        = int(ar.tokens or 0)
+        voice_minutes = float(ar.voice_minutes or 0)
+    except Exception as _ae:
+        logger.warning("billing_overview_analytics_query_failed", error=str(_ae))
+        sessions, messages, chats, tokens, voice_minutes = 0, 0, 0, 0, 0.0
 
     # Ensure agent_count reflects active state for UI consistency
     sub_status = getattr(tenant, "subscription_status", "inactive")
@@ -296,9 +314,9 @@ async def billing_overview(
         "price_per_agent": price_per_agent,
         "agent_count": agent_count,
         "limits": {
-            "chat_messages": plan["chat_equivalents_included"] if sub_status == "active" else 0,
-            "voice_minutes": plan["voice_minutes_included"] if sub_status == "active" else 0,
-            "team_seats": plan["team_seats"] if sub_status == "active" else 0,
+            "chat_messages": plan["chat_equivalents_included"] if sub_status in ("active", "trialing") else 0,
+            "voice_minutes": plan["voice_minutes_included"] if sub_status in ("active", "trialing") else 0,
+            "team_seats": plan["team_seats"] if sub_status in ("active", "trialing") else 0,
         },
         "usage": {
             "sessions": sessions,
@@ -408,15 +426,18 @@ async def billing_agents(
                 "total_cost": price_per_agent,
             })
 
-        # Fill in remainining slots
+        # Fill in remaining slots
         while len(results) < purchased_slots:
             results.append({
                 "agent_id": None,
                 "agent_name": "Available Slot",
                 "sessions": 0,
                 "messages": 0,
+                "chats": 0,
+                "tokens": 0,
                 "voice_minutes": 0.0,
                 "base_cost": price_per_agent,
+                "overage": 0.0,
                 "status": "available",
                 "total_cost": price_per_agent,
             })
@@ -436,7 +457,13 @@ async def billing_agents(
             purchased_slots = 1
 
         return [
-            {"agent_id": None, "agent_name": f"Agent Slot {i+1}", "base_cost": price_per_agent, "status": "available"}
+            {
+                "agent_id": None,
+                "agent_name": f"Agent Slot {i+1}",
+                "sessions": 0, "messages": 0, "chats": 0, "tokens": 0,
+                "voice_minutes": 0.0, "base_cost": price_per_agent,
+                "overage": 0.0, "total_cost": price_per_agent, "status": "available",
+            }
             for i in range(purchased_slots)
         ]
 

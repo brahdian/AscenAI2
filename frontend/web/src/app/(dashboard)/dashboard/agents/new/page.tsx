@@ -96,19 +96,46 @@ export default function NewAgentPage() {
       toast.loading('Payment confirmed! Activating your agent...', { id: 'post-payment' })
       sessionStorage.removeItem('ascenai_pending_agent')
 
-      agentsApi.update(agentIdParam, { is_active: true })
-        .then(() => {
-          toast.success('Agent is now active!', { id: 'post-payment' })
-          qc.invalidateQueries({ queryKey: ['agents'] })
-          qc.invalidateQueries({ queryKey: ['billing-overview'] })
-          router.push(`/dashboard/agents/${agentIdParam}`)
-        })
-        .catch(() => {
-          toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
-          qc.invalidateQueries({ queryKey: ['agents'] })
-          qc.invalidateQueries({ queryKey: ['billing-overview'] })
-          router.push('/dashboard/agents')
-        })
+      // Zero-trust: the backend blocks direct activation of PENDING_PAYMENT agents.
+      // Subscribe to the SSE activation-stream so we get an instant push the moment
+      // the Stripe webhook fires — no repeated round-trips.
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+      const waitForActivation = async () => {
+        try {
+          const resp = await fetch(
+            `${API_URL}/api/v1/proxy/agents/${agentIdParam}/activation-stream`,
+            { credentials: 'include' },
+          )
+          if (!resp.ok || !resp.body) throw new Error('stream_unavailable')
+          const reader = resp.body.getReader()
+          const decoder = new TextDecoder()
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            const chunk = decoder.decode(value, { stream: true })
+            for (const line of chunk.split('\n')) {
+              if (!line.startsWith('data: ')) continue
+              try {
+                const evt = JSON.parse(line.slice(6))
+                if (evt.status === 'active') {
+                  toast.success('Agent is now active!', { id: 'post-payment' })
+                  qc.invalidateQueries({ queryKey: ['agents'] })
+                  qc.invalidateQueries({ queryKey: ['billing-overview'] })
+                  router.push(`/dashboard/agents/${agentIdParam}`)
+                  return
+                }
+                // status === 'timeout' — server closed after 40s
+              } catch { /* ignore malformed lines */ }
+            }
+          }
+        } catch { /* stream unavailable */ }
+        // Fallback: webhook may still be in-flight
+        toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
+        qc.invalidateQueries({ queryKey: ['agents'] })
+        qc.invalidateQueries({ queryKey: ['billing-overview'] })
+        router.push('/dashboard/agents')
+      }
+      waitForActivation()
       return
     }
 

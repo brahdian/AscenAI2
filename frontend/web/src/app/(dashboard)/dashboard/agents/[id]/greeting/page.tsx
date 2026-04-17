@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi, voiceApi, platformApi } from '@/lib/api'
+import { agentsApi, voiceApi, platformApi, variablesApi, toolsApi, documentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ArrowLeft,
@@ -21,6 +21,7 @@ import {
   Loader2,
   PhoneCall,
 } from 'lucide-react'
+import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 
 type RecordingState = 'idle' | 'recording' | 'recorded'
 
@@ -66,6 +67,26 @@ export default function GreetingPage() {
   const { data: agent, isLoading } = useQuery({
     queryKey: ['agent', id],
     queryFn: () => agentsApi.get(id),
+    enabled: !!id,
+  })
+
+  const { data: baseVariables = [] } = useQuery({
+    queryKey: ['variables', id],
+    queryFn: () => variablesApi.list(id),
+    enabled: !!id,
+  })
+  
+  const globalVariables = Array.isArray(baseVariables) ? baseVariables.filter((v: any) => v.scope === 'global') : []
+
+  const { data: tools = [] } = useQuery({
+    queryKey: ['tools', id],
+    queryFn: () => toolsApi.list(id),
+    enabled: !!id,
+  })
+
+  const { data: documents = [] } = useQuery({
+    queryKey: ['documents', id],
+    queryFn: () => documentsApi.list(id),
     enabled: !!id,
   })
 
@@ -492,13 +513,13 @@ export default function GreetingPage() {
         )}
 
         <div>
-          <textarea
+          <PlaybookMentionsEditor
             value={greetingText}
-            onChange={(e) => setGreetingText(e.target.value)}
-            maxLength={1000}
-            rows={3}
-            placeholder={`Hi! I'm ${agent.name}. How can I help you today?`}
-            className="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-none"
+            onChange={(val) => setGreetingText(val)}
+            tools={tools}
+            variables={globalVariables}
+            documents={documents}
+            placeholder={`Hi! I'm ${agent?.name || 'an agent'}. How can I help you today?`}
           />
           <p className="text-xs text-gray-400 mt-1 text-right">{greetingText.length}/1000</p>
         </div>
@@ -545,13 +566,13 @@ export default function GreetingPage() {
         )}
 
         <div>
-          <textarea
+          <PlaybookMentionsEditor
             value={ivrLanguagePrompt}
-            onChange={(e) => setIvrLanguagePrompt(e.target.value)}
-            maxLength={500}
-            rows={3}
+            onChange={(val) => setIvrLanguagePrompt(val)}
+            tools={tools}
+            variables={globalVariables}
+            documents={documents}
             placeholder="For English, press 1. Pour le français, appuyez sur 2."
-            className="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-none"
           />
           <p className="text-xs text-gray-400 mt-1 text-right">{ivrLanguagePrompt.length}/500</p>
         </div>
@@ -583,12 +604,13 @@ export default function GreetingPage() {
           Advanced instructions for how the agent handles voice-specific logic, like language switching and IVR behavior.
         </p>
         <div className="relative">
-          <textarea
+          <PlaybookMentionsEditor
             value={voiceSystemPrompt}
-            onChange={(e) => setVoiceSystemPrompt(e.target.value)}
-            rows={8}
+            onChange={(val) => setVoiceSystemPrompt(val)}
+            tools={tools}
+            variables={globalVariables}
+            documents={documents}
             placeholder="Enter voice-specific system instructions..."
-            className="w-full px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-violet-500 focus:border-transparent font-mono"
           />
           {!voiceSystemPrompt && (
             <button

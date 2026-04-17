@@ -13,6 +13,7 @@ import {
   RefreshCw, GitBranch, BookOpen, Wrench, CheckCircle2,
   Users, Briefcase, Scale, DollarSign, Monitor,
 } from 'lucide-react'
+import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 
 // ---------------------------------------------------------------------------
 // Template metadata (category icons, gradients, taglines)
@@ -575,12 +576,18 @@ export default function NewAgentPage() {
                         <span className="text-xs text-gray-400 font-mono bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{vari.key}</span>
                       </label>
                       {vari.type === 'textarea' || vari.type === 'list' ? (
-                        <textarea
-                          value={variables[vari.key] || ''}
-                          onChange={(e) => setVariables(p => ({ ...p, [vari.key]: e.target.value }))}
-                          className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/30 min-h-[90px] text-sm"
-                          placeholder={`Enter ${vari.label.toLowerCase()}`}
-                        />
+                        <div className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden focus-within:ring-2 focus-within:ring-violet-500/30 transition-all">
+                          <PlaybookMentionsEditor
+                            value={variables[vari.key] || ''}
+                            onChange={(val) => setVariables(p => ({ ...p, [vari.key]: val }))}
+                            placeholder={`Enter ${vari.label.toLowerCase()}`}
+                            minHeight="120px"
+                            variables={selectedTemplate.variables.map((v: any) => ({
+                              name: v.key,
+                              description: v.label
+                            }))}
+                          />
+                        </div>
                       ) : (
                         <input
                           type={vari.type === 'number' ? 'number' : 'text'}

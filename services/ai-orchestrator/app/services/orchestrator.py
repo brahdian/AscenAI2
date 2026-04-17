@@ -22,6 +22,7 @@ from app.services.context_builder_service import ContextBuilderService
 from app.services.playbook_handler import PlaybookHandler
 from app.services.session_billing_service import SessionBillingService
 from app.services.moderation_service import ModerationService, OutputBlockedError
+from app.services.settings_service import SettingsService
 from app.core.metrics import CONTEXT_RETRIEVALS
 from app.services.session_state_machine import SessionStateMachine
 
@@ -193,12 +194,16 @@ class Orchestrator:
                 session.metadata_ = new_meta
                 session_meta = new_meta
 
+        voice_sys_prompt_setting = await SettingsService.get_setting(self.db, "voice_agent_system_prompt", {})
+        voice_system_prompt_template = voice_sys_prompt_setting.get("template", "")
+
         system_prompt = self.context_builder.build_system_prompt(
             agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
             session_language=session_language, playbook=playbook, corrections=corrections,
             guardrails=guardrails, custom_guardrails=custom_guardrails,
             platform_guardrails=platform_guardrails,
-            variables=variables, session_meta=session_meta, local_vars=local_vars
+            variables=variables, session_meta=session_meta, local_vars=local_vars,
+            voice_system_prompt_template=voice_system_prompt_template
         )
 
         tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
@@ -505,12 +510,16 @@ class Orchestrator:
         session_meta = dict(session.metadata_ or {}) if hasattr(session, "metadata_") else {}
         session_language = session_meta.get("language")
 
+        voice_sys_prompt_setting = await SettingsService.get_setting(self.db, "voice_agent_system_prompt", {})
+        voice_system_prompt_template = voice_sys_prompt_setting.get("template", "")
+
         system_prompt = self.context_builder.build_system_prompt(
             agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
             session_language=session_language, playbook=playbook, corrections=corrections,
             guardrails=guardrails, custom_guardrails=custom_guardrails,
             platform_guardrails=platform_guardrails,
-            variables=variables, session_meta=session_meta, local_vars=local_vars
+            variables=variables, session_meta=session_meta, local_vars=local_vars,
+            voice_system_prompt_template=voice_system_prompt_template
         )
 
         tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
@@ -794,12 +803,16 @@ class Orchestrator:
 
         session_language = session_meta.get("language")
 
+        voice_sys_prompt_setting = await SettingsService.get_setting(self.db, "voice_agent_system_prompt", {})
+        voice_system_prompt_template = voice_sys_prompt_setting.get("template", "")
+
         system_prompt = self.context_builder.build_system_prompt(
             agent=agent, context_items=context_items, customer_profile=customer_profile, intent=intent,
             session_language=session_language, playbook=playbook, corrections=corrections,
             guardrails=guardrails, custom_guardrails=custom_guardrails,
             platform_guardrails=platform_guardrails,
-            variables=variables, session_meta=session_meta, local_vars=local_vars
+            variables=variables, session_meta=session_meta, local_vars=local_vars,
+            voice_system_prompt_template=voice_system_prompt_template
         )
 
         tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)

@@ -72,11 +72,36 @@ def expand_playbook_references(
 
     def var_sub(match):
         name = match.group(1) or match.group(2)
+        # 1. Check runtime session variables
         val = runtime_vars.get(name)
+        
+        # 2. Check built-in agent attributes & guardrails
+        if val is None and agent:
+            # Identity and tone
+            if name == 'agent_name':
+                val = agent.name
+            elif name == 'business_name' or name == 'business_type':
+                val = (agent.business_type or "general").replace("_", " ").title()
+            elif name == 'tone' or name == 'personality':
+                val = agent.personality or (agent.agent_config or {}).get("tone", "professional")
+            
+            # Guardrails (resolved from agent.guardrails.config)
+            elif name in ['allowed_topics', 'out_of_scope_response', 'tone_description']:
+                if agent.guardrails and agent.guardrails.config:
+                    val = agent.guardrails.config.get(name)
+                # Fallback to agent_config if guardrails is missing
+                if val is None:
+                    val = (agent.agent_config or {}).get(name)
+
+        # 3. Check persistent tenant variables (AgentVariable)
         if val is None:
             v_obj = next((v for v in variables if v.name == name), None)
-            if v_obj and isinstance(v_obj.default_value, dict):
-                val = v_obj.default_value.get("value")
+            if v_obj:
+                if isinstance(v_obj.default_value, dict):
+                    val = v_obj.default_value.get("value")
+                else:
+                    val = v_obj.default_value
+
         if val is not None:
             return f"{val} (variable: {name})"
         return f"[unknown variable: {name}]"
@@ -139,6 +164,7 @@ def build_xml_system_prompt(
     guardrails: Optional[dict] = None,
     variables: list["AgentVariable"] = None,
     session_metadata: dict = None,
+    voice_system_prompt_template: str = None,
 ) -> str:
     context_items = context_items or []
     business_info = business_info or {}
@@ -178,13 +204,17 @@ def build_xml_system_prompt(
             out_of_scope = playbook.config.get("out_of_scope_response")
 
         voice_identity = build_voice_system_prompt(
+            base_prompt_template=voice_system_prompt_template,
             agent_name=agent_name,
             business_name=business_type,
             allowed_topics=allowed_topics,
             out_of_scope_response=out_of_scope,
             tone_description=tone_desc,
-            voice_protocol=config.get("voice_system_prompt") or "",
-            supported_languages=config.get("supported_languages", None) or [],
+            voice_protocol=config.get("voice_system_prompt") or config.get("_cached_protocol") or "",
+        )
+        # Expand any context variables injected into the voice identity (global template or custom)
+        voice_identity = expand_playbook_references(
+            voice_identity, variables, session_metadata, agent_tools, agent
         )
 
         # Build voice context: tell the LLM what the scripted opening said and
@@ -233,8 +263,11 @@ def build_xml_system_prompt(
     # Only emitted when a playbook with a description is active.          #
     # ------------------------------------------------------------------ #
     if playbook and getattr(playbook, "description", None):
+        expanded_objective = expand_playbook_references(
+            playbook.description, variables, session_metadata, agent_tools, agent
+        )
         objective = (
-            f"Your goal: {_escape_xml(playbook.description)}\n"
+            f"Your goal: {_escape_xml(expanded_objective)}\n"
             f"Success means: The customer's request is fully resolved within the scope of this playbook."
         )
         parts.append(f"<objective>\n{objective}\n</objective>")
@@ -446,14 +479,20 @@ def build_xml_system_prompt(
 
         out_of_scope_response = playbook_config.get("out_of_scope_response")
         if out_of_scope_response:
+            expanded_out_of_scope = expand_playbook_references(
+                out_of_scope_response, variables, session_metadata, agent_tools, agent
+            )
             playbook_sections.append(
-                f"<out_of_scope>{_escape_xml(out_of_scope_response)}</out_of_scope>"
+                f"<out_of_scope>{_escape_xml(expanded_out_of_scope)}</out_of_scope>"
             )
 
         fallback_response = playbook_config.get("fallback_response")
         if fallback_response:
+            expanded_fallback = expand_playbook_references(
+                fallback_response, variables, session_metadata, agent_tools, agent
+            )
             playbook_sections.append(
-                f"<fallback>{_escape_xml(fallback_response)}</fallback>"
+                f"<fallback>{_escape_xml(expanded_fallback)}</fallback>"
             )
 
         if playbook_sections:
@@ -499,6 +538,7 @@ def build_system_prompt(
     guardrails: Optional[dict] = None,
     variables: list["AgentVariable"] = None,
     session_metadata: dict = None,
+    voice_system_prompt_template: str = None,
 ) -> str:
     return build_xml_system_prompt(
         agent=agent,
@@ -509,4 +549,5 @@ def build_system_prompt(
         guardrails=guardrails,
         variables=variables,
         session_metadata=session_metadata,
+        voice_system_prompt_template=voice_system_prompt_template,
     )

@@ -129,9 +129,15 @@ function TagInput({
 function ScenarioEditor({
   scenarios,
   onChange,
+  tools,
+  variables,
+  documents,
 }: {
   scenarios: Scenario[]
   onChange: (s: Scenario[]) => void
+  tools: any[]
+  variables: any[]
+  documents: any[]
 }) {
   const addScenario = () =>
     onChange([...scenarios, { trigger: '', response: '' }])
@@ -168,12 +174,13 @@ function ScenarioEditor({
             placeholder="Trigger (e.g. user asks about refunds)"
             className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
           />
-          <textarea
+          <PlaybookMentionsEditor
             value={s.response}
-            onChange={(e) => update(i, 'response', e.target.value)}
+            onChange={(val) => update(i, 'response', val)}
             placeholder="Response to give in this scenario"
-            rows={2}
-            className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
+            tools={tools}
+            variables={variables}
+            documents={documents}
           />
         </div>
       ))}
@@ -647,6 +654,9 @@ function PlaybookFormPanel({
                   <ScenarioEditor
                     scenarios={form.scenarios}
                     onChange={(s) => setForm((p) => ({ ...p, scenarios: s }))}
+                    tools={tools}
+                    variables={variables}
+                    documents={documents}
                   />
                 </div>
               </div>
@@ -734,12 +744,13 @@ function PlaybookFormPanel({
                   <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                     Out of Scope Response
                   </label>
-                  <textarea
+                  <PlaybookMentionsEditor
                     value={form.out_of_scope_response}
-                    onChange={(e) => setForm((p) => ({ ...p, out_of_scope_response: e.target.value }))}
-                    rows={2}
+                    onChange={(val) => setForm((p) => ({ ...p, out_of_scope_response: val }))}
+                    tools={tools}
+                    variables={variables}
+                    documents={documents}
                     placeholder="I'm sorry, that's outside the scope of what I can help with..."
-                    className={`${inputCls} resize-none`}
                   />
                 </div>
 
@@ -747,12 +758,13 @@ function PlaybookFormPanel({
                   <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                     Fallback Response
                   </label>
-                  <textarea
+                  <PlaybookMentionsEditor
                     value={form.fallback_response}
-                    onChange={(e) => setForm((p) => ({ ...p, fallback_response: e.target.value }))}
-                    rows={2}
+                    onChange={(val) => setForm((p) => ({ ...p, fallback_response: val }))}
+                    tools={tools}
+                    variables={variables}
+                    documents={documents}
                     placeholder="I didn't quite understand that. Could you rephrase?"
-                    className={`${inputCls} resize-none`}
                   />
                 </div>
 
@@ -760,12 +772,13 @@ function PlaybookFormPanel({
                   <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                     Escalation Message
                   </label>
-                  <textarea
+                  <PlaybookMentionsEditor
                     value={form.escalation_message}
-                    onChange={(e) => setForm((p) => ({ ...p, escalation_message: e.target.value }))}
-                    rows={2}
+                    onChange={(val) => setForm((p) => ({ ...p, escalation_message: val }))}
+                    tools={tools}
+                    variables={variables}
+                    documents={documents}
                     placeholder="I'll connect you with a human agent now..."
-                    className={`${inputCls} resize-none`}
                   />
                 </div>
               </div>

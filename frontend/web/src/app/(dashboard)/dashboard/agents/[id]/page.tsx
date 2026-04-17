@@ -4,8 +4,9 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi, chatApi, voiceApi, feedbackApi } from '@/lib/api'
+import { agentsApi, chatApi, voiceApi, feedbackApi, variablesApi, toolsApi, documentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
+import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 import {
   ArrowLeft,
   Bot,
@@ -126,6 +127,28 @@ export default function AgentDetailPage() {
     queryFn: () => agentsApi.get(id),
     enabled: !!id,
     retry: 1,
+  })
+
+  // Global/Local autocomplete context queries
+  const { data: baseVariables = [] } = useQuery({
+    queryKey: ['variables', id],
+    queryFn: () => variablesApi.list(id),
+    enabled: !!id,
+  })
+  
+  // Filter variables up to Global scope or playbooks that apply to this agent generally.
+  const globalVariables = Array.isArray(baseVariables) ? baseVariables.filter((v: any) => v.scope === 'global') : []
+
+  const { data: tools = [] } = useQuery({
+    queryKey: ['tools', id],
+    queryFn: () => toolsApi.list(id),
+    enabled: !!id,
+  })
+
+  const { data: documents = [] } = useQuery({
+    queryKey: ['documents', id],
+    queryFn: () => documentsApi.list(id),
+    enabled: !!id,
   })
 
   const getBrowserLanguage = (): string => {
@@ -682,36 +705,16 @@ export default function AgentDetailPage() {
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
               System prompt
             </label>
-            <textarea
+            <PlaybookMentionsEditor
               value={(formData.system_prompt as string) || ''}
-              onChange={(e) => setFormData((p) => ({ ...p, system_prompt: e.target.value }))}
-              rows={5}
+              onChange={(val) => setFormData((p: any) => ({ ...p, system_prompt: val }))}
+              tools={tools}
+              variables={globalVariables}
+              documents={documents}
               placeholder="You are a helpful assistant for {business_name}..."
-              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
             />
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-              Greeting message
-              <span className="ml-2 text-xs font-normal text-gray-400">(shown at start of every conversation)</span>
-            </label>
-            <textarea
-              value={(formData.greeting_message as string) || ''}
-              onChange={(e) => setFormData((p) => ({ ...p, greeting_message: e.target.value }))}
-              rows={2}
-              maxLength={1000}
-              placeholder={`Hi! I'm ${agent.name}. How can I help you today?`}
-              className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
-            />
-            <p className="text-xs text-gray-400 mt-1">
-              For voice recording, go to{' '}
-              <Link href={`/dashboard/agents/${id}/greeting`} className="text-violet-600 hover:underline">
-                Greeting &amp; Language
-              </Link>
-              .
-            </p>
-          </div>
 
           <div className="flex items-center gap-3">
             <input

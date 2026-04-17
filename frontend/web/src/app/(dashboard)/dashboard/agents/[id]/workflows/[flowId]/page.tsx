@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { workflowsApi } from '@/lib/api'
+import { workflowsApi, variablesApi, toolsApi, documentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ChevronLeft,
@@ -32,6 +32,7 @@ import {
   Code,
   ArrowRight,
 } from 'lucide-react'
+import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -133,9 +134,15 @@ function defaultConfig(type: NodeType): Record<string, unknown> {
 function NodeConfigForm({
   node,
   onChange,
+  tools,
+  variables,
+  documents,
 }: {
   node: WorkflowNode
   onChange: (config: Record<string, unknown>) => void
+  tools: any[]
+  variables: any[]
+  documents: any[]
 }) {
   const cfg = node.config
   const set = (key: string, value: unknown) => onChange({ ...cfg, [key]: value })
@@ -156,12 +163,13 @@ function NodeConfigForm({
   const textarea = (label: string, key: string, rows = 2, placeholder = '') => (
     <div key={key}>
       <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">{label}</label>
-      <textarea
+      <PlaybookMentionsEditor
         value={String(cfg[key] ?? '')}
-        onChange={(e) => set(key, e.target.value)}
-        rows={rows}
+        onChange={(val) => set(key, val)}
+        tools={tools}
+        variables={variables}
+        documents={documents}
         placeholder={placeholder}
-        className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-sm resize-none focus:outline-none focus:ring-1 focus:ring-violet-500"
       />
     </div>
   )
@@ -308,6 +316,9 @@ function NodeRow({
   onEdgeChange: (edgeId: string, field: string, value: string) => void
   onAddEdge: (sourceId: string) => void
   onDeleteEdge: (edgeId: string) => void
+  tools: any[]
+  variables: any[]
+  documents: any[]
 }) {
   const [open, setOpen] = useState(false)
   const meta = NODE_META[node.type]
@@ -375,7 +386,7 @@ function NodeRow({
           {/* Config fields */}
           <div>
             <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Config</p>
-            <NodeConfigForm node={node} onChange={(cfg) => onUpdate({ ...node, config: cfg })} />
+            <NodeConfigForm node={node} onChange={(cfg) => onUpdate({ ...node, config: cfg })} tools={tools} variables={variables} documents={documents} />
           </div>
 
           {/* Outgoing edges */}
@@ -598,6 +609,26 @@ export default function FlowDetailPage() {
   const { data: flow, isLoading } = useQuery<Flow>({
     queryKey: ['flow', agentId, flowId],
     queryFn: () => workflowsApi.get(agentId, flowId),
+  })
+
+  const { data: baseVariables = [] } = useQuery({
+    queryKey: ['variables', agentId],
+    queryFn: () => variablesApi.list(agentId),
+    enabled: !!agentId,
+  })
+  
+  const globalVariables = Array.isArray(baseVariables) ? baseVariables.filter((v: any) => v.scope === 'global') : []
+
+  const { data: tools = [] } = useQuery({
+    queryKey: ['tools', agentId],
+    queryFn: () => toolsApi.list(agentId),
+    enabled: !!agentId,
+  })
+
+  const { data: documents = [] } = useQuery({
+    queryKey: ['documents', agentId],
+    queryFn: () => documentsApi.list(agentId),
+    enabled: !!agentId,
   })
 
   // Hydrate state from server data
@@ -949,6 +980,9 @@ export default function FlowDetailPage() {
                     onEdgeChange={updateEdge}
                     onAddEdge={addEdge}
                     onDeleteEdge={deleteEdge}
+                    tools={tools}
+                    variables={globalVariables}
+                    documents={documents}
                   />
                 ))}
               </div>

@@ -26,7 +26,7 @@ router = APIRouter(prefix="/compliance-audit")
 
 def _require_admin(request: Request) -> str:
     role = getattr(request.state, "role", "")
-    if role not in ("super_admin", "tenant_owner", "tenant_admin"):
+    if role not in ("super_admin", "owner", "admin"):
         raise HTTPException(status_code=403, detail="Admin access required.")
     return getattr(request.state, "tenant_id", "")
 

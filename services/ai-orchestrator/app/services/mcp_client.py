@@ -159,9 +159,13 @@ class MCPClient:
         _t0 = time.monotonic()
         try:
             client = self._get_client()
+            headers = {
+                "X-Tenant-ID": tenant_id,
+                "X-Internal-Key": settings.INTERNAL_API_KEY,
+            }
             # Hard timeout — prevents indefinite worker blockage
             response = await asyncio.wait_for(
-                client.post("/execute", json=payload),
+                client.post("/execute", json=payload, headers=headers),
                 timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
@@ -280,7 +284,14 @@ class MCPClient:
 
         try:
             client = self._get_client()
-            response = await client.post("/context/retrieve", json=payload)
+            response = await client.post(
+                "/context/retrieve",
+                json=payload,
+                headers={
+                    "X-Tenant-ID": tenant_id,
+                    "X-Internal-Key": settings.INTERNAL_API_KEY,
+                },
+            )
             response.raise_for_status()
             data = response.json()
             items = data.get("items", data) if isinstance(data, dict) else data
@@ -317,6 +328,10 @@ class MCPClient:
             response = await client.get(
                 "/tools",
                 params={"tenant_id": tenant_id},
+                headers={
+                    "X-Tenant-ID": tenant_id,
+                    "X-Internal-Key": settings.INTERNAL_API_KEY,
+                },
             )
             response.raise_for_status()
             data = response.json()
@@ -347,6 +362,10 @@ class MCPClient:
             response = await client.post(
                 "/tools/schemas",
                 json={"tenant_id": tenant_id, "tool_names": tool_names},
+                headers={
+                    "X-Tenant-ID": tenant_id,
+                    "X-Internal-Key": settings.INTERNAL_API_KEY,
+                },
             )
             response.raise_for_status()
             data = response.json()

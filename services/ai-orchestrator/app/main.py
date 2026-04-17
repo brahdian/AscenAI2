@@ -19,6 +19,7 @@ from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
 from app.core.config import settings
 from app.core.database import init_db, close_db
+from app.core.leadership import RedisLeaderLease
 from app.core.redis_client import init_redis, close_redis, get_redis
 from app.core.security import get_current_tenant
 
@@ -176,7 +177,7 @@ async def lifespan(app: FastAPI):
 
     # Start background session cleanup worker
     from app.workers.session_cleanup import SessionCleanupWorker
-    session_cleanup = SessionCleanupWorker(db_factory=AsyncSessionLocal)
+    session_cleanup = SessionCleanupWorker(db_factory=AsyncSessionLocal, redis=redis_client)
     app.state.session_cleanup = session_cleanup
     asyncio.create_task(session_cleanup.start())
     logger.info("session_cleanup_worker_started")
@@ -192,8 +193,12 @@ async def lifespan(app: FastAPI):
     from app.core.metrics import DOC_INDEX_QUEUE_DEPTH, DOC_INDEX_DLQ_DEPTH
 
     async def _poll_queue_depths() -> None:
+        lease = RedisLeaderLease(redis_client, "ai-orchestrator:queue-depth-poller")
         while True:
             try:
+                if not await lease.acquire_or_renew():
+                    await asyncio.sleep(30)
+                    continue
                 r = app.state.redis
                 q = await r.llen("doc_index_queue") or 0
                 d = await r.llen("doc_index_dlq") or 0

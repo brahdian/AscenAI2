@@ -1052,6 +1052,8 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 # action="add_agent_slot" / missing → new slot, bump agent_count
                 agent_id = metadata.get("agent_id")
                 is_reactivation = metadata.get("action") == "reactivate_agent"
+                slot_delta = 0
+                slot_accounted = False
                 if agent_id:
                     logger.info("activating_agent_from_webhook", tenant_id=tenant_id, agent_id=agent_id)
                     subscription_id = session.get("subscription")
@@ -1091,12 +1093,8 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 # Only bump agent_count for NEW slots, not reactivations
                                 # (the slot was already counted when the agent was first created)
                                 if not is_reactivation:
-                                    await db.execute(
-                                        _sa_update(TenantUsage)
-                                        .where(TenantUsage.tenant_id == tenant.id)
-                                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
-                                    )
-                                    await db.commit()
+                                    slot_delta = 1
+                                    slot_accounted = True
                             else:
                                 logger.error("agent_activation_failed_upstream", agent_id=agent_id, status=activate_res.status_code)
                                 # Failsafe: Agent missing or errored -> Issue refund/cancel to prevent unauthorized charge
@@ -1137,12 +1135,8 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 )
                                 if create_res.status_code in (200, 201):
                                     await db.delete(pending)
-                                    # Atomic increment — avoids race on concurrent webhooks
-                                    await db.execute(
-                                        _sa_update(TenantUsage)
-                                        .where(TenantUsage.tenant_id == tenant.id)
-                                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
-                                    )
+                                    slot_delta = 1
+                                    slot_accounted = True
                                     await db.commit()
                                     logger.info("pending_agent_created_and_cleaned_up", tenant_id=tenant_id)
                         except Exception as e:
@@ -1151,14 +1145,18 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 # FLOW 3: Generic Slot Increment
                 if metadata.get("action") == "add_agent_slot":
                     logger.info("adding_generic_agent_slot", tenant_id=tenant_id)
-                    # Atomic increment — avoids race on concurrent webhooks
+                    if not slot_accounted:
+                        slot_delta = 1
+                        slot_accounted = True
+
+                if tenant and slot_delta:
                     await db.execute(
                         _sa_update(TenantUsage)
                         .where(TenantUsage.tenant_id == tenant.id)
-                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + 1))
+                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + slot_delta))
                     )
                     await db.commit()
-                    logger.info("generic_slot_added_successfully", tenant_id=tenant_id)
+                    logger.info("agent_slot_accounted", tenant_id=tenant_id, slot_delta=slot_delta)
 
             except Exception as e:
                 logger.error("billing_webhook_checkout_error", error=str(e), tenant_id=tenant_id)

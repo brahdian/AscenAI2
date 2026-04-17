@@ -13,6 +13,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import settings
+from app.core.leadership import RedisLeaderLease
 
 logger = structlog.get_logger(__name__)
 
@@ -23,12 +24,15 @@ class SessionCleanupWorker:
     def __init__(
         self,
         db_factory: async_sessionmaker,
+        redis=None,
         interval_seconds: int = 300,
     ):
         self.db_factory = db_factory
+        self.redis = redis
         self.interval_seconds = interval_seconds
         self._running = False
         self._task: asyncio.Task | None = None
+        self._lease = RedisLeaderLease(redis, "ai-orchestrator:session-cleanup") if redis else None
 
     async def start(self) -> None:
         self._running = True
@@ -48,6 +52,9 @@ class SessionCleanupWorker:
     async def _run_loop(self) -> None:
         while self._running:
             try:
+                if self._lease and not await self._lease.acquire_or_renew():
+                    await asyncio.sleep(self.interval_seconds)
+                    continue
                 await self._close_expired_sessions()
             except Exception as exc:
                 logger.error("session_cleanup_error", error=str(exc))

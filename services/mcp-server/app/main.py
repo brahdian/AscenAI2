@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 3. Start booking expiry worker
     from app.workers.booking_expiry_worker import get_booking_expiry_worker
-    booking_worker = get_booking_expiry_worker()
+    booking_worker = get_booking_expiry_worker(redis_client)
     booking_worker.start()
     logger.info("booking_expiry_worker_registered")
 
@@ -123,7 +123,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # --- Shutdown ---
     logger.info("mcp_server_shutting_down")
     from app.workers.booking_expiry_worker import get_booking_expiry_worker
-    await get_booking_expiry_worker().stop()
+    await get_booking_expiry_worker(redis_client).stop()
 
     if redis_client:
         await redis_client.aclose()

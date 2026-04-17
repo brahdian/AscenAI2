@@ -20,10 +20,17 @@ router = APIRouter(prefix="/context")
 
 
 def _tenant_id(request: Request) -> str:
-    tid = request.headers.get("X-Tenant-ID") or getattr(request.state, "tenant_id", None)
+    tid = getattr(request.state, "tenant_id", None)
     if not tid:
         raise HTTPException(status_code=401, detail="Tenant ID required.")
     return tid
+
+
+async def _tenant_db(
+    tenant_id: str = Depends(_tenant_id),
+):
+    async for session in get_db(tenant_id):
+        yield session
 
 
 def _get_provider(request: Request, db: AsyncSession) -> ContextProvider:
@@ -35,10 +42,10 @@ def _get_provider(request: Request, db: AsyncSession) -> ContextProvider:
 async def retrieve_context(
     body: MCPContextRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Retrieve relevant context for a query."""
-    tenant_id = _tenant_id(request)
     body_dict = body.model_dump()
     body_dict["tenant_id"] = tenant_id
     body = MCPContextRequest(**body_dict)
@@ -51,10 +58,10 @@ async def retrieve_context(
 async def create_knowledge_base(
     body: KnowledgeBaseCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Create a new knowledge base."""
-    tenant_id = _tenant_id(request)
     provider = _get_provider(request, db)
     kb = await provider.create_knowledge_base(tenant_id, body)
     await db.commit()
@@ -65,10 +72,10 @@ async def create_knowledge_base(
 @router.get("/knowledge-bases", response_model=list[KnowledgeBaseResponse])
 async def list_knowledge_bases(
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """List knowledge bases for the tenant."""
-    tenant_id = _tenant_id(request)
     provider = _get_provider(request, db)
     return await provider.list_knowledge_bases(tenant_id)
 
@@ -82,10 +89,10 @@ async def add_document(
     kb_id: str,
     body: KnowledgeDocumentCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Add a document to a knowledge base."""
-    tenant_id = _tenant_id(request)
     body_dict = body.model_dump()
     body_dict["kb_id"] = kb_id
     body = KnowledgeDocumentCreate(**body_dict)
@@ -102,10 +109,10 @@ async def delete_document(
     kb_id: str,
     doc_id: str,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
 ):
     """Delete a document from a knowledge base."""
-    tenant_id = _tenant_id(request)
     provider = _get_provider(request, db)
     deleted = await provider.delete_document(tenant_id, kb_id, doc_id)
     if not deleted:

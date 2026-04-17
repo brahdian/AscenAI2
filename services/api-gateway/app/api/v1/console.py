@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import desc, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_tenant_db, get_current_tenant
 from app.services.audit_service import list_audit_logs
@@ -55,7 +56,7 @@ async def get_tenant_audit_logs(
 ):
     """
     Return audit logs scoped to the requesting tenant.
-    Accessible to tenant_owner, tenant_admin, and developer roles.
+    Accessible to owner, admin, and developer roles.
     """
     tenant_id = _require_tenant(request)
 

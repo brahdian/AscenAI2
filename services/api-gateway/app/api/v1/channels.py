@@ -44,9 +44,9 @@ _WHATSAPP_APP_SECRET = settings.WHATSAPP_APP_SECRET
 _TWILIO_AUTH_TOKEN = settings.TWILIO_AUTH_TOKEN
 _SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 _SENDGRID_WEBHOOK_KEY = os.getenv("SENDGRID_WEBHOOK_KEY", "")
-_ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://ai-orchestrator:8000")
-_ORCHESTRATOR_INTERNAL_KEY = os.getenv("ORCHESTRATOR_INTERNAL_KEY", "")
-_MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://mcp-server:8001")
+_ORCHESTRATOR_URL = settings.AI_ORCHESTRATOR_URL
+_ORCHESTRATOR_INTERNAL_KEY = settings.INTERNAL_API_KEY
+_MCP_SERVER_URL = settings.MCP_SERVER_URL
 
 # Dedup cache TTL (seconds) — prevents duplicate webhook deliveries
 # SECURITY: Uses Redis SETNX for constant-time O(1) dedup instead of an in-memory

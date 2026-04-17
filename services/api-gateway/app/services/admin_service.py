@@ -1,39 +1,27 @@
 """
-Admin Service — Platform administration, tenant management, RBAC.
-
-Provides:
-- Tenant management (list, create, suspend, delete)
-- User management with role-based access control
-- System prompt management (global + per-agent)
-- Platform settings management (global greeting phrases, etc.)
-- Audit logging for all admin actions
-- Observability APIs (traces, metrics, logs)
-
-RBAC Roles:
-- super_admin: Full platform access, can manage all tenants
-- tenant_owner: Full tenant access, can manage users and agents
-- tenant_admin: Can manage agents, tools, playbooks
-- developer: Read-only access, can view traces and metrics
-- viewer: Minimal read-only access
+Admin Service — platform administration, tenant management, and RBAC metadata.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.platform import PlatformSetting
+from app.models.tenant import Tenant, TenantUsage
+from app.models.user import User
+from app.services.audit_service import audit_log
+from app.services.auth_service import auth_service
 
 logger = structlog.get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# RBAC Definitions
-# ---------------------------------------------------------------------------
+CANONICAL_TENANT_ROLES = ("owner", "admin", "developer", "viewer")
 
-# Fallback roles if DB is empty or during initial startup
 DEFAULT_ROLES = {
     "super_admin": {
         "level": 100,
@@ -50,7 +38,7 @@ DEFAULT_ROLES = {
             "settings:read", "settings:write",
         ],
     },
-    "tenant_owner": {
+    "owner": {
         "level": 80,
         "permissions": [
             "tenants:read", "tenants:write",
@@ -63,7 +51,7 @@ DEFAULT_ROLES = {
             "billing:read",
         ],
     },
-    "tenant_admin": {
+    "admin": {
         "level": 60,
         "permissions": [
             "agents:read", "agents:write",
@@ -90,123 +78,97 @@ DEFAULT_ROLES = {
     },
 }
 
-# Cache for dynamic roles
 _ROLES_CACHE: Dict[str, Any] = {}
 _LAST_ROLES_FETCH: Optional[datetime] = None
-_CACHE_TTL = 300  # 5 minutes
+_CACHE_TTL_SECONDS = 300
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _tenant_lifecycle(tenant: Tenant) -> str:
+    if not tenant.is_active:
+        return "suspended"
+    status = (tenant.subscription_status or "").lower()
+    if status in {"canceled", "cancelled"}:
+        return "cancelled"
+    if status in {"past_due", "unpaid"}:
+        return "past_due"
+    if tenant.trial_ends_at and tenant.trial_ends_at > _utcnow():
+        return "trial"
+    return "active"
+
+
+def _serialize_tenant(tenant: Tenant, *, agent_count: int = 0, user_count: int = 0) -> dict[str, Any]:
+    return {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "slug": tenant.slug,
+        "business_name": tenant.business_name,
+        "business_type": tenant.business_type,
+        "email": tenant.email,
+        "phone": tenant.phone,
+        "plan": tenant.plan,
+        "plan_display_name": tenant.plan_display_name,
+        "subscription_status": tenant.subscription_status,
+        "subscription_id": tenant.subscription_id,
+        "stripe_customer_id": tenant.stripe_customer_id,
+        "is_active": tenant.is_active,
+        "status": _tenant_lifecycle(tenant),
+        "trial_ends_at": tenant.trial_ends_at.isoformat() if tenant.trial_ends_at else None,
+        "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+        "updated_at": tenant.updated_at.isoformat() if tenant.updated_at else None,
+        "agent_count": agent_count,
+        "user_count": user_count,
+    }
+
+
+def _serialize_user(user: User) -> dict[str, Any]:
+    return {
+        "id": str(user.id),
+        "tenant_id": str(user.tenant_id),
+        "email": user.email,
+        "full_name": user.full_name,
+        "role": user.role,
+        "is_active": user.is_active,
+        "is_email_verified": user.is_email_verified,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
 
 
 async def get_all_roles(db: AsyncSession) -> Dict[str, Any]:
-    """Fetch roles from DB (with caching)."""
     global _ROLES_CACHE, _LAST_ROLES_FETCH
-    
-    now = datetime.now(timezone.utc)
-    if _ROLES_CACHE and _LAST_ROLES_FETCH and (now - _LAST_ROLES_FETCH).total_seconds() < _CACHE_TTL:
-        return _ROLES_CACHE
+
+    now = _utcnow()
+    if _ROLES_CACHE and _LAST_ROLES_FETCH:
+        age = (now - _LAST_ROLES_FETCH).total_seconds()
+        if age < _CACHE_TTL_SECONDS:
+            return _ROLES_CACHE
 
     try:
-        from app.models.platform import PlatformSetting
         result = await db.execute(
             select(PlatformSetting).where(PlatformSetting.key == "rbac_roles")
         )
         setting = result.scalar_one_or_none()
         if setting and setting.value:
-            _ROLES_CACHE = setting.value
+            merged_roles = dict(DEFAULT_ROLES)
+            for role_name, role_value in setting.value.items():
+                merged_roles[role_name] = role_value
+            _ROLES_CACHE = merged_roles
             _LAST_ROLES_FETCH = now
             return _ROLES_CACHE
-    except Exception as e:
-        logger.warning("failed_to_fetch_roles_from_db", error=str(e))
-    
+    except Exception as exc:
+        logger.warning("failed_to_fetch_roles_from_db", error=str(exc))
+
     return DEFAULT_ROLES
 
 
-async def has_permission(role: str, permission: str, db: AsyncSession) -> bool:
-    """Check if a role has a specific permission."""
-    roles = await get_all_roles(db)
-    role_config = roles.get(role, {})
-    return permission in role_config.get("permissions", [])
-
-
-async def get_role_level(role: str, db: AsyncSession) -> int:
-    """Get the numeric level of a role."""
-    roles = await get_all_roles(db)
-    return roles.get(role, {}).get("level", 0)
-
-
-# ---------------------------------------------------------------------------
-# Audit Logger
-# ---------------------------------------------------------------------------
-
-class AuditLogger:
-    """Logs all admin actions for compliance."""
-
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
-    async def log_action(
-        self,
-        user_id: str,
-        tenant_id: str,
-        action: str,
-        resource_type: str,
-        resource_id: str = "",
-        details: Dict[str, Any] = None,
-        ip_address: str = "",
-    ) -> None:
-        """Log an admin action."""
-        log_entry = {
-            "id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "action": action,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "details": details or {},
-            "ip_address": ip_address,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info(
-            "audit_action",
-            **log_entry,
-        )
-
-        # Persist to database (if audit_log table exists)
-        try:
-            await self.db.execute(
-                text("""
-                    INSERT INTO audit_logs (id, user_id, tenant_id, action, resource_type, resource_id, details, ip_address, created_at)
-                    VALUES (:id, :user_id, :tenant_id, :action, :resource_type, :resource_id, :details, :ip_address, :timestamp)
-                """),
-                {
-                    "id": log_entry["id"],
-                    "user_id": user_id,
-                    "tenant_id": tenant_id,
-                    "action": action,
-                    "resource_type": resource_type,
-                    "resource_id": resource_id,
-                    "details": str(details or {}),
-                    "ip_address": ip_address,
-                    "timestamp": log_entry["timestamp"],
-                },
-            )
-            await self.db.commit()
-        except Exception as e:
-            # Table might not exist yet; log and continue
-            logger.debug("audit_log_db_error", error=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Admin Service
-# ---------------------------------------------------------------------------
-
 class AdminService:
-    """Platform administration service."""
-
     def __init__(self, db: AsyncSession, redis_client):
         self.db = db
         self.redis = redis_client
-        self.audit = AuditLogger(db)
 
     async def list_tenants(
         self,
@@ -214,117 +176,166 @@ class AdminService:
         per_page: int = 50,
         status: str = "",
     ) -> Dict[str, Any]:
-        """List all tenants with pagination."""
         offset = (page - 1) * per_page
 
-        query = "SELECT id, name, business_name, plan, status, created_at FROM tenants"
-        params: Dict[str, Any] = {}
+        tenant_query = select(Tenant).order_by(Tenant.created_at.desc())
+        if status == "active":
+            tenant_query = tenant_query.where(
+                Tenant.is_active.is_(True),
+                ~Tenant.subscription_status.in_(["canceled", "cancelled", "past_due", "unpaid"]),
+                or_(Tenant.trial_ends_at.is_(None), Tenant.trial_ends_at <= func.now()),
+            )
+        elif status == "suspended":
+            tenant_query = tenant_query.where(Tenant.is_active.is_(False))
+        elif status in ("cancelled", "canceled"):
+            tenant_query = tenant_query.where(
+                Tenant.is_active.is_(True),
+                Tenant.subscription_status.in_(["canceled", "cancelled"]),
+            )
+        elif status == "past_due":
+            tenant_query = tenant_query.where(
+                Tenant.is_active.is_(True),
+                Tenant.subscription_status.in_(["past_due", "unpaid"]),
+            )
+        elif status == "trial":
+            tenant_query = tenant_query.where(
+                Tenant.is_active.is_(True),
+                Tenant.trial_ends_at.isnot(None),
+                Tenant.trial_ends_at > func.now(),
+            )
 
-        if status:
-            query += " WHERE status = :status"
-            params["status"] = status
+        total_result = await self.db.execute(
+            select(func.count()).select_from(tenant_query.subquery())
+        )
+        total = total_result.scalar_one()
 
-        query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
-        params["limit"] = per_page
-        params["offset"] = offset
+        result = await self.db.execute(tenant_query.offset(offset).limit(per_page))
+        tenants = list(result.scalars().all())
+        tenant_ids = [tenant.id for tenant in tenants]
 
-        result = await self.db.execute(text(query), params)
-        tenants = [dict(row._mapping) for row in result.fetchall()]
+        agent_counts: dict[uuid.UUID, int] = {}
+        user_counts: dict[uuid.UUID, int] = {}
+        if tenant_ids:
+            agent_count_rows = await self.db.execute(
+                text("""
+                    SELECT tenant_id, COUNT(*) AS count
+                    FROM agents
+                    WHERE tenant_id = ANY(:tenant_ids)
+                    GROUP BY tenant_id
+                """),
+                {"tenant_ids": tenant_ids},
+            )
+            agent_counts = {
+                row.tenant_id: int(row.count or 0)
+                for row in agent_count_rows
+            }
 
-        # Get total count
-        count_query = "SELECT COUNT(*) FROM tenants"
-        if status:
-            count_query += " WHERE status = :status"
-        count_result = await self.db.execute(text(count_query), {"status": status} if status else {})
-        total = count_result.scalar() or 0
+            user_count_rows = await self.db.execute(
+                select(User.tenant_id, func.count())
+                .where(User.tenant_id.in_(tenant_ids))
+                .group_by(User.tenant_id)
+            )
+            user_counts = {
+                tenant_id: int(count or 0)
+                for tenant_id, count in user_count_rows.all()
+            }
+
+        serialized = [
+            _serialize_tenant(
+                tenant,
+                agent_count=agent_counts.get(tenant.id, 0),
+                user_count=user_counts.get(tenant.id, 0),
+            )
+            for tenant in tenants
+        ]
 
         return {
-            "tenants": tenants,
+            "tenants": serialized,
             "pagination": {
                 "page": page,
                 "per_page": per_page,
                 "total": total,
-                "pages": (total + per_page - 1) // per_page,
+                "pages": (total + per_page - 1) // per_page if total else 0,
             },
         }
 
-    async def get_tenant_details(
-        self,
-        tenant_id: str,
-    ) -> Dict[str, Any]:
-        """Get detailed tenant information."""
-        result = await self.db.execute(
-            text("SELECT * FROM tenants WHERE id = :id"),
-            {"id": tenant_id},
-        )
-        tenant = result.fetchone()
-
+    async def get_tenant_details(self, tenant_id: str) -> Dict[str, Any]:
+        tenant_uuid = uuid.UUID(tenant_id)
+        result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+        tenant = result.scalar_one_or_none()
         if not tenant:
             return {"error": "Tenant not found"}
 
-        tenant_dict = dict(tenant._mapping)
-
-        # Get agent count
-        agent_result = await self.db.execute(
-            text("SELECT COUNT(*) FROM agents WHERE tenant_id = :tid"),
-            {"tid": tenant_id},
+        usage_result = await self.db.execute(
+            select(TenantUsage).where(TenantUsage.tenant_id == tenant_uuid)
         )
-        tenant_dict["agent_count"] = agent_result.scalar() or 0
+        usage = usage_result.scalar_one_or_none()
 
-        # Get user count
-        user_result = await self.db.execute(
-            text("SELECT COUNT(*) FROM users WHERE tenant_id = :tid"),
-            {"tid": tenant_id},
+        user_count_result = await self.db.execute(
+            select(func.count()).select_from(User).where(User.tenant_id == tenant_uuid)
         )
-        tenant_dict["user_count"] = user_result.scalar() or 0
+        user_count = int(user_count_result.scalar() or 0)
 
-        return tenant_dict
-
-    async def suspend_tenant(
-        self,
-        tenant_id: str,
-        reason: str,
-        admin_user_id: str,
-    ) -> Dict[str, Any]:
-        """Suspend a tenant."""
-        await self.db.execute(
-            text("UPDATE tenants SET status = 'suspended' WHERE id = :id"),
-            {"id": tenant_id},
+        agent_count_result = await self.db.execute(
+            text("SELECT COUNT(*) FROM agents WHERE tenant_id = :tenant_id"),
+            {"tenant_id": tenant_uuid},
         )
-        await self.db.commit()
+        agent_count = int(agent_count_result.scalar() or 0)
 
-        await self.audit.log_action(
-            user_id=admin_user_id,
-            tenant_id=tenant_id,
-            action="tenant_suspend",
+        data = _serialize_tenant(tenant, agent_count=agent_count, user_count=user_count)
+        data["usage"] = {
+            "agent_count": usage.agent_count if usage else 0,
+            "current_month_sessions": usage.current_month_sessions if usage else 0,
+            "current_month_messages": usage.current_month_messages if usage else 0,
+            "current_month_chat_units": usage.current_month_chat_units if usage else 0,
+            "current_month_tokens": usage.current_month_tokens if usage else 0,
+            "current_month_voice_minutes": usage.current_month_voice_minutes if usage else 0.0,
+            "total_cost_usd": usage.total_cost_usd if usage else 0.0,
+        }
+        return data
+
+    async def suspend_tenant(self, tenant_id: str, reason: str, admin_user_id: str) -> Dict[str, Any]:
+        tenant_uuid = uuid.UUID(tenant_id)
+        result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+        tenant = result.scalar_one_or_none()
+        if not tenant:
+            return {"error": "Tenant not found"}
+
+        tenant.is_active = False
+        await audit_log(
+            self.db,
+            "tenant.suspended",
+            tenant_id=str(tenant.id),
+            actor_user_id=admin_user_id,
+            actor_role="super_admin",
+            category="admin",
             resource_type="tenant",
-            resource_id=tenant_id,
+            resource_id=str(tenant.id),
             details={"reason": reason},
         )
-
+        await self.db.commit()
         logger.info("tenant_suspended", tenant_id=tenant_id, reason=reason)
         return {"status": "suspended", "tenant_id": tenant_id}
 
-    async def reactivate_tenant(
-        self,
-        tenant_id: str,
-        admin_user_id: str,
-    ) -> Dict[str, Any]:
-        """Reactivate a suspended tenant."""
-        await self.db.execute(
-            text("UPDATE tenants SET status = 'active' WHERE id = :id"),
-            {"id": tenant_id},
+    async def reactivate_tenant(self, tenant_id: str, admin_user_id: str) -> Dict[str, Any]:
+        tenant_uuid = uuid.UUID(tenant_id)
+        result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+        tenant = result.scalar_one_or_none()
+        if not tenant:
+            return {"error": "Tenant not found"}
+
+        tenant.is_active = True
+        await audit_log(
+            self.db,
+            "tenant.reactivated",
+            tenant_id=str(tenant.id),
+            actor_user_id=admin_user_id,
+            actor_role="super_admin",
+            category="admin",
+            resource_type="tenant",
+            resource_id=str(tenant.id),
         )
         await self.db.commit()
-
-        await self.audit.log_action(
-            user_id=admin_user_id,
-            tenant_id=tenant_id,
-            action="tenant_reactivate",
-            resource_type="tenant",
-            resource_id=tenant_id,
-        )
-
         logger.info("tenant_reactivated", tenant_id=tenant_id)
         return {"status": "active", "tenant_id": tenant_id}
 
@@ -334,63 +345,31 @@ class AdminService:
         admin_user_id: str,
         hard_delete: bool = False,
     ) -> Dict[str, Any]:
-        """Delete a tenant (soft or hard)."""
+        tenant_uuid = uuid.UUID(tenant_id)
+        result = await self.db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+        tenant = result.scalar_one_or_none()
+        if not tenant:
+            return {"error": "Tenant not found"}
+
         if hard_delete:
-            # Cascade delete all related data.
-            # Use a fixed allowlist of table names rather than dynamic f-string
-            # SQL to eliminate any future SQL-injection risk if this code is
-            # ever refactored to accept external input.
-            _TENANT_DATA_TABLES = (
-                "messages",
-                "sessions",
-                "agents",
-                "agent_playbooks",
-                "agent_guardrails",
-                "agent_documents",
-                "agent_analytics",
-                "message_feedback",
-                "conversation_traces",
-                "playbook_executions",
-            )
-            _ALLOWED_SET = frozenset(_TENANT_DATA_TABLES)
-            for table in _TENANT_DATA_TABLES:
-                # Belt-and-suspenders: assert the name is in the allowlist so
-                # any future code that modifies _TENANT_DATA_TABLES is audited.
-                assert table in _ALLOWED_SET, f"Table '{table}' not in delete allowlist"
-                # SQLAlchemy text() with a literal identifier — safe because the
-                # name is validated against the immutable frozenset above.
-                await self.db.execute(
-                    text(f"DELETE FROM {table} WHERE tenant_id = :tid"),  # noqa: S608
-                    {"tid": tenant_id},
-                )
-
-            await self.db.execute(
-                text("DELETE FROM users WHERE tenant_id = :tid"),
-                {"tid": tenant_id},
-            )
-            await self.db.execute(
-                text("DELETE FROM tenants WHERE id = :id"),
-                {"id": tenant_id},
-            )
+            await self.db.delete(tenant)
         else:
-            # Soft delete
-            await self.db.execute(
-                text("UPDATE tenants SET status = 'deleted' WHERE id = :id"),
-                {"id": tenant_id},
-            )
+            tenant.is_active = False
+            tenant.subscription_status = "cancelled"
 
-        await self.db.commit()
-
-        await self.audit.log_action(
-            user_id=admin_user_id,
-            tenant_id=tenant_id,
-            action="tenant_delete",
+        await audit_log(
+            self.db,
+            "tenant.deleted",
+            tenant_id=str(tenant.id),
+            actor_user_id=admin_user_id,
+            actor_role="super_admin",
+            category="admin",
             resource_type="tenant",
-            resource_id=tenant_id,
+            resource_id=str(tenant.id),
             details={"hard_delete": hard_delete},
         )
-
-        logger.info("tenant_deleted", tenant_id=tenant_id, hard=hard_delete)
+        await self.db.commit()
+        logger.info("tenant_deleted", tenant_id=tenant_id, hard_delete=hard_delete)
         return {"status": "deleted", "tenant_id": tenant_id, "hard": hard_delete}
 
     async def list_users(
@@ -399,37 +378,26 @@ class AdminService:
         page: int = 1,
         per_page: int = 50,
     ) -> Dict[str, Any]:
-        """List users, optionally filtered by tenant."""
         offset = (page - 1) * per_page
-
-        query = "SELECT id, email, name, role, tenant_id, is_active, created_at FROM users"
-        params: Dict[str, Any] = {}
-
+        query = select(User).order_by(User.created_at.desc())
         if tenant_id:
-            query += " WHERE tenant_id = :tid"
-            params["tid"] = tenant_id
+            query = query.where(User.tenant_id == uuid.UUID(tenant_id))
 
-        query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
-        params["limit"] = per_page
-        params["offset"] = offset
+        total_result = await self.db.execute(
+            select(func.count()).select_from(query.subquery())
+        )
+        total = total_result.scalar_one()
 
-        result = await self.db.execute(text(query), params)
-        users = [dict(row._mapping) for row in result.fetchall()]
-
-        # Get total count
-        count_query = "SELECT COUNT(*) FROM users"
-        if tenant_id:
-            count_query += " WHERE tenant_id = :tid"
-        count_result = await self.db.execute(text(count_query), {"tid": tenant_id} if tenant_id else {})
-        total = count_result.scalar() or 0
+        result = await self.db.execute(query.offset(offset).limit(per_page))
+        users = result.scalars().all()
 
         return {
-            "users": users,
+            "users": [_serialize_user(user) for user in users],
             "pagination": {
                 "page": page,
                 "per_page": per_page,
                 "total": total,
-                "pages": (total + per_page - 1) // per_page,
+                "pages": (total + per_page - 1) // per_page if total else 0,
             },
         }
 
@@ -439,34 +407,38 @@ class AdminService:
         new_role: str,
         admin_user_id: str,
     ) -> Dict[str, Any]:
-        """Update a user's role."""
-        roles = await get_all_roles(self.db)
-        if new_role not in roles:
+        normalized_role = new_role.strip().lower()
+        if normalized_role not in CANONICAL_TENANT_ROLES:
             return {"error": f"Invalid role: {new_role}"}
 
-        await self.db.execute(
-            text("UPDATE users SET role = :role WHERE id = :id"),
-            {"role": new_role, "id": user_id},
+        user_uuid = uuid.UUID(user_id)
+        result = await self.db.execute(select(User).where(User.id == user_uuid))
+        user = result.scalar_one_or_none()
+        if not user:
+            return {"error": "User not found"}
+
+        user.role = normalized_role
+        await audit_log(
+            self.db,
+            "user.role_changed",
+            tenant_id=str(user.tenant_id),
+            actor_user_id=admin_user_id,
+            actor_role="super_admin",
+            category="user",
+            resource_type="user",
+            resource_id=str(user.id),
+            details={"new_role": normalized_role},
         )
         await self.db.commit()
+        logger.info("user_role_updated", user_id=user_id, new_role=normalized_role)
+        return {
+            "status": "updated",
+            "user_id": user_id,
+            "role": normalized_role,
+            "tenant_id": str(user.tenant_id),
+        }
 
-        await self.audit.log_action(
-            user_id=admin_user_id,
-            tenant_id="",
-            action="user_role_update",
-            resource_type="user",
-            resource_id=user_id,
-            details={"new_role": new_role},
-        )
-
-        logger.info("user_role_updated", user_id=user_id, new_role=new_role)
-        return {"status": "updated", "user_id": user_id, "role": new_role}
-
-    async def get_system_prompts(
-        self,
-        agent_id: str = "",
-    ) -> Dict[str, Any]:
-        """Get system prompts (global or per-agent)."""
+    async def get_system_prompts(self, agent_id: str = "") -> Dict[str, Any]:
         if agent_id:
             result = await self.db.execute(
                 text("SELECT system_prompt, system_prompt_version FROM agents WHERE id = :id"),
@@ -481,12 +453,20 @@ class AdminService:
                 }
             return {"error": "Agent not found"}
 
-        # Return global prompts (from templates)
         result = await self.db.execute(
-            text("SELECT id, name, system_prompt_template FROM agent_templates LIMIT 20"),
+            select(PlatformSetting).where(PlatformSetting.key.in_(["voice_agent_system_prompt", "system_defaults"]))
         )
-        templates = [dict(row._mapping) for row in result.fetchall()]
-        return {"templates": templates}
+        settings_rows = result.scalars().all()
+        return {
+            "settings": [
+                {
+                    "key": row.key,
+                    "value": row.value,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                }
+                for row in settings_rows
+            ]
+        }
 
     async def update_system_prompt(
         self,
@@ -494,7 +474,6 @@ class AdminService:
         system_prompt: str,
         admin_user_id: str,
     ) -> Dict[str, Any]:
-        """Update an agent's system prompt."""
         await self.db.execute(
             text("""
                 UPDATE agents
@@ -505,17 +484,17 @@ class AdminService:
             """),
             {"prompt": system_prompt, "id": agent_id},
         )
-        await self.db.commit()
-
-        await self.audit.log_action(
-            user_id=admin_user_id,
-            tenant_id="",
-            action="system_prompt_update",
+        await audit_log(
+            self.db,
+            "agent.system_prompt_updated",
+            actor_user_id=admin_user_id,
+            actor_role="super_admin",
+            category="admin",
             resource_type="agent",
             resource_id=agent_id,
             details={"prompt_length": len(system_prompt)},
         )
-
+        await self.db.commit()
         logger.info("system_prompt_updated", agent_id=agent_id)
         return {"status": "updated", "agent_id": agent_id}
 
@@ -525,61 +504,61 @@ class AdminService:
         tenant_id: str = "",
         limit: int = 50,
     ) -> Dict[str, Any]:
-        """Get conversation traces (redacted)."""
         query = "SELECT * FROM conversation_traces WHERE 1=1"
-        params: Dict[str, Any] = {}
-
+        params: Dict[str, Any] = {"limit": limit}
         if session_id:
-            query += " AND session_id = :sid"
-            params["sid"] = session_id
+            query += " AND session_id = :session_id"
+            params["session_id"] = session_id
         if tenant_id:
-            query += " AND tenant_id = :tid"
-            params["tid"] = tenant_id
-
+            query += " AND tenant_id = :tenant_id"
+            params["tenant_id"] = tenant_id
         query += " ORDER BY created_at DESC LIMIT :limit"
-        params["limit"] = limit
-
         result = await self.db.execute(text(query), params)
         traces = [dict(row._mapping) for row in result.fetchall()]
-
         return {"traces": traces, "count": len(traces)}
 
     async def get_platform_metrics(self) -> Dict[str, Any]:
-        """Get platform-wide metrics."""
-        # Active tenants
-        result = await self.db.execute(
-            text("SELECT COUNT(*) FROM tenants WHERE status = 'active'")
+        active_tenants_result = await self.db.execute(
+            select(func.count()).select_from(Tenant).where(Tenant.is_active.is_(True))
         )
-        active_tenants = result.scalar() or 0
+        active_tenants = int(active_tenants_result.scalar() or 0)
 
-        # Total agents
-        result = await self.db.execute(text("SELECT COUNT(*) FROM agents"))
-        total_agents = result.scalar() or 0
+        total_agents_result = await self.db.execute(text("SELECT COUNT(*) FROM agents"))
+        total_agents = int(total_agents_result.scalar() or 0)
 
-        # Total sessions today
-        result = await self.db.execute(
+        sessions_today_result = await self.db.execute(
             text("SELECT COUNT(*) FROM sessions WHERE created_at > NOW() - INTERVAL '24 hours'")
         )
-        sessions_today = result.scalar() or 0
+        sessions_today = int(sessions_today_result.scalar() or 0)
 
-        # Total messages today
-        result = await self.db.execute(
+        messages_today_result = await self.db.execute(
             text("SELECT COUNT(*) FROM messages WHERE created_at > NOW() - INTERVAL '24 hours'")
         )
-        messages_today = result.scalar() or 0
+        messages_today = int(messages_today_result.scalar() or 0)
 
         return {
             "active_tenants": active_tenants,
             "total_agents": total_agents,
             "sessions_today": sessions_today,
             "messages_today": messages_today,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": _utcnow().isoformat(),
         }
 
-    async def get_platform_settings(self) -> List[Dict[str, Any]]:
-        """Get all platform settings."""
-        result = await self.db.execute(text("SELECT key, value, description, updated_at FROM platform_settings ORDER BY key ASC"))
-        return [dict(row._mapping) for row in result.fetchall()]
+    async def get_platform_settings(self) -> list[dict[str, Any]]:
+        result = await self.db.execute(
+            select(PlatformSetting).order_by(PlatformSetting.key.asc())
+        )
+        return [
+            {
+                "key": row.key,
+                "value": row.value,
+                "description": row.description,
+                "is_sensitive": row.is_sensitive,
+                "is_public": row.is_public,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in result.scalars().all()
+        ]
 
     async def update_platform_setting(
         self,
@@ -587,41 +566,32 @@ class AdminService:
         value: Any,
         admin_user_id: str,
     ) -> Dict[str, Any]:
-        """Update a platform setting."""
-        # Check if exists
         result = await self.db.execute(
-            text("SELECT key FROM platform_settings WHERE key = :key"),
-            {"key": key}
+            select(PlatformSetting).where(PlatformSetting.key == key)
         )
-        if not result.fetchone():
+        setting = result.scalar_one_or_none()
+        if not setting:
             return {"error": f"Setting '{key}' not found"}
 
-        import json
-        json_value = json.dumps(value) if not isinstance(value, str) else value
-
-        await self.db.execute(
-            text("UPDATE platform_settings SET value = CAST(:value AS JSONB), updated_at = NOW() WHERE key = :key"),
-            {"value": json_value, "key": key}
+        setting.value = value
+        await audit_log(
+            self.db,
+            "admin.platform_setting_changed",
+            actor_user_id=admin_user_id,
+            actor_role="super_admin",
+            category="admin",
+            resource_type="platform_setting",
+            resource_id=key,
+            details={"key": key},
         )
         await self.db.commit()
 
-        await self.audit.log_action(
-            user_id=admin_user_id,
-            tenant_id="",
-            action="platform_setting_update",
-            resource_type="platform_setting",
-            resource_id=key,
-            details={"key": key}
-        )
-
-        logger.info("platform_setting_updated", key=key)
-        
-        # Invalidate cache if roles were updated
         if key == "rbac_roles":
             global _ROLES_CACHE, _LAST_ROLES_FETCH
             _ROLES_CACHE = {}
             _LAST_ROLES_FETCH = None
-            
+
+        logger.info("platform_setting_updated", key=key)
         return {"status": "updated", "key": key}
 
     async def create_trial_tenant(
@@ -633,86 +603,95 @@ class AdminService:
         admin_password: str,
         created_by: str,
     ) -> Dict[str, Any]:
-        """Create a trial tenant with admin user (bypasses Stripe/payment)."""
-        import hashlib
-        import json
-        
-        tenant_id = str(uuid.uuid4())
-        user_id = str(uuid.uuid4())
-        
-        # Create tenant
-        await self.db.execute(
-            text("""
-                INSERT INTO tenants (id, name, business_name, plan, status, created_at, updated_at)
-                VALUES (:id, :name, :business_name, :plan, 'active', NOW(), NOW())
-            """),
-            {
-                "id": tenant_id,
-                "name": name,
-                "business_name": business_name,
-                "plan": plan,
-            },
+        normalized_email = admin_email.strip().lower()
+        slug = name.strip().lower().replace(" ", "-")
+
+        existing_slug = await self.db.execute(select(Tenant).where(Tenant.slug == slug))
+        if existing_slug.scalar_one_or_none():
+            return {"error": "Tenant slug already exists"}
+
+        existing_user = await self.db.execute(select(User).where(User.email == normalized_email))
+        if existing_user.scalar_one_or_none():
+            return {"error": "Admin email already exists"}
+
+        tenant = Tenant(
+            id=uuid.uuid4(),
+            name=name,
+            slug=slug,
+            business_type="other",
+            business_name=business_name,
+            email=normalized_email,
+            phone="",
+            address={},
+            timezone="UTC",
+            plan=plan,
+            plan_limits={},
+            is_active=True,
+            subscription_status="trialing",
+            trial_ends_at=_utcnow() + timedelta(days=14),
+            metadata_={"created_via": "admin_trial_tenant"},
         )
-        
-        # Create tenant usage record
-        await self.db.execute(
-            text("""
-                INSERT INTO tenant_usage (tenant_id, current_month_messages, current_month_chat_units, 
-                    current_month_sessions, current_month_stt_tokens, current_month_tts_tokens, 
-                    current_month_cost_usd, agent_count, updated_at)
-                VALUES (:tenant_id, 0, 0, 0, 0, 0, 0.0, 3, NOW())
-            """),
-            {"tenant_id": tenant_id},
+        self.db.add(tenant)
+        await self.db.flush()
+
+        usage = TenantUsage(
+            id=uuid.uuid4(),
+            tenant_id=tenant.id,
+            agent_count=1,
+            last_reset_at=_utcnow(),
         )
-        
-        # Create admin user
-        password_hash = hashlib.sha256(admin_password.encode()).hexdigest()
-        await self.db.execute(
-            text("""
-                INSERT INTO users (id, email, name, password_hash, role, tenant_id, is_active, created_at, updated_at)
-                VALUES (:id, :email, :name, :password_hash, 'tenant_owner', :tenant_id, true, NOW(), NOW())
-            """),
-            {
-                "id": user_id,
-                "email": admin_email,
-                "name": admin_email.split("@")[0],
-                "password_hash": password_hash,
-                "tenant_id": tenant_id,
-            },
+        self.db.add(usage)
+
+        user = User(
+            id=uuid.uuid4(),
+            tenant_id=tenant.id,
+            email=normalized_email,
+            hashed_password=auth_service.hash_password(admin_password),
+            full_name=business_name,
+            role="owner",
+            is_active=True,
+            is_email_verified=True,
         )
-        
-        await self.db.commit()
-        
-        await self.audit.log_action(
-            user_id=created_by,
-            tenant_id=tenant_id,
-            action="trial_tenant_created",
+        self.db.add(user)
+
+        await audit_log(
+            self.db,
+            "tenant.trial_created",
+            tenant_id=str(tenant.id),
+            actor_user_id=created_by,
+            actor_role="super_admin",
+            category="admin",
             resource_type="tenant",
-            resource_id=tenant_id,
+            resource_id=str(tenant.id),
             details={"name": name, "business_name": business_name, "plan": plan},
         )
-        
-        logger.info("trial_tenant_created", tenant_id=tenant_id, name=name)
-        return {"id": tenant_id, "name": name, "business_name": business_name, "plan": plan, "status": "active"}
+        await self.db.commit()
+        logger.info("trial_tenant_created", tenant_id=str(tenant.id), slug=slug)
+        return _serialize_tenant(tenant, agent_count=1, user_count=1)
 
     async def get_all_tenants_usage(self) -> Dict[str, Any]:
-        """Get usage stats for all tenants."""
         result = await self.db.execute(
-            text("""
-                SELECT 
-                    t.id as tenant_id,
-                    t.business_name as tenant_name,
-                    COALESCE(tu.current_month_messages, 0) as current_month_messages,
-                    COALESCE(tu.current_month_chat_units, 0) as current_month_chat_units,
-                    COALESCE(tu.current_month_sessions, 0) as current_month_sessions,
-                    COALESCE(tu.current_month_stt_tokens, 0) as current_month_stt_tokens,
-                    COALESCE(tu.current_month_tts_tokens, 0) as current_month_tts_tokens,
-                    COALESCE(tu.current_month_cost_usd, 0.0) as current_month_cost_usd
-                FROM tenants t
-                LEFT JOIN tenant_usage tu ON t.id = tu.tenant_id
-                WHERE t.status != 'deleted'
-                ORDER BY current_month_cost_usd DESC
-            """)
+            select(Tenant, TenantUsage)
+            .join(TenantUsage, TenantUsage.tenant_id == Tenant.id, isouter=True)
+            .where(Tenant.subscription_status != "deleted")
+            .order_by(TenantUsage.total_cost_usd.desc().nullslast(), Tenant.created_at.desc())
         )
-        tenants = [dict(row._mapping) for row in result.fetchall()]
+
+        tenants: list[dict[str, Any]] = []
+        for tenant, usage in result.all():
+            tenants.append(
+                {
+                    "tenant_id": str(tenant.id),
+                    "tenant_name": tenant.business_name,
+                    "status": _tenant_lifecycle(tenant),
+                    "plan": tenant.plan,
+                    "current_month_messages": usage.current_month_messages if usage else 0,
+                    "current_month_chat_units": usage.current_month_chat_units if usage else 0,
+                    "current_month_sessions": usage.current_month_sessions if usage else 0,
+                    "current_month_tokens": usage.current_month_tokens if usage else 0,
+                    "current_month_voice_minutes": usage.current_month_voice_minutes if usage else 0.0,
+                    "total_cost_usd": usage.total_cost_usd if usage else 0.0,
+                    "agent_count": usage.agent_count if usage else 0,
+                }
+            )
         return {"tenants": tenants}

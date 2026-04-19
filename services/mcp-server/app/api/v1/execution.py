@@ -9,8 +9,10 @@ from app.schemas.mcp import ExecutionResponse, MCPToolCall, MCPToolResult
 from app.services.tool_executor import ToolExecutor
 from app.services.tool_registry import ToolRegistry
 
+from app.api.v1.internal_auth import verify_internal_token
+
 logger = structlog.get_logger(__name__)
-router = APIRouter(prefix="/execute")
+router = APIRouter(prefix="/execute", dependencies=[Depends(verify_internal_token)])
 
 
 def _tenant_id(request: Request) -> str:

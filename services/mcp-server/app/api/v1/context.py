@@ -14,9 +14,12 @@ from app.schemas.mcp import (
     MCPContextResult,
 )
 from app.services.context_provider import ContextProvider
+from app.api.v1.internal_auth import verify_internal_key
 
 logger = structlog.get_logger(__name__)
-router = APIRouter(prefix="/context")
+from app.api.v1.internal_auth import verify_internal_token
+
+router = APIRouter(prefix="/context", dependencies=[Depends(verify_internal_token)])
 
 
 def _tenant_id(request: Request) -> str:
@@ -60,6 +63,7 @@ async def create_knowledge_base(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
+    _: None = Depends(verify_internal_key),
 ):
     """Create a new knowledge base."""
     provider = _get_provider(request, db)
@@ -91,6 +95,7 @@ async def add_document(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
+    _: None = Depends(verify_internal_key),
 ):
     """Add a document to a knowledge base."""
     body_dict = body.model_dump()
@@ -111,6 +116,7 @@ async def delete_document(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
+    _: None = Depends(verify_internal_key),
 ):
     """Delete a document from a knowledge base."""
     provider = _get_provider(request, db)
@@ -118,3 +124,40 @@ async def delete_document(
     if not deleted:
         raise HTTPException(status_code=404, detail="Document not found.")
     await db.commit()
+
+@router.post("/knowledge-bases/{kb_id}/documents/cleanup", status_code=200)
+async def cleanup_documents(
+    kb_id: str,
+    metadata_key: str,
+    metadata_value: str,
+    request: Request,
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
+    _: None = Depends(verify_internal_key),
+):
+    """Delete all documents matching metadata key/value."""
+    # Phase 8 — Gap 3: Enforce metadata_key allowlist for security
+    ALLOWED_KEYS = {"document_id", "agent_id", "source", "is_semantic_duplicate"}
+    if metadata_key not in ALLOWED_KEYS:
+        raise HTTPException(
+            status_code=422, 
+            detail=f"Invalid metadata_key '{metadata_key}'. Allowed: {', '.join(sorted(ALLOWED_KEYS))}"
+        )
+
+    provider = _get_provider(request, db)
+    count = await provider.delete_documents_by_metadata(tenant_id, kb_id, metadata_key, metadata_value)
+    await db.commit()
+    return {"deleted_count": count}
+
+@router.delete("/knowledge-bases/bulk-wipe", status_code=200)
+async def bulk_wipe_knowledge(
+    request: Request,
+    tenant_id: str = Depends(_tenant_id),
+    db: AsyncSession = Depends(_tenant_db),
+    _: None = Depends(verify_internal_key),
+):
+    """Wipe ALL knowledge bases and documents for the current tenant. Permanent erasure."""
+    provider = _get_provider(request, db)
+    doc_count = await provider.delete_all_tenant_knowledge(tenant_id)
+    await db.commit()
+    return {"success": True, "deleted_documents": doc_count}

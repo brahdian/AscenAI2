@@ -66,6 +66,7 @@ services:
   # ---------------------------------------------------------------------------
   mailhog:
     image: mailhog/mailhog
+    platform: linux/amd64
     restart: unless-stopped
     ports:
       - "1025:1025"
@@ -99,6 +100,7 @@ services:
       MCP_SERVER_URL: http://mcp-server:8001
       AI_ORCHESTRATOR_URL: http://ai-orchestrator:8002
       VOICE_PIPELINE_URL: http://voice-pipeline:8003
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     command: >
       sh -c "python -m app.scripts.migrate && python -m app.scripts.seed_platform && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     depends_on:
@@ -145,6 +147,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ascenai}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -183,6 +186,7 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       MCP_SERVER_URL: http://mcp-server:8001
       MCP_WS_URL: ws://mcp-server:8001
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -226,6 +230,7 @@ services:
       STT_PROVIDER: ${STT_PROVIDER:-deepgram}
       CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
       CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID:-a0e99841-438c-4a64-b679-ae501e7d6091}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy

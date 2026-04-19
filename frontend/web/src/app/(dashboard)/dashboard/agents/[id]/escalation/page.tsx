@@ -200,6 +200,7 @@ export default function EscalationPage() {
     mutationFn: (data: Record<string, unknown>) => agentsApi.update(id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agent', id] })
+      qc.invalidateQueries({ queryKey: ['agents'] })
       setSaved(true)
       setTimeout(() => setSaved(false), 2500)
       toast.success('Escalation settings saved')

@@ -4,7 +4,7 @@ from typing import Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -62,6 +62,7 @@ class KnowledgeDocument(Base):
         Index("ix_knowledge_documents_tenant_id", "tenant_id"),
         Index("ix_knowledge_documents_content_type", "content_type"),
         Index("ix_knowledge_documents_vector_id", "vector_id"),
+        Index("ix_knowledge_documents_metadata", "doc_metadata", postgresql_using="gin"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -89,7 +90,7 @@ class KnowledgeDocument(Base):
     # Legacy Vector ID (kept for backwards compat, no longer used for lookup)
     vector_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    doc_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    doc_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

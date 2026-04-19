@@ -9,13 +9,18 @@ class UserInfo(BaseModel):
     full_name: str
     role: str
     tenant_id: str
+    mfa_enabled: bool = False
 
     model_config = {"from_attributes": True}
 
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, description="Minimum 8 characters")
+    password: str = Field(
+        min_length=8,
+        pattern=r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$",
+        description="Minimum 8 characters with at least one uppercase, lowercase, and number"
+    )
     full_name: str = Field(min_length=1, max_length=255)
     business_name: str = Field(min_length=1, max_length=255)
     business_type: str = Field(
@@ -29,19 +34,15 @@ class RegisterRequest(BaseModel):
 
 
 class RegisterResponse(BaseModel):
-    message: str = "Verification code sent. Complete email verification and payment to activate your account."
+    message: str = "Verification code sent. Complete email verification to continue."
     email: str
     requires_verification: bool = True
-    requires_payment: bool = True
-    payment_url: str | None = None
 
 
 class VerifyEmailResponse(BaseModel):
     message: str
     email: str
     tenant_id: str
-    requires_payment: bool = True
-    payment_url: str | None = None
 
 
 class SubscribeRequest(BaseModel):
@@ -89,7 +90,11 @@ class ForgotPasswordRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     token: str
-    new_password: str = Field(min_length=8)
+    new_password: str = Field(
+        min_length=8,
+        pattern=r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$",
+        description="Minimum 8 characters with at least one uppercase, lowercase, and number"
+    )
 
 
 class APIKeyCreateRequest(BaseModel):
@@ -97,6 +102,13 @@ class APIKeyCreateRequest(BaseModel):
     scopes: list[str] = Field(default_factory=lambda: ["chat"])
     expires_at: str | None = None  # ISO datetime string, optional
     agent_id: str | None = None  # Optional: restrict key to specific agent
+    allowed_origins: list[str] | None = None  # Optional: restrict key to these domains
+
+
+class APIKeyUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=255)
+    allowed_origins: list[str] | None = None
+    is_active: bool | None = None
 
 
 class APIKeyResponse(BaseModel):
@@ -110,6 +122,7 @@ class APIKeyResponse(BaseModel):
     expires_at: str | None
     created_at: str
     agent_id: str | None = None
+    allowed_origins: list[str] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -147,3 +160,13 @@ class WebhookResponse(BaseModel):
 class WebhookCreatedResponse(WebhookResponse):
     """Returned only at creation time — includes the signing secret (one-time show)."""
     secret: str
+
+
+class AcceptInviteRequest(BaseModel):
+    token: str
+    full_name: str = Field(min_length=1, max_length=255)
+    password: str = Field(
+        min_length=8,
+        pattern=r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$",
+        description="Minimum 8 characters with at least one uppercase, lowercase, and number"
+    )

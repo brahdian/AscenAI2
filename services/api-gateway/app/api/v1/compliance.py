@@ -135,8 +135,12 @@ async def update_compliance_settings(
     body: ComplianceSettings,
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
+    request: Request = None,  # Added to access state
 ) -> ComplianceSettings:
     """Update compliance/privacy settings (owner/admin only)."""
+    if request:
+        _require_owner_or_admin(request)
+
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")
@@ -158,11 +162,42 @@ async def _execute_erasure(
     contact_identifier: str,
     request_id: str,
 ) -> None:
-    """Background task: hard-delete all messages and sessions for the contact."""
+    """Background task: hard-delete all messages, sessions, and traces for the contact."""
     _session_factory = async_sessionmaker(_db_engine, expire_on_commit=False)
     async with _session_factory() as db:
         try:
-            # Delete messages belonging to the contact's sessions in this tenant
+            # 1. Delete message feedback belonging to contact's sessions
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM message_feedback
+                    WHERE session_id IN (
+                        SELECT id FROM sessions
+                        WHERE tenant_id = :tid
+                          AND customer_identifier = :contact
+                    )
+                    """
+                ),
+                {"tid": tenant_id, "contact": contact_identifier},
+            )
+
+            # 2. Delete conversation traces
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM conversation_traces
+                    WHERE tenant_id = :tid
+                      AND session_id IN (
+                        SELECT id FROM sessions
+                        WHERE tenant_id = :tid
+                          AND customer_identifier = :contact
+                    )
+                    """
+                ),
+                {"tid": tenant_id, "contact": contact_identifier},
+            )
+
+            # 3. Delete messages
             await db.execute(
                 text(
                     """
@@ -176,7 +211,8 @@ async def _execute_erasure(
                 ),
                 {"tid": tenant_id, "contact": contact_identifier},
             )
-            # Delete the sessions themselves
+
+            # 4. Delete the sessions themselves
             await db.execute(
                 text(
                     """
@@ -189,7 +225,7 @@ async def _execute_erasure(
             )
             await db.commit()
             logger.info(
-                "erasure_executed",
+                "erasure_executed_complete",
                 tenant_id=tenant_id,
                 request_id=request_id,
                 contact=contact_identifier,
@@ -215,7 +251,7 @@ async def request_erasure(
     Submit a right-to-erasure request (PIPEDA Principle 4.3.6 / GDPR Art. 17).
 
     This logs the request and queues background deletion of all sessions, messages,
-    and associated PII for the given contact identifier.
+    feedback, traces, and associated PII for the given contact identifier.
     """
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
@@ -264,17 +300,19 @@ async def request_erasure(
         estimated_completion=(now + timedelta(days=30)).isoformat(),
         message=(
             "Your erasure request has been received and will be processed within 30 days "
-            "as required by PIPEDA. You will be notified at the submitter's contact once complete."
+            "as required by PIPEDA. You will be notified once complete."
         ),
     )
 
 
 @router.get("/erasure-log")
 async def get_erasure_log(
+    request: Request,
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ) -> list[dict]:
     """Return the audit log of erasure requests for this tenant (owner/admin only)."""
+    _require_owner_or_admin(request)
     tenant = await tenant_service.get_tenant(tenant_id, db)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found.")

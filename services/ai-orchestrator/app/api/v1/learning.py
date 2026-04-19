@@ -15,12 +15,30 @@ from app.schemas.chat import (
     LearningInsights, LearningGap, UnreviewedNegative,
     GuardrailTrigger, SuggestedTrainingPair,
 )
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
-async def _get_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agent:
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
+async def _get_agent(agent_id: str, tenant_id: str, db: AsyncSession, request: Request | None = None) -> Agent:
+    # Apply isolation (CRIT-005)
+    if request:
+        raid = _restricted_agent_id(request)
+        if raid and uuid.UUID(agent_id) != raid:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -50,7 +68,7 @@ async def get_learning_insights(
     """
     tenant_id = str(tenant)
     agent_uuid = uuid.UUID(agent_id)
-    await _get_agent(agent_id, tenant_id, db)
+    await _get_agent(agent_id, tenant_id, db, request=request)
 
     # 1. Knowledge gaps: assistant messages with is_fallback=True for this agent.
     # Use a self-join to fetch the preceding user message in the same query,
@@ -93,8 +111,8 @@ async def get_learning_insights(
             message_id=str(asst_msg.id),
             session_id=asst_msg.session_id,
             agent_id=agent_id,
-            user_message=user_msg.content[:500],
-            agent_response=asst_msg.content[:500],
+            user_message=pii_service.redact_for_display(user_msg.content[:500], None),
+            agent_response=pii_service.redact_for_display(asst_msg.content[:500], None),
             created_at=asst_msg.created_at.isoformat(),
         ))
 
@@ -122,9 +140,9 @@ async def get_learning_insights(
                 message_id=str(fb.message_id),
                 session_id=fb.session_id,
                 agent_id=agent_id,
-                agent_response=msg.content[:500],
+                agent_response=pii_service.redact_for_display(msg.content[:500], None),
                 labels=fb.labels or [],
-                comment=fb.comment,
+                comment=pii_service.redact_for_display(fb.comment, None),
                 created_at=fb.created_at.isoformat(),
             ))
 
@@ -135,6 +153,15 @@ async def get_learning_insights(
                 Message.tenant_id == uuid.UUID(tenant_id),
                 Message.guardrail_triggered.is_not(None),
                 Message.role == "user",
+                # Hardening: Enforce agent-level isolation for guardrail triggers
+                Message.session_id.in_(
+                    select(Session.id).where(
+                        and_(
+                            Session.agent_id == agent_uuid,
+                            Session.tenant_id == uuid.UUID(tenant_id),
+                        )
+                    )
+                ),
             )
         ).order_by(Message.created_at.desc()).limit(limit)
     )
@@ -146,7 +173,7 @@ async def get_learning_insights(
             message_id=str(msg.id),
             session_id=msg.session_id,
             agent_id=agent_id,
-            user_message=msg.content[:500],
+            user_message=pii_service.redact_for_display(msg.content[:500], None),
             trigger_reason=msg.guardrail_triggered or "",
             created_at=msg.created_at.isoformat(),
         ))
@@ -187,8 +214,8 @@ async def get_learning_insights(
                 message_id=str(asst_msg.id),
                 session_id=asst_msg.session_id,
                 agent_id=agent_id,
-                user_message=user_msg.content[:500],
-                agent_response=asst_msg.content[:500],
+                user_message=pii_service.redact_for_display(user_msg.content[:500], None),
+                agent_response=pii_service.redact_for_display(asst_msg.content[:500], None),
                 labels=fb.labels or [],
                 created_at=fb.created_at.isoformat(),
             ))

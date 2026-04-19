@@ -31,8 +31,10 @@ import {
   Activity,
   Code,
   ArrowRight,
+  GripVertical,
 } from 'lucide-react'
 import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
+import { Reorder } from 'framer-motion'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +44,7 @@ type NodeType =
   | 'INPUT' | 'SET_VARIABLE' | 'VALIDATION' | 'CONDITION' | 'SWITCH'
   | 'FOR_EACH' | 'TOOL_CALL' | 'LLM_CALL' | 'ACTION' | 'SEND_SMS'
   | 'DELAY' | 'HUMAN_HANDOFF' | 'END'
+  | 'CALL_WORKFLOW' | 'PARALLEL' | 'WAIT_FOR_SIGNAL' | 'CODE_EXEC'
 
 interface WorkflowNode {
   id: string
@@ -106,6 +109,10 @@ const NODE_TYPES: { type: NodeType; label: string; color: string; desc: string }
   { type: 'DELAY',        label: 'Delay',         color: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',      desc: 'Pause execution for N seconds' },
   { type: 'HUMAN_HANDOFF', label: 'Handoff',      color: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300',       desc: 'Escalate to a human agent' },
   { type: 'END',          label: 'End',           color: 'bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200',          desc: 'Terminal — emit a final message' },
+  { type: 'CALL_WORKFLOW', label: 'Call Workflow', color: 'bg-indigo-200 text-indigo-800 dark:bg-indigo-800/40 dark:text-indigo-200', desc: 'Call another workflow as a sub-workflow' },
+  { type: 'PARALLEL',     label: 'Parallel',      color: 'bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300',       desc: 'Run multiple workflows concurrently' },
+  { type: 'WAIT_FOR_SIGNAL', label: 'Wait for Signal', color: 'bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-900/40 dark:text-fuchsia-300', desc: 'Pause execution until an external webhook signal' },
+  { type: 'CODE_EXEC',    label: 'Code Sandbox',  color: 'bg-zinc-200 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200',          desc: 'Safely evaluate a Python expression' },
 ]
 
 const NODE_META = Object.fromEntries(NODE_TYPES.map((n) => [n.type, n]))
@@ -125,6 +132,10 @@ function defaultConfig(type: NodeType): Record<string, unknown> {
     case 'DELAY':        return { seconds: 60 }
     case 'HUMAN_HANDOFF': return { message: 'Transferring you to a human agent. Please hold.' }
     case 'END':          return { final_message: '' }
+    case 'CALL_WORKFLOW': return { workflow_id: '', input_mapping: {}, output_mapping: {}, output_variable: 'sub_result' }
+    case 'PARALLEL':     return { branches: [], join_output_key: 'parallel_results', fail_fast: true }
+    case 'WAIT_FOR_SIGNAL': return { signal_name: '', correlation_id_key: 'session_id', ttl_seconds: 86400, output_variable: 'signal_payload' }
+    case 'CODE_EXEC':    return { code: '', output_variable: 'code_result', on_error: 'fail' }
     default:             return {}
   }
 }
@@ -279,6 +290,18 @@ function NodeConfigForm({
           {textarea('Message (supports {{vars}})', 'message', 3, 'Hi {{name}}, your appointment is at {{time}}.')}
           {checkbox('Await SMS reply before continuing', 'await_reply')}
           {Boolean(cfg.await_reply) && field('Reply timeout (seconds)', 'reply_ttl_seconds', 'number')}
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">On failure</label>
+            <select 
+              value={String(cfg.on_error ?? 'skip')} 
+              onChange={(e) => set('on_error', e.target.value)} 
+              className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+            >
+              <option value="skip">Ignore and continue</option>
+              <option value="fail">Fail the entire workflow</option>
+            </select>
+            <p className="text-[10px] text-gray-400 mt-1">If "fail", any SMS delivery error will stop the execution.</p>
+          </div>
         </div>
       )
     case 'DELAY':
@@ -287,6 +310,85 @@ function NodeConfigForm({
       return <div className="space-y-3">{textarea('Handoff message', 'message', 2)}</div>
     case 'END':
       return <div className="space-y-3">{textarea('Final message (supports {{vars}})', 'final_message', 2, 'Thank you! Your request has been processed.')}</div>
+    case 'CALL_WORKFLOW':
+      return (
+        <div className="space-y-3">
+          {field('Workflow ID (UUID)', 'workflow_id', 'text', 'e.g. 123e4567-e89b...')}
+          {field('Output variable', 'output_variable', 'text', 'sub_result')}
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Input mapping (JSON)</label>
+            <textarea
+              value={JSON.stringify(cfg.input_mapping ?? {}, null, 2)}
+              onChange={(e) => { try { set('input_mapping', JSON.parse(e.target.value)) } catch {} }}
+              rows={3}
+              placeholder='{"child_var": "{{parent_var}}"}'
+              className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Output mapping (JSON)</label>
+            <textarea
+              value={JSON.stringify(cfg.output_mapping ?? {}, null, 2)}
+              onChange={(e) => { try { set('output_mapping', JSON.parse(e.target.value)) } catch {} }}
+              rows={3}
+              placeholder='{"parent_var": "child_var"}'
+              className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+          </div>
+        </div>
+      )
+    case 'PARALLEL':
+      return (
+        <div className="space-y-3">
+          {field('Join output key', 'join_output_key', 'text', 'parallel_results')}
+          {checkbox('Fail fast (fail if any branch fails)', 'fail_fast')}
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Branches (JSON array)</label>
+            <textarea
+              value={JSON.stringify(cfg.branches ?? [], null, 2)}
+              onChange={(e) => { try { set('branches', JSON.parse(e.target.value)) } catch {} }}
+              rows={5}
+              placeholder='[{"workflow_id": "...", "input_mapping": {}, "output_variable": "branch_1"}]'
+              className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+            <p className="text-[10px] text-gray-400 mt-1">Defines the sub-workflows to execute concurrently.</p>
+          </div>
+        </div>
+      )
+    case 'WAIT_FOR_SIGNAL':
+      return (
+        <div className="space-y-3">
+          {field('Signal name', 'signal_name', 'text', 'e.g. payment_completed')}
+          {field('Correlation ID Context Key', 'correlation_id_key', 'text', 'e.g. session_id')}
+          {field('TTL (seconds)', 'ttl_seconds', 'number')}
+          {field('Output variable', 'output_variable', 'text', 'signal_payload')}
+          <p className="text-[10px] text-gray-400 mt-1">Pauses execution until `POST /internal/workflows/signal/&lt;name&gt;` is hit with the matching correlation ID.</p>
+        </div>
+      )
+    case 'CODE_EXEC':
+      return (
+        <div className="space-y-3">
+          {field('Output variable', 'output_variable', 'text', 'code_result')}
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Python Expression</label>
+            <textarea
+              value={String(cfg.code ?? '')}
+              onChange={(e) => set('code', e.target.value)}
+              rows={4}
+              placeholder="len(results) * 10"
+              className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-violet-500"
+            />
+            <p className="text-[10px] text-gray-400 mt-1">Evaluated safely via simpleeval. Use mathematical and built-in transformations.</p>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">On error</label>
+            <select value={String(cfg.on_error ?? 'fail')} onChange={(e) => set('on_error', e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-sm focus:outline-none focus:ring-1 focus:ring-violet-500">
+              <option value="fail">Fail the workflow</option>
+              <option value="skip">Skip and continue</option>
+            </select>
+          </div>
+        </div>
+      )
     default:
       return <p className="text-xs text-gray-400">No configurable fields for this node type.</p>
   }
@@ -294,18 +396,7 @@ function NodeConfigForm({
 
 // ─── Node row ─────────────────────────────────────────────────────────────────
 
-function NodeRow({
-  node,
-  isEntry,
-  allNodes,
-  edges,
-  onUpdate,
-  onDelete,
-  onSetEntry,
-  onEdgeChange,
-  onAddEdge,
-  onDeleteEdge,
-}: {
+function NodeRow(props: {
   node: WorkflowNode
   isEntry: boolean
   allNodes: WorkflowNode[]
@@ -320,6 +411,10 @@ function NodeRow({
   variables: any[]
   documents: any[]
 }) {
+  const { 
+    node, isEntry, allNodes, edges, onUpdate, onDelete, onSetEntry, 
+    onEdgeChange, onAddEdge, onDeleteEdge, tools, variables, documents 
+  } = props
   const [open, setOpen] = useState(false)
   const meta = NODE_META[node.type]
   const outEdges = edges.filter((e) => e.source === node.id)
@@ -331,6 +426,9 @@ function NodeRow({
         className="flex items-center gap-3 p-3 cursor-pointer select-none"
         onClick={() => setOpen(!open)}
       >
+        <div className="cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+          <GripVertical size={16} />
+        </div>
         <span className={`text-xs font-semibold px-2 py-0.5 rounded-full shrink-0 ${meta?.color ?? 'bg-gray-100 text-gray-600'}`}>
           {meta?.label ?? node.type}
         </span>
@@ -490,14 +588,25 @@ function TriggerConfig({
     <div className="space-y-3">
       <div>
         <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Webhook secret (optional)</label>
-        <input
-          type="password"
-          value={String(config.webhook_secret ?? '')}
-          onChange={(e) => set('webhook_secret', e.target.value)}
-          placeholder="whsec_..."
-          className="w-full px-3 py-2 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-violet-500"
-        />
-        <p className="text-xs text-gray-400 mt-1">If set, incoming requests must include a valid HMAC-SHA256 signature header.</p>
+        <div className="relative">
+          <input
+            type="password"
+            value={String(config.webhook_secret ?? '')}
+            onChange={(e) => set('webhook_secret', e.target.value)}
+            placeholder="whsec_..."
+            className={`w-full px-3 py-2 rounded-xl border ${!config.webhook_secret ? 'border-amber-200 dark:border-amber-900/50' : 'border-gray-200 dark:border-gray-700'} bg-gray-50 dark:bg-gray-800 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-violet-500`}
+          />
+        </div>
+        {!config.webhook_secret ? (
+          <div className="mt-2 p-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 flex items-start gap-2 border border-amber-100 dark:border-amber-900/30">
+            <AlertCircle size={14} className="text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
+            <p className="text-[10px] text-amber-700 dark:text-amber-300">
+              <span className="font-semibold text-amber-800 dark:text-amber-200">Security Warning:</span> No secret set. Anyone with the URL can trigger this workflow.
+            </p>
+          </div>
+        ) : (
+          <p className="text-xs text-gray-400 mt-1">Incoming requests must include a valid HMAC-SHA256 signature header.</p>
+        )}
       </div>
     </div>
   )
@@ -714,9 +823,11 @@ export default function FlowDetailPage() {
     mark()
   }
 
-  const updateNode = (idx: number, node: WorkflowNode) => {
+  const updateNode = (id: string, node: WorkflowNode) => {
     setDefinition((d) => {
       const nodes = [...d.nodes]
+      const idx = nodes.findIndex(n => n.id === id)
+      if (idx === -1) return d
       const oldId = nodes[idx].id
       nodes[idx] = node
       // Update edges if node id changed
@@ -731,10 +842,12 @@ export default function FlowDetailPage() {
     mark()
   }
 
-  const deleteNode = (idx: number) => {
+  const deleteNode = (id: string) => {
     setDefinition((d) => {
+      const idx = d.nodes.findIndex(n => n.id === id)
+      if (idx === -1) return d
       const removed = d.nodes[idx].id
-      const nodes = d.nodes.filter((_, i) => i !== idx)
+      const nodes = d.nodes.filter((n) => n.id !== id)
       const edges = d.edges.filter((e) => e.source !== removed && e.target !== removed)
       const entry_node_id = d.entry_node_id === removed ? (nodes[0]?.id ?? '') : d.entry_node_id
       return { ...d, nodes, edges, entry_node_id }
@@ -966,25 +1079,70 @@ export default function FlowDetailPage() {
                 </button>
               </div>
             ) : (
-              <div className="space-y-2">
-                {definition.nodes.map((node, idx) => (
-                  <NodeRow
-                    key={node.id}
-                    node={node}
-                    isEntry={definition.entry_node_id === node.id}
-                    allNodes={definition.nodes}
-                    edges={definition.edges}
-                    onUpdate={(n) => updateNode(idx, n)}
-                    onDelete={() => deleteNode(idx)}
-                    onSetEntry={() => { setDefinition((d) => ({ ...d, entry_node_id: node.id })); mark() }}
-                    onEdgeChange={updateEdge}
-                    onAddEdge={addEdge}
-                    onDeleteEdge={deleteEdge}
-                    tools={tools}
-                    variables={globalVariables}
-                    documents={documents}
-                  />
-                ))}
+              <div className="space-y-4">
+                {/* Visual Start Node */}
+                <div className="flex flex-col items-center">
+                  <div className="w-full bg-violet-50 dark:bg-violet-900/10 border-2 border-dashed border-violet-200 dark:border-violet-800/50 rounded-2xl p-4 flex items-center justify-between shadow-sm">
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-center justify-center w-8 h-8 rounded-full bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-400">
+                        <Play size={16} />
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-gray-900 dark:text-white">Start / Trigger</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          Flow begins at: <span className="font-medium text-violet-600 dark:text-violet-400">
+                            {definition.nodes.find(n => n.id === definition.entry_node_id)?.label || definition.entry_node_id || 'None'}
+                          </span>
+                        </p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[10px] uppercase tracking-wider font-bold text-violet-400 dark:text-violet-600">
+                        Trigger: {triggerType}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="h-6 w-0.5 bg-gray-200 dark:bg-gray-800 mt-2"></div>
+                </div>
+
+                <Reorder.Group 
+                  axis="y" 
+                  values={definition.nodes} 
+                  onReorder={(newNodes) => { 
+                    setDefinition(d => ({ ...d, nodes: newNodes })); 
+                    mark();
+                  }} 
+                  className="space-y-2"
+                >
+                  {definition.nodes.map((node) => (
+                    <Reorder.Item key={node.id} value={node} className="relative z-10">
+                      <NodeRow
+                        node={node}
+                        isEntry={definition.entry_node_id === node.id}
+                        allNodes={definition.nodes}
+                        edges={definition.edges}
+                        onUpdate={(n) => updateNode(node.id, n)}
+                        onDelete={() => deleteNode(node.id)}
+                        onSetEntry={() => { setDefinition((d) => ({ ...d, entry_node_id: node.id })); mark() }}
+                        onEdgeChange={updateEdge}
+                        onAddEdge={addEdge}
+                        onDeleteEdge={deleteEdge}
+                        tools={tools}
+                        variables={globalVariables}
+                        documents={documents}
+                      />
+                    </Reorder.Item>
+                  ))}
+                </Reorder.Group>
+
+                <div className="flex justify-center pt-2">
+                  <button
+                    onClick={() => setShowAddNode(true)}
+                    className="flex items-center gap-2 px-6 py-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-full text-sm font-medium text-gray-500 hover:text-violet-600 hover:border-violet-300 transition-all shadow-sm"
+                  >
+                    <Plus size={14} /> Add Step
+                  </button>
+                </div>
               </div>
             )}
 

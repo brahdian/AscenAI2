@@ -14,8 +14,10 @@ from app.schemas.mcp import ToolAuthConfig, ToolRegistration, ToolResponse, Tool
 from app.services.tool_executor import SSRFError, _validate_tool_url
 from app.services.tool_registry import ToolRegistry
 
+from app.api.v1.internal_auth import verify_internal_token
+
 logger = structlog.get_logger(__name__)
-router = APIRouter(prefix="/tools")
+router = APIRouter(prefix="/tools", dependencies=[Depends(verify_internal_token)])
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +362,7 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
                     "type": "object",
                     "properties": {
                         "amount": {"type": "number"},
-                        "currency": {"type": "string", "default": "CAD"},
+                        "currency": {"type": "string", "default": "USD"},
                         "description": {"type": "string"}
                     },
                     "required": ["amount"]
@@ -375,37 +377,38 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "category": "payments",
         "requires_config": True,
         "is_builtin": True,
-        "voice_capable": False,
-        "pci_method": "direct",
-        "pci_compliant": False,
-        "channel_support": ["chat"],
+        "voice_capable": True,
+        "pci_method": "hosted_page",
+        "pci_compliant": True,
+        "channel_support": ["voice", "chat"],
         "config_schema": {
             "type": "object",
             "properties": {
                 "store_id": {"type": "string", "description": "Moneris Store ID"},
                 "api_token": {"type": "string", "description": "Moneris API Token"},
+                "checkout_id": {"type": "string", "description": "Moneris Checkout ID (MCO)"},
                 "environment": {"type": "string", "description": "qa or live"}
             },
-            "required": ["store_id", "api_token"]
+            "required": ["store_id", "api_token", "checkout_id"]
         },
         "credentials": [
             {"field": "store_id", "label": "Store ID", "type": "text"},
             {"field": "api_token", "label": "API Token", "type": "password"},
+            {"field": "checkout_id", "label": "Checkout ID (MCO)", "type": "text"},
             {"field": "environment", "label": "Environment (qa/live)", "type": "text"}
         ],
         "tools": [
             {
-                "name": "moneris_process_purchase",
-                "description": "Process a direct purchase transaction via Moneris.",
+                "name": "moneris_create_payment_link",
+                "description": "Generate a secure Moneris Checkout link for the customer.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "amount": {"type": "string"},
-                        "order_id": {"type": "string"},
-                        "pan": {"type": "string", "description": "Credit Card Number"},
-                        "expdate": {"type": "string", "description": "YYMM"}
+                        "description": {"type": "string"},
+                        "order_id": {"type": "string"}
                     },
-                    "required": ["amount", "order_id", "pan", "expdate"]
+                    "required": ["amount"]
                 }
             }
         ]
@@ -417,31 +420,30 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
         "category": "payments",
         "requires_config": True,
         "is_builtin": True,
-        "voice_capable": False,
-        "pci_method": "direct",
-        "pci_compliant": False,
-        "channel_support": ["chat"],
+        "voice_capable": True,
+        "pci_method": "hosted_page",
+        "pci_compliant": True,
+        "channel_support": ["voice", "chat"],
         "config_schema": {
             "type": "object",
             "properties": {
-                "account_id": {"type": "string", "description": "Helcim Account ID"},
                 "api_token": {"type": "string", "description": "Helcim API Token"}
             },
-            "required": ["account_id", "api_token"]
+            "required": ["api_token"]
         },
         "credentials": [
-            {"field": "account_id", "label": "Account ID", "type": "text"},
             {"field": "api_token", "label": "API Token", "type": "password"}
         ],
         "tools": [
             {
-                "name": "helcim_process_payment",
-                "description": "Process a direct purchase transaction via Helcim.",
+                "name": "helcim_create_payment_link",
+                "description": "Generate a secure Helcim Pay checkout link for the customer.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "amount": {"type": "string"},
-                        "card_token": {"type": "string"}
+                        "amount": {"type": "number"},
+                        "currency": {"type": "string", "default": "CAD"},
+                        "invoice_number": {"type": "string"}
                     },
                     "required": ["amount"]
                 }
@@ -502,12 +504,6 @@ async def _tenant_db(
         yield session
 
 
-def _require_internal_key(request: Request) -> None:
-    internal_key = request.headers.get("X-Internal-Key", "")
-    from app.core.config import settings as _cfg
-
-    if not _cfg.INTERNAL_API_KEY or internal_key != _cfg.INTERNAL_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid internal API key.")
 
 
 class SchemasRequest(BaseModel):
@@ -526,7 +522,6 @@ async def get_tool_schemas(
     Return OpenAI function-calling schemas for the requested tools.
     The orchestrator calls this so Gemini knows which functions it can invoke.
     """
-    _require_internal_key(request)
     registry = ToolRegistry(db)
     schemas: list[dict[str, Any]] = []
 
@@ -693,7 +688,6 @@ async def upsert_builtin_tool(
     - If one already exists → updates description, schemas, metadata, and
       is_active without changing the tool's UUID.
     """
-    _require_internal_key(request)
 
     tenant_id = _tenant_id(request)
     registry = ToolRegistry(db)

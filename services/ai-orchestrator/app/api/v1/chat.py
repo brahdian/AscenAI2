@@ -55,10 +55,29 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-async def _load_agent(tenant_id: str, agent_id: str, db: AsyncSession) -> Agent:
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
+async def _load_agent(tenant_id: str, agent_id: str, db: AsyncSession, request: Request | None = None) -> Agent:
+    agent_uuid = uuid.UUID(agent_id)
+    
+    # Apply isolation (CRIT-005)
+    if request:
+        raid = _restricted_agent_id(request)
+        if raid and agent_uuid != raid:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
-            Agent.id == uuid.UUID(agent_id),
+            Agent.id == agent_uuid,
             Agent.tenant_id == uuid.UUID(tenant_id),
             Agent.is_active.is_(True),
         )
@@ -76,6 +95,7 @@ async def _get_or_create_session(
     channel: str,
     customer_identifier: Optional[str],
     db: AsyncSession,
+    ip_address: Optional[str] = None,
 ) -> AgentSession:
     if session_id:
         result = await db.execute(
@@ -107,6 +127,7 @@ async def _get_or_create_session(
         customer_identifier=customer_identifier,
         channel=channel,
         status="active",
+        ip_address=ip_address,
         last_activity_at=datetime.now(_tz.utc),
     )
     db.add(sess)
@@ -132,7 +153,7 @@ async def chat(
             logger.info("chat_idempotent_hit", key=body.idempotency_key, session_id=body.session_id)
             return cached
 
-    agent = await _load_agent(tenant_id, body.agent_id, db)
+    agent = await _load_agent(tenant_id, body.agent_id, db, request=request)
     session = await _get_or_create_session(
         body.session_id,
         tenant_id,
@@ -140,6 +161,7 @@ async def chat(
         body.channel,
         body.customer_identifier,
         db,
+        ip_address=request.headers.get("X-Original-IP"),
     )
 
     llm_client = getattr(request.app.state, "llm_client", None)
@@ -234,6 +256,7 @@ async def agent_call(
         channel="agent_call",
         customer_identifier="agent_caller",
         db=db,
+        ip_address="internal",
     )
 
     memory_manager = MemoryManager(redis_client=redis_client, db=db)
@@ -272,7 +295,7 @@ async def chat_stream(
 ):
     """Stream a chat response as Server-Sent Events."""
     tenant_id = _tenant_id(request)
-    agent = await _load_agent(tenant_id, body.agent_id, db)
+    agent = await _load_agent(tenant_id, body.agent_id, db, request=request)
     session = await _get_or_create_session(
         body.session_id,
         tenant_id,
@@ -280,6 +303,7 @@ async def chat_stream(
         body.channel,
         body.customer_identifier,
         db,
+        ip_address=request.headers.get("X-Original-IP"),
     )
 
     redis_client = getattr(request.app.state, "redis", None)

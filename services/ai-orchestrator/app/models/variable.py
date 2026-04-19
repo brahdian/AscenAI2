@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    String, Boolean, Text, ForeignKey, func, Index, DateTime
+    String, Boolean, Text, ForeignKey, func, Index, DateTime, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -19,6 +19,7 @@ class AgentVariable(Base):
     __table_args__ = (
         Index("ix_agent_variables_agent_id", "agent_id"),
         Index("ix_agent_variables_tenant_id", "tenant_id"),
+        UniqueConstraint("agent_id", "name", name="ux_agent_variables_name"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

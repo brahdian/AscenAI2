@@ -63,15 +63,63 @@ def _resolve_tenant_from_metadata(metadata: dict) -> Optional[str]:
 # Stripe
 # ---------------------------------------------------------------------------
 
-async def _load_tenant_config(tenant_id) -> dict:
+async def _load_tenant_config(tenant_id, db: AsyncSession) -> dict:
     """Load tenant config dict for a given tenant_id.
 
-    In production this would query the tenant's agent configuration from the DB.
-    We return an empty dict here so downstream code gracefully degrades; the
-    booking provider registry falls back to "builtin" for unknown providers.
+    Queries the mcp_tools table for the tenant's active booking and SMS tools
+    and assembles the config dict consumed by BookingProviderRegistry and
+    SMSWorkflowEngine.  Falls back to an empty dict if no tools are configured
+    so the booking provider registry can fall back to "builtin".
     """
-    # TODO: integrate with the actual tenant config store
-    return {}
+    from sqlalchemy import select, text
+    from app.models.tool import MCPTool
+
+    config: dict = {}
+    try:
+        result = await db.execute(
+            select(MCPTool).where(
+                MCPTool.tenant_id == str(tenant_id),
+                MCPTool.enabled == True,  # noqa: E712
+            )
+        )
+        tools = result.scalars().all()
+
+        for tool in tools:
+            auth = tool.auth_config or {}
+            name = (tool.tool_name or "").lower()
+
+            # Booking provider — first match wins
+            if "booking_provider" not in config:
+                if "calendly" in name:
+                    config["booking_provider"] = "calendly"
+                    config["calendly_api_key"] = auth.get("value_encrypted", auth.get("api_key", ""))
+                    config["calendly_user_uri"] = auth.get("user_uri", "")
+                elif "square" in name:
+                    config["booking_provider"] = "square"
+                    config["square_access_token"] = auth.get("value_encrypted", auth.get("access_token", ""))
+                    config["square_location_id"] = auth.get("location_id", "")
+                elif "google" in name and "calendar" in name:
+                    config["booking_provider"] = "google_cal"
+                    config["google_calendar_id"] = auth.get("calendar_id", "primary")
+                    config["google_credentials"] = auth.get("credentials", {})
+
+            # SMS / Twilio
+            if "twilio" in name:
+                config["twilio_account_sid"] = auth.get("account_sid", "")
+                config["twilio_auth_token"] = auth.get("value_encrypted", auth.get("auth_token", ""))
+                config["sms_from_number"] = auth.get("from_number", "")
+
+        # Slot hold TTL — stored in tool extra_metadata when set by tenant
+        for tool in tools:
+            ttl = (tool.auth_config or {}).get("slot_hold_ttl_minutes")
+            if ttl:
+                config["slot_hold_ttl_minutes"] = int(ttl)
+                break
+
+    except Exception as exc:
+        logger.warning("tenant_config_load_failed", tenant_id=str(tenant_id), error=str(exc))
+
+    return config
 
 
 @router.post("/stripe", status_code=200)
@@ -91,8 +139,9 @@ async def stripe_webhook(
     webhook_secret = getattr(settings, "STRIPE_WEBHOOK_SECRET", "")
     if not webhook_secret:
         logger.error("stripe_webhook_secret_not_configured")
-        # Fail open with a warning rather than blocking all Stripe events in dev
-        # In production STRIPE_WEBHOOK_SECRET must be set.
+        if settings.ENVIRONMENT == "production":
+            raise HTTPException(status_code=500, detail="Stripe webhook secret not configured")
+        # In development: log the error but allow through so devs can test without Stripe CLI
     elif stripe_signature:
         if not verify_stripe_signature(raw, stripe_signature, webhook_secret):
             logger.warning("stripe_webhook_invalid_signature")
@@ -124,11 +173,14 @@ async def stripe_webhook(
         payment_intent_id = internal_event.payload.get("payment_id")
         if payment_intent_id:
             from app.api.v1.payment_webhook_handler import handle_payment_completed
+            async def _loader(tid):
+                return await _load_tenant_config(tid, db)
+
             await handle_payment_completed(
                 db=db,
                 payment_intent_id=payment_intent_id,
                 stripe_event_id=internal_event.idempotency_key,
-                tenant_config_loader=_load_tenant_config,
+                tenant_config_loader=_loader,
             )
 
     # ── 7. Forward to shared event bus (ai-orchestrator workflow triggers) ──
@@ -179,6 +231,8 @@ async def twilio_webhook(
 
     if not auth_token:
         logger.error("twilio_auth_token_not_configured")
+        if settings.ENVIRONMENT == "production":
+            raise HTTPException(status_code=500, detail="Twilio auth token not configured")
     elif x_twilio_signature:
         url = str(request.url)
         if not verify_twilio_signature(auth_token, url, form_data, x_twilio_signature):
@@ -223,6 +277,8 @@ async def calendly_webhook(
 
     if not webhook_secret:
         logger.error("calendly_webhook_secret_not_configured")
+        if settings.ENVIRONMENT == "production":
+            raise HTTPException(status_code=500, detail="Calendly webhook secret not configured")
     elif calendly_webhook_signature:
         if not verify_calendly_signature(raw, calendly_webhook_signature, webhook_secret):
             logger.warning("calendly_webhook_invalid_signature")

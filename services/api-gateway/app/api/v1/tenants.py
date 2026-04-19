@@ -141,3 +141,73 @@ async def get_my_usage(
         total_cost_usd=usage.total_cost_usd,
         last_reset_at=usage.last_reset_at.isoformat(),
     )
+
+
+@router.post("/me/self-destruct")
+async def self_destruct_tenant(
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """
+    Mark tenant for hard-deletion after a 30-day grace period (owner only).
+    Suspends all activity and cancels billing immediately.
+    """
+    # 1. Require owner role
+    role = getattr(request.state, "role", "viewer")
+    if role != "owner":
+        raise HTTPException(status_code=403, detail="Only the account owner can delete the tenant.")
+
+    tenant = await tenant_service.get_tenant(tenant_id, db)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found.")
+
+    # 2. Cancel Stripe subscription if applicable
+    if tenant.subscription_id:
+        try:
+            import stripe
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            # Cancel at period end to avoid immediate access loss, or cancel now?
+            # SaaS pattern usually cancels at end of period for UX, but suspends app access now.
+            # We'll cancel now to be safe.
+            stripe.Subscription.delete(tenant.subscription_id)
+        except Exception as e:
+            # Log but don't block deletion if Stripe fails (might already be cancelled)
+            from app.api.v1.compliance import logger as _comp_logger
+            _comp_logger.warning("stripe_cancellation_failed_during_self_destruct", tenant_id=tenant_id, error=str(e))
+
+    # 3. Mark as inactive and set deletion metadata
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    hard_delete_at = now + timedelta(days=30)
+    
+    current_meta = dict(tenant.metadata_ or {})
+    current_meta["deletion_requested_at"] = now.isoformat()
+    current_meta["hard_delete_at"] = hard_delete_at.isoformat()
+    current_meta["deletion_status"] = "pending_grace_period"
+    
+    await tenant_service.update_tenant(
+        tenant_id, 
+        {"is_active": False, "metadata_": current_meta, "subscription_status": "canceled"}, 
+        db
+    )
+
+    # 4. Audit log
+    from app.services.audit_service import audit_log
+    await audit_log(
+        db,
+        "tenant.self_destruct_requested",
+        tenant_id=tenant_id,
+        actor_user_id=getattr(request.state, "user_id", "unknown"),
+        actor_role="owner",
+        category="compliance",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        details={"hard_delete_at": hard_delete_at.isoformat()},
+    )
+
+    return {
+        "status": "success",
+        "message": "Account suspended. Data will be permanently deleted in 30 days.",
+        "hard_delete_at": hard_delete_at.isoformat(),
+    }

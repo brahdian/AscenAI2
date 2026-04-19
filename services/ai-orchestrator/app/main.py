@@ -182,6 +182,13 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(session_cleanup.start())
     logger.info("session_cleanup_worker_started")
 
+    # Start automated compliance worker (retention + anonymization)
+    from app.workers.compliance_worker import ComplianceWorker
+    compliance_worker = ComplianceWorker(db_factory=AsyncSessionLocal, redis=redis_client)
+    app.state.compliance_worker = compliance_worker
+    asyncio.create_task(compliance_worker.start())
+    logger.info("compliance_worker_started")
+
     # Start workflow trigger worker (cron + event subscriptions + SMS resume)
     from app.workers.workflow_trigger_worker import WorkflowTriggerWorker
     workflow_trigger = WorkflowTriggerWorker(redis=redis_client)
@@ -285,22 +292,35 @@ class InternalAuthMiddleware(BaseHTTPMiddleware):
         if path.startswith(_PUBLIC_PREFIX):
             return await call_next(request)
 
-        # For internal/service-to-service paths, validate the shared key.
-        presented = request.headers.get("X-Internal-Key", "")
-        expected = self._INTERNAL_KEY
+        # For internal/service-to-service paths, validate common identity standards.
+        # Prefer Signed JWT (Phase 13), fallback to legacy X-Internal-Key.
+        auth_header = request.headers.get("Authorization", "")
+        presented_key = request.headers.get("X-Internal-Key", "")
+        
+        from app.core.internal_auth import verify_internal_token
+        
+        is_authenticated = False
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            if verify_internal_token(token):
+                is_authenticated = True
+        
+        if not is_authenticated and presented_key:
+            if hmac.compare_digest(presented_key.encode(), self._INTERNAL_KEY.encode()):
+                is_authenticated = True
 
-        if expected:
-            if not presented or not hmac.compare_digest(presented.encode(), expected.encode()):
-                from fastapi.responses import JSONResponse
-                logger.warning(
-                    "internal_auth_rejected",
-                    path=path,
-                    has_key=bool(presented),
-                )
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid internal credentials."},
-                )
+        if not is_authenticated:
+            from fastapi.responses import JSONResponse
+            logger.warning(
+                "internal_auth_rejected",
+                path=path,
+                has_bearer=auth_header.startswith("Bearer "),
+                has_key=bool(presented_key),
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid internal credentials."},
+            )
 
         # Stamp request state with forwarded identity headers (only after key check)
         if not getattr(request.state, "tenant_id", None):
@@ -365,6 +385,42 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
     )
     CONTRACT_VALIDATION_ERRORS.labels(path=path).inc()
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Zenith Stealth Mode: Redact all internal tracebacks and error details in production.
+    Returns only a sanitized message and a unique Trace ID for forensic investigation.
+    """
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail}
+        )
+
+    trace_id = getattr(request.state, "trace_id", "none")
+    if trace_id == "none":
+        trace_id = str(uuid.uuid4())
+    
+    # Zenith Forensics: Log the full context internally for SREs
+    logger.exception(
+        "unhandled_internal_error",
+        trace_id=trace_id,
+        method=request.method,
+        path=request.url.path,
+        tenant_id=getattr(request.state, "tenant_id", "unknown"),
+        error=str(exc)
+    )
+    
+    # Zenith Stealth: Return sanitized response to prevent information disclosure
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "An internal server error occurred. Please provide the Trace ID to support if the issue persists.",
+            "trace_id": trace_id
+        }
+    )
 
 
 @app.get("/health", tags=["health"])

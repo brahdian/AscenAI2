@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -26,10 +26,21 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
 @router.get("/overview", response_model=AnalyticsOverview)
 async def analytics_overview(
     request: Request,
-    days: int = Query(30, ge=1, le=365, description="Number of days to look back"),
+    days: int = Query(30, ge=1, le=90, description="Number of days to look back (capped for resilience)"),
     agent_id: Optional[str] = Query(None, description="Filter to a single agent"),
     db: AsyncSession = Depends(get_tenant_db),
 ):
@@ -44,6 +55,7 @@ async def analytics_overview(
     - **Verified Dashboard Accuracy**: Confirmed via `curl` that for a tenant with 25 sessions and 60 messages, the dashboard now correctly reports **25 Chats** (instead of 7).
     """
     tenant_id = _tenant_id(request)
+    start_time = time.time()
     since = date.today() - timedelta(days=days)
 
     # Build base query for AgentAnalytics rows
@@ -53,6 +65,13 @@ async def analytics_overview(
     )
     if agent_id:
         query = query.where(AgentAnalytics.agent_id == uuid.UUID(agent_id))
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid:
+        if agent_id and uuid.UUID(agent_id) != raid:
+            raise HTTPException(status_code=403, detail=f"Access denied to agent {agent_id}.")
+        query = query.where(AgentAnalytics.agent_id == raid)
 
     result = await db.execute(query)
     rows: list[AgentAnalytics] = list(result.scalars().all())
@@ -64,6 +83,10 @@ async def analytics_overview(
     )
     if agent_id:
         sessions_query = sessions_query.where(Session.agent_id == uuid.UUID(agent_id))
+    
+    # Apply isolation (CRIT-005)
+    if raid:
+        sessions_query = sessions_query.where(Session.agent_id == raid)
     sessions_result = await db.execute(sessions_query)
     total_sessions = sessions_result.scalar() or 0
 
@@ -74,7 +97,7 @@ async def analytics_overview(
     total_chats = max(total_sessions, sum(r.total_chat_units for r in rows))
     total_tokens = sum(r.total_tokens_used for r in rows)
     total_cost = round(sum(r.estimated_cost_usd for r in rows), 6)
-    total_tools = sum(r.tool_executions for r in rows)
+    total_tools = sum(r.total_tools_used if hasattr(r, 'total_tools_used') else r.tool_executions for r in rows) # Fallback handling
     total_escalations = sum(r.escalations for r in rows)
     total_voice_minutes = sum(r.total_voice_minutes for r in rows)
 
@@ -103,6 +126,10 @@ async def analytics_overview(
         daily_sessions_query = daily_sessions_query.where(
             Session.agent_id == uuid.UUID(agent_id)
         )
+    
+    # Apply isolation (CRIT-005)
+    if raid:
+        daily_sessions_query = daily_sessions_query.where(Session.agent_id == raid)
     daily_sessions_query = daily_sessions_query.group_by(trunc_day)
     daily_sessions_result = await db.execute(daily_sessions_query)
     
@@ -204,14 +231,22 @@ async def analytics_overview(
     ).where(
         Session.tenant_id == uuid.UUID(tenant_id),
         Session.started_at >= datetime.combine(since, datetime.min.time()).replace(tzinfo=timezone.utc),
-    ).group_by(Session.agent_id)
+    )
+    
+    # Apply isolation (CRIT-005)
+    if raid:
+        agent_sessions_query = agent_sessions_query.where(Session.agent_id == raid)
+
+    agent_sessions_query = agent_sessions_query.group_by(Session.agent_id)
     agent_sessions_result = await db.execute(agent_sessions_query)
     agent_sessions_map = {str(row.agent_id): row.cnt for row in agent_sessions_result.all()}
 
-    # Fetch agent names
-    agents_result = await db.execute(
-        select(Agent).where(Agent.tenant_id == uuid.UUID(tenant_id))
-    )
+    # Fetch agent names (Harden: Metadata leak fix — filter by raid)
+    agent_names_query = select(Agent).where(Agent.tenant_id == uuid.UUID(tenant_id))
+    if raid:
+        agent_names_query = agent_names_query.where(Agent.id == raid)
+    
+    agents_result = await db.execute(agent_names_query)
     agent_names = {str(a.id): a.name for a in agents_result.scalars().all()}
 
     # Fetch feedback positive % per agent
@@ -222,7 +257,13 @@ async def analytics_overview(
     ).where(
         MessageFeedback.tenant_id == uuid.UUID(tenant_id),
         MessageFeedback.created_at >= datetime.combine(since, datetime.min.time()).replace(tzinfo=timezone.utc),
-    ).group_by(MessageFeedback.agent_id, MessageFeedback.rating)
+    )
+    
+    # Apply isolation (CRIT-005)
+    if raid:
+        fb_query = fb_query.where(MessageFeedback.agent_id == raid)
+
+    fb_query = fb_query.group_by(MessageFeedback.agent_id, MessageFeedback.rating)
     fb_result = await db.execute(fb_query)
     fb_by_agent: dict[str, dict] = {}
     for row in fb_result.all():
@@ -258,6 +299,9 @@ async def analytics_overview(
         )
     by_agent.sort(key=lambda x: x.total_messages, reverse=True)
 
+    duration = time.time() - start_time
+    logger.info("analytics_overview_generated", tenant_id=tenant_id, days=days, duration_ms=round(duration * 1000), agent_count=len(by_agent))
+
     return AnalyticsOverview(
         period_days=days,
         total_sessions=total_sessions,
@@ -272,3 +316,60 @@ async def analytics_overview(
         daily=daily,
         by_agent=by_agent,
     )
+
+
+@router.get("/top-ips")
+async def get_top_ips(
+    request: Request,
+    days: int = Query(30, ge=1, le=30),
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """
+    Forensic Analytics: Return the most active source IPs for the tenant.
+    Used to identify botnets, wallet-draining attacks, or suspicious traffic spikes.
+    """
+    tenant_id = _tenant_id(request)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+
+    query = (
+        select(
+            Session.ip_address,
+            func.count(Session.id).label("session_count"),
+            func.count(func.distinct(Session.agent_id)).label("agent_diversity"),
+        )
+        .where(
+            Session.tenant_id == uuid.UUID(tenant_id),
+            Session.started_at >= since,
+            Session.ip_address.is_not(None),
+            Session.ip_address != "internal",
+        )
+    )
+    
+    if raid:
+        query = query.where(Session.agent_id == raid)
+        
+    query = (
+        query.group_by(Session.ip_address)
+        .order_by(func.count(Session.id).desc())
+        .limit(limit)
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    return {
+        "period_days": days,
+        "top_ips": [
+            {
+                "ip": row.ip_address,
+                "count": row.session_count,
+                "agent_diversity": row.agent_diversity,
+            }
+            for row in rows
+        ],
+    }
+

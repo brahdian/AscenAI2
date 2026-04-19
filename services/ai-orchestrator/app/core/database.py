@@ -121,6 +121,17 @@ async def init_db() -> None:
         # AgentVariable migrations
         await conn.execute(_t("ALTER TABLE agent_variables ADD COLUMN IF NOT EXISTS playbook_id UUID"))
         await conn.execute(_t("ALTER TABLE agent_variables ADD COLUMN IF NOT EXISTS is_secret BOOLEAN NOT NULL DEFAULT FALSE"))
+        
+        # Unique name per agent to prevent expansion non-determinism
+        if not _is_sqlite:
+            await conn.execute(_t("CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_variables_name ON agent_variables (agent_id, name)"))
+        else:
+            # SQLite doesn't support IF NOT EXISTS on indexes in old versions, but common in 3.33+
+            # We'll stick to a safe attempt
+            try:
+                await conn.execute(_t("CREATE UNIQUE INDEX ux_agent_variables_name ON agent_variables (agent_id, name)"))
+            except Exception:
+                pass
 
         # Session auto-close: last_activity_at column
         await conn.execute(_t("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ"))
@@ -236,6 +247,85 @@ async def init_db() -> None:
         # Workflow execution customer_phone index for fast SMS lookup
         await conn.execute(_t(
             "CREATE INDEX IF NOT EXISTS ix_workflow_executions_customer_phone ON workflow_executions (customer_phone)"
+        ))
+
+        # ── Analytics Hardening ────────────────────────────────────────────────
+        # Before adding the unique constraint, merge any pre-existing duplicate
+        # rows for the same (tenant_id, agent_id, date) tuple into a single row
+        # by summing all counters. Without this step the ALTER TABLE below will
+        # fail if the database already has duplicates from the old non-atomic
+        # SELECT-then-INSERT pattern.
+        if not _is_sqlite:
+            await conn.execute(_t("""
+                WITH duplicates AS (
+                    SELECT
+                        MIN(id) AS keep_id,
+                        tenant_id, agent_id, date,
+                        SUM(total_sessions)         AS s_sessions,
+                        SUM(total_messages)         AS s_messages,
+                        CASE WHEN SUM(total_messages) > 0
+                             THEN SUM(avg_response_latency_ms * total_messages)
+                                  / SUM(total_messages)
+                             ELSE 0
+                        END                         AS s_latency,
+                        SUM(total_tokens_used)      AS s_tokens,
+                        SUM(estimated_cost_usd)     AS s_cost,
+                        SUM(tool_executions)        AS s_tools,
+                        SUM(escalations)            AS s_escalations,
+                        SUM(successful_completions) AS s_completions,
+                        SUM(total_chat_units)       AS s_chat_units,
+                        SUM(total_voice_minutes)    AS s_voice_minutes
+                    FROM agent_analytics
+                    GROUP BY tenant_id, agent_id, date
+                    HAVING COUNT(*) > 1
+                )
+                UPDATE agent_analytics aa SET
+                    total_sessions         = d.s_sessions,
+                    total_messages         = d.s_messages,
+                    avg_response_latency_ms= d.s_latency,
+                    total_tokens_used      = d.s_tokens,
+                    estimated_cost_usd     = d.s_cost,
+                    tool_executions        = d.s_tools,
+                    escalations            = d.s_escalations,
+                    successful_completions = d.s_completions,
+                    total_chat_units       = d.s_chat_units,
+                    total_voice_minutes    = d.s_voice_minutes
+                FROM duplicates d
+                WHERE aa.id = d.keep_id
+            """))
+            # Delete the non-canonical duplicate rows (keep the MIN(id) row above)
+            await conn.execute(_t("""
+                DELETE FROM agent_analytics
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM agent_analytics
+                    GROUP BY tenant_id, agent_id, date
+                )
+            """))
+            # Now safe to add the unique constraint that the UPSERT depends on.
+            await conn.execute(_t("""
+                DO $$ BEGIN
+                    ALTER TABLE agent_analytics
+                        ADD CONSTRAINT uq_agent_analytics_tenant_agent_date
+                        UNIQUE (tenant_id, agent_id, date);
+                EXCEPTION WHEN duplicate_table THEN null;
+                END $$
+            """))
+
+        # Performance indices for the analytics_overview endpoint.
+        # Without these, every dashboard load performs a sequential scan on the
+        # sessions table, which becomes a DoS risk for tenants with large history.
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_sessions_tenant_started_at "
+            "ON sessions (tenant_id, started_at)"
+        ))
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_sessions_agent_started_at "
+            "ON sessions (agent_id, started_at)"
+        ))
+        await conn.execute(_t(
+            "CREATE INDEX IF NOT EXISTS ix_analytics_tenant_date_covering "
+            "ON agent_analytics (tenant_id, date, agent_id)"
         ))
 
         # Agent lifecycle state machine — add status column if not present

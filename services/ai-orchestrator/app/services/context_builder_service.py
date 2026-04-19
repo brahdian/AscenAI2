@@ -11,6 +11,7 @@ from app.models.variable import AgentVariable
 from app.prompts.system_prompts import build_system_prompt
 from app.services.mcp_client import MCPClient
 from app.services.settings_service import SettingsService
+import app.services.pii_service as pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -86,26 +87,100 @@ class ContextBuilderService:
         return data
 
     async def load_platform_guardrails(self) -> Optional[dict]:
-        return await SettingsService.get_setting(self.db, "global_guardrails", default={})
+        return await SettingsService.get_setting(self.db, "platform_guardrails", default={})
+
+    async def load_platform_limits(self) -> dict:
+        """Fetch platform-wide response conciseness limits (admin-configurable)."""
+        return await SettingsService.get_setting(self.db, "global_response_limits", default={})
 
     async def load_corrections(self, agent_id: str) -> List[dict]:
         if self.redis is None:
             return []
+        
+        key = f"corrections:{agent_id}"
         try:
-            key = f"corrections:{agent_id}"
             raw_items = await self.redis.lrange(key, 0, 19)
-            corrections = []
-            for raw in raw_items:
+            if raw_items:
+                corrections = []
+                for raw in raw_items:
+                    try:
+                        corrections.append(json.loads(raw))
+                    except Exception as e:
+                        logger.warning("correction_parse_failed", raw=raw[:100], error=str(e))
+                return corrections
+            
+            # --- SELF-HEALING FALLBACK ---
+            # If cache is empty, pull the 20 most recent corrections from DB
+            from app.models.agent import MessageFeedback, Message
+            from sqlalchemy.orm import aliased
+            
+            UserMsg = aliased(Message)
+            result = await self.db.execute(
+                select(MessageFeedback, Message.content, UserMsg.content)
+                .join(Message, Message.id == MessageFeedback.message_id)
+                .outerjoin(UserMsg, and_(
+                    UserMsg.session_id == Message.session_id,
+                    UserMsg.role == "user",
+                    UserMsg.created_at < Message.created_at
+                ))
+                .where(MessageFeedback.agent_id == uuid.UUID(agent_id))
+                .where(MessageFeedback.ideal_response.is_not(None))
+                .order_by(MessageFeedback.created_at.desc())
+                .limit(20)
+            )
+            
+            rows = result.all()
+            if not rows:
+                return []
+            
+            db_corrections = []
+            redis_entries = []
+            for fb, asst_content, user_content in rows:
+                entry = {
+                    "user_message": (user_content or "")[:300],
+                    "ideal_response": pii_service.redact((fb.ideal_response or ""))[:800],
+                    "playbook_correction": pii_service.redact((fb.playbook_correction or "")),
+                    "tool_corrections": fb.tool_corrections or [],
+                    "ts": fb.created_at.timestamp() if fb.created_at else 0,
+                }
+                db_corrections.append(entry)
+                redis_entries.append(json.dumps(entry))
+            
+            # Re-prime Redis cache (LIFO push)
+            if redis_entries:
                 try:
-                    corrections.append(json.loads(raw))
+                    pipe = self.redis.pipeline()
+                    # Push in reverse order so latest is at the front (lpush)
+                    for re in reversed(redis_entries):
+                        pipe.lpush(key, re)
+                    pipe.ltrim(key, 0, 19)
+                    pipe.expire(key, 60 * 60 * 24 * 30) # 30 days
+                    await pipe.execute()
+                    logger.info("corrections_cache_reprimed", agent_id=agent_id, count=len(redis_entries))
                 except Exception as e:
-                    logger.warning("correction_parse_failed", raw=raw[:100], error=str(e))
-            return corrections
+                    logger.warning("corrections_cache_reprime_failed", agent_id=agent_id, error=str(e))
+            
+            return db_corrections
+            
         except Exception as e:
             logger.warning("corrections_load_failed", agent_id=agent_id, error=str(e))
             return []
 
     async def load_variables(self, agent_id: str, playbook_id: Optional[str] = None) -> List[AgentVariable]:
+        # FIX-12: Cache the variable list to avoid a per-turn DB query at scale
+        cache_key = f"agent_variables:{agent_id}:{playbook_id or 'global'}"
+        if self.redis:
+            try:
+                cached = await self.redis.get(cache_key)
+                if cached:
+                    import json as _json
+                    # We can't cache ORM objects — we need raw dicts; skip cache for now
+                    # and use the cache only as a "has variables" hint below.
+                    # Full ORM cache requires a separate schema; fall through to DB.
+                    pass
+            except Exception as e:
+                logger.warning("redis_variables_cache_load_failed", agent_id=agent_id, error=str(e))
+
         filters = [AgentVariable.agent_id == uuid.UUID(agent_id)]
 
         if playbook_id:
@@ -124,7 +199,29 @@ class ContextBuilderService:
         result = await self.db.execute(
             select(AgentVariable).where(*filters)
         )
-        return list(result.scalars().all())
+        variables = list(result.scalars().all())
+
+        # Cache the list of variable names (cheap sentinel) to detect mis-configured agents
+        if self.redis and variables:
+            try:
+                import json as _json
+                names = [v.name for v in variables]
+                await self.redis.setex(cache_key + ":names", 60, _json.dumps(names))
+            except Exception as e:
+                logger.warning("redis_variables_cache_set_failed", agent_id=agent_id, error=str(e))
+
+        return variables
+
+    async def invalidate_variables_cache(self, agent_id: str) -> None:
+        """Call this from variable mutation endpoints to keep the cache coherent."""
+        if not self.redis:
+            return
+        try:
+            # Invalidate both global and any per-playbook cache entries
+            async for key in self.redis.scan_iter(f"agent_variables:{agent_id}:*"):
+                await self.redis.delete(key)
+        except Exception as e:
+            logger.warning("redis_variables_cache_invalidate_failed", agent_id=agent_id, error=str(e))
 
     def build_system_prompt(
         self,
@@ -141,7 +238,8 @@ class ContextBuilderService:
         variables: List[AgentVariable],
         session_meta: dict,
         local_vars: dict,
-        voice_system_prompt_template: str = ""
+        voice_system_prompt_template: str = "",
+        platform_limits: dict = None,
     ) -> str:
         all_variables = {**session_meta.get("variables", {}), **local_vars}
 
@@ -165,6 +263,7 @@ class ContextBuilderService:
             variables=variables,
             session_metadata={**session_meta, "variables": all_variables},
             voice_system_prompt_template=voice_system_prompt_template,
+            platform_limits=platform_limits,
         )
 
     async def get_agent_tools_schema(

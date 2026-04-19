@@ -19,6 +19,7 @@ from app.core.database import get_db
 from app.core.security import get_tenant_db
 from app.models.agent import Session as AgentSession
 from app.models.trace import ConversationTrace
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -31,13 +32,29 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-async def _verify_session(session_id: str, tenant_id: str, db: AsyncSession) -> AgentSession:
-    result = await db.execute(
-        select(AgentSession).where(
-            AgentSession.id == session_id,
-            AgentSession.tenant_id == uuid.UUID(tenant_id),
-        )
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
+async def _verify_session(session_id: str, tenant_id: str, request: Request, db: AsyncSession) -> AgentSession:
+    query = select(AgentSession).where(
+        AgentSession.id == session_id,
+        AgentSession.tenant_id == uuid.UUID(tenant_id),
     )
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid:
+        query = query.where(AgentSession.agent_id == raid)
+
+    result = await db.execute(query)
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -57,7 +74,7 @@ async def list_replay_turns(
     guardrail actions, response excerpt, and latency breakdown.
     """
     tenant_id = _tenant_id(request)
-    await _verify_session(session_id, tenant_id, db)
+    await _verify_session(session_id, tenant_id, request, db)
 
     result = await db.execute(
         select(ConversationTrace)
@@ -69,11 +86,11 @@ async def list_replay_turns(
     )
     traces = result.scalars().all()
 
-    return {
+    return pii_service.redact_deep({
         "session_id": session_id,
         "total_turns": len(traces),
         "turns": [t.to_summary_dict() for t in traces],
-    }
+    })
 
 
 @router.get("/sessions/{session_id}/replay/{turn_index}")
@@ -91,7 +108,7 @@ async def get_replay_turn(
     tool calls, guardrail actions, final response, and latency breakdown.
     """
     tenant_id = _tenant_id(request)
-    await _verify_session(session_id, tenant_id, db)
+    await _verify_session(session_id, tenant_id, request, db)
 
     result = await db.execute(
         select(ConversationTrace).where(
@@ -104,7 +121,7 @@ async def get_replay_turn(
     if not trace:
         raise HTTPException(status_code=404, detail=f"Turn {turn_index} not found.")
 
-    return trace.to_full_dict()
+    return pii_service.redact_deep(trace.to_full_dict())
 
 
 @router.get("/sessions/{session_id}/replay/{turn_index}/why")
@@ -127,7 +144,7 @@ async def explain_turn(
     - Latency breakdown
     """
     tenant_id = _tenant_id(request)
-    await _verify_session(session_id, tenant_id, db)
+    await _verify_session(session_id, tenant_id, request, db)
 
     result = await db.execute(
         select(ConversationTrace).where(
@@ -222,10 +239,10 @@ async def explain_turn(
         f"{trace.tokens_used} tokens used"
     )
 
-    return {
+    return pii_service.redact_deep({
         "session_id": session_id,
         "turn_index": turn_index,
-        "explanation": "\n\n".join(explanation_parts),
+        "explanation": pii_service.redact_for_display("\n\n".join(explanation_parts), None),
         "trace_id": str(trace.id),
-        "final_response": trace.final_response,
-    }
+        "final_response": pii_service.redact_for_display(trace.final_response, None),
+    })

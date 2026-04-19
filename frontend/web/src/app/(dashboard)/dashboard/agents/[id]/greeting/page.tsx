@@ -3,27 +3,23 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { agentsApi, voiceApi, platformApi, variablesApi, toolsApi, documentsApi } from '@/lib/api'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { agentsApi, platformApi, variablesApi, toolsApi, documentsApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 import {
   ArrowLeft,
-  Mic,
-  MicOff,
-  Play,
-  Trash2,
-  Save,
-  Upload,
   Volume2,
   Globe,
   Info,
   CheckCircle2,
   Loader2,
   PhoneCall,
+  Save,
+  Mic,
+  AlertTriangle,
+  Zap,
 } from 'lucide-react'
 import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
-
-type RecordingState = 'idle' | 'recording' | 'recorded'
 
 export default function GreetingPage() {
   const params = useParams()
@@ -47,22 +43,26 @@ export default function GreetingPage() {
   const [greetingText, setGreetingText] = useState('')
   const [ivrLanguagePrompt, setIvrLanguagePrompt] = useState('')
   const [openingPreview, setOpeningPreview] = useState('')
+  const [voiceProtocolPresetId, setVoiceProtocolPresetId] = useState('')
   const [voiceSystemPrompt, setVoiceSystemPrompt] = useState('')
 
-  // Voice recording state
-  const [recordingState, setRecordingState] = useState<RecordingState>('idle')
-  const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
-  const [audioUrl, setAudioUrl] = useState<string | null>(null)
-  const [recordingSeconds, setRecordingSeconds] = useState(0)
-  const [isUploading, setIsUploading] = useState(false)
-  const [isSaving, setIsSaving] = useState(false)
-  const [isGeneratingTts, setIsGeneratingTts] = useState(false)
-  const [isGeneratingIvrTts, setIsGeneratingIvrTts] = useState(false)
+  const { data: voiceProtocols = [] } = useQuery({
+    queryKey: ['platform-voice-protocols'],
+    queryFn: () => platformApi.getVoiceProtocols(),
+    staleTime: 1000 * 60 * 60, // 1 hour
+  })
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef = useRef<BlobPart[]>([])
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const [isSaving, setIsSaving] = useState(false)
+  const [isGeneratingGreeting, setIsGeneratingGreeting] = useState(false)
+  const [isGeneratingIvr, setIsGeneratingIvr] = useState(false)
+
+  // Detect session-variable placeholders ($vars:name or $[vars:name]) in text.
+  // When present the backend skips pre-generation and uses JIT TTS at call time.
+  const hasVariables = (text: string): boolean =>
+    /\$\[vars:\w+\]|\$vars:\w+/.test(text)
+
+  const greetingHasVars = hasVariables(greetingText)
+  const ivrHasVars = hasVariables(ivrLanguagePrompt)
 
   const { data: agent, isLoading } = useQuery({
     queryKey: ['agent', id],
@@ -99,13 +99,10 @@ export default function GreetingPage() {
       setSupportedLanguages((cfg.supported_languages as string[]) || (agent.supported_languages as string[]) || [])
       setGreetingText((cfg.greeting_message as string) || (agent.greeting_message as string) || '')
       setIvrLanguagePrompt((cfg.ivr_language_prompt as string) || (agent.ivr_language_prompt as string) || '')
+      setVoiceProtocolPresetId((cfg.voice_protocol_preset_id as string) || (agent.voice_protocol_preset_id as string) || '')
       setVoiceSystemPrompt((cfg.voice_system_prompt as string) || (agent.voice_system_prompt as string) || '')
-      const voiceUrl = (cfg.voice_greeting_url as string) || (agent.voice_greeting_url as string)
-      if (voiceUrl) {
-        setAudioUrl(voiceUrl)
-        setRecordingState('recorded')
-      }
-      // Load opening preview text from agent if available or fetch it
+      
+      // Load opening preview text from agent if available
       if (agent.computed_greeting) {
         setOpeningPreview(agent.computed_greeting)
       }
@@ -115,12 +112,12 @@ export default function GreetingPage() {
   const fetchPreview = useCallback(async () => {
     if (!id) return
     try {
-      const { text } = await agentsApi.getOpeningPreview(id, language, supportedLanguages)
+      const { text } = await agentsApi.getOpeningPreview(id, language, supportedLanguages, greetingText)
       setOpeningPreview(text)
     } catch {
       // fallback
     }
-  }, [id, language, supportedLanguages])
+  }, [id, language, supportedLanguages, greetingText])
 
   // Refresh preview on state change
   useEffect(() => {
@@ -128,199 +125,37 @@ export default function GreetingPage() {
       fetchPreview()
     }, 300) // debounce 300ms
     return () => clearTimeout(timer)
-  }, [language, supportedLanguages, fetchPreview])
+  }, [language, supportedLanguages, greetingText, fetchPreview])
 
-  // Cleanup object URL on unmount
-  useEffect(() => {
-    return () => {
-      if (audioUrl && audioUrl.startsWith('blob:')) {
-        URL.revokeObjectURL(audioUrl)
-      }
-      if (timerRef.current) clearInterval(timerRef.current)
-    }
-  }, [audioUrl])
-
-  // ── Recording ────────────────────────────────────────────────────────────
-
-  const generateTtsRecording = async () => {
-    if (!greetingText.trim()) {
-      toast.error('Please enter a text greeting first.')
-      return
-    }
-    setIsGeneratingTts(true)
+  const handleGenerateGreetingAudio = async () => {
     try {
-      // We synthesize the FULL entrance: Mandatory Opening + User Greeting
-      const fullText = `${openingPreview} ... ${greetingText}`
-      const stream = await voiceApi.streamTts(fullText, agent?.voice_id || 'alloy')
-      if (!stream) throw new Error('Failed to start TTS stream')
-      
-      const reader = stream.getReader()
-      const chunks: Uint8Array[] = []
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (value) chunks.push(value)
-      }
-      
-      const blob = new Blob(chunks as BlobPart[], { type: 'audio/mpeg' })
-      setAudioBlob(blob)
-      const url = URL.createObjectURL(blob)
-      setAudioUrl(url)
-      setRecordingState('recorded')
-      setRecordingSeconds(0)
-      toast.success('Preview generated! This combines the mandatory opening and your custom greeting.')
-    } catch {
-      toast.error('Failed to generate recording via TTS.')
-    } finally {
-      setIsGeneratingTts(false)
-    }
-  }
-
-  const generateIvrTts = async () => {
-    if (!ivrLanguagePrompt.trim()) {
-      toast.error('Please enter an IVR prompt first.')
-      return
-    }
-    setIsGeneratingIvrTts(true)
-    try {
-      // Use the stream api to preview it
-      const stream = await voiceApi.streamTts(ivrLanguagePrompt, agent?.voice_id || 'alloy')
-      if (!stream) throw new Error('Failed to start TTS stream')
-      
-      const reader = stream.getReader()
-      const chunks: Uint8Array[] = []
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (value) chunks.push(value)
-      }
-      
-      const blob = new Blob(chunks as BlobPart[], { type: 'audio/mpeg' })
-      const url = URL.createObjectURL(blob)
-      
-      // We don't save this to the main audioUrl state as that's for the greeting
-      // We'll just play it immediately to let the user hear it
-      const audio = new Audio(url)
-      audio.play()
-      toast.success('Playing IVR prompt preview...')
-    } catch {
-      toast.error('Failed to generate IVR preview.')
-    } finally {
-      setIsGeneratingIvrTts(false)
-    }
-  }
-
-  const startRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/mp4')
-        ? 'audio/mp4'
-        : 'audio/webm'
-
-      const mr = new MediaRecorder(stream, { mimeType })
-      chunksRef.current = []
-
-      mr.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data)
-      }
-
-      mr.onstop = () => {
-        stream.getTracks().forEach((t) => t.stop())
-        const blob = new Blob(chunksRef.current, { type: mimeType })
-        setAudioBlob(blob)
-        const url = URL.createObjectURL(blob)
-        setAudioUrl(url)
-        setRecordingState('recorded')
-      }
-
-      mr.start(250) // collect chunks every 250 ms
-      mediaRecorderRef.current = mr
-      setRecordingState('recording')
-      setRecordingSeconds(0)
-
-      timerRef.current = setInterval(() => {
-        setRecordingSeconds((s) => {
-          if (s >= 60) {
-            stopRecording()
-            return s
-          }
-          return s + 1
-        })
-      }, 1000)
-    } catch {
-      toast.error('Microphone access denied. Please allow microphone access in your browser.')
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const stopRecording = useCallback(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current)
-      timerRef.current = null
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop()
-    }
-  }, [])
-
-  const discardRecording = useCallback(() => {
-    if (audioUrl && audioUrl.startsWith('blob:')) {
-      URL.revokeObjectURL(audioUrl)
-    }
-    setAudioBlob(null)
-    setAudioUrl(agent?.voice_greeting_url || null)
-    setRecordingState(agent?.voice_greeting_url ? 'recorded' : 'idle')
-    setRecordingSeconds(0)
-  }, [audioUrl, agent])
-
-  // ── Upload new recording ─────────────────────────────────────────────────
-
-  const uploadRecording = async () => {
-    if (!audioBlob) return
-    setIsUploading(true)
-    try {
-      const mimeType = audioBlob.type
-      const ext = mimeType.includes('mp4') ? 'm4a' : mimeType.includes('ogg') ? 'ogg' : 'webm'
-      const result = await agentsApi.uploadVoiceGreeting(id, audioBlob, ext)
-      setAudioUrl(result.url)
-      setAudioBlob(null) // already uploaded; keep URL as saved URL
+      setIsGeneratingGreeting(true)
+      await agentsApi.generateGreetingAudio(id)
       qc.invalidateQueries({ queryKey: ['agent', id] })
-      toast.success('Voice greeting saved — plays on every new call at no TTS cost.')
+      toast.success('Greeting audio generated!')
     } catch {
-      toast.error('Upload failed. Please try again.')
+      toast.error('Failed to generate greeting audio.')
     } finally {
-      setIsUploading(false)
+      setIsGeneratingGreeting(false)
     }
   }
 
-  // ── Delete saved recording ────────────────────────────────────────────────
-
-  const deleteRecording = async () => {
-    if (!confirm('Remove the saved voice greeting?')) return
+  const handleGenerateIvrAudio = async () => {
     try {
-      await agentsApi.deleteVoiceGreeting(id)
-      if (audioUrl && audioUrl.startsWith('blob:')) URL.revokeObjectURL(audioUrl)
-      setAudioUrl(null)
-      setAudioBlob(null)
-      setRecordingState('idle')
+      setIsGeneratingIvr(true)
+      await agentsApi.generateIvrAudio(id)
       qc.invalidateQueries({ queryKey: ['agent', id] })
-      toast.success('Voice greeting removed.')
+      toast.success('IVR prompt audio generated!')
     } catch {
-      toast.error('Failed to remove greeting.')
+      toast.error('Failed to generate IVR audio.')
+    } finally {
+      setIsGeneratingIvr(false)
     }
   }
-
-  // ── Save text greeting + language ─────────────────────────────────────────
 
   const saveSettings = async () => {
     setIsSaving(true)
     try {
-      const prevGreeting = (agent?.agent_config as Record<string, unknown>)?.greeting_message as string | undefined
-      const prevIvr = (agent?.agent_config as Record<string, unknown>)?.ivr_language_prompt as string | undefined
-      const greetingChanged = greetingText !== (prevGreeting || '')
-      const ivrChanged = ivrLanguagePrompt !== (prevIvr || '')
-
       await agentsApi.update(id, {
         language,
         auto_detect_language: autoDetectLanguage,
@@ -328,30 +163,17 @@ export default function GreetingPage() {
         greeting_message: greetingText || null,
         ivr_language_prompt: ivrLanguagePrompt || null,
         voice_system_prompt: voiceSystemPrompt || null,
+        voice_protocol_preset_id: voiceProtocolPresetId || null,
       })
       qc.invalidateQueries({ queryKey: ['agent', id] })
-
-      if (greetingChanged && greetingText) {
-        toast.success('Settings saved — generating greeting audio in background…')
-      } else if (ivrChanged && ivrLanguagePrompt) {
-        toast.success('Settings saved — generating IVR prompt audio in background…')
-      } else {
-        toast.success('Greeting settings saved.')
-      }
+      qc.invalidateQueries({ queryKey: ['agents'] })
+      toast.success('Settings saved.')
     } catch {
       toast.error('Save failed. Please try again.')
     } finally {
       setIsSaving(false)
     }
   }
-
-  // ── Opening Preview Logic Removed (Backend Driven) ────────────────────────
-
-  // ── Recording timer label ─────────────────────────────────────────────────
-
-  const timerLabel = `${Math.floor(recordingSeconds / 60)
-    .toString()
-    .padStart(2, '0')}:${(recordingSeconds % 60).toString().padStart(2, '0')}`
 
   if (isLoading) {
     return (
@@ -362,14 +184,11 @@ export default function GreetingPage() {
   }
 
   if (!agent) {
-    return (
-      <div className="text-center py-16 text-gray-500">Agent not found.</div>
-    )
+    return <div className="text-center py-16 text-gray-500">Agent not found.</div>
   }
 
   const savedGreetingUrl = agent.voice_greeting_url
   const savedIvrUrl = (agent.agent_config as Record<string, unknown>)?.ivr_language_url as string | undefined
-  const hasPendingUpload = !!audioBlob
 
   return (
     <div className="p-8 w-full space-y-6">
@@ -387,15 +206,6 @@ export default function GreetingPage() {
           </h1>
           <p className="text-sm text-gray-500">{agent.name}</p>
         </div>
-      </div>
-
-      {/* Cost-saving notice */}
-      <div className="flex gap-3 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl text-sm text-blue-800 dark:text-blue-300">
-        <Info size={16} className="flex-shrink-0 mt-0.5" />
-        <span>
-          Pre-recorded greetings are played as a static audio file on every new call —
-          no TTS synthesis is triggered, which saves cost. Recording storage is billed to your account.
-        </span>
       </div>
 
       {/* Language */}
@@ -494,23 +304,37 @@ export default function GreetingPage() {
         </div>
         <p className="text-sm text-gray-500">
           The greeting spoken to callers when a new call connects. Saving this text
-          automatically generates a high-quality TTS audio file — no manual recording required.
+          automatically generates a high-quality TTS audio file.
         </p>
 
-        {/* Auto-generated audio status */}
-        {savedGreetingUrl && (
-          <div className="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-sm">
-            <CheckCircle2 size={14} className="text-green-600 dark:text-green-400 flex-shrink-0" />
-            <span className="text-green-700 dark:text-green-300 flex-1">TTS audio generated</span>
-            <audio src={savedGreetingUrl} controls className="h-7" preload="none" />
-          </div>
-        )}
-        {!savedGreetingUrl && greetingText && (
-          <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg text-sm text-amber-700 dark:text-amber-300">
-            <Loader2 size={14} className="flex-shrink-0" />
-            Save to auto-generate TTS audio for this greeting.
-          </div>
-        )}
+        {/* Text Greeting generation status */}
+        <div className="flex items-center gap-3">
+          {savedGreetingUrl ? (
+            <div className="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-sm flex-1">
+              <CheckCircle2 size={14} className="text-green-600 dark:text-green-400 flex-shrink-0" />
+              <span className="text-green-700 dark:text-green-300 flex-1 truncate">TTS audio active</span>
+              <audio src={savedGreetingUrl} controls className="h-7" preload="none" />
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-500 flex-1">
+              <Info size={14} className="flex-shrink-0" />
+              No audio generated yet.
+            </div>
+          )}
+          <button
+            onClick={handleGenerateGreetingAudio}
+            disabled={isGeneratingGreeting || !greetingText || greetingHasVars}
+            title={greetingHasVars ? 'Cannot pre-generate audio for a greeting with session variables — it will be synthesized live at call time.' : undefined}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 text-gray-700 dark:text-gray-300 rounded-lg text-sm font-medium transition-colors"
+          >
+            {isGeneratingGreeting
+              ? <Loader2 size={14} className="animate-spin" />
+              : greetingHasVars
+                ? <Zap size={14} className="text-amber-500" />
+                : <Volume2 size={14} />}
+            {greetingHasVars ? 'JIT (Live)' : savedGreetingUrl ? 'Regenerate' : 'Generate Audio'}
+          </button>
+        </div>
 
         <div>
           <PlaybookMentionsEditor
@@ -519,9 +343,17 @@ export default function GreetingPage() {
             tools={tools}
             variables={globalVariables}
             documents={documents}
-            placeholder={`Hi! I'm ${agent?.name || 'an agent'}. How can I help you today?`}
+            placeholder={`Hi! I me ${agent?.name || 'an agent'}. How can I help you today?`}
           />
           <p className="text-xs text-gray-400 mt-1 text-right">{greetingText.length}/1000</p>
+          {greetingHasVars && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-200 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-900/20 px-3 py-2.5">
+              <Zap size={14} className="text-amber-500 mt-0.5 flex-shrink-0" />
+              <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed">
+                <span className="font-semibold">JIT Synthesis Active</span> — This greeting contains dynamic variables and will be spoken verbatim at call-time. No static audio file is generated; the voice engine resolves placeholders live for each caller.
+              </p>
+            </div>
+          )}
         </div>
         <button
           onClick={saveSettings}
@@ -541,29 +373,36 @@ export default function GreetingPage() {
         </div>
         <p className="text-sm text-gray-500">
           Optional prompt played immediately after the greeting to offer callers a language choice.
-          Saving auto-generates a TTS audio file. Leave blank to skip.
         </p>
-        <div className="flex gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg text-xs text-gray-500 items-start">
-          <Info size={13} className="flex-shrink-0 mt-0.5" />
-          <span>
-            Example: <em>"For English, press 1. Pour le français, appuyez sur 2. Para español, presione 3."</em>
-          </span>
-        </div>
 
-        {/* Auto-generated IVR audio status */}
-        {savedIvrUrl && (
-          <div className="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-sm">
-            <CheckCircle2 size={14} className="text-green-600 dark:text-green-400 flex-shrink-0" />
-            <span className="text-green-700 dark:text-green-300 flex-1">IVR audio generated</span>
-            <audio src={savedIvrUrl} controls className="h-7" preload="none" />
-          </div>
-        )}
-        {!savedIvrUrl && ivrLanguagePrompt && (
-          <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg text-sm text-amber-700 dark:text-amber-300">
-            <Loader2 size={14} className="flex-shrink-0" />
-            Save to auto-generate TTS audio for this IVR prompt.
-          </div>
-        )}
+        {/* IVR Prompt generation status */}
+        <div className="flex items-center gap-3">
+          {savedIvrUrl ? (
+            <div className="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg text-sm flex-1">
+              <CheckCircle2 size={14} className="text-green-600 dark:text-green-400 flex-shrink-0" />
+              <span className="text-green-700 dark:text-green-300 flex-1 truncate">IVR audio active</span>
+              <audio src={savedIvrUrl} controls className="h-7" preload="none" />
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-500 flex-1">
+              <Info size={14} className="flex-shrink-0" />
+              No IVR audio generated yet.
+            </div>
+          )}
+          <button
+            onClick={handleGenerateIvrAudio}
+            disabled={isGeneratingIvr || !ivrLanguagePrompt || ivrHasVars}
+            title={ivrHasVars ? 'Cannot pre-generate audio for an IVR prompt with session variables — it will be synthesized live at call time.' : undefined}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 text-gray-700 dark:text-gray-300 rounded-lg text-sm font-medium transition-colors"
+          >
+            {isGeneratingIvr
+              ? <Loader2 size={14} className="animate-spin" />
+              : ivrHasVars
+                ? <Zap size={14} className="text-amber-500" />
+                : <Volume2 size={14} />}
+            {ivrHasVars ? 'JIT (Live)' : savedIvrUrl ? 'Regenerate' : 'Generate Audio'}
+          </button>
+        </div>
 
         <div>
           <PlaybookMentionsEditor
@@ -575,58 +414,74 @@ export default function GreetingPage() {
             placeholder="For English, press 1. Pour le français, appuyez sur 2."
           />
           <p className="text-xs text-gray-400 mt-1 text-right">{ivrLanguagePrompt.length}/500</p>
+          {ivrHasVars && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-200 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-900/20 px-3 py-2.5">
+              <Zap size={14} className="text-amber-500 mt-0.5 flex-shrink-0" />
+              <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed">
+                <span className="font-semibold">JIT Synthesis Active</span> — This IVR prompt contains dynamic variables and will be resolved live at call time.
+              </p>
+            </div>
+          )}
         </div>
-          <button
-            onClick={generateIvrTts}
-            disabled={isGeneratingIvrTts}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 text-gray-700 dark:text-gray-300 rounded-lg text-sm font-medium transition-colors"
-          >
-            {isGeneratingIvrTts ? <Loader2 size={14} className="animate-spin" /> : <Volume2 size={14} />}
-            {isGeneratingIvrTts ? 'Generating Preview...' : 'Test with Agent Voice'}
-          </button>
-          <button
-            onClick={saveSettings}
-            disabled={isSaving}
-            className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
-          >
-            {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-            {isSaving ? 'Saving…' : 'Save IVR Prompt'}
-          </button>
+        <button
+          onClick={saveSettings}
+          disabled={isSaving}
+          className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+        >
+          {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+          {isSaving ? 'Saving…' : 'Save IVR Prompt'}
+        </button>
       </div>
 
-      {/* Voice Protocol (System Prompt Extension) */}
+      {/* Voice Protocol */}
       <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 space-y-4">
         <div className="flex items-center gap-2 mb-1">
           <Mic size={18} className="text-violet-600 dark:text-violet-400" />
           <h2 className="text-base font-semibold text-gray-900 dark:text-white">Voice Protocol</h2>
         </div>
         <p className="text-sm text-gray-500">
-          Advanced instructions for how the agent handles voice-specific logic, like language switching and IVR behavior.
+          Advanced instructions for how the agent handles voice-specific logic. Select a platform preset and add any optional custom instructions.
         </p>
-        <div className="relative">
+
+        {/* Protocol Presets */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          {voiceProtocols.map((preset: any) => {
+            const isSelected = voiceProtocolPresetId === preset.id
+            return (
+              <button
+                key={preset.id}
+                onClick={() => setVoiceProtocolPresetId(preset.id)}
+                className={`text-left p-3 border rounded-lg transition-colors group ${
+                  isSelected 
+                    ? 'bg-violet-50 dark:bg-violet-900/40 border-violet-600 dark:border-violet-500 ring-1 ring-violet-600 dark:ring-violet-500' 
+                    : 'bg-gray-50 dark:bg-gray-800 hover:bg-violet-50/50 dark:hover:bg-violet-900/20 border-gray-200 dark:border-gray-700 hover:border-violet-300 dark:hover:border-violet-700'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-0.5">
+                  <p className={`text-sm font-medium ${isSelected ? 'text-violet-800 dark:text-violet-200' : 'text-gray-800 dark:text-gray-200 group-hover:text-violet-700 dark:group-hover:text-violet-300'}`}>
+                    {preset.label}
+                  </p>
+                  {isSelected && (
+                    <div className="w-2 h-2 rounded-full bg-violet-600 dark:bg-violet-400" />
+                  )}
+                </div>
+              </button>
+            )
+          })}
+        </div>
+
+        <div className="relative mt-2">
+          <label className="block text-xs font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-2">
+            Additional Custom Instructions (Optional)
+          </label>
           <PlaybookMentionsEditor
             value={voiceSystemPrompt}
             onChange={(val) => setVoiceSystemPrompt(val)}
             tools={tools}
             variables={globalVariables}
             documents={documents}
-            placeholder="Enter voice-specific system instructions..."
+            placeholder="Enter any custom voice-specific system instructions to append to the chosen preset..."
           />
-          {!voiceSystemPrompt && (
-            <button
-              onClick={() => setVoiceSystemPrompt(`## Multi-lingual & IVR Operational Protocol
-- **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
-- **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
-  "${openingPreview}"
-- **DYNAMIC LANGUAGE ADAPTATION**: You are globally configured to handle multiple languages.
-- **PROTOCOL**: Upon detecting ANY supported language, pivot your response language immediately to match the user without requesting procedural confirmation (e.g., avoid "Would you like to speak French?").
-- **CONTEXTUAL METADATA**: Ensure your response metadata accurately identifies the current communication language.`)}
-              className="mt-2 text-xs text-violet-600 hover:underline flex items-center gap-1"
-            >
-              <Info size={12} />
-              Load Professional IVR Default
-            </button>
-          )}
         </div>
         <div className="flex justify-start">
           <button
@@ -638,144 +493,6 @@ export default function GreetingPage() {
             {isSaving ? 'Saving…' : 'Save Voice Protocol'}
           </button>
         </div>
-      </div>
-
-      {/* Voice recording */}
-      <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 space-y-5">
-        <div className="flex items-center gap-2 mb-1">
-          <Mic size={18} className="text-violet-600 dark:text-violet-400" />
-          <h2 className="text-base font-semibold text-gray-900 dark:text-white">Voice Recording</h2>
-        </div>
-        <p className="text-sm text-gray-500">
-          Record a greeting that plays automatically when every new call starts.
-          Max 60 seconds. Supported formats: WebM, MP3, WAV (max 5 MB).
-        </p>
-
-        {/* Existing saved greeting */}
-        {savedGreetingUrl && !hasPendingUpload && (
-          <div className="flex items-center gap-3 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
-            <Volume2 size={16} className="text-green-600 flex-shrink-0" />
-            <span className="text-sm text-green-700 dark:text-green-400 flex-1 truncate">
-              Saved recording active
-            </span>
-            <audio
-              ref={audioRef}
-              src={savedGreetingUrl}
-              className="h-8 flex-shrink-0"
-              controls
-              preload="none"
-            />
-            <button
-              onClick={deleteRecording}
-              className="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-colors group"
-              title="Delete recording"
-            >
-              <Trash2 size={15} className="text-red-500 group-hover:text-red-600" />
-            </button>
-          </div>
-        )}
-
-        {/* Recording controls */}
-        <div className="flex flex-col gap-4">
-          {recordingState === 'idle' && (
-            <div className="flex flex-col sm:flex-row gap-3">
-              <button
-                onClick={startRecording}
-                className="flex items-center justify-center gap-2 flex-1 py-8 border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-xl hover:border-violet-400 dark:hover:border-violet-600 hover:bg-violet-50/30 dark:hover:bg-violet-900/10 transition-colors text-gray-500 dark:text-gray-400 hover:text-violet-600 dark:hover:text-violet-400"
-              >
-                <Mic size={20} />
-                <span className="text-sm font-medium">Record with Microphone</span>
-              </button>
-              <button
-                onClick={generateTtsRecording}
-                disabled={isGeneratingTts}
-                className="flex flex-col items-center justify-center gap-2 flex-1 py-8 border border-gray-200 dark:border-gray-800 rounded-xl hover:border-violet-400 dark:hover:border-violet-600 bg-gray-50 dark:bg-gray-800 transition-colors text-gray-700 dark:text-gray-300 hover:text-violet-600 dark:hover:text-violet-400 disabled:opacity-50"
-              >
-                <Volume2 size={20} className={isGeneratingTts ? 'animate-pulse text-violet-500' : ''} />
-                <span className="text-sm font-medium">
-                  {isGeneratingTts ? 'Generating TTS...' : 'Generate with Agent Voice'}
-                </span>
-              </button>
-            </div>
-          )}
-
-          {recordingState === 'recording' && (
-            <div className="flex flex-col items-center gap-4 py-6 border-2 border-red-400 rounded-xl bg-red-50/30 dark:bg-red-900/10">
-              <div className="flex items-center gap-2">
-                <span className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
-                <span className="text-sm font-medium text-red-600 dark:text-red-400">
-                  Recording… {timerLabel}
-                </span>
-              </div>
-              <p className="text-xs text-gray-500">Max 60 seconds</p>
-              <button
-                onClick={stopRecording}
-                className="flex items-center gap-2 px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-colors"
-              >
-                <MicOff size={15} />
-                Stop Recording
-              </button>
-            </div>
-          )}
-
-          {recordingState === 'recorded' && audioUrl && hasPendingUpload && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
-                <Play size={15} className="text-violet-600 flex-shrink-0" />
-                <span className="text-sm text-gray-700 dark:text-gray-300 flex-1">
-                  New recording — {timerLabel}
-                </span>
-                <audio src={audioUrl} controls className="h-8" preload="auto" />
-              </div>
-
-              <div className="flex gap-2">
-                <button
-                  onClick={uploadRecording}
-                  disabled={isUploading}
-                  className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
-                >
-                  <Upload size={14} />
-                  {isUploading ? 'Uploading…' : 'Save Recording'}
-                </button>
-                <button
-                  onClick={() => {
-                    // Re-record
-                    discardRecording()
-                    setRecordingState('idle')
-                  }}
-                  disabled={isUploading}
-                  className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50 text-gray-700 dark:text-gray-300 rounded-lg text-sm font-medium transition-colors"
-                >
-                  <Mic size={14} />
-                  Re-record
-                </button>
-                <button
-                  onClick={discardRecording}
-                  disabled={isUploading}
-                  className="flex items-center gap-2 px-4 py-2 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
-                >
-                  <Trash2 size={14} />
-                  Discard
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Re-record option when saved greeting exists */}
-        {savedGreetingUrl && !hasPendingUpload && recordingState !== 'recording' && (
-          <button
-            onClick={() => {
-              discardRecording()
-              setRecordingState('idle')
-              setTimeout(startRecording, 100)
-            }}
-            className="flex items-center gap-2 text-sm text-violet-600 dark:text-violet-400 hover:underline"
-          >
-            <Mic size={14} />
-            Record a new greeting (replaces current)
-          </button>
-        )}
       </div>
     </div>
   )

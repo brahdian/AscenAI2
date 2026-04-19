@@ -1,6 +1,7 @@
 from .analytics import AgentAnalytics
 from .tenant import Tenant, TenantUsage
 from .user import APIKey, User, Webhook
+from .invite import UserInvite
 from .platform import PlatformSetting
 
 __all__ = [
@@ -9,6 +10,7 @@ __all__ = [
     "User",
     "APIKey",
     "Webhook",
+    "UserInvite",
     "AgentAnalytics",
     "PlatformSetting",
 ]

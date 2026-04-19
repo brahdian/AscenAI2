@@ -50,7 +50,7 @@ class Agent(Base):
     # Values: draft | pending_payment | active | grace | expired | archived
     # Use app.services.agent_lifecycle.transition_agent() to change this field;
     # never mutate it directly outside of that service.
-    status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="DRAFT")
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Agent subscription expiry - set when payment is made, checked before allowing agent usage
@@ -161,8 +161,10 @@ class Session(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
 
     agent: Mapped["Agent"] = relationship("Agent", back_populates="sessions")
+
     messages: Mapped[list["Message"]] = relationship(
         "Message", back_populates="session", order_by="Message.created_at"
     )
@@ -205,7 +207,7 @@ class Session(Base):
             "customer_identifier": self.customer_identifier,
             "channel": self.channel,
             "status": self.status,
-            "metadata": self.metadata_ or {},
+            "ip_address": self.ip_address,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "last_activity_at": self.last_activity_at.isoformat() if self.last_activity_at else None,
@@ -405,6 +407,8 @@ class AgentPlaybook(Base):
     config: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), nullable=False, server_default='{}')
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_from_template: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_template_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -423,7 +427,6 @@ class AgentPlaybook(Base):
             "name": self.name,
             "description": self.description,
             "intent_triggers": self.intent_triggers or [],
-            "is_default": self.is_default,
             "config": self.config or {},
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -431,11 +434,14 @@ class AgentPlaybook(Base):
         }
 
 
+from sqlalchemy import UniqueConstraint
+
 class AgentDocument(Base):
     __tablename__ = "agent_documents"
     __table_args__ = (
         Index("ix_agent_docs_agent_id", "agent_id"),
         Index("ix_agent_docs_tenant_id", "tenant_id"),
+        UniqueConstraint("agent_id", "name", name="uq_agent_doc_name"),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
@@ -445,12 +451,23 @@ class AgentDocument(Base):
     file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     storage_path: Mapped[str] = mapped_column(String(1000), nullable=True) # Now optional because it can be raw text
     content: Mapped[Optional[str]] = mapped_column(Text, nullable=True) # Direct raw text content
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True) # SHA-256 hash for deduplication
 
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(768), nullable=True)
     vector_ids: Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSONB), nullable=True, default=list)
     status: Mapped[str] = mapped_column(String(20), default="processing")  # draft | published | processing | ready | failed
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extraction_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=dict) # Quality metrics (Phase 5)
+    residency_region: Mapped[Optional[str]] = mapped_column(String(50), nullable=True) # Data residency (e.g. 'us', 'eu')
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True) # Fact staleness
+
+    # Zenith Pillar 1: Forensic Traceability
+    created_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True) # actor_email
+    updated_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    trace_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    original_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    justification_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -467,11 +484,19 @@ class AgentDocument(Base):
             "name": self.name,
             "file_type": self.file_type,
             "file_size_bytes": self.file_size_bytes,
-            "storage_path": self.storage_path,
+            # No storage_path in to_dict (Phase 8 - Gap 1: Information Disclosure Fix)
             "content": self.content,
             "chunk_count": self.chunk_count,
             "status": self.status,
             "error_message": self.error_message,
+            "extraction_metadata": self.extraction_metadata,
+            "residency_region": self.residency_region,
+            "valid_until": self.valid_until.isoformat() if self.valid_until else None,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
+            "trace_id": self.trace_id,
+            "original_ip": pii_service.redact(self.original_ip) if self.original_ip else None,
+            "justification_id": self.justification_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -486,6 +511,10 @@ class AgentDocumentChunk(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     doc_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agent_documents.id", ondelete="CASCADE"), nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    
+    # Zenith Pillar 1: Granular Forensic Correlation
+    trace_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -628,3 +657,77 @@ class EscalationAttempt(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class AgentGuardrailChangeRequest(Base):
+    """
+    Tracks requests to change global or system-wide guardrail rules.
+    """
+    __tablename__ = "guardrail_change_requests"
+    __table_args__ = (
+        Index("ix_gr_change_req_tenant_id", "tenant_id"),
+        Index("ix_gr_change_req_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    guardrail_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    proposed_rule: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")  # pending, approved, rejected
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "tenant_id": str(self.tenant_id),
+            "guardrail_id": self.guardrail_id,
+            "proposed_rule": self.proposed_rule,
+            "reason": self.reason,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class GuardrailEvent(Base):
+    """
+    Audit log of when guardrails trigger (blocks, jailbreaks, emergencies, etc).
+    """
+    __tablename__ = "guardrail_events"
+    __table_args__ = (
+        Index("ix_gr_event_tenant_id", "tenant_id"),
+        Index("ix_gr_event_agent_id", "agent_id"),
+        Index("ix_gr_event_session_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False) # e.g., 'input_blocked', 'emergency', 'jailbreak', 'pii_redacted'
+    details: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSONB), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "tenant_id": str(self.tenant_id),
+            "agent_id": str(self.agent_id),
+            "session_id": self.session_id,
+            "event_type": self.event_type,
+            "details": self.details or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

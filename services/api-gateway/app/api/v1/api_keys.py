@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import get_tenant_db, get_current_tenant, get_current_user
 from app.models.user import APIKey
-from app.schemas.auth import APIKeyCreateRequest, APIKeyCreatedResponse, APIKeyResponse
+from app.schemas.auth import APIKeyCreateRequest, APIKeyCreatedResponse, APIKeyResponse, APIKeyUpdateRequest
 from app.services.auth_service import auth_service
 
 router = APIRouter(prefix="/api-keys")
@@ -84,6 +84,11 @@ async def create_api_key(
             )
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid expires_at format. Use ISO 8601.")
+    
+    # Enforce maximum 90 day expiration (Zenith Pillar)
+    max_expiry = datetime.now(timezone.utc) + timedelta(days=90)
+    if not expires_at or expires_at > max_expiry:
+        expires_at = max_expiry
 
     raw_key, api_key = await auth_service.create_api_key(
         tenant_id=uuid.UUID(tenant_id),
@@ -92,6 +97,8 @@ async def create_api_key(
         scopes=body.scopes,
         db=db,
         expires_at=expires_at,
+        agent_id=uuid.UUID(body.agent_id) if body.agent_id else None,
+        allowed_origins=body.allowed_origins,
     )
     return APIKeyCreatedResponse(
         id=str(api_key.id),
@@ -141,17 +148,65 @@ async def list_api_keys(
             last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
             expires_at=k.expires_at.isoformat() if k.expires_at else None,
             created_at=k.created_at.isoformat(),
+            agent_id=str(k.agent_id) if k.agent_id else None,
+            allowed_origins=k.allowed_origins,
         )
         for k in keys
     ]
 
 
-@router.delete("/{key_id}", status_code=204)
-async def revoke_api_key(
+@router.patch("/{key_id}", response_model=APIKeyResponse)
+async def update_api_key(
     key_id: str,
+    body: APIKeyUpdateRequest,
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
+    """Update API key metadata (name, origins)."""
+    result = await db.execute(
+        select(APIKey).where(
+            APIKey.id == uuid.UUID(key_id),
+            APIKey.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    api_key = result.scalar_one_or_none()
+    if not api_key:
+        raise HTTPException(status_code=404, detail="API key not found.")
+
+    if body.name is not None:
+        api_key.name = body.name
+    if body.allowed_origins is not None:
+        api_key.allowed_origins = body.allowed_origins
+    if body.is_active is not None:
+        api_key.is_active = body.is_active
+
+    await db.commit()
+    await db.refresh(api_key)
+    return [
+        APIKeyResponse(
+            id=str(api_key.id),
+            name=api_key.name,
+            key_prefix=api_key.key_prefix,
+            scopes=api_key.scopes,
+            rate_limit_per_minute=api_key.rate_limit_per_minute,
+            is_active=api_key.is_active,
+            last_used_at=api_key.last_used_at.isoformat() if api_key.last_used_at else None,
+            expires_at=api_key.expires_at.isoformat() if api_key.expires_at else None,
+            created_at=api_key.created_at.isoformat(),
+            agent_id=str(api_key.agent_id) if api_key.agent_id else None,
+            allowed_origins=api_key.allowed_origins,
+        )
+    ][0]
+
+
+@router.delete("/{key_id}", status_code=204)
+async def revoke_api_key(
+    key_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+
     """Revoke (soft-delete) an API key."""
     result = await db.execute(
         select(APIKey).where(
@@ -164,3 +219,19 @@ async def revoke_api_key(
         raise HTTPException(status_code=404, detail="API key not found.")
     api_key.is_active = False
     await db.commit()
+
+    # Instant Revocation: Wipe the Redis cache so the key is rejected immediately (Phase 10)
+    redis = getattr(request.app.state, "redis", None)
+    await auth_service.invalidate_api_key_cache(api_key.key_hash, redis=redis)
+
+    from app.services.audit_service import audit_log
+    await audit_log(
+        db=db,
+        action="api_key.revoked",
+        tenant_id=tenant_id,
+        category="security",
+        resource_type="api_key",
+        resource_id=str(api_key.id),
+        status="success",
+        details={"name": api_key.name, "key_prefix": api_key.key_prefix},
+    )

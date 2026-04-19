@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
+from app.core.security import get_tenant_db, get_current_tenant, generate_internal_token
 from app.services.idempotency_service import IdempotencyService
 
 logger = structlog.get_logger(__name__)
@@ -23,6 +23,7 @@ router = APIRouter(prefix="/billing")
 
 class CheckoutSessionRequest(BaseModel):
     plan: str = Field(..., description="Plan: text_growth, voice_growth, voice_business")
+    billing_cycle: str = Field("monthly", description="Billing cycle: monthly, yearly")
 
 
 class AgentSlotSessionRequest(BaseModel):
@@ -45,6 +46,7 @@ DEFAULT_PLANS: dict[str, dict] = {
         "color": "border-white/10",
         "highlight": False,
         "price_per_agent": 49.00,
+        "price_per_agent_yearly": 470.00,  # ~20% discount
         "chat_equivalents_included": 20_000,
         "base_chat_equivalents": 20_000,
         "voice_minutes_included": 0,
@@ -63,6 +65,7 @@ DEFAULT_PLANS: dict[str, dict] = {
         "color": "border-violet-500/50",
         "highlight": True,
         "price_per_agent": 99.00,
+        "price_per_agent_yearly": 950.00,  # ~20% discount
         "chat_equivalents_included": 80_000,
         "base_chat_equivalents": 20_000,
         "voice_minutes_included": 1500,
@@ -81,6 +84,7 @@ DEFAULT_PLANS: dict[str, dict] = {
         "color": "border-white/10",
         "highlight": False,
         "price_per_agent": 199.00,
+        "price_per_agent_yearly": 1910.00,  # ~20% discount
         "chat_equivalents_included": 170_000,
         "base_chat_equivalents": 20_000,
         "voice_minutes_included": 3500,
@@ -99,6 +103,7 @@ DEFAULT_PLANS: dict[str, dict] = {
         "color": "border-white/10",
         "highlight": False,
         "price_per_agent": None,
+        "price_per_agent_yearly": None,
         "chat_equivalents_included": None,
         "base_chat_equivalents": None,
         "voice_minutes_included": None,
@@ -149,12 +154,91 @@ def _require_tenant(request: Request) -> str:
     return tenant_id
 
 
-def _billing_period() -> tuple[date, date]:
-    today = date.today()
-    start = date(today.year, today.month, 1)
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    end = date(today.year, today.month, last_day)
-    return start, end
+async def _check_billing_rate_limit(request: Request, action: str, limit: int = 5, window: int = 60) -> None:
+    """
+    Zenith Pillar 4: Standalone Redis rate-limit check for billing mutations.
+    Uses a per-tenant sliding window keyed as: billing_rl:{tenant_id}:{action}
+    Raises HTTP 429 if the limit is exceeded. Fails open if Redis is unavailable.
+    """
+    import math, time as _time
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return  # Fail open — no Redis, allow traffic
+    tenant_id = getattr(request.state, "tenant_id", "anon")
+    key = f"billing_rl:{tenant_id}:{action}"
+    window_end = math.ceil(_time.time() / window) * window
+    try:
+        pipe = redis.pipeline()
+        pipe.incr(key)
+        pipe.expireat(key, int(window_end))
+        results = await pipe.execute()
+        count = int(results[0])
+        if count > limit:
+            logger.warning(
+                "billing_rate_limit_exceeded",
+                tenant_id=tenant_id,
+                action=action,
+                count=count,
+                limit=limit,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many {action} requests. Please wait before trying again.",
+                headers={"Retry-After": str(int(window_end - _time.time()))},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("billing_rate_limit_redis_error", action=action, error=str(exc))
+        # Fail open
+
+
+from app.utils.dates import get_calendar_billing_period as _billing_period
+
+
+async def _get_usage_summary_db(tenant_id: uuid.UUID, db: AsyncSession) -> dict[str, Any]:
+    """Helper to fetch monthly usage summary from agent_analytics (source of truth)."""
+    from sqlalchemy import text as _text
+    from datetime import datetime, timedelta, timezone
+    from app.utils.dates import enforce_temporal_cap
+    billing_start, _ = _billing_period()
+    
+    # Zenith Pillar 4: Resilience Wall - Cap analytical scans to 90 days
+    # Transform date to datetime for the cap function, then back to date
+    billing_start_dt = datetime.combine(billing_start, datetime.min.time(), tzinfo=timezone.utc)
+    capped_start_dt = enforce_temporal_cap(billing_start_dt, max_days=90)
+    billing_start = capped_start_dt.date()
+
+    try:
+        res = await db.execute(
+            _text("""
+                SELECT COALESCE(SUM(total_sessions), 0)    AS sessions,
+                       COALESCE(SUM(total_messages), 0)    AS messages,
+                       COALESCE(SUM(total_chat_units), 0)  AS chats,
+                       COALESCE(SUM(total_tokens_used), 0) AS tokens,
+                       COALESCE(SUM(total_voice_minutes), 0.0) AS voice_minutes
+                FROM agent_analytics
+                WHERE tenant_id = :tenant_id AND date >= :start_date
+            """),
+            {"tenant_id": tenant_id, "start_date": billing_start},
+        )
+        ar = res.one()
+        return {
+            "sessions": int(ar.sessions or 0),
+            "messages": int(ar.messages or 0),
+            "chats": int(ar.chats or 0),
+            "tokens": int(ar.tokens or 0),
+            "voice_minutes": float(ar.voice_minutes or 0.0),
+        }
+    except Exception as e:
+        logger.warning("usage_summary_db_failed", tenant_id=str(tenant_id), error=str(e))
+        return {
+            "sessions": 0,
+            "messages": 0,
+            "chats": 0,
+            "tokens": 0,
+            "voice_minutes": 0.0,
+        }
 
 
 def _calc_overage(plan: dict, chats: int, voice_minutes: float) -> float:
@@ -225,44 +309,45 @@ async def billing_overview(
     )
     usage_row = usage_result.scalar_one_or_none()
     agent_count = usage_row.agent_count if usage_row else 0
-
-    # TenantUsage.current_month_* counters are never written — read from
-    # agent_analytics (shared DB) for real usage figures, same as billing_agents.
-    from sqlalchemy import text as _text
-    billing_start, _ = _billing_period()
-    try:
-        analytics_res = await db.execute(
-            _text("""
-                SELECT COALESCE(SUM(total_sessions), 0)    AS sessions,
-                       COALESCE(SUM(total_messages), 0)    AS messages,
-                       COALESCE(SUM(total_chat_units), 0)  AS chats,
-                       COALESCE(SUM(total_tokens_used), 0) AS tokens,
-                       COALESCE(SUM(total_voice_minutes), 0.0) AS voice_minutes
-                FROM agent_analytics
-                WHERE tenant_id = :tenant_id AND date >= :start_date
-            """),
-            {"tenant_id": tenant_uuid, "start_date": billing_start},
-        )
-        ar = analytics_res.one()
-        sessions      = int(ar.sessions or 0)
-        messages      = int(ar.messages or 0)
-        chats         = int(ar.chats or 0)
-        tokens        = int(ar.tokens or 0)
-        voice_minutes = float(ar.voice_minutes or 0)
-    except Exception as _ae:
-        logger.warning("billing_overview_analytics_query_failed", error=str(_ae))
-        sessions, messages, chats, tokens, voice_minutes = 0, 0, 0, 0, 0.0
+    
+    # Source of Truth: Read from agent_analytics (shared DB) for real usage figures.
+    usage_data = await _get_usage_summary_db(tenant_uuid, db)
+    sessions = usage_data["sessions"]
+    messages = usage_data["messages"]
+    chats = usage_data["chats"]
+    tokens = usage_data["tokens"]
+    voice_minutes = usage_data["voice_minutes"]
 
     # Ensure agent_count reflects active state for UI consistency
     sub_status = getattr(tenant, "subscription_status", "inactive")
-    if sub_status == "active" or sub_status == "trialing":
-        # If subscription is active, ensure we show at least 1 agent if they've paid
-        if agent_count == 0:
-            agent_count = 1
     
-    # User feedback: "when agent has 2 slots it shows 0"
-    # We should trust TenantUsage.agent_count if it's > 0, otherwise fallback to 1 if active.
-    # Actually, let's also check if we can get a ground truth from the DB or similar soon.
+    # Ground Truth Reconciliation:
+    # If the user has active agents in Orchestrator, that is the floor for agent_count.
+    # We already fetched 'actual_agents' in billing_agents, let's do similar here or 
+    # use the analytics count as a proxy for active agents this month.
+    active_agent_ids_count = 0
+    try:
+        # Count distinct agents with activity in agent_analytics
+        aa_count_res = await db.execute(
+            _text("SELECT COUNT(DISTINCT agent_id) FROM agent_analytics WHERE tenant_id = :tenant_id AND date >= :start_date"),
+            {"tenant_id": tenant_uuid, "start_date": billing_start}
+        )
+        active_agent_ids_count = aa_count_res.scalar() or 0
+    except Exception:
+        pass
+
+    # Purchased slots is what they've paid for.
+    purchased_slots = agent_count 
+    
+    # If they are active, they have at least 1 slot.
+    if sub_status in ("active", "trialing") and purchased_slots == 0:
+        purchased_slots = 1
+        
+    # Total agent count shown to user is the max of purchased vs active.
+    agent_count = max(purchased_slots, active_agent_ids_count)
+    
+    # User feedback: "when agent has 2 slots it shows 0" 
+    # If we still have 0 here, it's likely a trial or legacy state.
 
     price_per_agent = plan["price_per_agent"] or 0
     base_cost = round(agent_count * price_per_agent, 2)
@@ -378,6 +463,7 @@ async def billing_agents(
             FROM agent_analytics
             WHERE tenant_id = :tenant_id AND date >= :start_date
             GROUP BY agent_id
+            ORDER BY agent_id ASC
         """)
         usage_res = await db.execute(usage_query, {"tenant_id": tenant_uuid, "start_date": start_date})
         usage_map = {str(r.agent_id): r for r in usage_res.all()}
@@ -389,18 +475,24 @@ async def billing_agents(
         purchased_slots = usage_row.agent_count if usage_row else 0
 
         # Fetch actual agents from orchestrator
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
-                headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY}
-            )
-            resp.raise_for_status()
-            actual_agents = resp.json()
+        resp = await client.get(
+            f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+            headers={"X-Tenant-ID": tenant_id, "Authorization": f"Bearer {generate_internal_token()}"}
+        )
+        resp.raise_for_status()
+        actual_agents = resp.json()
 
         # If tenant has an active subscription but no usage recorded yet, default slots to 1 for display
         sub_status = getattr(tenant, "subscription_status", "inactive")
         if purchased_slots == 0 and tenant and sub_status == "active":
             purchased_slots = 1
+
+        # B22 FIX: Pre-fetch usage summary once to avoid N+1 queries in the loop below
+        usage_summary = await _get_usage_summary_db(tenant_uuid, db)
+        total_tenant_chats = usage_summary["chats"] + int(usage_summary["voice_minutes"] * 100)
+        included_chat_equivalents = plan["chat_equivalents_included"] or 0
+        tenant_overage_units = max(0, total_tenant_chats - included_chat_equivalents)
+        overage_per_unit = plan["overage_per_chat_equivalent"]
 
         # We display the actual agents first, then empty slots
         results = []
@@ -411,8 +503,13 @@ async def billing_agents(
             chats = int(a_usage.chats) if a_usage else 0
             voice_minutes = float(a_usage.voice_minutes) if a_usage else 0.0
             
-            # Simple overage logic per agent for display (pro-rata estimated)
-            # Actually, overage is usually calculated at tenant level, but we can show "contribution"
+            # Per-agent overage allocation:
+            agent_chats_total = chats + int(voice_minutes * 100)
+            chat_share_ratio = agent_chats_total / max(1, total_tenant_chats)
+            
+            agent_overage_share = round(chat_share_ratio * tenant_overage_units, 1)
+            agent_overage_cost_share = round(agent_overage_share * overage_per_unit, 2)
+
             results.append({
                 "agent_id": agent["id"],
                 "agent_name": agent["name"],
@@ -422,12 +519,12 @@ async def billing_agents(
                 "tokens": 0,
                 "voice_minutes": round(voice_minutes, 2),
                 "base_cost": price_per_agent,
+                "overage": agent_overage_cost_share,
+                "overage_units": agent_overage_share,
                 "status": "active" if agent.get("is_active") else "inactive",
-                "overage": 0.0, # Tenant-level usually, but can be split if needed
-                "total_cost": price_per_agent,
+                "total_cost": round(price_per_agent + agent_overage_cost_share, 2),
             })
 
-        # Fill in remaining slots
         while len(results) < purchased_slots:
             results.append({
                 "agent_id": None,
@@ -443,7 +540,8 @@ async def billing_agents(
                 "total_cost": price_per_agent,
             })
 
-        return results
+        from app.utils.pii import mask_pii
+        return mask_pii(results, deep=False)
     except Exception as exc:
         logger.warning("billing_agents_error", error=str(exc))
         # Fallback if orchestrator or analytics query fails
@@ -479,6 +577,9 @@ async def create_checkout_session(
     """Create Stripe checkout session for subscription."""
     tenant_uuid = uuid.UUID(tenant_id)
 
+    # Zenith Pillar 4: Resilience Wall - Rate throttle high-risk points
+    await _check_billing_rate_limit(request, "checkout", limit=5, window=60)
+
     from app.models.tenant import Tenant
 
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
@@ -486,8 +587,17 @@ async def create_checkout_session(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    plan = body.plan
+    billing_cycle = body.billing_cycle
     plan_data = await _get_plan(plan, db)
+    
     price = plan_data.get("price_per_agent")
+    interval = "month"
+    
+    if billing_cycle == "yearly":
+        price = plan_data.get("price_per_agent_yearly")
+        interval = "year"
+        
     if not price:
         raise HTTPException(status_code=400, detail="Invalid plan or price not available")
 
@@ -500,16 +610,18 @@ async def create_checkout_session(
     frontend_base = _origin.rstrip("/") if _origin else settings.FRONTEND_URL
 
     try:
-        checkout_session = stripe.checkout.Session.create(
+        checkout_session = await _asyncio.to_thread(
+            stripe.checkout.Session.create,
             payment_method_types=["card"],
             line_items=[
                 {
                     "price_data": {
                         "currency": "usd",
                         "unit_amount": int(price * 100),
-                        "recurring": {"interval": "month"},
+                        "recurring": {"interval": interval},
                         "product_data": {
                             "name": f"AscenAI {plan_data['display_name']} Plan",
+                            "description": f"{plan_data['display_name']} - {billing_cycle.capitalize()} billing",
                         },
                     },
                     "quantity": 1,
@@ -522,11 +634,39 @@ async def create_checkout_session(
             metadata={
                 "tenant_id": str(tenant.id),
                 "plan": plan,
+                "billing_cycle": billing_cycle,
             },
+            subscription_data={
+                "metadata": {
+                    "tenant_id": str(tenant.id),
+                    "plan": plan,
+                    "billing_cycle": billing_cycle,
+                }
+            }
+        )
+
+        # Zenith Pillar 1: Audit every billing financial mutation
+        from app.services.audit_service import AuditService
+        await AuditService().audit_log(
+            db=db, request=request,
+            action="billing.checkout_session.created",
+            category="billing",
+            resource_type="checkout_session",
+            resource_id=checkout_session.id,
+            status="success",
+            details={"plan": plan, "billing_cycle": billing_cycle},
+        )
+
+        logger.info(
+            "checkout_session_created",
+            tenant_id=tenant_id,
+            plan=plan,
+            billing_cycle=billing_cycle,
+            session_id=checkout_session.id,
         )
         return {"checkout_url": checkout_session.url, "session_id": checkout_session.id}
     except stripe.error.StripeError as e:
-        logger.warning("stripe_checkout_error", error=str(e))
+        logger.warning("stripe_checkout_error", error=str(e), tenant_id=tenant_id)
         raise HTTPException(status_code=500, detail="Failed to create checkout session")
 
 
@@ -570,12 +710,15 @@ async def create_agent_slot_session(
     # If agent_config is provided, create a pending purchase record
     pending_id = None
     if agent_config:
+        from app.core.pii import redact_pii
+        scrubbed_config = redact_pii(agent_config)
+        
         # Phase 2: Use stripe_session_id for idempotency — but we don't have it yet
         # at checkout-creation time. We store a pending record and will set the
         # stripe_session_id on the PendingAgentPurchase when the webhook fires.
         pending = PendingAgentPurchase(
             tenant_id=tenant_uuid,
-            config=agent_config,
+            config=scrubbed_config,
         )
         db.add(pending)
         await db.commit()
@@ -633,6 +776,13 @@ async def create_agent_slot_session(
                 "action": "add_agent_slot",
                 "pending_agent_purchase_id": pending_id or "",
             },
+            "subscription_data": {
+                "metadata": {
+                    "tenant_id": str(tenant.id),
+                    "action": "add_agent_slot",
+                    "pending_agent_purchase_id": pending_id or "",
+                }
+            }
         }
         if tenant.stripe_customer_id:
             kwargs["customer"] = tenant.stripe_customer_id
@@ -748,8 +898,15 @@ async def create_reactivation_session(
         ],
     }
 
+    kwargs["subscription_data"] = {
+        "metadata": {
+            "tenant_id": str(tenant.id),
+            "action": "reactivate_agent",
+            "agent_id": payload.agent_id,
+        }
+    }
     if trial_end:
-        kwargs["subscription_data"] = {"trial_end": trial_end}
+        kwargs["subscription_data"]["trial_end"] = trial_end
 
     if tenant.stripe_customer_id:
         kwargs["customer"] = tenant.stripe_customer_id
@@ -773,10 +930,14 @@ async def create_reactivation_session(
 
 @router.post("/portal-session")
 async def create_portal_session(
+    request: Request,
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
     """Create a Stripe customer portal session for managing billing."""
+    # Zenith Pillar 4: Resilience Wall - Rate throttle high-risk points
+    await _check_billing_rate_limit(request, "portal_session", limit=5, window=60)
+
     tenant_uuid = uuid.UUID(tenant_id)
     
     from app.models.tenant import Tenant
@@ -796,6 +957,89 @@ async def create_portal_session(
         return_url=settings.FRONTEND_URL + "/dashboard/billing",
     )
     return {"portal_url": session.url}
+
+
+@router.post("/cancel")
+async def cancel_subscription(
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """
+    Cancel the tenant's active Stripe subscription at period end.
+    Zenith Pillars: 1 (audit), 4 (rate-limit), 5 (stealth), 11 (idempotency).
+    """
+    await _check_billing_rate_limit(request, "cancel", limit=3, window=300)
+
+    import asyncio as _asyncio, stripe as _stripe
+    _stripe.api_key = settings.STRIPE_SECRET_KEY
+
+    from app.models.tenant import Tenant
+    from app.services.audit_service import AuditService
+
+    tenant_uuid = uuid.UUID(tenant_id)
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not tenant.subscription_id:
+        raise HTTPException(status_code=422, detail="No active subscription to cancel")
+
+    try:
+        # Cancel at period end — tenants retain access until billing cycle ends
+        await _asyncio.to_thread(
+            _stripe.Subscription.modify,
+            tenant.subscription_id,
+            cancel_at_period_end=True,
+        )
+    except _stripe.error.StripeError as exc:
+        logger.error("subscription_cancel_stripe_error", tenant_id=tenant_id, error=str(exc))
+        raise HTTPException(status_code=502, detail="Failed to schedule subscription cancellation")
+
+    # Persist intent — webhook will finalize status
+    tenant.subscription_status = "cancelling"
+    await db.commit()
+
+    await AuditService().audit_log(
+        db=db, request=request,
+        action="billing.subscription.cancel_requested",
+        category="billing",
+        resource_type="subscription",
+        resource_id=tenant.subscription_id,
+        status="success",
+        details={"tenant_id": tenant_id},
+    )
+
+    logger.info("subscription_cancellation_scheduled", tenant_id=tenant_id, sub_id=tenant.subscription_id)
+    return {"status": "cancellation_scheduled", "message": "Subscription will end at the current billing period."}
+
+
+@router.post("/voice-addon")
+async def toggle_voice_addon(
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """
+    Stub endpoint for future voice add-on toggling.
+    Currently returns 501 with a clear upgrade path message.
+    Pillar 8: No backend feature should silently 404 when the UI calls it.
+    """
+    from app.services.audit_service import AuditService
+    await AuditService().audit_log(
+        db=db, request=request,
+        action="billing.voice_addon.toggle_attempted",
+        category="billing",
+        resource_type="addon",
+        resource_id=tenant_id,
+        status="rejected",
+        details={"reason": "voice_addon_management_via_stripe_portal"},
+    )
+    raise HTTPException(
+        status_code=501,
+        detail="Voice add-on management is handled via the Stripe Customer Portal. "
+               "Please click 'Manage Billing in Stripe' to update your voice add-on.",
+    )
 
 
 @router.get("/invoices")
@@ -844,136 +1088,250 @@ async def sync_subscription(
     tenant_id: str = Depends(get_current_tenant),
 ):
     """
-    Sync subscription status with Stripe.
-    - Validates the tenant's subscription with Stripe.
-    - Activates any inactive agents that already have a stripe_subscription_id
-      (self-healing for cases where the initial webhook failed to propagate).
-    """
-    import stripe
-    from datetime import datetime, timezone, timedelta
+    Deep-Sync: reconcile local agent/subscription state against Stripe.
 
-    stripe.api_key = settings.STRIPE_SECRET_KEY
+    Flow:
+    1. Load tenant from DB. If subscription_id is missing, query Stripe by
+       stripe_customer_id to find all active subscriptions (DB-wipe recovery).
+    2. For each active Stripe subscription, read `agent_id` from its metadata.
+       - If an `agent_id` is present, activate that specific agent.
+       - If not, find the first inactive PENDING_PAYMENT agent and activate it.
+    3. Update tenant.subscription_status and subscription_id in the DB.
+    4. Return a summary: {"status", "agents_activated", "agents_skipped"}.
+    """
+    import asyncio as _asyncio
+    import stripe as _stripe
+    from datetime import datetime, timezone, timedelta
+    from app.models.tenant import Tenant
+
+    _stripe.api_key = settings.STRIPE_SECRET_KEY
 
     tenant_uuid = uuid.UUID(tenant_id)
-
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    if not tenant.subscription_id:
-        return {"status": "no_subscription", "message": "No subscription found"}
+    if not tenant.stripe_customer_id:
+        return {
+            "status": "no_customer",
+            "message": "No Stripe customer linked to this account. Please make a payment first.",
+        }
 
     try:
-        stripe_sub = stripe.Subscription.retrieve(tenant.subscription_id)
-        is_active = stripe_sub.status in ("active", "trialing")
+        # --- Step 1: Gather all active Stripe subscriptions for this customer ---
+        subs_response = await _asyncio.to_thread(
+            _stripe.Subscription.list,
+            customer=tenant.stripe_customer_id,
+            status="active",
+            limit=50,
+        )
+        active_subs = subs_response.get("data", [])
 
-        if is_active:
-            tenant.subscription_status = "active"
-            tenant.is_active = True
-            await db.commit()
-            logger.info("subscription_synced_active", tenant_id=tenant_id)
+        # Also check trialing subs
+        trial_subs_response = await _asyncio.to_thread(
+            _stripe.Subscription.list,
+            customer=tenant.stripe_customer_id,
+            status="trialing",
+            limit=50,
+        )
+        active_subs += trial_subs_response.get("data", [])
 
-            # --- Agent self-healing: re-activate any agent that still shows as
-            # inactive/payment-required despite the subscription being active.
-            agents_activated = 0
-            agents_skipped = 0
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    # Fetch ALL agents (active + inactive) from the orchestrator
-                    list_resp = await client.get(
-                        f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
-                        params={"status": "all"},
-                        headers={
-                            "X-Tenant-ID": tenant_id,
-                            "X-Internal-Key": settings.INTERNAL_API_KEY,
-                        },
-                    )
-                    if list_resp.status_code == 200:
-                        agents = list_resp.json()
+        if not active_subs:
+            return {
+                "status": "no_active_subscription",
+                "message": "No active subscriptions found in Stripe for this account. Please verify your payment.",
+            }
 
-                        # Calculate expiry from Stripe subscription period
-                        expires_at = None
-                        if stripe_sub.current_period_end:
-                            expires_at = datetime.fromtimestamp(
-                                stripe_sub.current_period_end, tz=timezone.utc
-                            ).isoformat()
-                        else:
-                            expires_at = (
-                                datetime.now(timezone.utc) + timedelta(days=30)
-                            ).isoformat()
+        # --- Step 2: Update tenant subscription status ---
+        # Use the most recent subscription as the primary one
+        primary_sub = active_subs[0]
+        tenant.subscription_status = "active"
+        tenant.is_active = True
+        if not tenant.subscription_id:
+            tenant.subscription_id = primary_sub.id
+        await db.commit()
+        logger.info(
+            "deep_sync_tenant_updated",
+            tenant_id=tenant_id,
+            subscription_count=len(active_subs),
+        )
 
-                        for agent in agents:
-                            agent_is_active = agent.get("is_active", False)
-                            agent_sub_id = agent.get("stripe_subscription_id")
+        # --- Step 3: Fetch all agents from orchestrator ---
+        agents_activated = 0
+        agents_skipped = 0
 
-                            # Activate the agent if:
-                            #   (a) it already has a subscription ID (was paid, webhook partially failed), OR
-                            #   (b) the tenant subscription is active and agent is inactive
-                            #       (covers plans where subscription is per-tenant not per-agent)
-                            needs_activation = not agent_is_active and (
-                                agent_sub_id is not None or
-                                agent.get("deleted_at") is None  # not archived
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            int_headers = {
+                "X-Tenant-ID": tenant_id,
+                "Authorization": f"Bearer {generate_internal_token()}",
+            }
+
+            list_resp = await client.get(
+                f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+                params={"status": "all"},
+                headers=int_headers,
+            )
+            if list_resp.status_code != 200:
+                logger.warning(
+                    "deep_sync_agent_list_failed",
+                    status=list_resp.status_code,
+                    tenant_id=tenant_id,
+                )
+                return {
+                    "status": "partial",
+                    "message": "Subscription synced but could not reach agent service.",
+                    "subscription_status": "active",
+                }
+
+            all_agents = list_resp.json()
+            agents_by_id = {a["id"]: a for a in all_agents}
+
+            # --- Step 4: For each Stripe subscription, resolve + activate agent ---
+            for sub in active_subs:
+                sub_meta = sub.get("metadata", {})
+                linked_agent_id = sub_meta.get("agent_id")
+                sub_id = sub.id
+
+                # Calculate expiry from Stripe billing period
+                expires_at = None
+                if sub.get("current_period_end"):
+                    expires_at = datetime.fromtimestamp(
+                        sub["current_period_end"], tz=timezone.utc
+                    ).isoformat()
+                else:
+                    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+                if linked_agent_id and linked_agent_id in agents_by_id:
+                    agent = agents_by_id[linked_agent_id]
+                    if not agent.get("is_active"):
+                        # Activate this specific agent via its dedicated endpoint
+                        activate_resp = await client.post(
+                            f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{linked_agent_id}/activate",
+                            json={
+                                "stripe_subscription_id": sub_id,
+                                "expires_at": expires_at,
+                            },
+                            headers=int_headers,
+                        )
+                        if activate_resp.status_code == 200:
+                            agents_activated += 1
+                            logger.info(
+                                "deep_sync_agent_activated_by_metadata",
+                                agent_id=linked_agent_id,
+                                sub_id=sub_id,
                             )
-
-                            if needs_activation:
-                                sub_id_to_set = agent_sub_id or tenant.subscription_id
-                                patch_resp = await client.patch(
-                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent['id']}",
-                                    json={
-                                        "is_active": True,
-                                        "stripe_subscription_id": sub_id_to_set,
-                                        "expires_at": expires_at,
-                                    },
-                                    headers={
-                                        "X-Tenant-ID": tenant_id,
-                                        "X-Internal-Key": settings.INTERNAL_API_KEY,
-                                    },
-                                )
-                                if patch_resp.status_code == 200:
-                                    agents_activated += 1
-                                    logger.info(
-                                        "agent_self_healed_on_sync",
-                                        agent_id=agent["id"],
-                                        tenant_id=tenant_id,
-                                        sub_id=sub_id_to_set,
-                                    )
-                                else:
-                                    agents_skipped += 1
-                                    logger.warning(
-                                        "agent_self_heal_failed",
-                                        agent_id=agent["id"],
-                                        status=patch_resp.status_code,
-                                        body=patch_resp.text[:200],
-                                    )
+                        else:
+                            agents_skipped += 1
+                            logger.warning(
+                                "deep_sync_agent_activate_failed",
+                                agent_id=linked_agent_id,
+                                status=activate_resp.status_code,
+                                body=activate_resp.text[:200],
+                            )
                     else:
-                        logger.warning(
-                            "sync_subscription_agent_list_failed",
-                            status=list_resp.status_code,
+                        # Agent already active but ensure subscription link is current
+                        await client.patch(
+                            f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{linked_agent_id}",
+                            json={"stripe_subscription_id": sub_id, "expires_at": expires_at},
+                            headers=int_headers,
+                        )
+                        logger.info("deep_sync_agent_subscription_refreshed", agent_id=linked_agent_id)
+                else:
+                    # No agent_id in metadata — find first PENDING_PAYMENT agent to link
+                    unlinked = [
+                        a for a in all_agents
+                        if not a.get("is_active")
+                        and a.get("status") in ("PENDING_PAYMENT", "DRAFT")
+                        and a.get("deleted_at") is None
+                        and not a.get("stripe_subscription_id")
+                    ]
+                    if unlinked:
+                        target = unlinked[0]
+                        activate_resp = await client.post(
+                            f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{target['id']}/activate",
+                            json={
+                                "stripe_subscription_id": sub_id,
+                                "expires_at": expires_at,
+                            },
+                            headers=int_headers,
+                        )
+                        if activate_resp.status_code == 200:
+                            agents_activated += 1
+                            # Back-fill agent_id into Stripe metadata for future syncs
+                            try:
+                                # B12 FIX: Stripe SDK is synchronous
+                                await _asyncio.to_thread(
+                                    _stripe.Subscription.modify,
+                                    sub_id,
+                                    metadata={"agent_id": target["id"], "tenant_id": tenant_id},
+                                )
+                                logger.info(
+                                    "deep_sync_stripe_metadata_backfilled",
+                                    agent_id=target["id"],
+                                    sub_id=sub_id,
+                                )
+                            except Exception as meta_err:
+                                logger.warning(
+                                    "deep_sync_stripe_metadata_backfill_failed",
+                                    error=str(meta_err),
+                                )
+                        else:
+                            agents_skipped += 1
+                    else:
+                        logger.info(
+                            "deep_sync_no_pending_agent_for_sub",
+                            sub_id=sub_id,
                             tenant_id=tenant_id,
                         )
-            except Exception as heal_err:
-                logger.error("agent_self_heal_error", error=str(heal_err), tenant_id=tenant_id)
 
-            return {
-                "status": "active",
-                "subscription_status": tenant.subscription_status,
-                "agents_activated": agents_activated,
-                "agents_skipped": agents_skipped,
-            }
-        else:
-            tenant.subscription_status = stripe_sub.status
-            await db.commit()
-            logger.info("subscription_synced_inactive", tenant_id=tenant_id, status=stripe_sub.status)
+        return {
+            "status": "active",
+            "subscription_status": "active",
+            "subscriptions_found": len(active_subs),
+            "agents_activated": agents_activated,
+            "agents_skipped": agents_skipped,
+        }
 
-            return {
-                "status": "inactive",
-                "subscription_status": tenant.subscription_status,
-            }
+    except _stripe.error.StripeError as e:
+        logger.error("deep_sync_stripe_error", tenant_id=tenant_id, error=str(e))
 
-    except stripe.error.StripeError as e:
-        logger.error("subscription_sync_failed", tenant_id=tenant_id, error=str(e))
         raise HTTPException(status_code=502, detail=f"Failed to sync with Stripe: {str(e)}")
+
+
+@router.post("/admin/sync-usage")
+async def admin_sync_usage(
+    request: Request,
+    tenant_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    SRE Endpoint: Sync Redis usage counters to PostgreSQL.
+    Requires X-Internal-Key.
+    """
+    if request.headers.get("X-Internal-Key") != settings.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Internal key required")
+
+    from app.services.billing_service import BillingService
+    
+    if tenant_id:
+        # Sync specific tenant
+        svc = BillingService(db)
+        success = await svc.sync_usage_to_db(tenant_id)
+        return {"success": success, "tenant_id": tenant_id}
+    else:
+        # Sync all tenants in TenantUsage
+        from app.models.tenant import TenantUsage
+        result = await db.execute(select(TenantUsage.tenant_id))
+        tenant_ids = [str(tid) for tid in result.scalars().all()]
+        
+        results = []
+        for tid in tenant_ids:
+            svc = BillingService(db)
+            success = await svc.sync_usage_to_db(tid)
+            results.append({"tenant_id": tid, "success": success})
+            
+        return {"processed": len(results), "details": results}
 
 
 @router.post("/webhook", status_code=200, include_in_schema=False)
@@ -1009,19 +1367,15 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
     logger.info("billing_webhook_received", event_type=event_type, event_id=event_id)
 
     # Phase 2: Defence-in-depth idempotency (Redis primary + DB fallback).
-    # Both the duplicate-check AND mark_processed run in the webhook's outer
-    # transaction so they are atomic with the business logic below.
+    # We acquire a temporary lock (5 min TTL) to prevent concurrent identical webhooks
+    # from executing simultaneously, while still allowing a retry if this container crashes.
     idempotency_svc = None
     if event_id:
         redis = getattr(request.app.state, "redis", None)
         idempotency_svc = IdempotencyService(db=db, redis=redis)
-        if await idempotency_svc.is_already_processed("stripe_event", event_id):
+        if not await idempotency_svc.check_and_acquire_lock("stripe_event", event_id):
             logger.info("billing_webhook_duplicate_skipped", event_id=event_id)
             return {"received": True}
-        # Mark processed now — business logic below must be idempotent itself
-        # as a last line of defence, but we record intent early so a crash
-        # mid-flight is treated as processed on the next retry.
-        await idempotency_svc.mark_processed("stripe_event", event_id)
 
     if event_type == "checkout.session.completed":
         session = event.get("data", {}).get("object", {})
@@ -1044,7 +1398,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                         if plan:
                             tenant.plan = plan
                             tenant.plan_limits = await get_plan_limits(plan, db)
-                    # Mark idempotency key inside same transaction for atomicity
+                    
                     logger.info("tenant_subscription_activated", tenant_id=tenant_id, plan=plan)
 
                 # FLOW 1: Activate specific agent if metadata contains agent_id
@@ -1062,7 +1416,8 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     expires_at = None
                     if subscription_id:
                         try:
-                            stripe_sub = stripe.Subscription.retrieve(subscription_id)
+                            # B12 FIX: Stripe SDK is synchronous
+                            stripe_sub = await _asyncio.to_thread(stripe.Subscription.retrieve, subscription_id)
                             if stripe_sub.current_period_end:
                                 expires_at = datetime.fromtimestamp(
                                     stripe_sub.current_period_end, tz=timezone.utc
@@ -1076,10 +1431,9 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     try:
                         async with httpx.AsyncClient() as client:
                             headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner", "X-Internal-Key": settings.INTERNAL_API_KEY}
-                            activate_res = await client.patch(
-                                f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}",
+                            activate_res = await client.post(
+                                f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}/activate",
                                 json={
-                                    "is_active": True,
                                     "stripe_subscription_id": subscription_id,
                                     "expires_at": expires_at.isoformat() if expires_at else None
                                 },
@@ -1089,18 +1443,48 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                             if activate_res.status_code == 200:
                                 logger.info("agent_activated_successfully", agent_id=agent_id,
                                             expires_at=expires_at, reactivation=is_reactivation)
+                                
+                                # B4 FIX: Automatic template instantiation after payment
+                                agent_data = activate_res.json()
+                                config = agent_data.get("agent_config", {})
+                                template_ctx = config.get("template_context")
+                                
+                                if template_ctx and not is_reactivation:
+                                    template_id = template_ctx.get("template_id")
+                                    if template_id:
+                                        instantiate_url = f"{settings.AI_ORCHESTRATOR_URL}/api/v1/templates/{template_id}/instantiate"
+                                        instantiate_payload = {
+                                            "agent_id": agent_id,
+                                            "template_version_id": template_ctx.get("template_version_id"),
+                                            "variable_values": template_ctx.get("variable_values", {}),
+                                            "tool_configs": template_ctx.get("tool_configs", {}),
+                                        }
+                                        try:
+                                            # Use the same headers (internal key + tenant id)
+                                            inst_resp = await client.post(instantiate_url, json=instantiate_payload, headers=headers, timeout=20.0)
+                                            if inst_resp.status_code == 200:
+                                                logger.info("webhook_auto_instantiation_success", agent_id=agent_id, template_id=template_id)
+                                                # Cleanup: Remove template_context from agent_config now that it's applied
+                                                new_config = {k: v for k, v in config.items() if k != "template_context"}
+                                                await client.patch(
+                                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}",
+                                                    json={"agent_config": new_config},
+                                                    headers=headers,
+                                                    timeout=5.0
+                                                )
+                                            else:
+                                                logger.warning("webhook_auto_instantiation_failed", agent_id=agent_id, status=inst_resp.status_code)
+                                        except Exception as inst_err:
+                                            logger.error("webhook_auto_instantiation_error", agent_id=agent_id, error=str(inst_err))
 
-                                # Only bump agent_count for NEW slots, not reactivations
-                                # (the slot was already counted when the agent was first created)
-                                if not is_reactivation:
-                                    slot_delta = 1
-                                    slot_accounted = True
+                                slot_delta = 1
+                                slot_accounted = True
                             else:
                                 logger.error("agent_activation_failed_upstream", agent_id=agent_id, status=activate_res.status_code)
-                                # Failsafe: Agent missing or errored -> Issue refund/cancel to prevent unauthorized charge
+                                # B12 FIX: Stripe SDK is synchronous
                                 if subscription_id:
                                     try:
-                                        stripe.Subscription.delete(subscription_id)
+                                        await _asyncio.to_thread(stripe.Subscription.delete, subscription_id)
                                         logger.info("stripe_subscription_cancelled_failsafe", subscription_id=subscription_id)
                                     except Exception as sub_e:
                                         logger.error("stripe_subscription_cancel_failed", error=str(sub_e))
@@ -1108,7 +1492,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 payment_intent = session.get("payment_intent")
                                 if payment_intent:
                                     try:
-                                        stripe.Refund.create(payment_intent=payment_intent)
+                                        await _asyncio.to_thread(stripe.Refund.create, payment_intent=payment_intent)
                                         logger.info("stripe_payment_refunded_failsafe", payment_intent=payment_intent)
                                     except Exception as ref_e:
                                         logger.error("stripe_refund_failed", error=str(ref_e))
@@ -1126,7 +1510,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                         logger.info("creating_agent_from_pending_purchase", tenant_id=tenant_id, pending_id=pending_purchase_id)
                         try:
                             async with httpx.AsyncClient() as client:
-                                headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner", "X-Internal-Key": settings.INTERNAL_API_KEY}
+                                headers = {"X-Tenant-ID": tenant_id, "X-User-Role": "owner", "Authorization": f"Bearer {generate_internal_token()}"}
                                 create_res = await client.post(
                                     f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/",
                                     json={**pending.config, "is_active": True, "stripe_subscription_id": session.get("subscription")},
@@ -1150,16 +1534,26 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                         slot_accounted = True
 
                 if tenant and slot_delta:
+                    # Atomic update to avoid race conditions with concurrent webhooks
+                    from sqlalchemy import text as _raw_text
                     await db.execute(
-                        _sa_update(TenantUsage)
-                        .where(TenantUsage.tenant_id == tenant.id)
-                        .values(agent_count=func.greatest(0, TenantUsage.agent_count + slot_delta))
+                        _raw_text("""
+                            UPDATE tenant_usage 
+                            SET agent_count = GREATEST(0, agent_count + :delta),
+                                updated_at = NOW()
+                            WHERE tenant_id = :tenant_id
+                        """),
+                        {"delta": slot_delta, "tenant_id": tenant.id}
                     )
                     await db.commit()
-                    logger.info("agent_slot_accounted", tenant_id=tenant_id, slot_delta=slot_delta)
+                    logger.info("agent_slot_accounted_atomically", tenant_id=tenant_id, slot_delta=slot_delta)
+                    
+                if idempotency_svc:
+                    await idempotency_svc.mark_processed("stripe_event", event_id)
 
             except Exception as e:
                 logger.error("billing_webhook_checkout_error", error=str(e), tenant_id=tenant_id)
+                raise HTTPException(status_code=500, detail="Checkout processing incomplete. Will rely on Stripe retry.")
 
     elif event_type == "customer.subscription.deleted":
         # Subscription cancelled externally (non-payment, admin action, or API call).
@@ -1176,17 +1570,19 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
                         f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
-                        headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
+                        headers={
+                            "X-Tenant-ID": tenant_id,
+                            "Authorization": f"Bearer {generate_internal_token()}"
+                        },
                     )
                     if resp.status_code == 200:
                         agents = resp.json()
                         for ag in agents:
                             if ag.get("stripe_subscription_id") == sub_id:
                                 # Deactivate agent
-                                await client.patch(
-                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{ag['id']}",
-                                    json={"is_active": False, "stripe_subscription_id": None},
-                                    headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
+                                await client.post(
+                                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{ag['id']}/archive",
+                                    headers={"X-Tenant-ID": tenant_id, "Authorization": f"Bearer {generate_internal_token()}"},
                                     timeout=10.0,
                                 )
                                 logger.info(
@@ -1198,11 +1594,16 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 break
 
                 # Atomic decrement (floor at 0) — avoids race on concurrent cancellation webhooks
+                from sqlalchemy import text as _raw_text
                 t_uuid = _uuid.UUID(tenant_id)
                 await db.execute(
-                    _sa_update(TenantUsage)
-                    .where(TenantUsage.tenant_id == t_uuid)
-                    .values(agent_count=func.greatest(0, TenantUsage.agent_count - 1))
+                    _raw_text("""
+                        UPDATE tenant_usage 
+                        SET agent_count = GREATEST(0, agent_count - 1),
+                            updated_at = NOW()
+                        WHERE tenant_id = :tenant_id
+                    """),
+                    {"tenant_id": t_uuid}
                 )
 
                 # Update tenant subscription status
@@ -1215,6 +1616,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 logger.info("subscription_deleted_processed", subscription_id=sub_id, tenant_id=tenant_id)
             except Exception as e:
                 logger.error("subscription_deleted_webhook_error", error=str(e), subscription_id=sub_id)
+                raise HTTPException(status_code=500, detail="Failed to process subscription deletion")
 
     elif event_type in ("customer.subscription.created", "customer.subscription.updated"):
         subscription = event.get("data", {}).get("object", {})
@@ -1248,6 +1650,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     logger.info("billing_webhook_subscription_updated", tenant_id=tenant_id, status=status)
             except Exception as e:
                 logger.error("billing_webhook_subscription_error", error=str(e), tenant_id=tenant_id)
+                raise HTTPException(status_code=500, detail="Failed to process subscription update")
 
     elif event_type == "invoice.paid":
         invoice = event.get("data", {}).get("object", {})
@@ -1273,5 +1676,90 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     logger.info("billing_webhook_invoice_paid", customer_id=customer_id)
             except Exception as e:
                 logger.error("billing_webhook_invoice_paid_error", error=str(e), customer_id=customer_id)
+                raise HTTPException(status_code=500, detail="Failed to process invoice payment")
+
+    if idempotency_svc and event_id:
+        # Mark processed now (upgrade temporary lock -> permanent tombstone)
+        # This is executed inside the DB session, so if the webhook crashes here,
+        # the entire business logic un-rolls and the temporary lock eventually expires,
+        # allowing Stripe to safely retry.
+        await idempotency_svc.mark_processed("stripe_event", event_id)
 
     return {"received": True}
+
+@router.post("/internal/report-overage")
+async def report_overage(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint called by ai-orchestrator to report potential overage usage.
+    Triggers Stripe InvoiceItem creation for pending overages.
+    """
+    # 1. Verify internal key (Zenith Pillar 3: Zero-Trust Perimeter)
+    import hmac
+    internal_key = request.headers.get("X-Internal-Key", "")
+    if not internal_key or not settings.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden: Missing internal key")
+    
+    if not hmac.compare_digest(internal_key.encode('utf-8'), settings.INTERNAL_API_KEY.encode('utf-8')):
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid internal key")
+
+    # 2. Extract tenant context
+    tenant_id = request.headers.get("X-Tenant-ID")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="Missing X-Tenant-ID")
+
+    # 3. Load Tenant
+    from app.models.tenant import Tenant
+    import uuid as _uuid
+    tenant_uuid = _uuid.UUID(tenant_id)
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
+    tenant = tenant_result.scalar_one_or_none()
+    
+    if not tenant or not tenant.stripe_customer_id:
+        return {"status": "skipped", "reason": "no_stripe_customer"}
+
+    # 4. Calculate overage using source of truth (including voice minutes)
+    usage = await _get_usage_summary_db(tenant_uuid, db)
+    plan = await _get_plan(tenant.plan or "growth", db)
+    
+    # B19 FIX: Must include voice minutes in overage reporting
+    chat_equivalents = usage["chats"] + int(usage["voice_minutes"] * 100)
+    included = plan["chat_equivalents_included"] or 0
+    overage_units = max(0, chat_equivalents - included)
+    
+    if overage_units <= 0:
+        return {"status": "idle", "overage_units": 0}
+
+    overage_cost = round(overage_units * plan["overage_per_chat_equivalent"], 2)
+    
+    if overage_cost < 0.50:  # Minimum Stripe charge threshold
+        return {"status": "idle", "cost": overage_cost, "reason": "below_threshold"}
+
+    # 5. Report to Stripe as an InvoiceItem
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    try:
+        import asyncio
+        start_date, _ = _billing_period()
+        month_str = start_date.strftime("%Y-%m")
+        
+        # simple idempotency key to prevent double charging for same month/amount
+        idem_key = f"overage_{tenant_id}_{month_str}_{int(overage_cost * 100)}"
+        
+        await asyncio.to_thread(
+            stripe.InvoiceItem.create,
+            customer=tenant.stripe_customer_id,
+            amount=int(overage_cost * 100),
+            currency="usd",
+            description=f"AI Usage Overage ({month_str})",
+            metadata={"units": overage_units, "tenant_id": tenant_id},
+            idempotency_key=idem_key
+        )
+        
+        logger.info("overage_reported_to_stripe", tenant_id=tenant_id, amount=overage_cost)
+        return {"status": "reported", "amount": overage_cost, "units": overage_units}
+    except stripe.error.StripeError as e:
+        logger.warning("stripe_overage_report_failed", error=str(e), tenant_id=tenant_id)
+        return {"status": "error", "detail": str(e)}

@@ -6,6 +6,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 import uuid
+import ipaddress
+
 
 from app.core.config import settings
 
@@ -38,6 +40,24 @@ def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) 
     )
     to_encode.update({"exp": expire, "type": "refresh"})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def generate_internal_token() -> str:
+    """
+    Generate a short-lived (60s) signed JWT for inter-service calls.
+    Used for authenticating from Gateway to Orchestrator/MCP.
+    """
+    payload = {
+        "sub": "internal-service-call",
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=60),
+        "iss": "api-gateway",
+    }
+    return jwt.encode(
+        payload, 
+        settings.SECRET_KEY, 
+        algorithm=settings.JWT_ALGORITHM
+    )
 
 
 def decode_access_token(token: str) -> dict:
@@ -169,3 +189,45 @@ async def get_tenant_db(
     from app.core.database import get_db
     async for session in get_db(tenant_id=tenant_id):
         yield session
+
+
+def get_client_ip(request: Request) -> str:
+    """
+    Return the real client IP, strictly validating X-Forwarded-For.
+    
+    If settings.TRUSTED_PROXY_IPS is set, we check if the immediate caller
+    is a trusted proxy. If so, we trust the client's provided IP in the chain.
+    Otherwise, we use the raw connection host to prevent spoofing.
+    """
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    trusted_proxies = getattr(settings, "TRUSTED_PROXY_IPS", [])
+
+    if forwarded_for and trusted_proxies:
+        client_host = request.client.host if request.client else None
+        if not client_host:
+            return "unknown"
+
+        # Check if caller is a trusted proxy (supports exact IP or CIDR)
+        is_trusted = False
+        try:
+            client_ip_obj = ipaddress.ip_address(client_host)
+            for trusted in trusted_proxies:
+                if "/" in trusted:
+                    if client_ip_obj in ipaddress.ip_network(trusted):
+                        is_trusted = True
+                        break
+                elif trusted == client_host:
+                    is_trusted = True
+                    break
+        except ValueError:
+            pass
+
+        if is_trusted:
+            # X-Forwarded-For: client, proxy1, proxy2
+            ips = [ip.strip() for ip in forwarded_for.split(",")]
+            if ips:
+                return ips[0]
+
+    return request.client.host if request.client else "unknown"
+
+

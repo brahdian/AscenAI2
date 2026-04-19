@@ -51,6 +51,7 @@ export default function SettingsPage() {
       consent_message: 'By chatting, you agree to our privacy policy.',
       privacy_policy_url: '',
       data_residency: 'Canada',
+      hipaa_mode: false,
     },
   })
 
@@ -64,6 +65,7 @@ export default function SettingsPage() {
         consent_message: compliance.consent_message ?? 'By chatting, you agree to our privacy policy.',
         privacy_policy_url: compliance.privacy_policy_url ?? '',
         data_residency: compliance.data_residency ?? 'Canada',
+        hipaa_mode: compliance.hipaa_mode ?? false,
       })
     }
   }, [compliance, resetCompliance])
@@ -130,17 +132,14 @@ export default function SettingsPage() {
     if (deleteConfirm !== 'DELETE') return
     setDeleting(true)
     try {
-      await complianceApi.requestErasure({
-        contact_identifier: user?.email || '',
-        reason: 'customer_request',
-      })
-      toast.success('Account deletion requested — signing you out.')
+      await tenantApi.selfDestruct()
+      toast.success('Account suspended. Data will be permanently deleted in 30 days.')
       setTimeout(() => {
         logout()
         router.push('/login')
-      }, 2000)
+      }, 3000)
     } catch {
-      toast.error('Failed to submit account deletion request')
+      toast.error('Failed to request account deletion')
       setDeleting(false)
     }
   }
@@ -236,6 +235,24 @@ export default function SettingsPage() {
           </div>
 
           <div className="pt-2 border-t border-gray-100 dark:border-gray-800">
+            <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Security & Compliance Profiles</h3>
+            <div className="flex items-center gap-3 mb-6 bg-red-50 dark:bg-red-900/10 p-4 rounded-lg border border-red-100 dark:border-red-900/30">
+              <input
+                type="checkbox"
+                id="hipaa_mode"
+                {...regCompliance('hipaa_mode')}
+                className="w-4 h-4 accent-red-600"
+              />
+              <div>
+                <label htmlFor="hipaa_mode" className="text-sm font-bold text-red-900 dark:text-red-400 block mb-0.5">
+                  Enable HIPAA Strict Mode
+                </label>
+                <p className="text-xs text-red-700 dark:text-red-500">
+                  Increases redaction sensitivity for PHI/PII. Logs and analytics will be heavily sanitized.
+                </p>
+              </div>
+            </div>
+
             <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Consent</h3>
             <div className="flex items-center gap-3 mb-4">
               <input

@@ -17,6 +17,7 @@ SKIP_PATHS = {
     "/redoc",
     "/openapi.json",
     "/metrics",
+    "/api/v1/tools/catalog",  # Public static catalog — no tenant context needed
 }
 
 
@@ -47,10 +48,20 @@ class TenantMiddleware(BaseHTTPMiddleware):
         if auth_header.startswith("Bearer "):
             token = auth_header[len("Bearer "):]
             tenant_id = extract_tenant_from_token(token)
+            
+            # Phase 13 Hardening: If this is a service-to-service call, 
+            # trust the X-Tenant-ID header.
+            if not tenant_id:
+                from app.core.security import is_internal_token
+                if is_internal_token(token):
+                    candidate_tenant = request.headers.get("X-Tenant-ID")
+                    if candidate_tenant:
+                        tenant_id = candidate_tenant
+            
             if tenant_id:
                 logger.debug("tenant_from_jwt", tenant_id=tenant_id, path=path)
 
-        # --- 2. X-Tenant-ID header (trusted internal caller only) ---
+        # --- 2. X-Tenant-ID header (Legacy Trusted internal caller) ---
         if not tenant_id:
             internal_key = request.headers.get("X-Internal-Key", "")
             candidate_tenant = request.headers.get("X-Tenant-ID")

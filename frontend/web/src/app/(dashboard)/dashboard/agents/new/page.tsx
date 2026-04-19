@@ -12,6 +12,7 @@ import {
   MessageCircle, PhoneCall, TrendingUp, MapPin,
   RefreshCw, GitBranch, BookOpen, Wrench, CheckCircle2,
   Users, Briefcase, Scale, DollarSign, Monitor,
+  ShieldCheck, AlertCircle,
 } from 'lucide-react'
 import { PlaybookMentionsEditor } from '@/components/PlaybookMentionsEditor'
 
@@ -129,7 +130,13 @@ export default function NewAgentPage() {
             }
           }
         } catch { /* stream unavailable */ }
-        // Fallback: webhook may still be in-flight
+        
+        // Fallback: webhook may still be in-flight or stream failed.
+        // Trigger an explicit sync to "self-heal" the agent state immediately.
+        try {
+          await billingApi.syncSubscription()
+        } catch { /* ignore sync failure */ }
+
         toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
         qc.invalidateQueries({ queryKey: ['agents'] })
         qc.invalidateQueries({ queryKey: ['billing-overview'] })
@@ -165,7 +172,15 @@ export default function NewAgentPage() {
           })
           .catch((err: any) => {
             const detail = err?.response?.data?.detail
-            toast.error(typeof detail === 'string' ? detail : 'Agent creation failed. Please contact support.', { id: 'post-payment' })
+            const traceId = err?.response?.data?.trace_id
+            const message = typeof detail === 'string' ? detail : 'Agent creation failed.'
+            toast.error(
+              <div className="flex flex-col gap-1">
+                <span>{message}</span>
+                {traceId && <span className="text-[10px] opacity-70 font-mono">Trace ID: {traceId}</span>}
+              </div>,
+              { id: 'post-payment' }
+            )
             router.push('/dashboard/agents')
           })
       } catch {
@@ -255,7 +270,17 @@ export default function NewAgentPage() {
       Object.entries(sourceVars).filter(([, v]) => v !== '' && v !== null && v !== undefined)
     )
     const fallbacks: Record<string, string> = {}
-    NAME_LIKE_KEYS.forEach(k => { fallbacks[k] = agentName })
+    
+    if (selectedTemplate?.variables) {
+      selectedTemplate.variables.forEach((v: any) => {
+        if (NAME_LIKE_KEYS.includes(v.key)) {
+          fallbacks[v.key] = agentName
+        }
+      })
+    } else {
+      fallbacks['agent_name'] = agentName
+    }
+
     return {
       ...fallbacks,
       ...filledVars,
@@ -321,7 +346,14 @@ export default function NewAgentPage() {
         return
       }
       const detail = err?.response?.data?.detail
-      toast.error(typeof detail === 'string' ? detail : detail?.message || 'Failed to create agent')
+      const traceId = err?.response?.data?.trace_id
+      const message = typeof detail === 'string' ? detail : detail?.message || 'Failed to create agent'
+      toast.error(
+        <div className="flex flex-col gap-1">
+          <span>{message}</span>
+          {traceId && <span className="text-[10px] opacity-70 font-mono">Trace ID: {traceId}</span>}
+        </div>
+      )
     },
   })
 
@@ -617,7 +649,7 @@ export default function NewAgentPage() {
                         </div>
                       ) : (
                         <input
-                          type={vari.type === 'number' ? 'number' : 'text'}
+                          type={vari.is_secret ? 'password' : (vari.type === 'number' ? 'number' : 'text')}
                           value={variables[vari.key] || ''}
                           onChange={(e) => setVariables(p => ({ ...p, [vari.key]: e.target.value }))}
                           className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/30 text-sm"
@@ -626,6 +658,72 @@ export default function NewAgentPage() {
                       )}
                     </div>
                   ))}
+                </div>
+              </>
+            )}
+
+            {/* Security & Compliance Preview */}
+            {selectedTemplate && (selectedTemplate.versions?.[0]?.compliance || selectedTemplate.versions?.[0]?.guardrails) && (
+              <>
+                <div className="p-6 border-y border-gray-100 dark:border-gray-800 bg-violet-50/30 dark:bg-violet-900/10">
+                  <div className="flex items-center gap-2 mb-1">
+                    <ShieldCheck className="text-violet-600 dark:text-violet-400" size={16} />
+                    <h2 className="font-semibold text-gray-900 dark:text-white text-sm">Security & Compliance</h2>
+                  </div>
+                  <p className="text-xs text-gray-500">This template includes pre-configured safeguards and compliance rules.</p>
+                </div>
+                <div className="p-6 space-y-4">
+                  {selectedTemplate.versions[0].compliance && (
+                    <div className="flex items-start gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center shrink-0">
+                        <Scale size={14} className="text-blue-600 dark:text-blue-400" />
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider">Compliance Framework</div>
+                        <div className="text-sm text-gray-600 dark:text-gray-400 mt-0.5">
+                          Built for <span className="font-semibold text-gray-900 dark:text-white">{selectedTemplate.versions[0].compliance.compliance_framework || 'General'}</span> standards.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {selectedTemplate.versions[0].guardrails && (
+                    <div className="flex items-start gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center shrink-0">
+                        <ShieldCheck size={14} className="text-emerald-600 dark:text-emerald-400" />
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider">Guardrails Enabled</div>
+                        <div className="flex flex-wrap gap-1.5 mt-1.5">
+                          {selectedTemplate.versions[0].guardrails.pii_redaction && (
+                            <span className="px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-300 text-[10px] font-medium border border-emerald-100 dark:border-emerald-800">
+                              PII Redaction
+                            </span>
+                          )}
+                          {selectedTemplate.versions[0].guardrails.blocked_keywords?.length > 0 && (
+                            <span className="px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 text-[10px] font-medium border border-amber-100 dark:border-amber-800">
+                              Keyword Filtering
+                            </span>
+                          )}
+                          <span className="px-2 py-0.5 rounded-md bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-400 text-[10px] font-medium border border-gray-200 dark:border-gray-700">
+                             + {selectedTemplate.versions[0].guardrails.content_filter_level || 'Medium'} Content Filter
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {selectedTemplate.versions[0].emergency_protocols && (
+                    <div className="flex items-start gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center shrink-0">
+                        <AlertCircle size={14} className="text-rose-600 dark:text-rose-400" />
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider">Emergency Protocols</div>
+                        <div className="text-sm text-gray-600 dark:text-gray-400 mt-0.5">
+                          Automated response scripts for high-risk scenarios.
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </>
             )}

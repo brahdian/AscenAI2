@@ -40,7 +40,19 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agent:
+async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession, request: Request | None = None) -> Agent:
+    raid = None
+    if request:
+        raid_str = request.headers.get("X-Restricted-Agent-ID")
+        if raid_str:
+            try:
+                raid = uuid.UUID(raid_str)
+            except ValueError: pass
+
+    # Apply isolation (CRIT-005)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -86,7 +98,7 @@ async def list_prompt_versions(
     db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request=request)
 
     query = select(PromptVersion).where(
         PromptVersion.agent_id == uuid.UUID(agent_id),
@@ -109,7 +121,7 @@ async def create_prompt_version(
 ):
     """Create a new immutable prompt version (inactive by default)."""
     tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, tenant_id, db, request=request)
 
     from app.core.redis_client import get_redis
     redis = await get_redis()
@@ -137,7 +149,7 @@ async def get_prompt_version(
     db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request=request)
 
     result = await db.execute(
         select(PromptVersion).where(
@@ -160,7 +172,7 @@ async def activate_prompt_version(
 ):
     """Activate a prompt version (deactivates any current active version)."""
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request=request)
 
     from app.core.redis_client import get_redis
     redis = await get_redis()
@@ -209,7 +221,7 @@ async def get_prompt_diff(
                        If omitted, compares against an empty string (shows full content as added).
     """
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request=request)
 
     from app.core.redis_client import get_redis
     redis = await get_redis()
@@ -236,7 +248,7 @@ async def list_ab_tests(
     db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request=request)
 
     result = await db.execute(
         select(PromptABTest).where(
@@ -255,7 +267,7 @@ async def create_ab_test(
     db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, tenant_id, db, request=request)
 
     test = PromptABTest(
         tenant_id=agent.tenant_id,
@@ -281,7 +293,7 @@ async def update_ab_test(
     db: AsyncSession = Depends(get_tenant_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request=request)
 
     result = await db.execute(
         select(PromptABTest).where(

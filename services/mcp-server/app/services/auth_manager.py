@@ -61,6 +61,14 @@ class AuthManager:
         if not token_url:
             raise ValueError("oauth2_cc auth requires 'token_url'")
 
+        # SSRF Guard for token_url
+        from app.services.tool_executor import _validate_tool_url, SSRFError
+        try:
+            _validate_tool_url(token_url)
+        except SSRFError as exc:
+            logger.warning("oauth2_token_url_ssrf_blocked", url=token_url)
+            raise ValueError(f"SSRF Protection: {str(exc)}")
+
         payload = {
             "grant_type": "client_credentials",
             "client_id": auth.get("client_id", ""),

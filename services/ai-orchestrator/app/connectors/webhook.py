@@ -15,6 +15,7 @@ import hmac
 import json
 import time
 import structlog
+from app.utils.security import is_safe_url
 
 from app.connectors.base import BaseConnector, ConnectorResult, EscalationPayload
 
@@ -30,12 +31,21 @@ class WebhookConnector(BaseConnector):
     def _required_config_keys(self) -> list[str]:
         return ["url"]
 
+    async def validate_credentials(self) -> tuple[bool, str]:
+        url = self.config.get("url", "").strip()
+        if not url:
+            return False, "Webhook url is required"
+        if not is_safe_url(url):
+            return False, "Webhook url is unsafe or blocked (must be public HTTPS)"
+        return True, ""
+
     async def handoff(self, payload: EscalationPayload) -> ConnectorResult:
         url = self.config.get("url", "").strip()
         if not url:
             return ConnectorResult(success=False, error="Webhook url is required")
-        if not url.startswith("https://"):
-            return ConnectorResult(success=False, error="Webhook url must use HTTPS")
+        
+        if not is_safe_url(url):
+            return ConnectorResult(success=False, error="Webhook url is unsafe or blocked (must be public HTTPS)")
 
         body = {
             "event": "escalation",

@@ -18,10 +18,15 @@ Endpoints:
 
 from __future__ import annotations
 
+import uuid
+import csv
+import io
 from typing import Optional, Any
+from datetime import datetime
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +61,36 @@ def _get_admin_service(request: Request, db: AsyncSession) -> AdminService:
     return AdminService(db, redis)
 
 
+async def _check_admin_mutation_rate_limit(request: Request):
+    """
+    Tactical rate limit for high-risk admin mutations.
+    Limit: 10 mutations per hour per super_admin.
+    """
+    redis = getattr(request.app.state, "redis", None)
+    if not redis:
+        return
+
+    admin_id = getattr(request.state, "user_id", "anonymous")
+    key = f"admin_mutation_limit:{admin_id}"
+    
+    # 10 actions per 3600 seconds
+    try:
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, 3600)
+        
+        if count > 10:
+            logger.warning("admin_mutation_rate_limit_exceeded", admin_id=admin_id)
+            raise HTTPException(
+                status_code=429, 
+                detail="Administrative mutation rate limit exceeded (10/hour). Please wait."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("admin_rate_limit_check_failed", error=str(e))
+
+
 _VALID_TENANT_STATUSES = {"", "active", "suspended", "deleted"}
 
 
@@ -75,14 +110,14 @@ async def list_tenants(
 
 @router.get("/tenants/{tenant_id}")
 async def get_tenant_details(
-    tenant_id: str,
+    tenant_id: uuid.UUID,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Get detailed tenant information."""
     _require_super_admin(request)
     service = _get_admin_service(request, db)
-    return await service.get_tenant_details(tenant_id)
+    return await service.get_tenant_details(str(tenant_id))
 
 
 class SuspendRequest(BaseModel):
@@ -91,25 +126,26 @@ class SuspendRequest(BaseModel):
 
 @router.post("/tenants/{tenant_id}/suspend")
 async def suspend_tenant(
-    tenant_id: str,
+    tenant_id: uuid.UUID,
     body: SuspendRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    _rate_limit: None = Depends(_check_admin_mutation_rate_limit),
 ):
     """Suspend a tenant."""
     from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    result = await service.suspend_tenant(tenant_id, body.reason, admin_user_id)
+    result = await service.suspend_tenant(str(tenant_id), body.reason, admin_user_id)
     await audit_log(db, "tenant.suspended", request=request, category="admin",
-                    resource_type="tenant", resource_id=tenant_id,
+                    resource_type="tenant", resource_id=str(tenant_id),
                     details={"reason": body.reason})
     return result
 
 
 @router.post("/tenants/{tenant_id}/reactivate")
 async def reactivate_tenant(
-    tenant_id: str,
+    tenant_id: uuid.UUID,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
@@ -117,26 +153,27 @@ async def reactivate_tenant(
     from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    result = await service.reactivate_tenant(tenant_id, admin_user_id)
+    result = await service.reactivate_tenant(str(tenant_id), admin_user_id)
     await audit_log(db, "tenant.reactivated", request=request, category="admin",
-                    resource_type="tenant", resource_id=tenant_id)
+                    resource_type="tenant", resource_id=str(tenant_id))
     return result
 
 
 @router.delete("/tenants/{tenant_id}")
 async def delete_tenant(
-    tenant_id: str,
+    tenant_id: uuid.UUID,
     request: Request,
     hard_delete: bool = False,
     db: AsyncSession = Depends(get_db),
+    _rate_limit: None = Depends(_check_admin_mutation_rate_limit),
 ):
     """Delete a tenant (soft or hard delete)."""
     from app.services.audit_service import audit_log
     admin_user_id = _require_super_admin(request)
     service = _get_admin_service(request, db)
-    result = await service.delete_tenant(tenant_id, admin_user_id, hard_delete)
+    result = await service.delete_tenant(str(tenant_id), admin_user_id, hard_delete)
     await audit_log(db, "tenant.deleted", request=request, category="admin",
-                    resource_type="tenant", resource_id=tenant_id,
+                    resource_type="tenant", resource_id=str(tenant_id),
                     details={"hard_delete": hard_delete})
     return result
 
@@ -149,10 +186,17 @@ async def list_users(
     per_page: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    """List users."""
-    _require_super_admin(request)
+    """List users (scoped to tenant for non-super-admins)."""
+    role = getattr(request.state, "role", "")
+    caller_tenant_id = getattr(request.state, "tenant_id", None)
+    
+    enforce_tenant_id = None
+    if role != "super_admin":
+        _require_admin(request)
+        enforce_tenant_id = caller_tenant_id
+
     service = _get_admin_service(request, db)
-    return await service.list_users(tenant_id, page, per_page)
+    return await service.list_users(tenant_id, page, per_page, enforced_tenant_id=enforce_tenant_id)
 
 
 class RoleUpdateRequest(BaseModel):
@@ -161,19 +205,33 @@ class RoleUpdateRequest(BaseModel):
 
 @router.put("/users/{user_id}/role")
 async def update_user_role(
-    user_id: str,
+    user_id: uuid.UUID,
     body: RoleUpdateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    _rate_limit: None = Depends(_check_admin_mutation_rate_limit),
 ):
     """Update a user's role."""
     from app.services.audit_service import audit_log
-    admin_user_id = _require_super_admin(request)
+    
+    role = getattr(request.state, "role", "")
+    caller_tenant_id = getattr(request.state, "tenant_id", None)
+    
+    enforce_tenant_id = None
+    if role != "super_admin":
+        _require_admin(request)
+        enforce_tenant_id = caller_tenant_id
+    else:
+        # Require super_admin for global role changes if no tenant context
+        admin_user_id = _require_super_admin(request)
+
     service = _get_admin_service(request, db)
-    result = await service.update_user_role(user_id, body.role, admin_user_id)
-    await audit_log(db, "user.role_changed", request=request, category="user",
-                    resource_type="user", resource_id=user_id,
-                    details={"new_role": body.role})
+    result = await service.update_user_role(str(user_id), body.role, getattr(request.state, "user_id", ""), enforced_tenant_id=enforce_tenant_id)
+    
+    if "error" not in result:
+        await audit_log(db, "user.role_changed", request=request, category="user",
+                        resource_type="user", resource_id=str(user_id),
+                        details={"new_role": body.role})
     return result
 
 
@@ -183,10 +241,16 @@ async def get_system_prompts(
     agent_id: str = "",
     db: AsyncSession = Depends(get_db),
 ):
-    """Get system prompts."""
-    _require_admin(request)
+    role = getattr(request.state, "role", "")
+    caller_tenant_id = getattr(request.state, "tenant_id", None)
+    
+    enforce_tenant_id = None
+    if role != "super_admin":
+        _require_admin(request)
+        enforce_tenant_id = caller_tenant_id
+
     service = _get_admin_service(request, db)
-    return await service.get_system_prompts(agent_id)
+    return await service.get_system_prompts(agent_id, tenant_id=enforce_tenant_id)
 
 
 class PromptUpdateRequest(BaseModel):
@@ -201,9 +265,16 @@ async def update_system_prompt(
     db: AsyncSession = Depends(get_db),
 ):
     """Update an agent's system prompt."""
-    admin_user_id, _ = _require_admin(request)
+    role = getattr(request.state, "role", "")
+    caller_tenant_id = getattr(request.state, "tenant_id", None)
+    
+    enforce_tenant_id = None
+    if role != "super_admin":
+        _require_admin(request)
+        enforce_tenant_id = caller_tenant_id
+
     service = _get_admin_service(request, db)
-    return await service.update_system_prompt(agent_id, body.system_prompt, admin_user_id)
+    return await service.update_system_prompt(agent_id, body.system_prompt, getattr(request.state, "user_id", ""), tenant_id=enforce_tenant_id)
 
 
 @router.get("/traces")
@@ -215,9 +286,16 @@ async def get_traces(
     db: AsyncSession = Depends(get_db),
 ):
     """Get conversation traces (redacted)."""
-    _require_admin(request)
+    role = getattr(request.state, "role", "")
+    caller_tenant_id = getattr(request.state, "tenant_id", None)
+    
+    enforce_tenant_id = None
+    if role != "super_admin":
+        _require_admin(request)
+        enforce_tenant_id = caller_tenant_id
+
     service = _get_admin_service(request, db)
-    return await service.get_traces(session_id, tenant_id, limit)
+    return await service.get_traces(session_id, tenant_id, limit, enforced_tenant_id=enforce_tenant_id)
 
 
 @router.get("/metrics")
@@ -259,6 +337,7 @@ async def update_platform_setting(
     body: SettingUpdateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    _rate_limit: None = Depends(_check_admin_mutation_rate_limit),
 ):
     """Update a platform setting (super_admin only)."""
     admin_user_id = _require_super_admin(request)
@@ -582,11 +661,21 @@ async def list_audit_logs(
 
     Required by SOC2 CC6.1/CC7.2, GDPR Art.30, HIPAA §164.312(b), PCI-DSS 10.2.
     """
-    from app.services.audit_service import list_audit_logs as _list
-    from datetime import datetime
+    from app.services.audit_service import list_audit_logs as _list, audit_log
+    from datetime import datetime, timedelta
 
     role = getattr(request.state, "role", "")
     caller_tenant_id = getattr(request.state, "tenant_id", None)
+
+    # Forensic: Log the viewing of audit logs (Who watched the watchers?)
+    await audit_log(
+        db,
+        "data.access",
+        request=request,
+        category="data",
+        resource_type="audit_logs",
+        details={"page": page, "per_page": per_page}
+    )
 
     if role != "super_admin":
         # Non-super-admin can only see their own tenant
@@ -594,9 +683,21 @@ async def list_audit_logs(
             raise HTTPException(status_code=403, detail="Admin access required.")
         tenant_id = caller_tenant_id
 
+    from app.utils.dates import enforce_temporal_cap
+    
     since_dt = datetime.fromisoformat(since) if since else None
-    until_dt = datetime.fromisoformat(until) if until else None
-
+    until_dt = datetime.fromisoformat(until) if until else datetime.now(timezone.utc)
+    
+    # DoS Protection: Enforce maximum date range (90 days) for real-time audit queries
+    if since_dt and until_dt:
+        if until_dt - since_dt > timedelta(days=90):
+            raise HTTPException(
+                status_code=400, 
+                detail="Audit log range cannot exceed 90 days for real-time viewing. Use export for larger windows."
+            )
+    
+    since_dt = enforce_temporal_cap(since_dt, max_days=90)
+    
     return await _list(
         db,
         tenant_id=tenant_id,
@@ -608,4 +709,84 @@ async def list_audit_logs(
         until=until_dt,
         page=page,
         per_page=per_page,
+    )
+
+
+@router.get("/audit-logs/export")
+async def export_audit_logs(
+    request: Request,
+    tenant_id: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    since: Optional[str] = Query(None),
+    until: Optional[str] = Query(None),
+    justification_id: str = Query(..., min_length=5, description="Zenith Pillar 2: Justification ID for data export"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Export audit logs to CSV via streaming.
+    SOC2/HIPAA compliance requirement: forensic data export.
+    """
+    from app.utils.dates import enforce_temporal_cap, sanitize_for_csv
+    from app.services.audit_service import stream_audit_logs as _stream
+    from datetime import datetime, timedelta
+
+    # Security: Exports of all tenant data are restricted to Super Admins
+    _require_super_admin(request)
+
+    since_dt = datetime.fromisoformat(since) if since else datetime.now(timezone.utc) - timedelta(days=30)
+    until_dt = datetime.fromisoformat(until) if until else datetime.now(timezone.utc)
+
+    # Zenith Pillar 4: Forensic Temporal Cap (366 days)
+    since_dt = enforce_temporal_cap(since_dt, max_days=366)
+
+    async def csv_generator():
+        # Write CSV header to buffer
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "ID", "Timestamp", "Tenant ID", "Actor Email", "Role", 
+            "Support Access", "Action", "Category", "Resource Type", 
+            "Resource ID", "Status", "IP Address"
+        ])
+        yield output.getvalue()
+        output.truncate(0)
+        output.seek(0)
+
+        # Stream rows
+        async for log in _stream(
+            db, 
+            tenant_id=tenant_id, 
+            category=category, 
+            since=since_dt, 
+            until=until_dt,
+            request=request,
+            export_reason=justification_id
+        ):
+            writer.writerow([
+                sanitize_for_csv(log["id"]), 
+                sanitize_for_csv(log["created_at"]), 
+                sanitize_for_csv(log["tenant_id"]), 
+                sanitize_for_csv(log["actor_email"]), 
+                sanitize_for_csv(log["actor_role"]), 
+                sanitize_for_csv(log["is_support_access"]),
+                sanitize_for_csv(log["action"]), 
+                sanitize_for_csv(log["category"]), 
+                sanitize_for_csv(log["resource_type"]), 
+                sanitize_for_csv(log["resource_id"]), 
+                sanitize_for_csv(log["status"]), 
+                sanitize_for_csv(log["ip_address"])
+            ])
+            yield output.getvalue()
+            output.truncate(0)
+            output.seek(0)
+
+        # Zenith Pillar 2: Forensic Continuity Marker
+        writer.writerow(["# END OF AUDIT EXPORT #", f"Exported By: {getattr(request.state, 'actor_email', 'unknown')}", f"Justification: {justification_id}"])
+        yield output.getvalue()
+
+    filename = f"audit_export_{datetime.now().strftime('%Y%p%m_%H%M%S')}.csv"
+    return StreamingResponse(
+        csv_generator(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )

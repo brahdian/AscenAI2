@@ -85,4 +85,58 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    pass
+    # --- agents ---
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS greeting_message TEXT")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice_greeting_url TEXT")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_detect_language BOOLEAN DEFAULT true")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS supported_languages JSONB DEFAULT '[\"en\"]'::jsonb")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice_system_prompt TEXT")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS tools JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_base_ids JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_config JSONB DEFAULT '{}'::jsonb")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS escalation_config JSONB DEFAULT '{}'::jsonb")
+    op.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice_config JSONB DEFAULT '{}'::jsonb")
+    
+    # --- template_playbooks ---
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS flow_definition JSONB DEFAULT '{}'::jsonb")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS tone VARCHAR(255) DEFAULT 'professional'")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS dos JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS donts JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS out_of_scope_response TEXT")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS fallback_response TEXT")
+    op.execute("ALTER TABLE template_playbooks ADD COLUMN IF NOT EXISTS custom_escalation_message TEXT")
+    
+    # --- agent_playbooks ---
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS instructions TEXT")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS tone VARCHAR(255) DEFAULT 'professional'")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS dos JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS donts JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS out_of_scope_response TEXT")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS fallback_response TEXT")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS custom_escalation_message TEXT")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS input_schema JSONB DEFAULT '{}'::jsonb")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS output_schema JSONB DEFAULT '{}'::jsonb")
+    op.execute("ALTER TABLE agent_playbooks ADD COLUMN IF NOT EXISTS tools JSONB DEFAULT '[]'::jsonb")
+    
+    # --- agent_guardrails ---
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_keywords JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_topics JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS allowed_topics JSONB DEFAULT '[]'::jsonb")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS profanity_filter BOOLEAN DEFAULT true")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS pii_redaction BOOLEAN DEFAULT true")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS pii_pseudonymization BOOLEAN DEFAULT false")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS max_response_length INTEGER DEFAULT 2000")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS require_disclaimer BOOLEAN DEFAULT false")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS blocked_message TEXT")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS off_topic_message TEXT")
+    op.execute("ALTER TABLE agent_guardrails ADD COLUMN IF NOT EXISTS content_filter_level VARCHAR(255) DEFAULT 'medium'")
+    
+    # --- sessions & messages metadata ---
+    op.execute("ALTER TABLE sessions DROP COLUMN IF EXISTS last_activity_at")
+    op.execute("ALTER TABLE sessions DROP COLUMN IF EXISTS turn_count")
+    op.execute("ALTER TABLE messages DROP COLUMN IF EXISTS playbook_name")
+    op.execute("ALTER TABLE messages DROP COLUMN IF EXISTS sources")
+    op.execute("ALTER TABLE message_feedback DROP COLUMN IF EXISTS playbook_correction")
+    op.execute("ALTER TABLE message_feedback DROP COLUMN IF EXISTS tool_corrections")

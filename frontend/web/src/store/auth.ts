@@ -7,6 +7,7 @@ interface UserInfo {
   full_name: string
   role: string
   tenant_id: string
+  avatar_url?: string | null
 }
 
 interface AuthState {

@@ -54,10 +54,10 @@ async def _get_builtin_handlers() -> dict:
         handle_google_sheets_append,
     )
     from app.tools.integrations.webhook import handle_custom_webhook
-    from app.tools.integrations.helcim_tool import handle_helcim_process_payment
+    from app.tools.integrations.helcim_tool import handle_helcim_create_link
     from app.tools.integrations.paypal_tool import handle_paypal_create_order
-    from app.tools.integrations.moneris_tool import handle_moneris_process_payment
-    from app.tools.integrations.square_tool import handle_square_create_payment
+    from app.tools.integrations.moneris_tool import handle_moneris_create_checkout
+    from app.tools.integrations.square_tool import handle_square_create_checkout
     from app.tools.integrations.mailchimp_tool import handle_mailchimp_add_subscriber
     from app.tools.integrations.telnyx_tool import handle_telnyx_send_bulk_sms
     from app.tools.builtin.twilio_pay import handle_twilio_pay
@@ -104,9 +104,9 @@ async def _get_builtin_handlers() -> dict:
         "custom_webhook": handle_custom_webhook,
         
         # Integrations
-        "moneris_process_payment": handle_moneris_process_payment,
-        "square_create_payment": handle_square_create_payment,
-        "helcim_process_payment": handle_helcim_process_payment,
+        "moneris_create_payment_link": handle_moneris_create_checkout,
+        "square_create_payment_link": handle_square_create_checkout,
+        "helcim_create_payment_link": handle_helcim_create_link,
         "paypal_create_order": handle_paypal_create_order,
         "mailchimp_add_subscriber": handle_mailchimp_add_subscriber,
         "telnyx_send_bulk_sms": handle_telnyx_send_bulk_sms,
@@ -289,6 +289,7 @@ class ToolExecutor:
                     tool_call.parameters,
                     session_id=tool_call.session_id,
                     tenant_id=tenant_id,
+                    execution_id=execution_id,
                 ),
                 timeout=float(timeout),
             )
@@ -379,11 +380,28 @@ class ToolExecutor:
                 status="failed",
             )
 
-        # 3. Execute with timeout
-        # Cap timeout_override to prevent resource exhaustion attacks
-        _MAX_TIMEOUT = getattr(settings, "MAX_TOOL_TIMEOUT_SECONDS", 300)
+        # 3. Strict SSRF validation for test executions - no internal access allowed ever
+        if tool.endpoint_url:
+            try:
+                _validate_tool_url(tool.endpoint_url)
+                # Additional test execution restrictions
+                parsed = urllib.parse.urlparse(tool.endpoint_url)
+                hostname = (parsed.hostname or "").lower()
+                if hostname.endswith('.internal') or hostname.endswith('.svc') or hostname.endswith('.local'):
+                    raise SSRFError("Test executions cannot access internal services")
+            except SSRFError as exc:
+                return MCPToolResult(
+                    tool_name=tool_call.tool_name,
+                    error=f"Test execution blocked: {exc}",
+                    duration_ms=0,
+                    trace_id=tool_call.trace_id,
+                    status="failed",
+                )
+
+        # 4. Execute with timeout - test executions have lower max timeout
+        _MAX_TEST_TIMEOUT = 10.0
         raw_timeout = tool_call.timeout_override or tool.timeout_seconds
-        timeout = min(float(raw_timeout), float(_MAX_TIMEOUT))
+        timeout = min(float(raw_timeout), _MAX_TEST_TIMEOUT)
         result_data: Optional[dict] = None
         error_msg: Optional[str] = None
         status = "completed"
@@ -395,6 +413,7 @@ class ToolExecutor:
                     tool_call.parameters,
                     session_id=tool_call.session_id,
                     tenant_id=tenant_id,
+                    execution_id=None,
                 ),
                 timeout=float(timeout),
             )
@@ -442,19 +461,20 @@ class ToolExecutor:
         parameters: dict,
         session_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        execution_id: Optional[str] = None,
     ) -> dict:
         """Route to built-in or HTTP executor based on tool type."""
         if tool.is_builtin:
             return await self._execute_builtin_tool(
-                tool, parameters, session_id=session_id, tenant_id=tenant_id
+                tool, parameters, session_id=session_id, tenant_id=tenant_id, execution_id=execution_id
             )
         if tool.endpoint_url:
-            return await self._execute_http_tool(tool, parameters)
+            return await self._execute_http_tool(tool, parameters, execution_id=execution_id)
         raise ValueError(
             f"Tool '{tool.name}' has no endpoint_url and is not a built-in tool"
         )
 
-    async def _execute_http_tool(self, tool: Tool, parameters: dict) -> dict:
+    async def _execute_http_tool(self, tool: Tool, parameters: dict, execution_id: Optional[str] = None) -> dict:
         """Execute an HTTP-based tool by posting parameters to its endpoint."""
         # ── 0. SSRF Guard ──────────────────────────────────────────────────
         try:
@@ -465,6 +485,12 @@ class ToolExecutor:
 
         headers = await self.auth_manager.resolve_tool_auth(tool)
         headers.setdefault("Content-Type", "application/json")
+
+        # Inject Idempotency Key
+        if execution_id:
+            headers.setdefault("X-Ascen-Idempotency-Key", execution_id)
+            headers.setdefault("Idempotency-Key", execution_id)
+            headers.setdefault("X-Idempotency-Key", execution_id)
 
         timeout = httpx.Timeout(float(tool.timeout_seconds))
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -482,6 +508,7 @@ class ToolExecutor:
         parameters: dict,
         session_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        execution_id: Optional[str] = None,
     ) -> dict:
         """Execute a platform built-in tool handler.
 
@@ -510,7 +537,12 @@ class ToolExecutor:
 
         # Decrypt credentials stored in tool_metadata before passing to handler
         decrypted_metadata = decrypt_sensitive_fields(tool.tool_metadata or {})
-        config = {**self.tenant_config, **decrypted_metadata}
+        config = {
+            **self.tenant_config, 
+            **decrypted_metadata,
+            "execution_id": execution_id,
+            "idempotency_key": execution_id
+        }
 
         # ── Try new adapter registry first ─────────────────────────────
         canonical_action = ACTION_REGISTRY.resolve_action(tool.name)
@@ -605,7 +637,12 @@ class ToolExecutor:
         _check_depth(parameters)
 
         if not schema:
-            return
+            # Empty schema means no parameters allowed
+            schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {}
+            }
 
         try:
             validator = jsonschema.Draft7Validator(schema)
@@ -618,4 +655,4 @@ class ToolExecutor:
                 raise ValidationError("; ".join(messages))
         except jsonschema.SchemaError as exc:
             logger.warning("invalid_tool_schema", error=str(exc))
-            # Don't block execution for a broken schema definition
+            raise ValidationError(f"Invalid tool schema: {exc}")

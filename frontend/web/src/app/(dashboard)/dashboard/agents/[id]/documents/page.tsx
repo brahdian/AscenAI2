@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { documentsApi, agentsApi } from '@/lib/api'
-import { FileText, Upload, Trash2, CheckCircle, Clock, AlertCircle, ChevronRight, Edit2, Plus, X } from 'lucide-react'
+import { FileText, Upload, Trash2, CheckCircle, Clock, AlertCircle, ChevronRight, Edit2, Plus, X, RefreshCw } from 'lucide-react'
 import toast from 'react-hot-toast'
 
 interface Doc {
@@ -72,8 +72,8 @@ export default function DocumentsPage() {
       setError('Only PDF, TXT, Markdown (.md), and Word (.docx) files are supported.')
       return
     }
-    if (file.size > 10 * 1024 * 1024) {
-      setError('File must be under 10 MB.')
+    if (file.size > 5 * 1024 * 1024) {
+      setError('File must be under 5 MB.')
       return
     }
     setUploading(true)
@@ -112,6 +112,19 @@ export default function DocumentsPage() {
       load()
     } catch (e: any) {
       toast.error(e?.response?.data?.detail || "Failed to save document")
+    }
+  }
+
+  const retry = async (doc: Doc) => {
+    try {
+      setLoading(true)
+      await documentsApi.retryIndexing(agentId, doc.id)
+      toast.success("Re-indexing started")
+      load()
+    } catch (e: any) {
+      toast.error(e?.response?.data?.detail || "Failed to retry")
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -185,7 +198,7 @@ export default function DocumentsPage() {
           Author Text Document
         </button>
 
-        <p className="text-xs text-gray-400 mt-3">PDF, TXT, MD, DOCX — max 10 MB</p>
+        <p className="text-xs text-gray-400 mt-3">PDF, TXT, MD, DOCX — max 5 MB</p>
       </div>
 
       {/* Documents list */}
@@ -216,7 +229,14 @@ export default function DocumentsPage() {
                       <FileText size={16} className="text-gray-400 flex-shrink-0" />
                       <div>
                         <p className="text-sm font-medium text-gray-900 dark:text-white truncate max-w-[200px]">{d.name}</p>
-                        <p className="text-xs text-gray-500 uppercase">{d.file_type}</p>
+                        <p className="text-xs text-gray-500 uppercase flex items-center gap-1">
+                          {d.file_type}
+                          {d.status === 'failed' && d.error_message && (
+                            <span className="text-[10px] text-red-500 lowercase bg-red-50 px-1 rounded truncate max-w-[150px]" title={d.error_message}>
+                              : {d.error_message}
+                            </span>
+                          )}
+                        </p>
                       </div>
                     </div>
                   </td>
@@ -238,6 +258,15 @@ export default function DocumentsPage() {
                           <Edit2 size={14} />
                         </button>
                       )}
+                       {d.status === 'failed' && (
+                         <button
+                           onClick={() => retry(d)}
+                           className="p-1.5 text-gray-400 hover:text-green-500 transition-colors"
+                           title="Retry Indexing"
+                         >
+                           <RefreshCw size={14} />
+                         </button>
+                       )}
                       <button onClick={() => remove(d.id, d.name)} className="p-1.5 text-gray-400 hover:text-red-500 transition-colors">
                         <Trash2 size={14} />
                       </button>

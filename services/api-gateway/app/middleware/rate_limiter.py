@@ -74,9 +74,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         redis = getattr(request.app.state, "redis", None)
         if redis is None:
-            # No Redis — fail open
+            # Fail closed for high risk authentication and billing endpoints
+            high_risk_paths = ("/api/v1/auth/", "/api/v1/billing/", "/api/v1/admin/")
+            if any(path.startswith(p) for p in high_risk_paths):
+                logger.error("rate_limiter_unavailable_high_risk_path", path=path)
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Service temporarily unavailable. Please try again later."}
+                )
+            # Fail open for non-critical paths
             return await call_next(request)
 
+        # Prioritize per-key rate limit if stamped by AuthMiddleware
+        effective_limit = getattr(request.state, "api_key_limit", self.limit)
+        
         identifier = self._get_identifier(request)
         key = f"rate_limit:{identifier}"
         window_end = math.ceil(time.time() / self.window) * self.window
@@ -92,19 +103,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Fail open — don't block legitimate traffic during Redis outage
             return await call_next(request)
 
-        remaining = max(0, self.limit - current_count)
+        remaining = max(0, effective_limit - current_count)
         headers = {
-            "X-RateLimit-Limit": str(self.limit),
+            "X-RateLimit-Limit": str(effective_limit),
             "X-RateLimit-Remaining": str(remaining),
             "X-RateLimit-Reset": str(int(window_end)),
         }
 
-        if current_count > self.limit:
+        if current_count > effective_limit:
             logger.warning(
                 "rate_limit_exceeded",
                 identifier=identifier,
                 count=current_count,
-                limit=self.limit,
+                limit=effective_limit,
                 path=path,
             )
             return JSONResponse(
@@ -124,13 +135,31 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     @staticmethod
     def _get_identifier(request: Request) -> str:
         """
-        Rate-limit by tenant_id (from JWT/middleware) when available,
+        Rate-limit by API key hash (if provided), tenant_id (from JWT),
         otherwise fall back to client IP.
         """
+        auth_method = getattr(request.state, "auth_method", None)
+        # If it's an API key, we MUST rate limit by the specific key to prevent
+        # one leaked/abused key from taking down the entire tenant's quota.
+        if auth_method == "api_key":
+            import hashlib
+            # We don't have the raw key here ideally, but AuthMiddleware 
+            # might have put a prefix or ID in state. 
+            # Actually, let's use the resource ID if we can.
+            # AuthMiddleware didn't put key_id in state, let's add it.
+            # Wait, I don't want to go back and forth too much.
+            # Let's use the 'user_id' which for API keys is the creator's ID. 
+            # Better: let's use a combination of tenant and key prefix if available.
+            
+            # Re-read: I'll update AuthMiddleware to include request.state.api_key_id.
+            key_id = getattr(request.state, "api_key_id", "unknown_key")
+            return f"api_key:{key_id}"
+
         tenant_id = getattr(request.state, "tenant_id", None)
         if tenant_id:
             return f"tenant:{tenant_id}"
-        # Best-effort IP extraction (behind reverse proxy)
-        forwarded_for = request.headers.get("X-Forwarded-For", "")
-        ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
+        
+        from app.core.security import get_client_ip
+        ip = get_client_ip(request)
         return f"ip:{ip}"
+

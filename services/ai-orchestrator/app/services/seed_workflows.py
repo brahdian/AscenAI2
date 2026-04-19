@@ -34,6 +34,8 @@ _PREBUILT_IDS = {
     "lead_qualification":  "10000000-0000-0000-0000-000000000002",
     "support_ticket":      "10000000-0000-0000-0000-000000000003",
     "order_placement":     "10000000-0000-0000-0000-000000000004",
+    # Orchestrator showcase workflow
+    "orchestrator_demo":   "10000000-0000-0000-0000-000000000005",
 }
 
 
@@ -437,6 +439,183 @@ _PREBUILTS = [
                 {"id": "e2", "source": "collect_address", "target": "collect_notes",   "source_handle": "default"},
                 {"id": "e3", "source": "collect_notes",   "target": "place_order",     "source_handle": "default"},
                 {"id": "e4", "source": "place_order",     "target": "confirm_end",     "source_handle": "default"},
+            ],
+        },
+    },
+
+    # ------------------------------------------------------------------
+    # 5. Orchestrator Demo — showcases CALL_WORKFLOW, PARALLEL,
+    #    WAIT_FOR_SIGNAL, and CODE_EXEC in a single VIP onboarding flow
+    # ------------------------------------------------------------------
+    {
+        "prebuilt_key": "orchestrator_demo",
+        "name": "Orchestrator Demo — VIP Customer Onboarding",
+        "description": (
+            "Demonstrates multi-workflow orchestration. "
+            "Collects VIP customer info, runs two parallel background checks "
+            "(credit scoring + CRM lookup) using PARALLEL, waits for a manual "
+            "approval signal via WAIT_FOR_SIGNAL, then calls a sub-workflow to "
+            "create a support ticket using CALL_WORKFLOW. "
+            "Uses CODE_EXEC to compute a composite risk score."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "customer_name":  {"type": "string"},
+                "customer_phone": {"type": "string"},
+                "customer_email": {"type": "string"},
+            },
+            "required": ["customer_name"],
+        },
+        "output_schema": {
+            "type": "object",
+            "properties": {
+                "risk_score":          {"type": "number"},
+                "parallel_results":    {"type": "array"},
+                "ticket_result":       {"type": "object"},
+            },
+        },
+        "tags": ["orchestrator", "demo", "parallel", "signals"],
+        "trigger_type": "none",
+        "trigger_config": {},
+        "definition": {
+            "entry_node_id": "collect_email",
+            "variables": {
+                "risk_threshold": 7,
+            },
+            "nodes": [
+                # Step 1 — collect email
+                {
+                    "id": "collect_email",
+                    "type": "INPUT",
+                    "label": "Collect email",
+                    "position": {"x": 100, "y": 100},
+                    "config": {
+                        "prompt": "What is {{customer_name}}'s email address?",
+                        "variable": "customer_email",
+                        "validation_regex": r"[^@]+@[^@]+\.[^@]+",
+                        "error_message": "Please enter a valid email address.",
+                    },
+                },
+                # Step 2 — PARALLEL: run CRM lookup + lead scoring concurrently
+                # Replace workflow_id values with real workflow UUIDs assigned to this agent
+                {
+                    "id": "parallel_checks",
+                    "type": "PARALLEL",
+                    "label": "Background checks (parallel)",
+                    "position": {"x": 100, "y": 240},
+                    "config": {
+                        "branches": [
+                            {
+                                "workflow_id": "10000000-0000-0000-0000-000000000003",  # support_ticket as stand-in
+                                "input_mapping": {
+                                    "customer_name": "{{customer_name}}",
+                                    "issue_description": "CRM lookup for {{customer_email}}",
+                                    "priority": "low",
+                                },
+                                "output_variable": "crm_branch",
+                            },
+                            {
+                                "workflow_id": "10000000-0000-0000-0000-000000000002",  # lead_qualification
+                                "input_mapping": {
+                                    "customer_name": "{{customer_name}}",
+                                },
+                                "output_variable": "lead_branch",
+                            },
+                        ],
+                        "join_output_key": "parallel_results",
+                        "fail_fast": False,  # continue even if one branch fails
+                    },
+                },
+                # Step 3 — CODE_EXEC: compute composite risk score from parallel results
+                {
+                    "id": "compute_risk",
+                    "type": "CODE_EXEC",
+                    "label": "Compute risk score",
+                    "position": {"x": 100, "y": 380},
+                    "config": {
+                        "code": (
+                            "len([r for r in parallel_results if r.get('status') == 'COMPLETED']) * 3 "
+                            "+ (5 if customer_email else 0)"
+                        ),
+                        "output_variable": "risk_score",
+                        "on_error": "skip",
+                    },
+                },
+                # Step 4 — CONDITION: branch on risk score
+                {
+                    "id": "check_risk",
+                    "type": "CONDITION",
+                    "label": "High risk?",
+                    "position": {"x": 100, "y": 500},
+                    "config": {
+                        "expression": "float(risk_score) >= float(risk_threshold)",
+                    },
+                },
+                # Step 5a — WAIT_FOR_SIGNAL: pause for manual approval (high risk path)
+                {
+                    "id": "await_approval",
+                    "type": "WAIT_FOR_SIGNAL",
+                    "label": "Await manager approval",
+                    "position": {"x": 300, "y": 620},
+                    "config": {
+                        "signal_name": "vip_approval",
+                        "correlation_id_key": "customer_email",
+                        "ttl_seconds": 86400,       # 24h
+                        "output_variable": "approval_payload",
+                    },
+                },
+                # Step 5b — auto-approve low risk path (SET_VARIABLE)
+                {
+                    "id": "auto_approve",
+                    "type": "SET_VARIABLE",
+                    "label": "Auto-approve",
+                    "position": {"x": -100, "y": 620},
+                    "config": {
+                        "variable": "approval_payload",
+                        "value": '{"approved": true, "approver": "auto"}',
+                    },
+                },
+                # Step 6 — CALL_WORKFLOW: create an onboarding support ticket
+                {
+                    "id": "create_ticket",
+                    "type": "CALL_WORKFLOW",
+                    "label": "Create onboarding ticket",
+                    "position": {"x": 100, "y": 760},
+                    "config": {
+                        "workflow_id": "10000000-0000-0000-0000-000000000003",  # support_ticket
+                        "input_mapping": {
+                            "customer_name":     "{{customer_name}}",
+                            "issue_description": "VIP onboarding for {{customer_email}} — risk_score={{risk_score}}",
+                            "priority":          "high",
+                        },
+                        "output_variable": "ticket_result",
+                    },
+                },
+                # Step 7 — END
+                {
+                    "id": "summary_end",
+                    "type": "END",
+                    "label": "Onboarding initiated",
+                    "position": {"x": 100, "y": 900},
+                    "config": {
+                        "final_message": (
+                            "VIP onboarding complete for {{customer_name}}. "
+                            "Risk score: {{risk_score}}. "
+                            "Ticket created. Welcome!"
+                        ),
+                    },
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source": "collect_email",   "target": "parallel_checks", "source_handle": "default"},
+                {"id": "e2", "source": "parallel_checks", "target": "compute_risk",    "source_handle": "default"},
+                {"id": "e3", "source": "compute_risk",    "target": "check_risk",      "source_handle": "default"},
+                {"id": "e4", "source": "check_risk",      "target": "await_approval",  "source_handle": "yes"},
+                {"id": "e5", "source": "check_risk",      "target": "auto_approve",    "source_handle": "no"},
+                {"id": "e6", "source": "await_approval",  "target": "create_ticket",   "source_handle": "default"},
+                {"id": "e7", "source": "auto_approve",    "target": "create_ticket",   "source_handle": "default"},
+                {"id": "e8", "source": "create_ticket",   "target": "summary_end",     "source_handle": "default"},
             ],
         },
     },

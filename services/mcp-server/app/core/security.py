@@ -101,6 +101,20 @@ def extract_tenant_from_token(token: str) -> Optional[str]:
         return None
 
 
+def is_internal_token(token: str) -> bool:
+    """Check if the token is a signed internal service call token."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            options={"verify_exp": True},
+        )
+        return payload.get("sub") == "internal-service-call"
+    except JWTError:
+        return False
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a plain password against a bcrypt hash."""
     return pwd_context.verify(plain_password, hashed_password)

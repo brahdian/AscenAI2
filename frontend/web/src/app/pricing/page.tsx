@@ -165,7 +165,7 @@ export default function PricingPage() {
                 <div className="flex items-end gap-1">
                   <span className="text-5xl font-bold text-white">
                     ${isYearly 
-                      ? Math.round((plan.price_per_agent || 0) * 12 * 0.8) 
+                      ? (plan.price_per_agent_yearly || Math.round((plan.price_per_agent || 0) * 12 * 0.8)) 
                       : (plan.price_per_agent || 0)
                     }
                   </span>

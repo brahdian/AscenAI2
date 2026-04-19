@@ -25,8 +25,8 @@ class User(Base):
     __tablename__ = "users"
     __table_args__ = (
         Index("ix_users_tenant_id", "tenant_id"),
-        Index("ix_users_email", "email", unique=True),
-        Index("ix_users_email_lower", text("lower(email)"), unique=True),
+        Index("ix_users_email", "email"),
+        Index("ix_users_tenant_email_lower", "tenant_id", text("lower(email)"), unique=True),
         Index("ix_users_is_active", "is_active"),
     )
 
@@ -38,15 +38,22 @@ class User(Base):
         ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
     )
-    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    avatar_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
 
     # Role: "owner" | "admin" | "developer" | "viewer"
     role: Mapped[str] = mapped_column(String(50), nullable=False, default="viewer")
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    
+    # Internal versioning for global session invalidation
+    session_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_email_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    mfa_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
 
@@ -117,6 +124,8 @@ class APIKey(Base):
     rate_limit_per_minute: Mapped[int] = mapped_column(
         Integer, nullable=False, default=60
     )
+    # List of allowed domains (e.g. ["https://example.com", "http://localhost:3000"])
+    allowed_origins: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     last_used_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

@@ -23,6 +23,8 @@ async def handle_send_sms(parameters: dict, tenant_config: dict) -> dict:
     to = parameters.get("to", "")
     message = parameters.get("message", "")
 
+    masked_to = f"{to[:4]}...{to[-2:]}" if len(to) > 6 else "***"
+
     if not to or not message:
         return {"success": False, "error": "Missing required parameters: to, message"}
 
@@ -35,7 +37,7 @@ async def handle_send_sms(parameters: dict, tenant_config: dict) -> dict:
 
     if not all([account_sid, auth_token, from_number]):
         # Dev mode — log and return success
-        logger.info("sms_dev_mode", to=to, message=message[:50])
+        logger.info("sms_dev_mode", to=masked_to, message=message[:50])
         return {
             "success": True,
             "sid": "TEST_SID",
@@ -56,5 +58,5 @@ async def handle_send_sms(parameters: dict, tenant_config: dict) -> dict:
             "to": to,
         }
     except Exception as exc:
-        logger.error("sms_send_failed", to=to, error=str(exc))
+        logger.error("sms_send_failed", to=masked_to, error=str(exc))
         return {"success": False, "error": str(exc), "to": to}

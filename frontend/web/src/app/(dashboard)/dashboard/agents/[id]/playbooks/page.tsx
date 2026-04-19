@@ -31,7 +31,6 @@ interface PlaybookForm {
   name: string
   description: string
   intent_triggers: string
-  is_default: boolean
   instructions: string
   tone: string
   dos: string[]
@@ -49,7 +48,6 @@ const EMPTY_FORM: PlaybookForm = {
   name: '',
   description: '',
   intent_triggers: '',
-  is_default: false,
   instructions: '',
   tone: 'professional',
   dos: [],
@@ -388,7 +386,6 @@ function PlaybookFormPanel({
         intent_triggers: Array.isArray(initial.intent_triggers)
           ? (initial.intent_triggers as string[]).join(', ')
           : (initial.intent_triggers as string) || '',
-        is_default: !!initial.is_default,
         instructions: (cfg.instructions as string) || (initial.instructions as string) || '',
         tone: (cfg.tone as string) || (initial.tone as string) || 'professional',
         dos: Array.isArray(cfg.dos) ? (cfg.dos as string[]) : Array.isArray(initial.dos) ? (initial.dos as string[]) : [],
@@ -483,7 +480,6 @@ function PlaybookFormPanel({
       name: form.name,
       description: form.description,
       intent_triggers: triggers,
-      is_default: form.is_default,
       is_active: true,
       config,
     })
@@ -563,18 +559,6 @@ function PlaybookFormPanel({
                   />
                 </div>
 
-                <div className="flex items-center gap-3">
-                  <input
-                    type="checkbox"
-                    id="is_default"
-                    checked={form.is_default}
-                    onChange={(e) => setForm((p) => ({ ...p, is_default: e.target.checked }))}
-                    className="w-4 h-4 accent-violet-600"
-                  />
-                  <label htmlFor="is_default" className="text-sm text-gray-700 dark:text-gray-300">
-                    Set as default playbook
-                  </label>
-                </div>
 
                 <div>
                   <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
@@ -831,14 +815,7 @@ export default function PlaybooksPage() {
     onError: () => toast.error('Failed to delete playbook'),
   })
 
-  const setDefaultMutation = useMutation({
-    mutationFn: (pbId: string) => playbooksApi.setDefault(agentId, pbId),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['playbooks', agentId] })
-      toast.success('Default playbook updated')
-    },
-    onError: () => toast.error('Failed to set default'),
-  })
+
 
   const items: any[] = Array.isArray(playbooks)
     ? playbooks
@@ -920,14 +897,9 @@ export default function PlaybooksPage() {
                       <h3 className="text-sm font-semibold text-gray-900 dark:text-white">
                         {pb.name}
                       </h3>
-                      {pb.is_default && (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 text-xs font-medium">
-                          <Star size={10} fill="currentColor" /> Default
-                        </span>
-                      )}
                     </div>
                     {pb.description && (
-                      <p className="text-sm text-gray-500 mb-2">{pb.description}</p>
+                      <p className="text-xs text-gray-500 mb-2 italic">{pb.description}</p>
                     )}
                     {triggers.length > 0 && (
                       <div className="flex flex-wrap gap-1.5">
@@ -943,16 +915,6 @@ export default function PlaybooksPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-2 flex-shrink-0">
-                    {!pb.is_default && (
-                      <button
-                        onClick={() => setDefaultMutation.mutate(pb.id)}
-                        disabled={setDefaultMutation.isPending}
-                        className="px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors disabled:opacity-50"
-                        title="Set as default"
-                      >
-                        Set default
-                      </button>
-                    )}
                     <button
                       onClick={() => {
                         setEditing(pb)

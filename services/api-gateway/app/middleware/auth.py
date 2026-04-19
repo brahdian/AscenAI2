@@ -135,6 +135,33 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        # ── Pillar 1: Forensic Traceability (Identity Binding) ─────────────
+        # Bind identity to the logging context so every log entry for this
+        # request includes the actor and tenant.
+        structlog.contextvars.bind_contextvars(
+            user_id=getattr(request.state, "user_id", None),
+            tenant_id=getattr(request.state, "tenant_id", None),
+            actor_email=getattr(request.state, "actor_email", None),
+            is_support_access=getattr(request.state, "is_support_access", False),
+        )
+
+        # ── Pillar 3: Zero-Trust Perimeter (Agent Isolation) ──────────────
+        # If X-Restricted-Agent-ID is provided, verify it against the auth context.
+        # This prevents lateral movement even if a session is compromised.
+        restricted_agent_id = request.headers.get("X-Restricted-Agent-ID")
+        if restricted_agent_id:
+            # API Keys restricted to a specific agent cannot access others
+            key_agent_id = getattr(request.state, "api_key_agent_id", None)
+            if key_agent_id and key_agent_id != restricted_agent_id:
+                logger.warning("auth_agent_isolation_violation", path=request.url.path, 
+                               requested=restricted_agent_id, key_restricted_to=key_agent_id)
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Access denied: request restricted to a different agent context."}
+                )
+            request.state.restricted_agent_id = restricted_agent_id
+
         return await call_next(request)
 
     async def _authenticate_jwt(self, request: Request, token: str) -> bool:
@@ -163,17 +190,36 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     cached = await redis.get(cache_key)
                     if cached:
                         entry = json.loads(cached)
+                        # ── Session version enforcement (Cache) ──────────────
+                        token_version = payload.get("version")
+                        cached_version = entry.get("session_version")
+                        
+                        if token_version is not None and cached_version is not None:
+                            if token_version != cached_version:
+                                logger.info("auth_session_version_mismatch_cached", user_id=user_id)
+                                return False
+
+                        # ── Tenant status enforcement (Cache - Phase 16) ──────
+                        # Ensure suspended tenants cannot access the console/API
+                        # Explicit naming for Zenith Pillar 5 compliance.
+                        entry_status = entry.get("tenant_activation_status", "active")
+                        if entry_status == "suspended" or entry.get("tenant_is_active") is False:
+                            logger.warning("auth_tenant_suspended_cached", tenant_id=tenant_id)
+                            return False
+
                         request.state.user_id = user_id
                         request.state.tenant_id = tenant_id
                         request.state.role = entry.get("role", role)
+                        request.state.actor_email = entry.get("email") or "system"
+                        request.state.is_support_access = entry.get("is_support_access", False)
+                        request.state.tenant_activation_status = "active"
                         request.state.auth_method = "jwt"
                         return True
+
                 except Exception as exc:
                     logger.warning("auth_cache_read_error", error=str(exc))
 
             # ── DB verification (cache miss) ──────────────────────────────────
-            # Verify that user and tenant still exist in the database.
-            # This handles stale sessions after a 'make clean' or record deletion.
             async with AsyncSessionLocal() as db:
                 user_res = await db.execute(
                     select(User).where(User.id == uuid.UUID(user_id))
@@ -182,20 +228,39 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 if not user or not user.is_active:
                     return False
 
+                token_version = payload.get("version")
+                if token_version is not None and token_version != user.session_version:
+                    logger.info(
+                        "auth_session_version_mismatch",
+                        user_id=user_id,
+                        token_version=token_version,
+                        db_version=user.session_version,
+                    )
+                    return False
+
                 tenant_res = await db.execute(
                     select(Tenant).where(Tenant.id == uuid.UUID(tenant_id))
                 )
                 tenant = tenant_res.scalar_one_or_none()
-                if not tenant:
+                if not tenant or not tenant.is_active:
                     return False
 
-            # Populate cache so subsequent requests skip the DB queries
+            # Support Access: Check payload claim (e.g. from Google internal SSO or specialized JWT)
+            is_support = payload.get("is_support", False)
+
+            # Populate cache
             if redis:
                 try:
                     await redis.setex(
                         cache_key,
                         _AUTH_CACHE_TTL,
-                        json.dumps({"role": role}),
+                        json.dumps({
+                            "role": role, 
+                            "email": user.email,
+                            "session_version": user.session_version,
+                            "tenant_activation_status": "active" if tenant.is_active else "suspended",
+                            "is_support_access": is_support
+                        }),
                     )
                 except Exception as exc:
                     logger.warning("auth_cache_write_error", error=str(exc))
@@ -203,8 +268,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.user_id = user_id
             request.state.tenant_id = tenant_id
             request.state.role = role
+            request.state.actor_email = user.email
+            request.state.is_support_access = is_support
+            request.state.tenant_activation_status = "active"
             request.state.auth_method = "jwt"
             return True
+
         except (JWTError, ValueError) as exc:
             logger.warning("jwt_decode_failed", error=str(exc))
             return False
@@ -212,19 +281,59 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def _authenticate_api_key(self, request: Request, raw_key: str) -> bool:
         import hashlib
         from datetime import datetime, timezone
+        import json
 
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        
+        # ── Redis auth cache (Phase 10) ──────────────────────────────────
+        # API Keys are now cached to reduce DB load, parity with JWTs.
+        cache_key = f"auth:api_key:{key_hash}"
+        redis = await _get_redis()
+        if redis:
+            try:
+                cached = await redis.get(cache_key)
+                if cached:
+                    entry = json.loads(cached)
+                    entry_status = entry.get("tenant_activation_status", "active")
+                    if entry_status == "suspended" or entry.get("tenant_is_active") is False:
+                        logger.warning("auth_api_key_tenant_suspended_cached", tenant_id=entry.get("tenant_id"))
+                        return False
+
+                    request.state.user_id = entry.get("user_id")
+                    request.state.tenant_id = entry.get("tenant_id")
+                    request.state.role = entry.get("role", "developer")
+                    request.state.actor_email = entry.get("email")
+                    request.state.auth_method = "api_key"
+                    request.state.api_key_id = entry.get("api_key_id")
+                    request.state.api_key_scopes = entry.get("scopes", [])
+                    request.state.api_key_agent_id = entry.get("agent_id")
+                    request.state.api_key_limit = entry.get("rate_limit", 60)
+                    request.state.is_support_access = False # API Keys are never support access
+                    request.state.tenant_activation_status = entry_status
+                    return True
+            except Exception as exc:
+                logger.warning("api_key_cache_read_error", error=str(exc))
+
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
-                    select(APIKey).where(
+                    select(APIKey, User).join(User, APIKey.user_id == User.id).where(
                         APIKey.key_hash == key_hash,
                         APIKey.is_active.is_(True),
                     )
                 )
-                api_key: Optional[APIKey] = result.scalar_one_or_none()
+                res = result.one_or_none()
+                if res is None:
+                    return False
 
-                if api_key is None:
+                api_key, user = res
+
+                # Ensure tenant is active for API keys too
+                tenant_res = await db.execute(
+                    select(Tenant).where(Tenant.id == api_key.tenant_id)
+                )
+                tenant = tenant_res.scalar_one_or_none()
+                if not tenant or not tenant.is_active:
                     return False
 
                 now = datetime.now(timezone.utc)
@@ -238,12 +347,79 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 except Exception:
                     await db.rollback()
 
-                request.state.user_id = str(api_key.user_id)
-                request.state.tenant_id = str(api_key.tenant_id)
-                request.state.role = "developer"
-                request.state.auth_method = "api_key"
-                request.state.api_key_scopes = api_key.scopes
-                return True
+                # Populate cache
+                if redis:
+                    try:
+                        cache_data = {
+                            "user_id": str(api_key.user_id),
+                            "tenant_id": str(api_key.tenant_id),
+                            "role": "developer",
+                            "email": user.email,
+                            "api_key_id": str(api_key.id),
+                            "scopes": api_key.scopes,
+                            "agent_id": str(api_key.agent_id) if api_key.agent_id else None,
+                            "rate_limit": api_key.rate_limit_per_minute,
+                            "tenant_activation_status": "active"
+                        }
+                        await redis.setex(cache_key, _AUTH_CACHE_TTL, json.dumps(cache_data))
+                    except Exception as exc:
+                        logger.warning("api_key_cache_write_error", error=str(exc))
+
+                # -- Origin Validation (Domain Lockdown) --
+                # MUST be inside the async-with block so:
+                #   1. `db` is still open for the audit_log write.
+                #   2. request.state is NOT pre-populated before a denial --
+                #      a denied origin must never receive an authenticated context.
+                if api_key.allowed_origins:
+                    origin = request.headers.get("Origin")
+                    if not origin:
+                        referer = request.headers.get("Referer")
+                        if referer:
+                            from urllib.parse import urlparse
+                            try:
+                                p = urlparse(referer)
+                                origin = f"{p.scheme}://{p.netloc}"
+                            except Exception:
+                                pass
+
+                    if not origin or origin.rstrip("/") not in [o.rstrip("/") for o in api_key.allowed_origins]:
+                        from app.services.audit_service import audit_log
+                        await audit_log(
+                            db=db,
+                            action="auth.api_key_origin_denied",
+                            tenant_id=str(api_key.tenant_id),
+                            user_id=str(api_key.user_id),
+                            category="security",
+                            resource_type="api_key",
+                            resource_id=str(api_key.id),
+                            status="failure",
+                            details={
+                                "requested_origin": origin,
+                                "key_prefix": api_key.key_prefix,
+                                "path": request.url.path,
+                            },
+                        )
+                        logger.warning(
+                            "auth_api_key_origin_denied",
+                            tenant_id=str(api_key.tenant_id),
+                            key_prefix=api_key.key_prefix,
+                            requested_origin=origin,
+                        )
+                        return False
+
+            # Origin validated (or not restricted). Safe to populate request.state.
+            request.state.user_id = str(api_key.user_id)
+            request.state.tenant_id = str(api_key.tenant_id)
+            request.state.role = "developer"
+            request.state.actor_email = user.email
+            request.state.auth_method = "api_key"
+            request.state.api_key_id = str(api_key.id)
+            request.state.api_key_scopes = api_key.scopes
+            request.state.api_key_agent_id = str(api_key.agent_id) if api_key.agent_id else None
+            request.state.api_key_limit = api_key.rate_limit_per_minute
+            request.state.is_support_access = False
+            request.state.tenant_activation_status = "active"
+            return True
         except Exception as exc:
             logger.error("api_key_lookup_failed", error=str(exc))
             return False

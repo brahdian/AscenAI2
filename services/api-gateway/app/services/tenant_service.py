@@ -4,10 +4,12 @@ import uuid
 from typing import Optional
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.tenant import Tenant, TenantUsage
+from app.models.user import User
+from app.models.invite import UserInvite
 
 logger = structlog.get_logger(__name__)
 
@@ -141,6 +143,57 @@ class TenantService:
         await db.refresh(tenant)
         logger.info("tenant_plan_upgraded", tenant_id=tenant_id, plan=new_plan)
         return tenant
+
+    async def check_team_seats(self, tenant_id: str, db: AsyncSession) -> bool:
+        """Check if the tenant has available seats in their plan.
+        Counts both active users and pending (unexpired) invitations.
+        """
+        tenant = await self.get_tenant(tenant_id, db)
+        if not tenant:
+            return False
+
+        # Get limits
+        limits = tenant.plan_limits or await get_plan_limits(tenant.plan, db)
+        max_seats = limits.get("max_team_seats", 5)
+        if max_seats == -1:
+            return True
+
+        # 1. Count current active users
+        user_count_result = await db.execute(
+            select(func.count())
+            .select_from(User)
+            .where(
+                User.tenant_id == uuid.UUID(tenant_id),
+                User.is_active == True
+            )
+        )
+        active_count = user_count_result.scalar() or 0
+
+        # 2. Count pending invites that haven't expired or been accepted
+        #    (Accepted invites become active users, so they are already counted above)
+        from datetime import datetime, timezone
+        invite_count_result = await db.execute(
+            select(func.count())
+            .select_from(UserInvite)
+            .where(
+                UserInvite.tenant_id == uuid.UUID(tenant_id),
+                UserInvite.accepted_at == None,
+                UserInvite.expires_at > datetime.now(timezone.utc)
+            )
+        )
+        pending_count = invite_count_result.scalar() or 0
+
+        total_occupied = active_count + pending_count
+        
+        is_allowed = total_occupied < max_seats
+        if not is_allowed:
+            logger.warning(
+                "seat_limit_reached",
+                tenant_id=tenant_id,
+                total_occupied=total_occupied,
+                max_seats=max_seats
+            )
+        return is_allowed
 
 
 tenant_service = TenantService()

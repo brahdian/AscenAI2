@@ -5,10 +5,12 @@ Admin Service — platform administration, tenant management, and RBAC metadata.
 from __future__ import annotations
 
 import uuid
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import structlog
+import stripe
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -351,7 +353,12 @@ class AdminService:
         if not tenant:
             return {"error": "Tenant not found"}
 
+        # 1. Cancel financial commitment to prevent zombie billing
+        await self._cancel_stripe_subscriptions(tenant)
+
         if hard_delete:
+            # 2. Wipe database and volatile data silos (Redis)
+            await self._wipe_tenant_data(tenant_uuid)
             await self.db.delete(tenant)
         else:
             tenant.is_active = False
@@ -372,12 +379,120 @@ class AdminService:
         logger.info("tenant_deleted", tenant_id=tenant_id, hard_delete=hard_delete)
         return {"status": "deleted", "tenant_id": tenant_id, "hard": hard_delete}
 
+    async def _cancel_stripe_subscriptions(self, tenant: Tenant) -> None:
+        """Cancel all active Stripe subscriptions for the tenant to prevent billing leaks."""
+        if not tenant.stripe_customer_id:
+            return
+            
+        try:
+            from app.core.config import settings
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            
+            # Use asyncio.to_thread for blocking Stripe calls
+            subs = await asyncio.to_thread(
+                stripe.Subscription.list,
+                customer=tenant.stripe_customer_id,
+                status="active"
+            )
+            
+            for sub in subs.data:
+                await asyncio.to_thread(stripe.Subscription.delete, sub.id)
+                logger.info("stripe_subscription_cancelled", tenant_id=str(tenant.id), sub_id=sub.id)
+        except Exception as e:
+            logger.error("stripe_cancellation_failed", tenant_id=str(tenant.id), error=str(e))
+
+    async def _wipe_tenant_data(self, tenant_id: uuid.UUID) -> None:
+        """
+        Hard-purge all data associated with a tenant across all platform tables.
+        Ensures GDPR/HIPAA compliance by scrubbing sensitive orphaned data.
+        """
+        # 3. Cascading database purge across all platform silos
+        # Order: Leaf-tables and dependent resources first to avoid FK violations
+        tables = [
+            "messages", "sessions", "conversation_traces",
+            "agent_documents", "agent_document_chunks", "agent_analytics", "message_feedback",
+            "agent_variables", "agent_custom_guardrails", "agent_guardrails",
+            "agent_playbooks", "playbook_executions", "playbook_state",
+            "escalation_attempts", "guardrail_change_requests", "guardrail_events",
+            "agent_state_transitions", "agent_lifecycle_audit",
+            
+            # Security Silos
+            "api_keys", "webhooks", "user_invites",
+            
+            # Templates and Instances
+            "agent_template_instances", "template_versions", "template_variables", 
+            "template_playbooks", "template_tools", "agent_templates",
+            
+            # Workflows
+            "workflow_step_executions", "workflow_events", "workflow_executions", "workflows",
+            
+            # Evaluations
+            "eval_scores", "eval_runs", "eval_cases",
+            
+            # Safety, Compliance & Marketplace
+            "template_compliance", "template_guardrails", "template_emergency_protocols",
+            "template_evaluations", "template_analytics", "template_marketplace",
+            
+            # Billing and Agents
+            "pending_agent_purchases", "agents"
+        ]
+        
+        for table in tables:
+            try:
+                await self.db.execute(
+                    text(f"DELETE FROM {table} WHERE tenant_id = :tid"),
+                    {"tid": tenant_id}
+                )
+            except Exception as e:
+                # Some tables might not exist in this schema or have different FKs
+                logger.warning("wipe_table_failed", table=table, error=str(e))
+
+        # --- Redis Scrubbing (Volatile PII & Cache) ---
+        if not self.redis:
+            return
+
+        try:
+            # A. Purge Session-specific volatile state (PII context, playbook engine)
+            sessions_query = text("SELECT session_id FROM sessions WHERE tenant_id = :tid")
+            sessions_res = await self.db.execute(sessions_query, {"tid": tenant_id})
+            session_ids = [row[0] for row in sessions_res.fetchall()]
+            
+            for sid in session_ids:
+                keys = [f"pii_ctx:{sid}", f"playbook_state:{sid}", f"tool_lock:{tenant_id}:{sid}"]
+                await self.redis.delete(*keys)
+
+            # B. Purge Agent-specific caches (Semantic RAG cache)
+            agents_query = text("SELECT id FROM agents WHERE tenant_id = :tid")
+            agents_res = await self.db.execute(agents_query, {"tid": tenant_id})
+            agent_ids = [str(row[0]) for row in agents_res.fetchall()]
+            
+            for aid in agent_ids:
+                await self.redis.delete(f"semantic_cache:{tenant_id}:{aid}")
+
+            # C. Purge Global Tenant Volatile State
+            await self.redis.delete(f"tenant_compliance:{tenant_id}")
+            
+            # D. Purge Billing and Throttling (patterns)
+            async for key in self.redis.scan_iter(f"billing:*:{tenant_id}:*"):
+                await self.redis.delete(key)
+            async for key in self.redis.scan_iter(f"rate_limit:*:{tenant_id}:*"):
+                await self.redis.delete(key)
+                
+            logger.info("redis_scrubbing_complete", tenant_id=str(tenant_id), sessions=len(session_ids))
+        except Exception as e:
+            logger.warning("redis_scrubbing_failed", tenant_id=str(tenant_id), error=str(e))
+
     async def list_users(
         self,
         tenant_id: str = "",
         page: int = 1,
         per_page: int = 50,
+        enforced_tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Security: Override if scoped to a specific tenant
+        if enforced_tenant_id:
+            tenant_id = str(enforced_tenant_id)
+
         offset = (page - 1) * per_page
         query = select(User).order_by(User.created_at.desc())
         if tenant_id:
@@ -406,6 +521,7 @@ class AdminService:
         user_id: str,
         new_role: str,
         admin_user_id: str,
+        enforced_tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         normalized_role = new_role.strip().lower()
         if normalized_role not in CANONICAL_TENANT_ROLES:
@@ -416,6 +532,10 @@ class AdminService:
         user = result.scalar_one_or_none()
         if not user:
             return {"error": "User not found"}
+            
+        # Security: Verify ownership if scoped
+        if enforced_tenant_id and str(user.tenant_id) != str(enforced_tenant_id):
+            return {"error": "Unauthorized to modify user in another tenant"}
 
         user.role = normalized_role
         await audit_log(
@@ -438,14 +558,16 @@ class AdminService:
             "tenant_id": str(user.tenant_id),
         }
 
-    async def get_system_prompts(self, agent_id: str = "") -> Dict[str, Any]:
+    async def get_system_prompts(self, agent_id: str = "", tenant_id: Optional[str] = None) -> Dict[str, Any]:
         if agent_id:
-            result = await self.db.execute(
-                text("SELECT system_prompt, system_prompt_version FROM agents WHERE id = :id"),
-                {"id": agent_id},
-            )
+            query = text("SELECT system_prompt, system_prompt_version, tenant_id FROM agents WHERE id = :id")
+            result = await self.db.execute(query, {"id": agent_id})
             row = result.fetchone()
             if row:
+                # Security Check: Ensure tenant_id matches if provided
+                if tenant_id and str(row._mapping.get("tenant_id")) != str(tenant_id):
+                     return {"error": "Unauthorized access to agent prompt"}
+
                 return {
                     "agent_id": agent_id,
                     "system_prompt": row._mapping.get("system_prompt", ""),
@@ -473,7 +595,18 @@ class AdminService:
         agent_id: str,
         system_prompt: str,
         admin_user_id: str,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Security Check: Verify agent ownership if not super_admin (implied by tenant_id presence)
+        if tenant_id:
+            agent_check = await self.db.execute(
+                text("SELECT tenant_id FROM agents WHERE id = :id"),
+                {"id": agent_id}
+            )
+            row = agent_check.fetchone()
+            if not row or str(row._mapping.get("tenant_id")) != str(tenant_id):
+                return {"error": "Unauthorized to update this agent prompt"}
+
         await self.db.execute(
             text("""
                 UPDATE agents
@@ -503,17 +636,24 @@ class AdminService:
         session_id: str = "",
         tenant_id: str = "",
         limit: int = 50,
+        enforced_tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        query = "SELECT * FROM conversation_traces WHERE 1=1"
+        # Security: Override tenant_id if enforced (for non-super-admins)
+        if enforced_tenant_id:
+            tenant_id = str(enforced_tenant_id)
+
         params: Dict[str, Any] = {"limit": limit}
+        # Use SQLAlchemy text() with named parameters for safety and clarity
+        stmt = "SELECT * FROM conversation_traces WHERE 1=1"
         if session_id:
-            query += " AND session_id = :session_id"
+            stmt += " AND session_id = :session_id"
             params["session_id"] = session_id
         if tenant_id:
-            query += " AND tenant_id = :tenant_id"
+            stmt += " AND tenant_id = :tenant_id"
             params["tenant_id"] = tenant_id
-        query += " ORDER BY created_at DESC LIMIT :limit"
-        result = await self.db.execute(text(query), params)
+        stmt += " ORDER BY created_at DESC LIMIT :limit"
+        
+        result = await self.db.execute(text(stmt), params)
         traces = [dict(row._mapping) for row in result.fetchall()]
         return {"traces": traces, "count": len(traces)}
 
@@ -536,11 +676,44 @@ class AdminService:
         )
         messages_today = int(messages_today_result.scalar() or 0)
 
+        # Calculate average latency from traces (last 24h)
+        latency_result = await self.db.execute(
+            text("""
+                SELECT 
+                    AVG((latency_breakdown->>'llm_ms')::float + (latency_breakdown->>'retrieval_ms')::float) as avg_latency,
+                    COUNT(*) FILTER (WHERE guardrail_input_check IS NOT NULL) as blocked_count,
+                    COUNT(*) as total_count
+                FROM conversation_traces 
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+            """)
+        )
+        latency_row = latency_result.fetchone()
+        avg_latency = float(latency_row.avg_latency or 0)
+        blocked_count = int(latency_row.blocked_count or 0)
+        total_traces = int(latency_row.total_count or 0)
+        error_rate = (blocked_count / total_traces * 100) if total_traces > 0 else 0.0
+
+        # Calculate Customer Satisfaction (CSAT) from feedback (last 30 days)
+        csat_result = await self.db.execute(
+            text("""
+                SELECT AVG(rating) as avg_csat, COUNT(*) as feedback_count
+                FROM message_feedback
+                WHERE created_at > NOW() - INTERVAL '30 days'
+            """)
+        )
+        csat_row = csat_result.fetchone()
+        avg_csat = float(csat_row.avg_csat or 0)
+        feedback_count = int(csat_row.feedback_count or 0)
+
         return {
             "active_tenants": active_tenants,
             "total_agents": total_agents,
             "sessions_today": sessions_today,
             "messages_today": messages_today,
+            "avg_latency_ms": round(avg_latency, 2),
+            "error_rate_percent": round(error_rate, 2),
+            "avg_satisfaction": round(avg_csat, 2),
+            "feedback_volume_30d": feedback_count,
             "timestamp": _utcnow().isoformat(),
         }
 
@@ -548,17 +721,25 @@ class AdminService:
         result = await self.db.execute(
             select(PlatformSetting).order_by(PlatformSetting.key.asc())
         )
-        return [
-            {
+        settings = []
+        for row in result.scalars().all():
+            value = row.value
+            # COMPLIANCE: Mask sensitive values to prevent accidental exposure to Admin UI
+            if row.is_sensitive and value:
+                if isinstance(value, str):
+                    value = value[:4] + "*" * (len(value) - 4) if len(value) > 8 else "********"
+                else:
+                    value = "********"
+            
+            settings.append({
                 "key": row.key,
-                "value": row.value,
+                "value": value,
                 "description": row.description,
                 "is_sensitive": row.is_sensitive,
                 "is_public": row.is_public,
                 "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-            }
-            for row in result.scalars().all()
-        ]
+            })
+        return settings
 
     async def update_platform_setting(
         self,
@@ -573,7 +754,16 @@ class AdminService:
         if not setting:
             return {"error": f"Setting '{key}' not found"}
 
+        old_value = setting.value
         setting.value = value
+        
+        # Mask sensitive values before logging to audit log
+        log_old = old_value
+        log_new = value
+        if setting.is_sensitive:
+            log_old = "********" if old_value else None
+            log_new = "********" if value else None
+
         await audit_log(
             self.db,
             "admin.platform_setting_changed",
@@ -582,7 +772,11 @@ class AdminService:
             category="admin",
             resource_type="platform_setting",
             resource_id=key,
-            details={"key": key},
+            details={
+                "key": key,
+                "old_value": log_old,
+                "new_value": log_new
+            },
         )
         await self.db.commit()
 

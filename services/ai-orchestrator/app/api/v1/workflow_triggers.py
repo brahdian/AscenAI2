@@ -91,7 +91,7 @@ async def webhook_trigger(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         if wf.trigger_type != "webhook":
             raise HTTPException(
@@ -106,6 +106,14 @@ async def webhook_trigger(
         secret = wf.trigger_config.get("webhook_secret", "")
         body   = await request.body()
         sig    = request.headers.get("X-Webhook-Signature", "")
+
+        if not secret:
+            logger.warning(
+                "insecure_webhook_trigger_detected",
+                workflow_id=str(flow_id),
+                tenant_id=tid_str,
+                detail="Workflow has no webhook_secret configured. Anyone with the URL can trigger it."
+            )
 
         if secret and not _verify_webhook_hmac(secret, body, sig):
             logger.warning(
@@ -163,7 +171,7 @@ async def test_trigger(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         if not wf.is_active:
             raise HTTPException(status_code=400, detail="Workflow is not active.")
@@ -216,7 +224,7 @@ async def list_executions(
 
     db = await _get_db_session(tid_str)
     try:
-        await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         q = (
             select(WorkflowExecution)

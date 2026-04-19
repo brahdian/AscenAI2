@@ -222,8 +222,37 @@ async def subscribe(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a Stripe Checkout session for the given plan."""
+    from app.services.billing_service import BillingService
+    from app.models.user import User
+    from app.models.tenant import Tenant
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    
+    # Resolve user by email. Use ordered first() to handle multi-tenant membership
+    # without crashing on MultipleResultsFound.
+    user_res = await db.execute(
+        select(User)
+        .where(User.email == request.email.lower())
+        .order_by(User.created_at.asc())
+    )
+    user = user_res.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    tenant_res = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
+    tenant = tenant_res.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
     redis = getattr(http_request.app.state, "redis", None)
-    return await auth_service.create_subscription(request.email, request.plan, db, redis)
+    billing_service = BillingService(db, redis)
+    
+    session_data = await billing_service.create_tenant_subscription_session(
+        tenant=tenant,
+        owner=user,
+        plan=request.plan
+    )
+    return session_data
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -246,7 +275,9 @@ async def refresh(
     if not token:
         from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Refresh token required.")
-    tokens = await auth_service.refresh_token(token, db)
+    
+    redis = getattr(http_request.app.state, "redis", None)
+    tokens = await auth_service.refresh_token(token, db, redis)
     _set_auth_cookies(response, tokens, http_request)
     return tokens
 
@@ -298,20 +329,52 @@ async def update_me(
     from app.models.user import User
     import uuid
 
-    body = await request.json()
-    user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = user_res.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        body = await request.json()
+        user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+        user = user_res.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
 
-    if "full_name" in body:
-        full_name = str(body["full_name"]).strip()
-        if not full_name:
-            raise HTTPException(status_code=422, detail="full_name cannot be empty")
-        user.full_name = full_name
+        if "full_name" in body:
+            full_name = str(body["full_name"]).strip()
+            if not full_name:
+                raise HTTPException(status_code=422, detail="full_name cannot be empty")
+            user.full_name = full_name
 
-    await db.commit()
-    return {"detail": "Profile updated", "full_name": user.full_name}
+        await db.commit()
+        return {"detail": "Profile updated", "full_name": user.full_name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = structlog.contextvars.get_contextvars().get("trace_id", "unknown")
+        logger.error("update_me_internal_error", error=str(e), trace_id=trace_id)
+        raise HTTPException(status_code=500, detail=f"Internal server error. Trace ID: {trace_id}")
+
+
+@router.delete("/me", status_code=204)
+async def delete_me(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Delete the current user's account (GDPR right to be forgotten)."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        redis = getattr(request.app.state, "redis", None)
+        await auth_service.delete_account(user_id, db, redis)
+        
+        _clear_auth_cookies(response)
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = structlog.contextvars.get_contextvars().get("trace_id", "unknown")
+        logger.error("delete_me_internal_error", error=str(e), trace_id=trace_id)
+        raise HTTPException(status_code=500, detail=f"Internal server error. Trace ID: {trace_id}")
 
 
 @router.post("/change-password", status_code=200)
@@ -325,29 +388,69 @@ async def change_password(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     from app.models.user import User
+    from app.services.audit_service import audit_log
     import uuid
 
-    body = await request.json()
-    current_password = body.get("current_password", "")
-    new_password = body.get("new_password", "")
+    try:
+        body = await request.json()
+        current_password = body.get("current_password", "")
+        new_password = body.get("new_password", "")
 
-    if not current_password or not new_password:
-        raise HTTPException(status_code=422, detail="current_password and new_password are required")
-    if len(new_password) < 8:
-        raise HTTPException(status_code=422, detail="new_password must be at least 8 characters")
+        if not current_password or not new_password:
+            raise HTTPException(status_code=422, detail="current_password and new_password are required")
+        
+        import re
+        if len(new_password) < 8 or not re.match(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$", new_password):
+            raise HTTPException(status_code=422, detail="new_password must be at least 8 characters with at least one uppercase, lowercase, and number")
 
-    user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = user_res.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+        user = user_res.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
 
-    if not auth_service.verify_password(current_password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
+        if not auth_service.verify_password(current_password, user.hashed_password):
+            await audit_log(
+                db, "auth.password_change_failed",
+                request=request,
+                actor_user_id=user_id,
+                actor_email=user.email,
+                category="security",
+                status="failure",
+                details={"reason": "invalid_current_password"},
+            )
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
 
-    user.hashed_password = auth_service.hash_password(new_password)
-    await db.commit()
-    return {"detail": "Password changed successfully"}
+        user.hashed_password = auth_service.hash_password(new_password)
+        user.session_version += 1 # Invalidate all current tokens
+        await db.commit()
+        
+        await audit_log(
+            db, "auth.password_changed",
+            request=request,
+            actor_user_id=user_id,
+            actor_email=user.email,
+            category="security",
+            details={"session_version": user.session_version},
+        )
 
+        # Invalidate JWT cache to prevent using old tokens on password change
+        redis = getattr(request.app.state, "redis", None)
+        if redis:
+            try:
+                pattern = f"auth:jwt:{user.id}:*"
+                async for cache_key in redis.scan_iter(match=pattern, count=100):
+                    await redis.delete(cache_key)
+                logger.info("jwt_cache_invalidated_after_password_change", user_id=str(user.id))
+            except Exception as exc:
+                logger.warning("jwt_cache_invalidation_failed", error=str(exc))
+
+        return {"detail": "Password changed successfully. All sessions invalidated."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = structlog.contextvars.get_contextvars().get("trace_id", "unknown")
+        logger.error("change_password_internal_error", error=str(e), trace_id=trace_id)
+        raise HTTPException(status_code=500, detail=f"Internal server error. Trace ID: {trace_id}")
 
 @router.post("/logout", status_code=204)
 async def logout(response: Response):
@@ -366,6 +469,15 @@ async def forgot_password(
     Always returns 202 regardless of whether the email exists — prevents enumeration.
     """
     await _auth_rate_limit(http_request, "forgot_password", limit=3, window=3600)  # 3/hr per IP
+    
+    from app.services.audit_service import audit_log
+    await audit_log(
+        db, "auth.forgot_password_requested",
+        request=http_request,
+        category="security",
+        details={"email_hash": str(hash(body.email.lower()))},
+    )
+    
     redis = getattr(http_request.app.state, "redis", None)
     await auth_service.request_password_reset(body.email, db, redis)
     return {"detail": "If that email exists, a reset link has been sent."}
@@ -378,6 +490,21 @@ async def reset_password(
     db: AsyncSession = Depends(get_db),
 ):
     """Reset password using a valid reset token (one-time, 1-hour TTL)."""
-    redis = getattr(http_request.app.state, "redis", None)
-    await auth_service.reset_password(body.token, body.new_password, db, redis)
-    return {"detail": "Password reset successfully."}
+    from app.services.audit_service import audit_log
+    try:
+        redis = getattr(http_request.app.state, "redis", None)
+        await auth_service.reset_password(body.token, body.new_password, db, redis)
+        
+        await audit_log(
+            db, "auth.password_reset_success",
+            request=http_request,
+            category="security",
+        )
+        
+        return {"detail": "Password reset successfully. All sessions invalidated."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        trace_id = structlog.contextvars.get_contextvars().get("trace_id", "unknown")
+        logger.error("reset_password_internal_error", error=str(e), trace_id=trace_id)
+        raise HTTPException(status_code=500, detail=f"Internal server error. Trace ID: {trace_id}")

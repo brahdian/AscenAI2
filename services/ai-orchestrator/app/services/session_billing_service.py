@@ -9,6 +9,9 @@ from sqlalchemy import select, and_, func, text
 from app.models.agent import Agent, Session as AgentSession, Message, AgentAnalytics, AgentPlaybook
 from app.schemas.chat import ChatResponse
 from app.core.config import settings
+from app.utils.expansion import resolve_agent_variables
+from app.models.variable import AgentVariable
+from app.services.pii_service import redact_pii, PIIContext
 
 logger = structlog.get_logger(__name__)
 
@@ -21,6 +24,7 @@ class SessionBillingService:
         self.memory = memory_manager
         self.session_expiry_minutes = getattr(settings, "SESSION_EXPIRY_MINUTES", 30)
         self.session_expiry_warning_minutes = getattr(settings, "SESSION_EXPIRY_WARNING_MINUTES", 5)
+        self._pii_ctx = PIIContext() # Reusable ephemeral context for metadata scrubbing
 
     def check_session_expiry(self, session: AgentSession) -> Optional[ChatResponse]:
         if session.is_expired(self.session_expiry_minutes):
@@ -67,43 +71,67 @@ class SessionBillingService:
         )
 
         if is_voice:
-            # For voice agents:
-            # 1. Prefer a pre-generated audio URL (voice_greeting_url) — the client
-            #    plays the file directly without any new TTS call.
-            # 2. Fall back to the cached text greeting (computed from supported_languages).
-            #    The client TTS engine speaks it verbatim.
-            # 3. If neither is set, fall back to a generic default greeting.
-            voice_greeting_url = agent_cfg.get("voice_greeting_url")
+            voice_greeting_url = agent_cfg.get(\"voice_greeting_url\")
+            custom_greeting_raw = agent_cfg.get(\"greeting_message\")
+
+            # FIX-08: Single variable fetch — used by both the pre-generated and JIT branches.
+            # Only query the DB when there's actually a text greeting to resolve.
+            variables = []
+            if voice_greeting_url or custom_greeting_raw:
+                result_vars = await self.db.execute(
+                    select(AgentVariable).where(AgentVariable.agent_id == agent.id)
+                )
+                variables = result_vars.scalars().all()
+
             if voice_greeting_url:
-                # Use the greeting_message text as the conversation record, but tag
-                # it with the pre-generated audio URL so the client can play the file.
-                greeting_text = agent_cfg.get("greeting_message") or ""
-                # Store the audio URL in session metadata so the voice client knows
-                # to play the pre-generated file instead of running live TTS.
+                greeting_text = custom_greeting_raw or \"\"
                 new_meta = dict(session.metadata_ or {})
-                new_meta["_voice_greeting_url"] = voice_greeting_url
-                if agent_cfg.get("ivr_language_url"):
-                    new_meta["_ivr_language_url"] = agent_cfg["ivr_language_url"]
+                new_meta[\"_voice_greeting_url\"] = voice_greeting_url
+                new_meta[\"_greeting_mode\"] = \"pre_generated\"
+                if agent_cfg.get(\"ivr_language_url\"):
+                    new_meta[\"_ivr_language_url\"] = agent_cfg[\"ivr_language_url\"]
                 session.metadata_ = new_meta
 
                 if not greeting_text:
-                    # No text for context — derive a generic placeholder
-                    greeting_text = f"[Pre-generated greeting audio: {voice_greeting_url}]"
-                greeting = greeting_text
+                    greeting_text = f\"[Pre-generated greeting audio: {voice_greeting_url}]\"
+
+                greeting = resolve_agent_variables(greeting_text, agent, variables, clean=True)
+            elif custom_greeting_raw:
+                greeting = resolve_agent_variables(custom_greeting_raw, agent, variables, clean=True)
+                new_meta = dict(session.metadata_ or {})
+                new_meta[\"_greeting_mode\"] = \"jit_tts\"
+                session.metadata_ = new_meta
+                logger.info(
+                    \"voice_greeting_jit\",
+                    agent_id=str(agent.id),
+                    reason=\"no_pre_generated_url\",
+                )
             else:
-                # No pre-generated file — use cached text computed from supported_languages.
+                # No custom greeting at all: fall back to computed multilingual opening.
                 from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
                 greeting, _, _ = await get_or_compute_voice_strings(self.db, agent)
+                new_meta = dict(session.metadata_ or {})
+                new_meta[\"_greeting_mode\"] = \"computed\"
+                session.metadata_ = new_meta
 
             # Ensure voice agents always have a greeting (platform requirement).
             if not greeting:
-                greeting = f"Thank you for calling. How can I assist you today?"
+                greeting = "Thank you for calling. How can I assist you today?"
                 logger.warning(
                     "voice_agent_missing_greeting_fallback",
                     agent_id=str(agent.id),
                 )
         else:
-            greeting = agent_cfg.get("greeting_message") or getattr(agent, "greeting_message", None)
+            greeting_raw = agent_cfg.get("greeting_message") or getattr(agent, "greeting_message", None)
+            if greeting_raw:
+                # FIX-08: Fetch variables once (text agents had same N+1 pattern)
+                result_vars = await self.db.execute(
+                    select(AgentVariable).where(AgentVariable.agent_id == agent.id)
+                )
+                variables = result_vars.scalars().all()
+                greeting = resolve_agent_variables(greeting_raw, agent, variables, clean=True)
+            else:
+                greeting = None
 
         if not greeting:
             return None
@@ -142,74 +170,108 @@ class SessionBillingService:
         voice_minutes: float = 0.0,
         is_new_session: bool = False,
         chat_units: int = 0,
+        turn_id: Optional[str] = None,
     ) -> None:
+        """
+        Atomically upsert one message's contribution into the AgentAnalytics
+        daily rollup row using INSERT … ON CONFLICT DO UPDATE.
+
+        Deduplication:
+        If a turn_id is provided and currentlyexists in Redis, the increment is skipped
+        to prevent double-billing on client retries or orchestrator failures.
+        """
+        if turn_id and self.redis:
+            billing_key = f"billing:processed_turn:{turn_id}"
+            already_billed = await self.redis.get(billing_key)
+            if already_billed:
+                logger.info("billing_skipped_already_processed", turn_id=turn_id)
+                return
+            # Set with a 24-hour TTL to handle retries within a reasonable window
+            await self.redis.setex(billing_key, 86400, "billed")
         try:
             today = date.today()
-            result = await self.db.execute(
-                select(AgentAnalytics).where(
-                    and_(
-                        AgentAnalytics.tenant_id == tenant_id,
-                        AgentAnalytics.agent_id == agent_id,
-                        AgentAnalytics.date == today,
+            estimated_cost = self.estimate_cost(tokens)
+
+            # B21 FIX: Use a single atomic CTE to update both agent_analytics AND tenant_usage.
+            # This prevents any possibility of drift between per-agent and per-tenant counters.
+            combined_sql = text("""
+                WITH upsert_aa AS (
+                    INSERT INTO agent_analytics (
+                        id, tenant_id, agent_id, date,
+                        total_sessions, total_messages,
+                        avg_response_latency_ms, total_tokens_used,
+                        estimated_cost_usd, tool_executions,
+                        escalations, successful_completions,
+                        total_chat_units, total_voice_minutes
+                    ) VALUES (
+                        gen_random_uuid(),
+                        CAST(:tenant_id AS UUID),
+                        CAST(:agent_id  AS UUID),
+                        :today,
+                        :session_inc, 1,
+                        :latency_ms, :tokens,
+                        :cost, :tool_count,
+                        :escalation_inc, :completion_inc,
+                        :chat_units, :voice_minutes
                     )
+                    ON CONFLICT (tenant_id, agent_id, date) DO UPDATE SET
+                        total_sessions          = agent_analytics.total_sessions + EXCLUDED.total_sessions,
+                        total_messages          = agent_analytics.total_messages + 1,
+                        avg_response_latency_ms = (
+                            agent_analytics.avg_response_latency_ms * agent_analytics.total_messages + :latency_ms
+                        ) / (agent_analytics.total_messages + 1),
+                        total_tokens_used       = agent_analytics.total_tokens_used + EXCLUDED.total_tokens_used,
+                        estimated_cost_usd      = agent_analytics.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
+                        tool_executions         = agent_analytics.tool_executions + EXCLUDED.tool_executions,
+                        escalations             = agent_analytics.escalations + EXCLUDED.escalations,
+                        successful_completions  = agent_analytics.successful_completions + EXCLUDED.successful_completions,
+                        total_chat_units        = agent_analytics.total_chat_units + EXCLUDED.total_chat_units,
+                        total_voice_minutes     = agent_analytics.total_voice_minutes + EXCLUDED.total_voice_minutes
+                    RETURNING tenant_id
                 )
-            )
-            analytics = result.scalar_one_or_none()
-
-            if analytics is None:
-                analytics = AgentAnalytics(
-                    tenant_id=tenant_id,
-                    agent_id=agent_id,
-                    date=today,
-                    total_sessions=1 if is_new_session else 0,
-                    total_messages=1,
-                    avg_response_latency_ms=float(latency_ms),
-                    total_tokens_used=tokens,
-                    estimated_cost_usd=self.estimate_cost(tokens),
-                    tool_executions=tool_count,
-                    escalations=1 if escalated else 0,
-                    successful_completions=1 if completed else 0,
-                    total_chat_units=chat_units,
-                    total_voice_minutes=voice_minutes,
-                )
-                self.db.add(analytics)
-            else:
-                analytics.total_messages += 1
-                analytics.total_tokens_used += tokens
-                analytics.estimated_cost_usd += self.estimate_cost(tokens)
-                analytics.tool_executions += tool_count
-                analytics.total_chat_units += chat_units
-                analytics.total_voice_minutes += voice_minutes
-                if is_new_session:
-                   analytics.total_sessions += 1
-                if escalated:
-                    analytics.escalations += 1
-                if completed:
-                    analytics.successful_completions += 1
-                n = analytics.total_messages
-                analytics.avg_response_latency_ms = (
-                    (analytics.avg_response_latency_ms * (n - 1) + latency_ms) / n
-                )
-
-            # --- Sync with TenantUsage (Tenant level aggregated counters) ---
-            # This ensures the Billing page shows the correct total and overage
-            usage_query = text("""
-                UPDATE tenant_usage 
-                SET current_month_messages = current_month_messages + 1,
-                    current_month_sessions = current_month_sessions + :session_increment,
-                    current_month_tokens = current_month_tokens + :tokens,
+                UPDATE tenant_usage
+                SET current_month_messages      = current_month_messages + 1,
+                    current_month_sessions      = current_month_sessions + :session_inc,
+                    current_month_tokens        = current_month_tokens + :tokens,
                     current_month_voice_minutes = current_month_voice_minutes + :voice_minutes,
-                    current_month_chat_units = current_month_chat_units + :chat_units,
-                    updated_at = NOW()
-                WHERE tenant_id = CAST(:tenant_id AS UUID)
+                    current_month_chat_units    = current_month_chat_units + :chat_units,
+                    updated_at                  = NOW()
+                WHERE tenant_id = (SELECT tenant_id FROM upsert_aa LIMIT 1)
             """)
-            await self.db.execute(usage_query, {
-                "tokens": tokens,
-                "voice_minutes": voice_minutes,
-                "chat_units": chat_units,
-                "tenant_id": str(tenant_id),
-                "session_increment": 1 if is_new_session else 0
+            await self.db.execute(combined_sql, {
+                "tenant_id":      str(tenant_id),
+                "agent_id":       str(agent_id),
+                "today":          today,
+                "session_inc":    1 if is_new_session else 0,
+                "latency_ms":     float(latency_ms),
+                "tokens":         tokens,
+                "cost":           estimated_cost,
+                "tool_count":     tool_count,
+                "escalation_inc": 1 if escalated else 0,
+                "completion_inc": 1 if completed else 0,
+                "chat_units":     chat_units,
+                "voice_minutes":  voice_minutes,
             })
+
+            logger.debug(
+                "analytics_upserted",
+                tenant_id=str(tenant_id),
+                agent_id=str(agent_id),
+                date=str(today),
+                tokens=tokens,
+                latency_ms=latency_ms,
+                chat_units=chat_units,
+                voice_minutes=voice_minutes,
+                is_new_session=is_new_session,
+            )
+            
+            # --- Automated Stripe Revenue Recovery ---
+            # Periodically notify the Gateway to check/report overages to Stripe. 
+            # We trigger this every time a session hits a 100-unit milestone (approx $1-10 revenue).
+            if (chat_units % 100) < chat_units or is_new_session:
+                # We use an internal task or fire-and-forget to avoid blocking the turn
+                import asyncio
+                asyncio.create_task(self._report_overage_to_gateway(tenant_id))
             
             # The calling orchestrator handles db.commit() to ensure atomicity.
         except Exception as exc:
@@ -242,6 +304,21 @@ class SessionBillingService:
             await pipe.execute()
         except Exception:
             pass
+
+    async def _report_overage_to_gateway(self, tenant_id: uuid.UUID) -> None:
+        """Helper to notify the API Gateway that a tenant's usage has reached a billing milestone."""
+        import httpx
+        try:
+            # api-gateway:8000 is the internal service name in docker-compose
+            url = f"http://api-gateway:8000/api/v1/billing/internal/report-overage"
+            headers = {
+                "X-Internal-Key": getattr(settings, "INTERNAL_API_KEY", ""),
+                "X-Tenant-ID": str(tenant_id),
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, headers=headers)
+        except Exception as e:
+            logger.warning("gateway_overage_notification_failed", error=str(e), tenant_id=str(tenant_id))
 
     @staticmethod
     def extract_suggested_actions(response: str, intent: str) -> list[str]:

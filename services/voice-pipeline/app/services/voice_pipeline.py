@@ -524,8 +524,11 @@ class VoicePipeline:
             state.is_speaking = True
             state.interrupt_tts = False
 
+            # Phase 13: Scrub transcript before sending to Orchestrator for inter-service privacy
+            redacted_user_text = _redact_pii(transcript.text)
+
             tts_task = asyncio.create_task(
-                self._stream_response(transcript.text, websocket, state, detected_language=transcript.language)
+                self._stream_response(redacted_user_text, websocket, state, detected_language=transcript.language)
             )
             state.current_tts_task = tts_task
 
@@ -1122,13 +1125,20 @@ class VoicePipeline:
             "detected_language": detected_language,
         }
 
+        from app.core.internal_auth import generate_internal_token
+        token = generate_internal_token()
+
         client = await self._get_http_client()
         try:
             async with client.stream(
                 "POST",
                 url,
                 json=payload,
-                headers={"Accept": "text/event-stream"},
+                headers={
+                    "Accept": "text/event-stream",
+                    "Authorization": f"Bearer {token}",
+                    "X-Tenant-ID": state.tenant_id,
+                },
                 timeout=60.0,
             ) as response:
                 response.raise_for_status()
@@ -1221,7 +1231,7 @@ class VoicePipeline:
             "escalation_to_extension",
             session_id=state.session_id,
             extension=extension,
-            target=target,
+            target=f"{str(target)[:3]}***{str(target)[-4:]}" if len(str(target)) > 7 else "[MASKED]",
         )
 
         # Notify WebSocket client (useful for browser-based voice sessions)
@@ -1251,7 +1261,7 @@ class VoicePipeline:
                         "twilio_call_redirected",
                         session_id=state.session_id,
                         call_sid=state.call_sid,
-                        target=target,
+                        target=f"{str(target)[:3]}***{str(target)[-4:]}" if len(str(target)) > 7 else "[MASKED]",
                     )
                 else:
                     logger.error(

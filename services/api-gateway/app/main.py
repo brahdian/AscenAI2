@@ -17,15 +17,21 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.database import close_db, init_db
-from app.core.scheduler import start_scheduler
+from app.core.scheduler import BACKGROUND_TASKS
 from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
+from app.middleware.rate_limiter import RateLimitMiddleware
+from app.middleware.security import SecurityHeadersMiddleware
+from app.middleware.logging import RequestLoggingMiddleware
+
 from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
 from app.api.v1 import channels as channels_router
 from app.api.v1 import admin as admin_router
 from app.api.v1 import compliance_audit as compliance_audit_router
 from app.api.v1 import playbooks as playbooks_router
 from app.api.v1 import console as console_router
+from app.utils.pii import mask_sensitive_data
+
 
 logger = structlog.get_logger(__name__)
 
@@ -62,102 +68,9 @@ async def get_redis() -> Redis:
     return redis_client
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """
-    Token-bucket rate limiter backed by Redis.
-    Key is tenant_id when authenticated, otherwise IP address.
-    Default: 300 requests / minute per tenant, 30 / minute for unauthenticated.
-    """
-
-    EXEMPT_PATHS = {"/health", "/health/startup", "/health/ready", "/health/live", "/metrics"}
-
-    async def dispatch(self, request: Request, call_next: object) -> Response:
-        if request.url.path in self.EXEMPT_PATHS:
-            return await call_next(request)
-
-        tenant_id = getattr(request.state, "tenant_id", None)
-        if tenant_id:
-            key = f"ratelimit:tenant:{tenant_id}"
-            limit = 300
-        else:
-            client_ip = request.client.host if request.client else "unknown"
-            key = f"ratelimit:ip:{client_ip}"
-            limit = 30
-
-        redis = await get_redis()
-        now = int(time.time())
-        window_key = f"{key}:{now // 60}"
-
-        try:
-            # Atomic INCR + EXPIRE via Lua script to avoid a race where INCR
-            # succeeds but EXPIRE is never called (e.g. crash between the two),
-            # which would leave the counter key without a TTL and block forever.
-            _lua = """
-local c = redis.call('INCR', KEYS[1])
-if c == 1 then redis.call('EXPIRE', KEYS[1], 120) end
-return c
-"""
-            count = await redis.eval(_lua, 1, window_key)
-        except Exception as _redis_err:
-            logger.warning("rate_limiter_redis_unavailable", error=type(_redis_err).__name__)
-            if settings.ENVIRONMENT == "production":
-                # Fail-closed in production: return 503 so we don't silently
-                # disable rate limiting when Redis is down.
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Service temporarily unavailable. Please try again shortly."},
-                    headers={"Retry-After": "5"},
-                )
-            # In dev/staging: fail-open so Redis outages don't block development
-            count = 0
-
-        if count > limit:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": "Rate limit exceeded. Please slow down.",
-                    "retry_after": 60 - (now % 60),
-                },
-                headers={"Retry-After": str(60 - (now % 60))},
-            )
-
-        response = await call_next(request)
-        response.headers["X-RateLimit-Limit"] = str(limit)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, limit - count))
-        return response
+# Middlewares are now imported from app.middleware.*
 
 
-class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    """Attach a trace ID to every request and log request/response."""
-
-    async def dispatch(self, request: Request, call_next: object) -> Response:
-        trace_id = request.headers.get("X-Trace-ID") or str(uuid.uuid4())
-        request.state.trace_id = trace_id
-
-        start = time.perf_counter()
-        logger.info(
-            "request_started",
-            trace_id=trace_id,
-            method=request.method,
-            path=request.url.path,
-            query=str(request.query_params),
-        )
-
-        response: Response = await call_next(request)
-
-        duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger.info(
-            "request_finished",
-            trace_id=trace_id,
-            method=request.method,
-            path=request.url.path,
-            status_code=response.status_code,
-            duration_ms=duration_ms,
-        )
-
-        response.headers["X-Trace-ID"] = trace_id
-        response.headers["X-Response-Time"] = f"{duration_ms}ms"
-        return response
 
 
 # ---------------------------------------------------------------------------
@@ -200,17 +113,37 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis_client  # expose for password reset and other routes
     logger.info("redis_connected", url=settings.REDIS_URL)
 
-    start_scheduler(app)
+    # Automatically start all native asyncio background loops
+    bg_tasks = []
+    for coroutine_func in BACKGROUND_TASKS:
+        # Determine if it needs Redis (the first two loops do, the purge loop doesn't)
+        if coroutine_func.__name__ == "_audit_purge_loop":
+            task = asyncio.create_task(coroutine_func())
+        else:
+            task = asyncio.create_task(coroutine_func(redis=redis_client))
+        bg_tasks.append(task)
+        
+    logger.info("background_scheduler_started", tasks_running=len(bg_tasks))
 
     app.state.startup_complete = True
     logger.info("api_gateway_started")
 
+    # Serve requests
     yield
+
+    # Clean shutdown
+    for task in bg_tasks:
+        task.cancel()
+        
+    # Wait briefly for tasks to acknowledge cancellation
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+    logger.info("background_scheduler_stopped")
 
     await close_db()
     if redis_client:
         await redis_client.aclose()
     logger.info("api_gateway_stopped")
+
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +182,42 @@ app.add_middleware(
     expose_headers=["X-Trace-ID", "X-Response-Time", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
 
-# 5. W3C traceparent propagation (Outermost — wraps everything)
+# 5. Quality of Service / Security Headers (Outermost)
+app.add_middleware(SecurityHeadersMiddleware)
+
+# 6. W3C traceparent propagation (Wraps everything)
 app.add_middleware(TracingMiddleware)
+
+
+# --- Global Exception Handlers ----------------------------------------------
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Hardened error handler: returns only a trace_id to the client.
+    Internal details are logged but never exposed (Anti-Information Disclosure).
+    """
+    trace_id = getattr(request.state, "trace_id", "none")
+    
+    # 1. Log the full traceback internally for SREs
+    logger.exception(
+        "unhandled_exception",
+        trace_id=trace_id,
+        method=request.method,
+        path=request.url.path,
+        error=str(exc)
+    )
+    
+    # 2. Return sanitized response (Zenith Pillar 5: Stealth)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal Server Error",
+            "trace_id": trace_id
+        }
+    )
+
+
 
 # --- Prometheus metrics -----------------------------------------------------
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")

@@ -27,7 +27,9 @@ import {
   Download,
   Play,
   Pause,
+  Shield,
 } from 'lucide-react'
+
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -110,7 +112,10 @@ export default function ConsolePage() {
   const [auditPage, setAuditPage] = useState(1)
   const [auditCategory, setAuditCategory] = useState('')
   const [auditStatus, setAuditStatus] = useState('')
+  const [auditSince, setAuditSince] = useState('')
+  const [auditUntil, setAuditUntil] = useState('')
   const [auditSearch, setAuditSearch] = useState('')
+
   const [auditDebounced, setAuditDebounced] = useState('')
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
@@ -142,46 +147,59 @@ export default function ConsolePage() {
       .catch(() => {})
   }, [])
 
-  const fetchAudit = useCallback(async () => {
-    setLoading(true)
+  const fetchAudit = useCallback(async (isSilent = false) => {
+    setLoading(!isSilent)
     setError(null)
     try {
       const p = new URLSearchParams({
         page: String(auditPage),
         per_page: '50',
+        silent: String(isSilent),
         ...(auditCategory && { category: auditCategory }),
         ...(auditStatus && { status: auditStatus }),
         ...(auditDebounced && { action: auditDebounced }),
+        ...(auditSince && { since: new Date(auditSince).toISOString() }),
+        ...(auditUntil && { until: new Date(auditUntil).toISOString() }),
       })
+
       const res = await fetch(`/api/v1/console/audit-logs?${p}`, { credentials: 'include' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setAuditData(await res.json())
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load')
+      if (!isSilent) setError(e instanceof Error ? e.message : 'Failed to load')
     } finally {
       setLoading(false)
     }
-  }, [auditPage, auditCategory, auditStatus, auditDebounced])
+  }, [auditPage, auditCategory, auditStatus, auditDebounced, auditSince, auditUntil])
 
-  const fetchActivity = useCallback(async () => {
-    setLoading(true)
+
+
+  const fetchActivity = useCallback(async (isSilent = false) => {
+    setLoading(!isSilent)
     setError(null)
     try {
-      const p = new URLSearchParams({ limit: '50', ...(agentFilter && { agent_id: agentFilter }) })
+      const p = new URLSearchParams({ 
+        limit: '50', 
+        silent: String(isSilent),
+        ...(agentFilter && { agent_id: agentFilter }) 
+      })
       const res = await fetch(`/api/v1/console/activity?${p}`, { credentials: 'include' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) throw new Error(`Orchestrator Activity: HTTP ${res.status}`)
       setActivityData(await res.json())
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load')
+      if (!isSilent) setError(e instanceof Error ? e.message : 'Failed to load activity')
     } finally {
       setLoading(false)
     }
   }, [agentFilter])
 
-  const refresh = useCallback(() => {
-    if (tab === 'audit') fetchAudit()
-    else fetchActivity()
+
+  const refresh = useCallback((isSilent = false) => {
+    if (tab === 'audit') fetchAudit(isSilent)
+    else fetchActivity(isSilent)
   }, [tab, fetchAudit, fetchActivity])
+
+
 
   useEffect(() => { fetchAudit() }, [fetchAudit])
   useEffect(() => { if (tab === 'sessions') fetchActivity() }, [tab, fetchActivity])
@@ -189,36 +207,55 @@ export default function ConsolePage() {
   // Auto-refresh
   useEffect(() => {
     if (autoRefresh) {
-      intervalRef.current = setInterval(refresh, 10_000)
+      intervalRef.current = setInterval(() => refresh(true), 10_000)
     } else {
+
       if (intervalRef.current) clearInterval(intervalRef.current)
     }
     return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
   }, [autoRefresh, refresh])
 
-  const exportCsv = () => {
-    const items = auditData?.items
-    if (!items?.length) return
-    const headers = ['Time', 'Actor', 'Role', 'Action', 'Category', 'Resource', 'Status', 'IP']
-    const rows = items.map(r => [
-      r.created_at,
-      r.actor_email ?? 'system',
-      r.actor_role ?? '',
-      r.action,
-      r.category,
-      r.resource_id ? `${r.resource_type}/${r.resource_id}` : (r.resource_type ?? ''),
-      r.status,
-      r.ip_address ?? '',
-    ])
-    const csv = [headers, ...rows].map(row => row.map(c => `"${c}"`).join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `audit-logs-${new Date().toISOString().split('T')[0]}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+  const exportCsv = async () => {
+    try {
+      const reason = window.prompt("Compliance Requirement: Please provide a justification for this forensic export (e.g., Ticket ID, Case #). Minimum 5 characters:");
+      if (!reason || reason.trim().length < 5) {
+        setError('A valid justification (min 5 characters) is required to export data.');
+        return;
+      }
+
+      const p = new URLSearchParams({
+        reason: reason.trim(),
+        ...(auditCategory && { category: auditCategory }),
+        ...(auditStatus && { status: auditStatus }),
+        ...(auditDebounced && { action: auditDebounced }),
+        ...(auditSince && { since: new Date(auditSince).toISOString() }),
+        ...(auditUntil && { until: new Date(auditUntil).toISOString() }),
+      })
+
+      const res = await fetch(`/api/v1/console/export?${p}`, { credentials: 'include' })
+      if (!res.ok) {
+        if (res.status === 403) throw new Error('Export restricted to Owners')
+        throw new Error('Export failed')
+      }
+      
+      const isTruncated = res.headers.get('X-Export-Truncated') === 'true'
+      if (isTruncated) {
+        window.alert('Note: This export was limited to the last 1,000 logs. For a full historical dump, please contact support or adjust your date filters.')
+      }
+
+      const blob = await res.blob()
+
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `audit-export-${new Date().toISOString().split('T')[0]}.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Export failed')
+    }
   }
+
 
   if (!_hasHydrated || !isAuthenticated) {
     return (
@@ -237,7 +274,12 @@ export default function ConsolePage() {
           <span className="text-sm font-bold text-green-400 tracking-wider">CONSOLE</span>
           <span className="text-xs text-gray-600">·</span>
           <span className="text-xs text-gray-500">tenant activity &amp; audit trail</span>
+          <div className="ml-4 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-indigo-950/40 border border-indigo-800/50 text-[10px] text-indigo-400 font-bold uppercase tracking-tighter">
+            <Shield className="w-2.5 h-2.5" />
+            Audited Access
+          </div>
         </div>
+
         <div className="flex items-center gap-2">
           {/* Auto-refresh toggle */}
           <button
@@ -250,8 +292,10 @@ export default function ConsolePage() {
             }`}
           >
             {autoRefresh ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+            {autoRefresh && <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
             {autoRefresh ? 'live' : 'paused'}
           </button>
+
           <button
             onClick={refresh}
             disabled={loading}
@@ -333,7 +377,31 @@ export default function ConsolePage() {
                 <option value="success">success</option>
                 <option value="failure">failure</option>
               </select>
+              <div className="flex items-center gap-1.5 bg-gray-800 border border-gray-700 rounded px-2 py-0.5">
+                <Clock className="w-3 h-3 text-gray-500" />
+                <input
+                  type="datetime-local"
+                  value={auditSince}
+                  onChange={e => setAuditSince(e.target.value)}
+                  className="text-[10px] bg-transparent text-gray-400 focus:outline-none"
+                  title="Filter from (Since)"
+                />
+                <span className="text-gray-700 mx-0.5">-</span>
+                <input
+                  type="datetime-local"
+                  value={auditUntil}
+                  onChange={e => setAuditUntil(e.target.value)}
+                  className="text-[10px] bg-transparent text-gray-400 focus:outline-none"
+                  title="Filter until"
+                />
+                {(auditSince || auditUntil) && (
+                  <button onClick={() => { setAuditSince(''); setAuditUntil(''); }} className="ml-1 text-gray-600 hover:text-gray-400">
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
               {auditData && (
+
                 <span className="text-xs text-gray-600 ml-auto">
                   {auditData.total.toLocaleString()} events
                 </span>
@@ -356,12 +424,18 @@ export default function ConsolePage() {
                 <div className="text-center text-xs text-gray-600 py-8">no audit events found</div>
               ) : (
                 <div className="divide-y divide-gray-800/60">
-                  {auditData.items.map(row => (
+                  {auditData.items
+                    .filter(row => {
+                      if (auditSearch.toLowerCase().includes('console')) return true
+                      return !row.action.startsWith('console.')
+                    })
+                    .map(row => (
                     <div key={row.id}>
                       <div
                         className="flex items-center gap-2 px-3 py-2 hover:bg-gray-800/40 cursor-pointer group"
                         onClick={() => setExpandedId(expandedId === row.id ? null : row.id)}
                       >
+
                         {/* Timestamp */}
                         <span className="text-xs text-gray-600 w-36 flex-shrink-0 font-mono">
                           {ts(row.created_at)}
@@ -403,10 +477,19 @@ export default function ConsolePage() {
                             )}
                           </div>
                           {row.details && (
-                            <pre className="mt-1 text-xs text-green-300 overflow-x-auto">
-                              {JSON.stringify(row.details, null, 2)}
-                            </pre>
+                            <>
+                              {row.details.__truncated && (
+                                <div className="mt-2 mb-1 px-2 py-1 bg-yellow-900/30 border border-yellow-800/50 rounded flex items-center gap-2 text-[10px] text-yellow-500">
+                                  <AlertCircle className="w-3 h-3" />
+                                  <span>Forensic detail truncated for performance (10KB cap)</span>
+                                </div>
+                              )}
+                              <pre className="mt-1 text-xs text-green-300 overflow-x-auto">
+                                {JSON.stringify(row.details, null, 2)}
+                              </pre>
+                            </>
                           )}
+
                         </div>
                       )}
                     </div>
@@ -425,7 +508,7 @@ export default function ConsolePage() {
                 >
                   <ChevronLeft className="w-3.5 h-3.5" /> prev
                 </button>
-                <span className="text-gray-600">page {auditData.page} / {auditData.pages}</span>
+                <span className="text-gray-600">page {auditPage} / {auditData.pages}</span>
                 <button
                   onClick={() => setAuditPage(p => Math.min(auditData.pages, p + 1))}
                   disabled={auditPage === auditData.pages}

@@ -41,6 +41,7 @@ from typing import Any, Optional
 
 import httpx
 import structlog
+import app.services.pii_service as pii_service
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,6 +67,10 @@ logger = structlog.get_logger(__name__)
 
 # Maximum nodes to process in a single advance() call — prevents infinite loops
 _MAX_STEPS = 50
+# Maximum sub-workflow recursion depth to prevent infinite call chains
+_MAX_CALL_DEPTH = 5
+# Redis key prefix for WAIT_FOR_SIGNAL correlation
+_SIGNAL_KEY_PREFIX = "wf:signal:"
 
 
 def _utcnow() -> datetime:
@@ -88,7 +93,8 @@ def _substitute_vars(template: str, context: dict) -> str:
                 return match.group(0)
         return str(val) if val != match.group(0) else match.group(0)
 
-    return re.sub(r"\{\{([^}]+)\}\}", _replace, str(template))
+    # FIX-04: Apply PII scrubbing to the final substituted string for defense-in-depth
+    return pii_service.redact(re.sub(r"\{\{([^}]+)\}\}", _replace, str(template)))
 
 
 def _resolve_template_dict(d: dict, context: dict) -> dict:
@@ -227,6 +233,8 @@ class WorkflowEngine:
                 current_node_id=execution.current_node_id,
             )
 
+        was_terminal = False  # Track if we transition to terminal in this run
+
         # Load workflow definition
         wf = await self.db.scalar(
             select(Workflow).where(Workflow.id == execution.workflow_id)
@@ -248,6 +256,21 @@ class WorkflowEngine:
 
         last_message: Optional[str] = None
         steps_taken = 0
+        MAX_EXECUTION_DURATION = timedelta(hours=24)
+        
+        # Enforce maximum execution duration
+        if _utcnow() - execution.created_at > MAX_EXECUTION_DURATION:
+            logger.error("workflow_max_duration_exceeded", execution_id=str(execution_id))
+            execution.status = ExecutionStatus.FAILED
+            execution.error_message = "Execution exceeded maximum allowed duration (24 hours)"
+            await self._checkpoint(execution)
+            return WorkflowAdvanceResult(
+                execution_id=execution.id,
+                status=execution.status,
+                completed=True,
+                context=execution.context,
+                current_node_id=execution.current_node_id,
+            )
 
         while steps_taken < _MAX_STEPS:
             if execution.status != ExecutionStatus.RUNNING:
@@ -331,6 +354,42 @@ class WorkflowEngine:
             execution.error_message = f"Exceeded maximum step limit ({_MAX_STEPS})"
             await self._checkpoint(execution)
 
+        is_terminal = execution.status in (ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.EXPIRED)
+        
+        # ---------------------------------------------------------------------
+        # Asynchronous Promise Resolution (Sub-Workflow Wakeup)
+        # ---------------------------------------------------------------------
+        if not was_terminal and is_terminal and execution.parent_execution_id:
+            logger.debug(
+                "workflow_promise_resolve_trigger", 
+                child_id=str(execution.id), 
+                parent_id=str(execution.parent_execution_id),
+                status=execution.status.value,
+            )
+            # DEADLOCK AVOIDANCE: The parent execution row might currently be locked 
+            # by its own `advance` transaction (especially in PARALLEL branches). 
+            # We spawn a background process with a slight delay and a fresh 
+            # Database Session to gracefully "poke" the parent and trigger re-entry.
+            from app.core.database import AsyncSessionLocal
+            import asyncio
+
+            async def _wake_parent(parent_id: uuid.UUID):
+                await asyncio.sleep(0.5)  # Allow child transaction to fully commit
+                async with AsyncSessionLocal() as parent_db:
+                    try:
+                        wake_engine = WorkflowEngine(db=parent_db, redis=self._redis)
+                        await wake_engine.advance(execution_id=parent_id)
+                        await parent_db.commit()
+                    except Exception as exc:
+                        await parent_db.rollback()
+                        logger.error("promise_resolve_wakeup_failed", parent_id=str(parent_id), error=str(exc))
+                        
+            task = asyncio.create_task(_wake_parent(execution.parent_execution_id))
+            # Optional: maintain reference to avoid garbage collection
+            self._bg_tasks = getattr(self, "_bg_tasks", set())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
         return WorkflowAdvanceResult(
             execution_id=execution.id,
             status=execution.status,
@@ -379,19 +438,24 @@ class WorkflowEngine:
             )
 
         dispatchers = {
-            NodeType.INPUT:         self._exec_input,
-            NodeType.SET_VARIABLE:  self._exec_set_variable,
-            NodeType.VALIDATION:    self._exec_validation,
-            NodeType.CONDITION:     self._exec_condition,
-            NodeType.SWITCH:        self._exec_switch,
-            NodeType.FOR_EACH:      self._exec_for_each,
-            NodeType.TOOL_CALL:     self._exec_tool_call,
-            NodeType.LLM_CALL:      self._exec_llm_call,
-            NodeType.ACTION:        self._exec_action,
-            NodeType.SEND_SMS:      self._exec_send_sms,
-            NodeType.DELAY:         self._exec_delay,
-            NodeType.HUMAN_HANDOFF: self._exec_human_handoff,
-            NodeType.END:           self._exec_end,
+            NodeType.INPUT:           self._exec_input,
+            NodeType.SET_VARIABLE:    self._exec_set_variable,
+            NodeType.VALIDATION:      self._exec_validation,
+            NodeType.CONDITION:       self._exec_condition,
+            NodeType.SWITCH:          self._exec_switch,
+            NodeType.FOR_EACH:        self._exec_for_each,
+            NodeType.TOOL_CALL:       self._exec_tool_call,
+            NodeType.LLM_CALL:        self._exec_llm_call,
+            NodeType.ACTION:          self._exec_action,
+            NodeType.SEND_SMS:        self._exec_send_sms,
+            NodeType.DELAY:           self._exec_delay,
+            NodeType.HUMAN_HANDOFF:   self._exec_human_handoff,
+            NodeType.END:             self._exec_end,
+            # ── Orchestrator nodes ──
+            NodeType.CALL_WORKFLOW:   self._exec_call_workflow,
+            NodeType.PARALLEL:        self._exec_parallel,
+            NodeType.WAIT_FOR_SIGNAL: self._exec_wait_for_signal,
+            NodeType.CODE_EXEC:       self._exec_code_exec,
         }
         handler = dispatchers.get(node.type)
         if not handler:
@@ -759,6 +823,10 @@ class WorkflowEngine:
         output_variable = cfg.get("output_variable", "action_result")
         timeout = float(cfg.get("timeout_seconds", 10))
 
+        from app.utils.security import is_safe_url
+        if not is_safe_url(url):
+            raise RuntimeError(f"ACTION node blocked: unsafe or non-HTTPS URL '{url}'")
+
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(method, url, headers=headers, json=body)
             resp.raise_for_status()
@@ -796,6 +864,8 @@ class WorkflowEngine:
                 logger.warning("workflow_sms_no_client", node_id=node.id, to=to_phone)
         except Exception as exc:
             logger.warning("workflow_sms_failed", node_id=node.id, error=str(exc))
+            if cfg.get("on_error") == "fail":
+                raise RuntimeError(f"SEND_SMS failed: {exc}")
 
         await self._record_event(
             execution=execution,
@@ -878,6 +948,490 @@ class WorkflowEngine:
         )
         return NodeResult(message=final_message, next_node_id=None)
 
+    # ==========================================================================
+    # ORCHESTRATOR NODES
+    # ==========================================================================
+
+    # -- CALL_WORKFLOW ---------------------------------------------------------
+
+    async def _exec_call_workflow(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+        edge_map: dict,
+        user_input: Optional[str],
+    ) -> NodeResult:
+        """Run another workflow as a sub-flow and block until it reaches a terminal
+        state or requires user input (which is then bubbled to the parent).
+
+        Config
+        ------
+        workflow_id        : UUID of the workflow to call (required)
+        input_mapping      : {target_context_key: "{{source_var}}"} — maps parent
+                             context vars into the child's initial context
+        output_mapping     : {parent_context_key: child_context_key} — merges
+                             child outputs back into the parent context
+        output_variable    : single key to store the child's full context dict
+        inherit_context    : bool (default False) — if True, copy entire parent
+                             context into child as the initial context
+
+        Recursion safety
+        ----------------
+        The call depth is tracked via execution.context["_call_depth"] (int).
+        If depth ≮ _MAX_CALL_DEPTH the node raises to avoid infinite loops.
+        """
+        # -------------------------------------------------------------
+        # Re-entry check: are we resuming from an asynchronous pause?
+        # -------------------------------------------------------------
+        child_ref_key = f"_child_{node.id}"
+        existing_child_id_str = execution.context.get(child_ref_key)
+        
+        if existing_child_id_str:
+            child_exec = await self.db.scalar(
+                select(WorkflowExecution).where(WorkflowExecution.id == uuid.UUID(existing_child_id_str))
+            )
+            if not child_exec:
+                raise RuntimeError(f"CALL_WORKFLOW resumed but child {existing_child_id_str} not found")
+                
+            # If child is still waiting, the parent must go back to sleep.
+            # (Usually this re-entry means the child woke us up because it completed,
+            # but we must verify strictly for correctness).
+            if child_exec.status not in (ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.EXPIRED):
+                return NodeResult(
+                    awaiting_event=child_exec.status == ExecutionStatus.AWAITING_EVENT,
+                    awaiting_input=child_exec.status == ExecutionStatus.AWAITING_INPUT,
+                    next_node_id=node.id,  # stay on this node
+                    output={},
+                )
+            
+            # The child has finished. Evaluate its current terminal state to get the final context.
+            child_result = await self.advance(execution_id=child_exec.id)
+            
+        else:
+            # ---------------------------------------------------------
+            # First invocation: create and launch child workflow
+            # ---------------------------------------------------------
+            current_depth = int(execution.context.get("_call_depth", 0))
+            if current_depth >= _MAX_CALL_DEPTH:
+                raise RuntimeError(f"CALL_WORKFLOW recursion limit reached ({_MAX_CALL_DEPTH}).")
+
+            cfg = node.config
+            raw_wf_id = cfg.get("workflow_id", "")
+            if not raw_wf_id:
+                raise ValueError("CALL_WORKFLOW node requires 'workflow_id' in config")
+    
+            try:
+                child_wf_id = uuid.UUID(raw_wf_id)
+            except ValueError:
+                raise ValueError(f"CALL_WORKFLOW: invalid workflow_id UUID '{raw_wf_id}'")
+    
+            # Build child initial context from input_mapping
+            input_mapping: dict = cfg.get("input_mapping", {})
+            child_initial: dict = {}
+            if cfg.get("inherit_context", False):
+                child_initial = {k: v for k, v in execution.context.items() if not k.startswith("_")}
+            for child_key, template in input_mapping.items():
+                child_initial[child_key] = _substitute_vars(str(template), execution.context)
+    
+            # Pass recursion depth into child
+            child_initial["_call_depth"] = current_depth + 1
+    
+            # Create child execution
+            child_exec = await self.create_execution(
+                workflow_id=child_wf_id,
+                session_id=execution.session_id or "",
+                tenant_id=execution.tenant_id,
+                initial_context=child_initial,
+                customer_phone=execution.customer_phone,
+            )
+            
+            # Critical link for asynchronous wakeup:
+            child_exec.parent_execution_id = execution.id
+            child_exec.trigger_source = "sub_workflow"
+            await self.db.flush()
+    
+            await self._record_event(
+                execution=execution,
+                event_type="CALL_WORKFLOW_STARTED",
+                payload={
+                    "child_workflow_id": str(child_wf_id),
+                    "child_execution_id": str(child_exec.id),
+                },
+            )
+    
+            # Advance child. If it needs input or an event, it will return early.
+            child_result = await self.advance(
+                execution_id=child_exec.id,
+                user_input=user_input,
+            )
+
+        # -------------------------------------------------------------
+        # Evaluate child_result (used by both init and re-entry paths)
+        # -------------------------------------------------------------
+        if not child_result.completed:
+            return NodeResult(
+                message=child_result.message,
+                awaiting_input=child_result.awaiting_input,
+                awaiting_event=child_result.status == ExecutionStatus.AWAITING_EVENT,
+                next_node_id=node.id,  # Stay on this node, we are now paused
+                output={child_ref_key: str(child_exec.id)},
+            )
+
+        # Child completed — merge outputs back into parent context
+        output_mapping: dict = cfg.get("output_mapping", {})
+        output_variable: str = cfg.get("output_variable", "")
+        
+        # Clear the internal tracking key since we're advancing
+        merged: dict = {child_ref_key: None} 
+
+        child_ctx = child_result.context or {}
+        public_child = {k: v for k, v in child_ctx.items() if not k.startswith("_")}
+
+        if output_variable:
+            merged[output_variable] = public_child
+        for parent_key, child_key in output_mapping.items():
+            if child_key in child_ctx:
+                merged[parent_key] = child_ctx[child_key]
+
+        await self._record_event(
+            execution=execution,
+            event_type="CALL_WORKFLOW_COMPLETED",
+            payload={
+                "child_execution_id": str(child_exec.id),
+                "child_status": child_result.status.value,
+                "output_keys": list([k for k in merged.keys() if k != child_ref_key]),
+            },
+        )
+
+        return NodeResult(
+            output=merged,
+            message=child_result.message,
+            next_node_id=self._resolve_next(edge_map, node.id, "default"),
+        )
+
+    # -- PARALLEL -------------------------------------------------------------
+
+    async def _exec_parallel(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+        edge_map: dict,
+        user_input: Optional[str],
+    ) -> NodeResult:
+        """Fan-out: create N isolated sub-executions concurrently, then join.
+
+        Config
+        ------
+        branches           : list of {workflow_id, input_mapping, output_variable}
+                             Each branch is a separate workflow invocation.
+        join_output_key    : context key where the list of all branch results
+                             is stored (default: "parallel_results")
+        fail_fast          : bool (default True) — if any branch fails, mark
+                             the whole PARALLEL node as failed
+
+        Design
+        ------
+        All branches are launched concurrently via asyncio.gather. Each branch
+        uses CALL_WORKFLOW semantics internally (child executions, depth guard).
+        User input is NOT supported inside parallel branches — only autonomous
+        (non-INPUT) nodes should be used as branch workflows.
+        """
+        cfg = node.config
+        branches: list[dict] = cfg.get("branches", [])
+        join_key: str = cfg.get("join_output_key", "parallel_results")
+        fail_fast: bool = cfg.get("fail_fast", True)
+
+        if not branches:
+            return NodeResult(
+                output={join_key: []},
+                next_node_id=self._resolve_next(edge_map, node.id, "default"),
+            )
+
+        parallel_ref_key = f"_parallel_{node.id}"
+        existing_branch_ids = execution.context.get(parallel_ref_key)
+
+        from app.core.database import AsyncSessionLocal
+
+        if existing_branch_ids is not None:
+            # -------------------------------------------------------------
+            # JOIN PHASE (Re-entry after waking up from branch completion)
+            # -------------------------------------------------------------
+            branch_execs = await self.db.scalars(
+                select(WorkflowExecution).where(
+                    WorkflowExecution.id.in_([uuid.UUID(uid) for uid in existing_branch_ids])
+                )
+            )
+            branch_map = {str(b.id): b for b in branch_execs}
+            
+            # Check if any branch is still running or waiting
+            still_pending = any(
+                b.status not in (ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.EXPIRED)
+                for b in branch_map.values()
+            )
+            
+            if still_pending:
+                # Branches are still evaluating, stay asleep
+                return NodeResult(
+                    awaiting_event=True,
+                    next_node_id=node.id,
+                    output={},
+                 )
+                 
+            # All branches have officially completed! Maintain original order.
+            results_list = []
+            for branch_cfg, uid in zip(branches, existing_branch_ids):
+                b_exec = branch_map[uid]
+                out_var = branch_cfg.get("output_variable", "branch_result")
+                public_ctx = {k: v for k, v in (b_exec.context or {}).items() if not k.startswith("_")}
+                results_list.append({
+                    "workflow_id": branch_cfg.get("workflow_id", ""),
+                    "execution_id": uid,
+                    "status": b_exec.status.value,
+                    "error": b_exec.error_message,
+                    out_var: public_ctx
+                })
+
+            if fail_fast and any(r.get("status") == "failed" for r in results_list):
+                 failed = [r for r in results_list if r.get("status") == "failed"]
+                 raise RuntimeError(f"PARALLEL: {len(failed)} branch(es) failed: {[f.get('error') for f in failed]}")
+
+            await self._record_event(
+                execution=execution,
+                event_type="PARALLEL_COMPLETED",
+                payload={"branch_count": len(branches), "results": results_list},
+            )
+            
+            return NodeResult(
+                output={join_key: results_list, parallel_ref_key: None},
+                next_node_id=self._resolve_next(edge_map, node.id, "default"),
+            )
+
+        else:
+            # -------------------------------------------------------------
+            # FORK PHASE (Initial Invocation)
+            # -------------------------------------------------------------
+            current_depth = int(execution.context.get("_call_depth", 0))
+            if current_depth >= _MAX_CALL_DEPTH:
+                raise RuntimeError(f"PARALLEL recursion limit reached ({_MAX_CALL_DEPTH}).")
+    
+            # Bounding semaphore: strictly limit concurrent DB connections to avoid pool exhaustion
+            sem = asyncio.Semaphore(5)
+    
+            async def _run_branch(branch_cfg: dict) -> str:
+                async with sem:
+                    raw_id = branch_cfg.get("workflow_id", "")
+                    try:
+                        branch_wf_id = uuid.UUID(raw_id)
+                    except ValueError:
+                        return None
+        
+                    input_mapping = branch_cfg.get("input_mapping", {})
+                    child_initial: dict = {"_call_depth": current_depth + 1}
+                    for child_key, tpl in input_mapping.items():
+                        child_initial[child_key] = _substitute_vars(str(tpl), execution.context)
+        
+                    # Each branch evaluates in a completely isolated database transaction session
+                    async with AsyncSessionLocal() as branch_db:
+                        try:
+                            branch_engine = WorkflowEngine(
+                                db=branch_db,
+                                mcp_client=self.mcp_client,
+                                llm_client=self._llm_client,
+                                redis=self._redis,
+                            )
+                            child_exec = await branch_engine.create_execution(
+                                workflow_id=branch_wf_id,
+                                session_id=execution.session_id or "",
+                                tenant_id=execution.tenant_id,
+                                initial_context=child_initial,
+                            )
+                            child_exec.parent_execution_id = execution.id
+                            child_exec.trigger_source = "sub_workflow"
+                            await branch_db.flush()
+                            child_id = str(child_exec.id)
+            
+                            # Advance the branch dynamically. Wait for it to hit AWAITING_EVENT or terminal.
+                            await branch_engine.advance(execution_id=child_exec.id)
+                            await branch_db.commit()
+                            return child_id
+                        except Exception as exc:
+                            await branch_db.rollback()
+                            logger.error("parallel_branch_start_error", error=str(exc))
+                            return None
+    
+            tasks = [_run_branch(b) for b in branches]
+            results: list[str] = await asyncio.gather(*tasks, return_exceptions=False)
+            
+            # Immediately enter AWAITING_EVENT, pausing the parent flow and saving the spawned IDs in context.
+            # As each child natively completes, its detached `_wake_parent` loop will wake this system up
+            # safely without deadlock.
+            valid_ids = [rid for rid in results if rid is not None]
+            
+            await self._record_event(
+                execution=execution,
+                event_type="PARALLEL_STARTED",
+                payload={"launched_branches": len(valid_ids)},
+            )
+            
+            return NodeResult(
+                awaiting_event=True, 
+                next_node_id=node.id, 
+                output={parallel_ref_key: valid_ids}
+            )
+
+    # -- WAIT_FOR_SIGNAL -------------------------------------------------------
+
+    async def _exec_wait_for_signal(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+        edge_map: dict,
+        user_input: Optional[str],
+    ) -> NodeResult:
+        """Pause the workflow until an external HTTP signal arrives.
+
+        Config
+        ------
+        signal_name        : str (required) — logical name, e.g. "payment_confirmed"
+        correlation_id_key : str (default "session_id") — context key whose value
+                             uniquely identifies this execution to the signal sender
+        ttl_seconds        : int (default 3600) — max wait time
+        output_variable    : str — where to store the signal payload
+
+        Resume flow
+        -----------
+        The signal API endpoint (POST /internal/workflows/signal/{signal_name})
+        looks up the execution_id in Redis by signal_name + correlation_id,
+        merges the signal payload into event_payload, then calls advance().
+
+        Redis key: wf:signal:{signal_name}:{correlation_value} → execution_id
+        """
+        cfg = node.config
+        signal_name: str = cfg.get("signal_name", "")
+        if not signal_name:
+            raise ValueError("WAIT_FOR_SIGNAL requires 'signal_name' in config")
+
+        ttl_seconds: int = int(cfg.get("ttl_seconds", 3600))
+        correlation_key: str = cfg.get("correlation_id_key", "session_id")
+        correlation_value: str = str(execution.context.get(correlation_key, execution.session_id or ""))
+        output_variable: str = cfg.get("output_variable", "signal_payload")
+
+        # If event_payload is present this is the RESUME call (signal already delivered)
+        # The output_variable will have been set via event_payload before advance()
+        if output_variable in execution.context:
+            return NodeResult(
+                output={},  # already in context from event_payload merge
+                next_node_id=self._resolve_next(edge_map, node.id, "default"),
+            )
+
+        # First visit: register in Redis and pause
+        redis_key = f"{_SIGNAL_KEY_PREFIX}{signal_name}:{correlation_value}"
+        if self._redis is not None:
+            await self._redis.set(
+                redis_key,
+                str(execution.id),
+                ex=ttl_seconds,
+            )
+
+        # Store signal_name on the execution row so the API can query it
+        execution.signal_name = signal_name
+
+        await self._record_event(
+            execution=execution,
+            event_type="AWAITING_SIGNAL",
+            payload={
+                "signal_name": signal_name,
+                "correlation_key": correlation_key,
+                "correlation_value": correlation_value,
+                "redis_key": redis_key,
+            },
+        )
+
+        return NodeResult(
+            awaiting_event=True,
+            event_ttl_seconds=ttl_seconds,
+            next_node_id=node.id,  # stay on this node until signal arrives
+        )
+
+    # -- CODE_EXEC ------------------------------------------------------------
+
+    async def _exec_code_exec(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+        edge_map: dict,
+        user_input: Optional[str],
+    ) -> NodeResult:
+        cfg = node.config
+        expression = cfg.get("expression", "False")
+        output_variable = cfg.get("output_variable", "code_result")
+        
+        # Use safe simpleeval with restricted functions only
+        try:
+            from simpleeval import simple_eval
+            result = simple_eval(
+                expression,
+                names=dict(execution.context),
+                functions={
+                    "int": int,
+                    "float": float,
+                    "str": str,
+                    "bool": bool,
+                    "len": len,
+                    "sum": sum,
+                    "min": min,
+                    "max": max,
+                    "round": round,
+                }
+            )
+            return NodeResult(
+                output={output_variable: result},
+                next_node_id=self._resolve_next(edge_map, node.id, "default"),
+            )
+        except Exception as exc:
+            logger.warning("workflow_code_exec_failed", expr=expression, error=str(exc))
+            raise RuntimeError(f"Code execution failed: {exc}") from exc
+
+        try:
+            from simpleeval import EvalWithCompoundTypes
+            import json as _json
+
+            safe_names = {
+                **execution.context,
+                "True": True, "False": False, "None": None,
+                "json": _json,
+            }
+            safe_functions = {
+                "int": int, "float": float, "str": str, "bool": bool,
+                "len": len, "abs": abs, "min": min, "max": max,
+                "round": round, "sorted": sorted, "list": list,
+                "dict": dict, "sum": sum, "any": any, "all": all,
+            }
+            evaluator = EvalWithCompoundTypes(
+                names=safe_names,
+                functions=safe_functions,
+            )
+            result = evaluator.eval(code)
+        except Exception as exc:
+            logger.warning(
+                "workflow_code_exec_error",
+                node_id=node.id,
+                code=code[:200],
+                error=str(exc),
+            )
+            if on_error == "skip":
+                return NodeResult(
+                    output={output_variable: None},
+                    next_node_id=self._resolve_next(edge_map, node.id, "default"),
+                )
+            raise RuntimeError(f"CODE_EXEC failed: {exc}") from exc
+
+        return NodeResult(
+            output={output_variable: result},
+            next_node_id=self._resolve_next(edge_map, node.id, "default"),
+        )
+
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -910,6 +1464,34 @@ class WorkflowEngine:
         )
         await self._checkpoint(execution)
 
+    async def _scrub_pii_recursive(self, data: Any, secret_keys: set[str]) -> Any:
+        """Recursively redact values for keys identified as secrets or matching PII patterns."""
+        if isinstance(data, dict):
+            scrubbed = {}
+            for k, v in data.items():
+                if k.lower() in secret_keys or any(word in k.lower() for word in ["password", "secret", "token", "cvv", "ssn"]):
+                    scrubbed[k] = "[REDACTED]"
+                else:
+                    scrubbed[k] = await self._scrub_pii_recursive(v, secret_keys)
+            return scrubbed
+        elif isinstance(data, list):
+            return [await self._scrub_pii_recursive(x, secret_keys) for x in data]
+        elif isinstance(data, str):
+            from app.services import pii_service
+            return pii_service.redact(data)
+        return data
+
+    async def _get_secret_keys(self, execution: WorkflowExecution) -> set[str]:
+        """Fetch names of all variables marked as 'is_secret' for this agent."""
+        from app.models.variable import AgentVariable
+        from sqlalchemy import select
+        stmt = select(AgentVariable.name).where(
+            AgentVariable.agent_id == execution.workflow.agent_id,
+            AgentVariable.is_secret == True
+        )
+        result = await self.db.execute(stmt)
+        return {r[0].lower() for r in result.all()}
+
     async def _checkpoint(self, execution: WorkflowExecution) -> None:
         """Flush execution state to the DB."""
         execution.updated_at = _utcnow()
@@ -925,14 +1507,18 @@ class WorkflowEngine:
         duration_ms: int,
         idem_key: str,
     ) -> None:
+        secret_keys = await self._get_secret_keys(execution)
+        safe_input = await self._scrub_pii_recursive(input_snapshot, secret_keys)
+        safe_output = await self._scrub_pii_recursive(output_snapshot, secret_keys)
+
         stmt = pg_insert(WorkflowStepExecution).values(
             id=uuid.uuid4(),
             execution_id=execution.id,
             node_id=node.id,
             node_type=node.type.value,
             status=status,
-            input_snapshot=input_snapshot,
-            output_snapshot=output_snapshot,
+            input_snapshot=safe_input,
+            output_snapshot=safe_output,
             duration_ms=duration_ms,
             idempotency_key=idem_key,
             started_at=_utcnow(),
@@ -948,12 +1534,15 @@ class WorkflowEngine:
         actor: str = "system",
         idempotency_key: Optional[str] = None,
     ) -> None:
+        secret_keys = await self._get_secret_keys(execution)
+        safe_payload = await self._scrub_pii_recursive(payload, secret_keys)
+
         idem = idempotency_key or f"{execution.id}:{event_type}:{_utcnow().timestamp()}"
         stmt = pg_insert(WorkflowEvent).values(
             id=uuid.uuid4(),
             execution_id=execution.id,
             event_type=event_type,
-            payload=payload,
+            payload=safe_payload,
             actor=actor,
             idempotency_key=idem,
             created_at=_utcnow(),

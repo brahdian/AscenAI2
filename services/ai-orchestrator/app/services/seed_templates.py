@@ -15,7 +15,7 @@ from sqlalchemy import text, select
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
 from app.core.database import AsyncSessionLocal
-from app.models.template import AgentTemplate, TemplateVersion, TemplateVariable, TemplatePlaybook
+from app.models.template import AgentTemplate, TemplateVersion, TemplateVariable, TemplatePlaybook, TemplateTool
 
 logger = structlog.get_logger(__name__)
 
@@ -2735,21 +2735,30 @@ async def seed_templates() -> None:
                     version_id = str(uuid.uuid4())
                     await db.execute(
                         text("""
-                            INSERT INTO template_versions (id, template_id, version, system_prompt_template)
-                            VALUES (:id, :template_id, 1, :prompt)
+                            INSERT INTO template_versions (id, template_id, version, system_prompt_template, compliance, guardrails, emergency_protocols)
+                            VALUES (:id, :template_id, 1, :prompt, :compliance, :guardrails, :emergency_protocols)
                         """),
                         {"id": version_id, "template_id": tpl_id,
-                         "prompt": tpl["system_prompt_template"]},
+                         "prompt": tpl["system_prompt_template"],
+                         "compliance": tpl.get("compliance"),
+                         "guardrails": tpl.get("guardrails"),
+                         "emergency_protocols": tpl.get("emergency_protocols")},
                     )
                 else:
                     version_id = str(version_id_scalar)
                     await db.execute(
                         text("""
                             UPDATE template_versions 
-                            SET system_prompt_template = :prompt
+                            SET system_prompt_template = :prompt,
+                                compliance = :compliance,
+                                guardrails = :guardrails,
+                                emergency_protocols = :emergency_protocols
                             WHERE id = :id
                         """),
-                        {"id": version_id, "prompt": tpl["system_prompt_template"]}
+                        {"id": version_id, "prompt": tpl["system_prompt_template"],
+                         "compliance": tpl.get("compliance"),
+                         "guardrails": tpl.get("guardrails"),
+                         "emergency_protocols": tpl.get("emergency_protocols")}
                     )
 
                 # --- Deep Sync: Clear existing associated data to ensure idempotency and updates ---
@@ -2790,7 +2799,7 @@ async def seed_templates() -> None:
                         "out_of_scope_response": pb.get("out_of_scope_response"),
                         "fallback_response": pb.get("fallback_response"),
                         "custom_escalation_message": pb.get("custom_escalation_message"),
-                        "flow_definition": pb.get("flow_definition", $[vars:]),
+                        "flow_definition": pb.get("flow_definition", {}),
                     }
                     await db.execute(
                         insert(TemplatePlaybook).values(

@@ -196,10 +196,14 @@ class BookingEvent(Base):
         UniqueConstraint("idempotency_key", name="uq_be_idempotency_key"),
         Index("ix_be_workflow_id", "workflow_id"),
         Index("ix_be_event_type", "event_type"),
+        Index("ix_be_tenant_id", "tenant_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
     )
     workflow_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

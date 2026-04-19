@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
+from app.core.security import get_tenant_db, get_current_tenant, generate_internal_token
+from app.core.rbac import require_role, require_scope
 from app.services.billing_service import create_agent_checkout_session
 
 logger = structlog.get_logger(__name__)
@@ -32,13 +33,11 @@ async def _get_tenant_and_usage(tenant_id: str, db: AsyncSession):
 
 
 async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
-    """Raise 402 if tenant is not subscribed, or is at/above purchased agent slots.
-    
-    B1 FIX: Uses a Redis distributed lock to prevent TOCTOU races where two
-    simultaneous agents can both pass the limit check before either increments
-    the usage counter.
+    """Raise 402 if tenant is not subscribed, or 409 if at/above purchased agent slots.
+
+    Returns the list of active agents alongside each error so the frontend can
+    render a meaningful Swap dialog rather than a bare error string.
     """
-    from app.services.tenant_service import get_plan_limits
     from app.services.auth_service import auth_service as _auth_service
     tenant, usage = await _get_tenant_and_usage(tenant_id, db)
     if tenant is None or usage is None:
@@ -48,7 +47,6 @@ async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
     if tenant.subscription_status != "active" or usage.agent_count == 0:
         payment_url = None
         try:
-            # Generate a checkout session for the user to purchase their first agent slot
             sub_resp = await _auth_service.create_subscription(
                 tenant.email or "", tenant.plan or "voice_growth", db, None
             )
@@ -64,29 +62,38 @@ async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
             },
         )
 
-    # Gate 2: Check if they are at their agent limit
+    # Gate 2: Check active agent count against purchased slots.
+    # Only ACTIVE agents consume a slot — archived/draft/pending do not.
     purchased_slots = usage.agent_count
-
-    # Query actual agent count from orchestrator
-    actual_count = 0
+    active_agents = []
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
-                headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY}
+                params={"status": "active"},
+                headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
             )
             if resp.status_code == 200:
-                agents = resp.json()
-                actual_count = len(agents)
+                active_agents = resp.json()
     except Exception as e:
         logger.warning("agent_count_query_error", error=str(e))
-        pass
 
-    if actual_count >= purchased_slots:
+    if len(active_agents) >= purchased_slots:
         raise HTTPException(
-            status_code=402,
-            detail=f"No available agent slots. You have {actual_count} agent(s) and {purchased_slots} slot(s). "
-                   f"Please purchase an additional slot in the Billing section."
+            status_code=409,
+            detail={
+                "code": "at_slot_capacity",
+                "message": (
+                    f"All {purchased_slots} slot(s) are in use. "
+                    "Archive an active agent to free a slot, or purchase additional slots."
+                ),
+                "slots_used": len(active_agents),
+                "slots_total": purchased_slots,
+                "active_agents": [
+                    {"id": a.get("id"), "name": a.get("name")}
+                    for a in active_agents
+                ],
+            },
         )
 
 
@@ -115,27 +122,6 @@ async def _increment_agent_count(tenant_id: str, delta: int, db: AsyncSession) -
     usage = usage_res.scalar_one_or_none()
     if usage:
         usage.agent_count = max(0, (usage.agent_count or 0) + delta)
-        await db.commit()
-
-
-async def _increment_message_count(tenant_id: str, db: AsyncSession, turn_count: int = 0) -> None:
-    """Increment current_month_messages on TenantUsage.
-    
-    B9 FIX: Chat unit accounting has been removed from here. The orchestrator
-    (session_billing_service.py::update_analytics) is the single source of truth
-    for chat units to prevent double-counting. This function only increments
-    the raw message counter and session counter.
-    """
-    from app.models.tenant import TenantUsage
-    import uuid as _uuid
-    tid = _uuid.UUID(tenant_id)
-    usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tid))
-    usage = usage_res.scalar_one_or_none()
-    if usage:
-        usage.current_month_messages = (usage.current_month_messages or 0) + 1
-        # Sessions: increment on the first turn
-        if turn_count == 1:
-            usage.current_month_sessions = (usage.current_month_sessions or 0) + 1
         await db.commit()
 
 
@@ -220,10 +206,19 @@ async def _proxy_request(
     headers = {
         "X-Tenant-ID": getattr(request.state, "tenant_id", ""),
         "X-User-ID": getattr(request.state, "user_id", ""),
+        "X-Actor-Email": getattr(request.state, "actor_email", ""),
         "X-Role": getattr(request.state, "role", ""),
         "X-Trace-ID": _trace_id,
+        "X-Is-Support-Access": "true" if getattr(request.state, "is_support_access", False) else "false",
+        "X-Original-IP": getattr(request.state, "client_ip", "unknown"),
         "Content-Type": request.headers.get("Content-Type", "application/json"),
     }
+
+    # Signal restricted agent-lockout to downstream services (CRIT-005 deep defense)
+    api_agent_id = getattr(request.state, "api_key_agent_id", None)
+    if api_agent_id:
+        headers["X-Restricted-Agent-ID"] = str(api_agent_id)
+
     # Attach shared internal secret so the ai-orchestrator can verify this
     # request originated from the trusted api-gateway (CRIT-002 defense).
     if settings.INTERNAL_API_KEY:
@@ -232,7 +227,11 @@ async def _proxy_request(
     if _trace_id and _span_id:
         headers["traceparent"] = f"00-{_trace_id}-{_span_id}-01"
 
-    body = await request.body()
+    # Use cached body if available (CRIT-005 Fix: prevent double consumption)
+    body = getattr(request.state, "body_bytes", None)
+    if body is None:
+        body = await request.body()
+
 
     if len(body) > settings.MAX_BODY_BYTES:
         raise HTTPException(
@@ -336,6 +335,82 @@ async def proxy(
         if method == "POST" and _CHAT_SEND.match(full_path):
             await _check_message_limit(tenant_id, db)
 
+    # ── RBAC & Scope Enforcement (CRIT-001 Fix) ───────────────────────────────
+    # For API Key authentication, we MUST validate that the key has the required
+    # scope for the requested service/action.
+    auth_method = getattr(request.state, "auth_method", "jwt")
+    if auth_method == "api_key":
+        api_scopes = getattr(request.state, "api_key_scopes", []) or []
+        
+        # 1. 'admin' scope bypasses all granular checks
+        if "admin" not in api_scopes:
+            # 2. DELETE/PATCH/PUT are restricted to 'admin' or specific 'write' scopes
+            if method in ("DELETE", "PATCH", "PUT"):
+                required_write = f"{service}:write"
+                if required_write not in api_scopes:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"API Key missing required write scope: {required_write} (or 'admin')"
+                    )
+
+            # 3. Chat and Session management for widgets
+            if service in ("chat", "sessions", "feedback"):
+                if "chat" not in api_scopes:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="API Key missing 'chat' scope required for widget interactions."
+                    )
+            
+            # 5. Agent-level Scoping (CRIT-005 Fix)
+            # If the API key is restricted to a specific Agent, enforce that here.
+            api_agent_id = getattr(request.state, "api_key_agent_id", None)
+            if api_agent_id:
+                # Cache the body bytes so we can inspect it here AND forward it later
+                # without exhausting the request stream (CRIT-FIX).
+                body_bytes = b""
+                if method in ("POST", "PUT", "PATCH"):
+                    body_bytes = await request.body()
+                    request.state.body_bytes = body_bytes
+
+                # Case A: Service is 'agents' (ID is usually in the URL path)
+                if service == "agents":
+                    path_parts = path.strip("/").split("/")
+                    if path_parts:
+                        target_id = path_parts[0]
+                        if target_id and len(target_id) > 30: # Basic UUID length check
+                            if target_id != api_agent_id:
+                                logger.warning("auth_api_key_agent_mismatch", key_agent_id=api_agent_id, requested_agent_id=target_id)
+                                raise HTTPException(status_code=403, detail=f"API Key restricted to Agent {api_agent_id}.")
+                        elif not target_id or target_id == "":
+                            raise HTTPException(status_code=403, detail="API Key restricted to a single agent. Listing all agents is blocked.")
+
+                # Case B: Service is 'chat' (Agent ID is in JSON body)
+                elif service == "chat" and body_bytes:
+                    try:
+                        body_json = _json.loads(body_bytes)
+                        target_id = body_json.get("agent_id")
+                        if target_id and target_id != api_agent_id:
+                            logger.warning("auth_api_key_chat_agent_mismatch", key_agent_id=api_agent_id, requested_agent_id=target_id)
+                            raise HTTPException(status_code=403, detail=f"API Key restricted to Agent {api_agent_id}.")
+                    except _json.JSONDecodeError: pass
+
+                # Case C: Other services (sessions, feedback)
+                elif service in ("sessions", "feedback") and body_bytes:
+                    try:
+                        body_json = _json.loads(body_bytes)
+                        target_id = body_json.get("agent_id")
+                        if target_id and target_id != api_agent_id:
+                            raise HTTPException(status_code=403, detail=f"API Key restricted to Agent {api_agent_id}.")
+                    except: pass
+
+
+            # 6. Block all other services (analytics, billing, etc.) for non-admin keys
+            elif service not in ("chat", "sessions", "feedback", "agents"):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"API Key restricted. Scope required for service '{service}'."
+                )
+
     # ── Forward the request ───────────────────────────────────────────────────
     url = _get_downstream_url(service, f"/{path}" if path else "")
 
@@ -369,18 +444,26 @@ async def proxy(
             tenant, usage = await _get_tenant_and_usage(tenant_id, db)
 
             purchased_slots = usage.agent_count if usage else 0
-            actual_count = 0
+            # Only count ACTIVE agents against the slot quota
+            active_agents_list = []
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    res = await client.get(f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents", headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY})
+                    res = await client.get(
+                        f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+                        params={"status": "active"},
+                        headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
+                    )
                     if res.status_code == 200:
-                        actual_count = len(res.json())
+                        active_agents_list = res.json()
             except Exception:
                 pass
 
-            has_slot = False
-            if tenant and tenant.subscription_status == "active" and (actual_count < purchased_slots):
-                has_slot = True
+            active_count = len(active_agents_list)
+            has_slot = bool(
+                tenant
+                and tenant.subscription_status == "active"
+                and active_count < purchased_slots
+            )
 
             try:
                 body_dict = await request.json()
@@ -389,15 +472,23 @@ async def proxy(
 
             # Extract template context for automatic instantiation
             template_ctx = body_dict.pop("template_context", None)
+            if template_ctx:
+                # B4 FIX: Inject into agent_config so it's persisted in the orchestrator
+                # This ensures we can recover the template config after payment redirect.
+                body_dict.setdefault("agent_config", {})["template_context"] = template_ctx
+            
+            logger.info("gateway_preparing_agent_create", tenant_id=tenant_id, template_id=template_ctx.get("template_id") if template_ctx else None)
                 
             body_dict["is_active"] = has_slot
+            if not has_slot:
+                body_dict["status"] = "PENDING_PAYMENT"
             
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 headers = {
                     "X-Tenant-ID": tenant_id,
                     "X-User-ID": getattr(request.state, "user_id", ""),
                     "X-Role": getattr(request.state, "role", ""),
-                    "X-Internal-Key": settings.INTERNAL_API_KEY,
+                    "Authorization": f"Bearer {generate_internal_token()}",
                     "Content-Type": "application/json",
                 }
                 resp = await client.post(url, json=body_dict, headers=headers)
@@ -427,6 +518,26 @@ async def proxy(
                                 logger.error("gateway_auto_instantiation_error", agent_id=agent_id, error=str(inst_err))
 
                     if has_slot:
+                        # ── CRIT-005 Fix: Automatic Widget Key Generation ────────────────
+                        # When a new agent is created, automatically generate a restricted
+                        # API key scoped ONLY to 'chat' and locked to this agent.
+                        try:
+                            from app.services.auth_service import auth_service
+                            # Identify the user creating the agent
+                            user_id = getattr(request.state, "user_id", "")
+                            if user_id:
+                                _, widget_key = await auth_service.create_api_key(
+                                    tenant_id=uuid.UUID(tenant_id),
+                                    user_id=uuid.UUID(user_id),
+                                    name=f"Widget Key: {body_dict.get('name', 'New Agent')}",
+                                    scopes=["chat", "sessions", "feedback"],
+                                    db=db,
+                                    agent_id=uuid.UUID(agent_id),
+                                )
+                                logger.info("gateway_auto_widget_key_created", agent_id=agent_id, key_id=str(widget_key.id))
+                        except Exception as key_err:
+                            logger.error("gateway_auto_widget_key_failed", agent_id=agent_id, error=str(key_err))
+
                         return Response(content=resp.content, status_code=201)
                     
                     # Create draft and redirect to Stripe
@@ -512,5 +623,212 @@ async def proxy(
                 status_code=getattr(delete_resp, 'status_code', 'unknown'),
             )
         return delete_resp
+
+    # CUSTOM HANDLING: slot-activate — revive an ARCHIVED/PENDING agent into an empty slot
+    _AGENT_SLOT_ACTIVATE = re.compile(r"^agents/([^/]+)/slot-activate$")
+    if service == "agents" and method == "POST" and _AGENT_SLOT_ACTIVATE.match(full_path):
+        m = _AGENT_SLOT_ACTIVATE.match(full_path)
+        target_agent_id = m.group(1)
+
+        _redis = getattr(request.app.state, "redis", None)
+        _lock_key = f"slot_lock:{tenant_id}"
+        _lock_acquired = False
+        if _redis:
+            try:
+                _lock_acquired = await _redis.set(_lock_key, "1", nx=True, ex=15)
+                if not _lock_acquired:
+                    raise HTTPException(status_code=429, detail="A slot update is already in progress.")
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("slot_lock_redis_error", error=str(e), tenant_id=tenant_id)
+                
+        try:
+            # Check capacity first
+            tenant, usage = await _get_tenant_and_usage(tenant_id, db)
+            purchased_slots = usage.agent_count if usage else 0
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    res = await client.get(
+                        f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
+                        params={"status": "active"},
+                        headers={"X-Tenant-ID": tenant_id, "X-Internal-Key": settings.INTERNAL_API_KEY},
+                    )
+                    active_agents_list = res.json() if res.status_code == 200 else []
+            except Exception:
+                active_agents_list = []
+
+            active_count = len(active_agents_list)
+            if active_count >= purchased_slots:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "at_slot_capacity",
+                        "message": (
+                            f"All {purchased_slots} slot(s) are in use. "
+                            "Archive an active agent first to free a slot."
+                        ),
+                        "slots_used": active_count,
+                        "slots_total": purchased_slots,
+                        "active_agents": [
+                            {"id": a.get("id"), "name": a.get("name")}
+                            for a in active_agents_list
+                        ],
+                    },
+                )
+
+            # Slot is available — forward to orchestrator activate endpoint
+            try:
+                body_bytes = await request.body()
+                async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                    int_headers = {
+                        "X-Tenant-ID": tenant_id,
+                        "Authorization": f"Bearer {generate_internal_token()}",
+                        "Content-Type": "application/json",
+                    }
+                    activate_resp = await client.post(
+                        f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{target_agent_id}/activate",
+                        content=body_bytes,
+                        headers=int_headers,
+                    )
+                    
+                    if activate_resp.status_code == 200:
+                        # Proactively update Stripe Metadata
+                        agent_data = activate_resp.json()
+                        sub_id = agent_data.get("stripe_subscription_id")
+                        if sub_id:
+                            import asyncio as _asyncio
+                            try:
+                                await _asyncio.to_thread(
+                                    stripe.Subscription.modify,
+                                    sub_id,
+                                    metadata={"agent_id": target_agent_id, "tenant_id": tenant_id}
+                                )
+                            except Exception as stripe_err:
+                                logger.warning("stripe_metadata_update_failed", error=str(stripe_err))
+
+                    return Response(
+                        content=activate_resp.content,
+                        status_code=activate_resp.status_code,
+                        media_type="application/json",
+                    )
+            except Exception as e:
+                logger.error("slot_activate_proxy_error", error=str(e))
+                raise HTTPException(status_code=502, detail="Failed to activate agent.")
+        finally:
+            if _redis and _lock_acquired:
+                try:
+                    await _redis.delete(_lock_key)
+                except Exception:
+                    pass
+
+    # CUSTOM HANDLING: slot-archive — archive an ACTIVE agent to free its slot
+    _AGENT_SLOT_ARCHIVE = re.compile(r"^agents/([^/]+)/slot-archive$")
+    if service == "agents" and method == "POST" and _AGENT_SLOT_ARCHIVE.match(full_path):
+        m = _AGENT_SLOT_ARCHIVE.match(full_path)
+        target_agent_id = m.group(1)
+        try:
+            body_bytes = await request.body()
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                int_headers = {
+                    "X-Tenant-ID": tenant_id,
+                    "Authorization": f"Bearer {generate_internal_token()}",
+                    "Content-Type": "application/json",
+                }
+                archive_resp = await client.post(
+                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{target_agent_id}/archive",
+                    content=body_bytes,
+                    headers=int_headers,
+                )
+                return Response(
+                    content=archive_resp.content,
+                    status_code=archive_resp.status_code,
+                    media_type="application/json",
+                )
+        except Exception as e:
+            logger.error("slot_archive_proxy_error", error=str(e))
+            raise HTTPException(status_code=502, detail="Failed to archive agent.")
+
+    # CUSTOM HANDLING: slot-swap — atomic archive and activate
+    _AGENT_SLOT_SWAP = re.compile(r"^agents/slot-swap$")
+    if service == "agents" and method == "POST" and _AGENT_SLOT_SWAP.match(full_path):
+        try:
+            body_dict = await request.json()
+            archive_id = body_dict.get("archive_id")
+            activate_id = body_dict.get("activate_id")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+            
+        if not archive_id or not activate_id:
+            raise HTTPException(status_code=400, detail="Missing archive_id or activate_id")
+            
+        _redis = getattr(request.app.state, "redis", None)
+        _lock_key = f"slot_lock:{tenant_id}"
+        _lock_acquired = False
+        if _redis:
+            try:
+                _lock_acquired = await _redis.set(_lock_key, "1", nx=True, ex=15)
+                if not _lock_acquired:
+                    raise HTTPException(status_code=429, detail="A slot update is already in progress.")
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("slot_lock_redis_error", error=str(e), tenant_id=tenant_id)
+                
+        try:
+            int_headers = {
+                "X-Tenant-ID": tenant_id,
+                "Authorization": f"Bearer {generate_internal_token()}",
+                "Content-Type": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                # 1. Archive
+                archive_resp = await client.post(
+                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{archive_id}/archive",
+                    headers=int_headers,
+                )
+                if archive_resp.status_code not in (200, 204):
+                    logger.error("slot_swap_archive_failed", archive_id=archive_id, status=archive_resp.status_code)
+                    raise HTTPException(status_code=502, detail="Failed to archive agent during swap.")
+                    
+                # 2. Activate
+                activate_resp = await client.post(
+                    f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{activate_id}/activate",
+                    headers=int_headers,
+                )
+                if activate_resp.status_code != 200:
+                    logger.error("slot_swap_activate_failed", activate_id=activate_id, status=activate_resp.status_code)
+                    raise HTTPException(status_code=502, detail="Failed to activate agent during swap.")
+                
+                # 3. Stripe Metadata Update
+                agent_data = activate_resp.json()
+                sub_id = agent_data.get("stripe_subscription_id")
+                if sub_id:
+                    import asyncio as _asyncio
+                    try:
+                        await _asyncio.to_thread(
+                            stripe.Subscription.modify,
+                            sub_id,
+                            metadata={"agent_id": activate_id, "tenant_id": tenant_id}
+                        )
+                    except Exception as e:
+                        logger.warning("stripe_metadata_update_failed", error=str(e))
+
+                return Response(
+                    content=activate_resp.content,
+                    status_code=activate_resp.status_code,
+                    media_type="application/json",
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("slot_swap_proxy_error", error=str(e))
+            raise HTTPException(status_code=502, detail="Failed to swap agents.")
+        finally:
+            if _redis and _lock_acquired:
+                try:
+                    await _redis.delete(_lock_key)
+                except Exception:
+                    pass
 
     return await _proxy_request(request, url, path, db, service=service)

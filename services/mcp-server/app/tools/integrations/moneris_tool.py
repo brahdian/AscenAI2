@@ -1,16 +1,17 @@
-"""Moneris payment integration (Canada).
+"""Moneris Checkout (MCO) integration (Canada).
 
-Moneris uses a custom XML-based gateway API.
-API reference: https://developer.moneris.com/Documentation/NA/E-Commerce%20Solutions/API
+Moneris Checkout (MCO) provides a secure, hosted payment page.
+API reference: https://developer.moneris.com/Documentation/NA/Moneris%20Checkout/
 
 Per-agent config keys required:
-  - store_id     : Moneris store ID
-  - api_token    : Moneris API token
-  - environment  : "production" | "sandbox" (default "sandbox")
+  - store_id      : Moneris store ID
+  - api_token     : Moneris API token
+  - checkout_id   : Moneris Checkout ID (MCO-xxxxxx)
+  - environment   : "production" | "qa" (default "qa")
 """
 from __future__ import annotations
 
-import xml.etree.ElementTree as ET
+import json
 from typing import Any
 
 import httpx
@@ -18,115 +19,96 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-_MONERIS_URLS = {
-    "production": "https://www3.moneris.com/gateway2/servlet/MpgRequest",
-    "sandbox": "https://esqa.moneris.com/gateway2/servlet/MpgRequest",
+# Moneris Checkout Preload Endpoints
+_MCO_PRELOAD_URLS = {
+    "production": "https://gateway.moneris.com/chkt/request/request.php",
+    "qa": "https://esqa.moneris.com/chkt/request/request.php",
+}
+
+# Moneris Checkout Redirect Endpoints
+_MCO_CHKT_URLS = {
+    "production": "https://gateway.moneris.com/chkt/index.php",
+    "qa": "https://esqa.moneris.com/chkt/index.php",
 }
 
 
-def _build_purchase_xml(store_id: str, api_token: str, order_id: str, amount: str, pan: str, expdate: str, crypt_type: str = "7") -> str:
-    """Build the Moneris Purchase XML request body."""
-    return f"""<?xml version="1.0" encoding="utf-8"?>
-<request>
-  <store_id>{store_id}</store_id>
-  <api_token>{api_token}</api_token>
-  <purchase>
-    <store_id>{store_id}</store_id>
-    <api_token>{api_token}</api_token>
-    <order_id>{order_id}</order_id>
-    <amount>{amount}</amount>
-    <pan>{pan}</pan>
-    <expdate>{expdate}</expdate>
-    <crypt_type>{crypt_type}</crypt_type>
-  </purchase>
-</request>"""
-
-
-def _parse_moneris_response(xml_text: str) -> dict[str, Any]:
-    """Parse Moneris XML response into a dict."""
-    try:
-        root = ET.fromstring(xml_text)
-        receipt = root.find("receipt")
-        if receipt is None:
-            return {"success": False, "error": "No receipt in response", "raw": xml_text}
-
-        response_code = receipt.findtext("ResponseCode", "")
-        message = receipt.findtext("Message", "")
-        trans_id = receipt.findtext("TransID", "")
-        receipt_id = receipt.findtext("ReceiptId", "")
-        complete = receipt.findtext("Complete", "false").lower() == "true"
-
-        # Moneris: ResponseCode < 50 and not "null" means approved
-        approved = False
-        try:
-            if response_code and response_code != "null":
-                approved = int(response_code) < 50
-        except ValueError:
-            approved = False
-
-        return {
-            "success": approved,
-            "approved": approved,
-            "response_code": response_code,
-            "message": message,
-            "transaction_id": trans_id,
-            "receipt_id": receipt_id,
-            "complete": complete,
-        }
-    except ET.ParseError as exc:
-        logger.error("moneris_xml_parse_error", error=str(exc))
-        return {"success": False, "error": f"Failed to parse Moneris response: {exc}"}
-
-
-async def handle_moneris_process_payment(parameters: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+async def handle_moneris_create_checkout(parameters: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """
-    Process a payment via Moneris (Canada).
+    Initialize a Moneris Checkout session and return a payment URL.
 
-    Required config: store_id, api_token
-    Optional config: environment (production|sandbox, default sandbox)
+    Required config: store_id, api_token, checkout_id
+    Optional config: environment (production|qa, default qa)
 
-    Required parameters: amount, pan, expdate, order_id
-    Optional parameters: crypt_type (default "7" = SSL)
+    Required parameters: amount
+    Optional parameters: cart_id (order reference), description
     """
     store_id = config.get("store_id", "").strip()
     api_token = config.get("api_token", "").strip()
-    environment = config.get("environment", "sandbox").lower()
+    checkout_id = config.get("checkout_id", "").strip()
+    environment = config.get("environment", "qa").lower()
 
-    if not store_id or not api_token:
-        return {"success": False, "error": "Moneris not configured. Add your store_id and api_token."}
+    if not all([store_id, api_token, checkout_id]):
+        return {"success": False, "error": "Moneris Checkout not fully configured. store_id, api_token, and checkout_id are required."}
 
     amount = str(parameters.get("amount", ""))
-    pan = str(parameters.get("pan", ""))
-    expdate = str(parameters.get("expdate", ""))
-    order_id = str(parameters.get("order_id", ""))
-    crypt_type = str(parameters.get("crypt_type", "7"))
+    cart_id = str(parameters.get("cart_id") or parameters.get("order_id", "order_link"))
+    description = str(parameters.get("description", "Payment Request"))
 
-    if not amount or not pan or not expdate or not order_id:
-        return {"success": False, "error": "Missing required parameters: amount, pan, expdate, order_id"}
+    if not amount:
+        return {"success": False, "error": "Missing required parameter: amount"}
 
-    url = _MONERIS_URLS.get(environment, _MONERIS_URLS["sandbox"])
-    xml_body = _build_purchase_xml(store_id, api_token, order_id, amount, pan, expdate, crypt_type)
+    preload_url = _MCO_PRELOAD_URLS.get(environment, _MCO_PRELOAD_URLS["qa"])
+    
+    # MCO Preload Request (JSON)
+    payload = {
+        "store_id": store_id,
+        "api_token": api_token,
+        "checkout_id": checkout_id,
+        "action": "preload",
+        "txn_total": f"{float(amount):.2f}",
+        "cart_id": cart_id,
+        "environment": environment,
+    }
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                url,
-                content=xml_body.encode("utf-8"),
-                headers={"Content-Type": "application/xml; charset=utf-8"},
+                preload_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
-            result = _parse_moneris_response(resp.text)
+            data = resp.json()
+
+            # MCO returns a 'ticket' which is used to build the checkout URL
+            ticket = data.get("response", {}).get("ticket")
+            if not ticket:
+                error_msg = data.get("response", {}).get("error_msg", "Failed to initialize checkout session")
+                logger.error("moneris_mco_preload_failed", error=error_msg, raw=data)
+                return {"success": False, "error": error_msg}
+
+            # Construct the final checkout link
+            base_chkt_url = _MCO_CHKT_URLS.get(environment, _MCO_CHKT_URLS["qa"])
+            full_checkout_url = f"{base_chkt_url}?ticket={ticket}"
+
             logger.info(
-                "moneris_payment_processed",
-                order_id=order_id,
-                approved=result.get("approved"),
-                response_code=result.get("response_code"),
+                "moneris_checkout_initialized",
+                cart_id=cart_id,
+                amount=amount,
                 environment=environment,
             )
-            return result
+            
+            return {
+                "success": True,
+                "checkout_url": full_checkout_url,
+                "ticket": ticket,
+                "amount": amount,
+                "cart_id": cart_id,
+            }
+            
     except httpx.HTTPStatusError as exc:
-        logger.error("moneris_http_error", status=exc.response.status_code, error=str(exc))
+        logger.error("moneris_mco_http_error", status=exc.response.status_code, error=str(exc))
         return {"success": False, "error": f"Moneris gateway returned HTTP {exc.response.status_code}"}
-    except httpx.RequestError as exc:
-        logger.error("moneris_request_error", error=str(exc))
-        return {"success": False, "error": f"Failed to connect to Moneris gateway: {exc}"}
+    except Exception as exc:
+        logger.error("moneris_mco_unexpected_error", error=str(exc))
+        return {"success": False, "error": f"Failed to initialize Moneris Checkout: {str(exc)}"}

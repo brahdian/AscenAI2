@@ -39,10 +39,29 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agent:
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
+async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession, request: Request | None = None) -> Agent:
+    agent_uuid = uuid.UUID(agent_id)
+    
+    # Apply isolation (CRIT-005)
+    if request:
+        raid = _restricted_agent_id(request)
+        if raid and agent_uuid != raid:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
-            Agent.id == uuid.UUID(agent_id),
+            Agent.id == agent_uuid,
             Agent.tenant_id == uuid.UUID(tenant_id),
         )
     )
@@ -81,7 +100,7 @@ async def create_eval_case(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, tenant_id, db, request)
 
     case = EvalCase(
         tenant_id=agent.tenant_id,
@@ -109,7 +128,7 @@ async def list_eval_cases(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request)
 
     result = await db.execute(
         select(EvalCase)
@@ -131,7 +150,7 @@ async def update_eval_case(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request)
 
     result = await db.execute(
         select(EvalCase).where(
@@ -165,7 +184,7 @@ async def delete_eval_case(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request)
 
     result = await db.execute(
         select(EvalCase).where(
@@ -190,7 +209,7 @@ async def trigger_eval_run(
 ):
     """Trigger an evaluation run (scores without an agent runner — registers the run)."""
     tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, tenant_id, db, request)
 
     svc = EvalService(db=db, llm_client=None)
     run = await svc.run_eval(
@@ -213,7 +232,7 @@ async def list_eval_runs(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request)
 
     result = await db.execute(
         select(EvalRun)
@@ -235,7 +254,7 @@ async def get_eval_run(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    await _verify_agent(agent_id, tenant_id, db, request)
 
     result = await db.execute(
         select(EvalRun).where(
@@ -274,7 +293,7 @@ async def eval_gate(
     Returns HTTP 200 in both cases; CI scripts should check ``"pass"`` field.
     """
     tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, tenant_id, db, request)
 
     svc = EvalService(db=db, llm_client=None)
     return await svc.gate_check(

@@ -33,6 +33,11 @@ class NodeType(str, enum.Enum):
     DELAY          = "DELAY"           # Wait N seconds before next node
     HUMAN_HANDOFF  = "HUMAN_HANDOFF"   # Escalate session to human agent
     END            = "END"             # Terminal — emit final message
+    # ── Orchestrator nodes ────────────────────────────────────────────
+    CALL_WORKFLOW   = "CALL_WORKFLOW"  # Run another workflow as a sub-flow and await its result
+    PARALLEL        = "PARALLEL"       # Fan-out: run multiple node chains concurrently, then join
+    WAIT_FOR_SIGNAL = "WAIT_FOR_SIGNAL" # Pause until an external webhook/event delivers a named signal
+    CODE_EXEC       = "CODE_EXEC"      # Safe Python expression evaluation for data transformation
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +88,42 @@ class WorkflowDefinition(BaseModel):
         node_ids = {n.id for n in nodes}
         if nodes and v not in node_ids:
             raise ValueError(f"entry_node_id '{v}' not found in nodes")
+        return v
+
+    @field_validator("definition")
+    @classmethod
+    def validate_no_cycles(cls, v: WorkflowDefinition) -> WorkflowDefinition:
+        """Validate workflow graph contains no cycles"""
+        node_ids = {n.id for n in v.nodes}
+        edge_map: dict[str, list[str]] = {}
+        
+        for edge in v.edges:
+            if edge.source not in node_ids:
+                raise ValueError(f"Edge source '{edge.source}' not found in nodes")
+            if edge.target not in node_ids:
+                raise ValueError(f"Edge target '{edge.target}' not found in nodes")
+            edge_map.setdefault(edge.source, []).append(edge.target)
+        
+        visited = set()
+        recursion_stack = set()
+        
+        def has_cycle(node_id: str) -> bool:
+            visited.add(node_id)
+            recursion_stack.add(node_id)
+            
+            for neighbor in edge_map.get(node_id, []):
+                if neighbor not in visited:
+                    if has_cycle(neighbor):
+                        return True
+                elif neighbor in recursion_stack:
+                    return True
+            
+            recursion_stack.remove(node_id)
+            return False
+        
+        if has_cycle(v.entry_node_id):
+            raise ValueError("Workflow graph contains a cycle which would cause infinite execution")
+        
         return v
 
 
@@ -197,7 +238,11 @@ class NodeResult(BaseModel):
     message: Optional[str] = None
     # If True the engine pauses and waits for user_input on the next advance()
     awaiting_input: bool = False
-    # If True the engine pauses and waits for an external event (webhook, delay)
+    # If True the engine pauses and waits for an external event (webhook, delay, signal)
     awaiting_event: bool = False
     # TTL for AWAITING_EVENT (seconds from now); used by DELAY and SEND_SMS nodes
     event_ttl_seconds: Optional[int] = None
+    # PARALLEL: list of branch entry node IDs to execute concurrently
+    parallel_branches: list[str] = Field(default_factory=list)
+    # WAIT_FOR_SIGNAL: correlation key stored so the signal endpoint can resume this execution
+    signal_correlation_id: Optional[str] = None

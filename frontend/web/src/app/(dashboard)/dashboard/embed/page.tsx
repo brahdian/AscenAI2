@@ -5,7 +5,15 @@ import { agentsApi, apiKeysApi, feedbackApi } from '@/lib/api'
 import { Code2, Copy, Check, Globe, Package, Terminal, MessageSquare, Eye, RefreshCw, Send, X, ThumbsUp, ThumbsDown, PenLine } from 'lucide-react'
 
 interface Agent { id: string; name: string; greeting_message?: string }
-interface APIKey { id: string; name: string; key_prefix: string; key?: string }
+interface APIKey {
+  id: string
+  name: string
+  key_prefix: string
+  key?: string
+  agent_id?: string
+  scopes: string[]
+  allowed_origins?: string[]
+}
 
 interface PreviewMessage {
   role: 'user' | 'assistant'
@@ -41,6 +49,8 @@ export default function EmbedPage() {
   const [showFeedbackModal, setShowFeedbackModal] = useState(false)
   const [feedbackMessageIndex, setFeedbackMessageIndex] = useState<number | null>(null)
   const [feedbackMode, setFeedbackMode] = useState<'rate' | 'correct'>('rate')
+  const [isUpdatingKey, setIsUpdatingKey] = useState(false)
+  const [newOrigin, setNewOrigin] = useState('')
 
   const selectedAgent = agents.find((a) => a.id === agentId)
   const selectedKey = keys.find((k) => k.id === selectedKeyId)
@@ -48,8 +58,12 @@ export default function EmbedPage() {
 
   useEffect(() => {
     agentsApi.list().then(setAgents).catch(() => {})
-    apiKeysApi.list().then(setKeys).catch(() => {})
+    refreshKeys()
   }, [])
+
+  const refreshKeys = () => {
+    apiKeysApi.list().then(setKeys).catch(() => {})
+  }
 
   useEffect(() => {
     previewEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -320,6 +334,39 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
     }
   }
 
+  const handleAddOrigin = async () => {
+    if (!selectedKey || !newOrigin.trim()) return
+    const origins = [...(selectedKey.allowed_origins || []), newOrigin.trim()]
+    setIsUpdatingKey(true)
+    try {
+      await apiKeysApi.patch(selectedKey.id, { allowed_origins: origins })
+      setNewOrigin('')
+      refreshKeys()
+    } catch (err) {
+      console.error('Failed to update origins', err)
+    } finally {
+      setIsUpdatingKey(false)
+    }
+  }
+
+  const handleRemoveOrigin = async (origin: string) => {
+    if (!selectedKey) return
+    const origins = (selectedKey.allowed_origins || []).filter(o => o !== origin)
+    setIsUpdatingKey(true)
+    try {
+      await apiKeysApi.patch(selectedKey.id, { allowed_origins: origins })
+      refreshKeys()
+    } catch (err) {
+      console.error('Failed to update origins', err)
+    } finally {
+      setIsUpdatingKey(false)
+    }
+  }
+
+  const isKeyInsecure = selectedKey?.scopes.includes('admin')
+  const isKeyAgentRestricted = selectedKey?.agent_id === agentId
+  const hasOrigins = (selectedKey?.allowed_origins?.length || 0) > 0
+
   return (
     <div className="p-8 w-full">
       <div className="mb-8">
@@ -352,23 +399,113 @@ const followUp = await chat('Tomorrow at 2pm works', reply.session_id);`
             <select
               value={selectedKeyId}
               onChange={(e) => setSelectedKeyId(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white"
+              className={`w-full px-3 py-2 rounded-lg border bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white ${
+                isKeyInsecure ? 'border-red-300 dark:border-red-900 ring-1 ring-red-100' : 'border-gray-200 dark:border-gray-700'
+              }`}
             >
               <option value="">Select an API key…</option>
               {keys.map((k) => (
-                <option key={k.id} value={k.id}>{k.name} ({k.key_prefix}…)</option>
+                <option key={k.id} value={k.id}>
+                  {k.name} {k.agent_id ? '🔒' : ''} {k.scopes.includes('admin') ? '🚩' : ''} ({k.key_prefix}…)
+                </option>
               ))}
             </select>
           </div>
         </div>
+
+        {selectedKey && (
+          <div className="mt-4 space-y-3">
+            {isKeyInsecure && (
+              <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 flex gap-3">
+                <Terminal size={16} className="text-red-600 shrink-0 mt-0.5" />
+                <div className="text-xs text-red-800 dark:text-red-300">
+                  <p className="font-bold mb-1">Critical Security Warning: Admin Key Detected</p>
+                  <p>You have selected a <b>Secret Admin Key</b>. If you paste this into a public website, an attacker can steal it and gain full control over your entire AscenAI account. <b>Do not use this for production widgets.</b></p>
+                  <p className="mt-1 font-medium italic underline">Requirement: Create a Restricted Key with 'chat' scope and specific Agent ID.</p>
+                </div>
+              </div>
+            )}
+            
+            {isKeyAgentRestricted && !isKeyInsecure && (
+              <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 flex gap-3">
+                <Check size={16} className="text-emerald-600 shrink-0 mt-0.5" />
+                <div className="text-xs text-emerald-800 dark:text-emerald-300">
+                  <p className="font-bold mb-0.5">Production Ready: Restricted Widget Key</p>
+                  <p>This key is restricted to this specific agent and chat functionality. This is the secure, recommended way to embed AscenAI.</p>
+                </div>
+              </div>
+            )}
+
+            {!isKeyAgentRestricted && !isKeyInsecure && selectedKey && (
+              <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 flex gap-3">
+                <Terminal size={16} className="text-amber-600 shrink-0 mt-0.5" />
+                <div className="text-xs text-amber-800 dark:text-amber-300">
+                  <p className="font-bold mb-0.5">Security Notice: Broad Access Key</p>
+                  <p>This key can access all agents in your tenant. For better security, use an <b>Agent-Restricted Key</b> to ensure that if a key is leaked, only one agent is affected.</p>
+                </div>
+              </div>
+            )}
+
+            {/* Origin lockdown */}
+            <div className="p-4 rounded-lg bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <Globe size={12} className="text-violet-500" />
+                  Domain Lockdown (Allowed Origins)
+                </h3>
+                {!hasOrigins && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 font-medium">Disabled (Global)</span>
+                )}
+                {hasOrigins && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 font-medium">{selectedKey?.allowed_origins?.length} Whitelisted</span>
+                )}
+              </div>
+              <p className="text-[11px] text-gray-500 mb-3">Add your website domain (e.g. <code>https://example.com</code>) to prevent this key from being used on unauthorized sites.</p>
+              
+              <div className="flex flex-wrap gap-2 mb-3">
+                {selectedKey?.allowed_origins?.map((origin) => (
+                  <div key={origin} className="flex items-center gap-1.5 px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-xs text-gray-700 dark:text-gray-300 group">
+                    {origin}
+                    <button 
+                      onClick={() => handleRemoveOrigin(origin)}
+                      disabled={isUpdatingKey}
+                      className="text-gray-400 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex gap-2">
+                <input 
+                  type="text" 
+                  value={newOrigin}
+                  onChange={(e) => setNewOrigin(e.target.value)}
+                  placeholder="https://your-site.com"
+                  className="flex-1 px-3 py-1.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-xs text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-violet-500"
+                />
+                <button 
+                  onClick={handleAddOrigin}
+                  disabled={isUpdatingKey || !newOrigin}
+                  className="px-3 py-1.5 rounded bg-violet-600 hover:bg-violet-700 text-white text-xs font-medium disabled:opacity-50 transition-all flex items-center gap-1.5 shadow-sm"
+                >
+                  {isUpdatingKey ? <RefreshCw size={12} className="animate-spin" /> : <PenLine size={12} />}
+                  Add Origin
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {(!agentId || !selectedKeyId) && (
           <p className="text-xs text-amber-600 dark:text-amber-400 mt-3">
             Select an agent and API key to generate your integration code.
           </p>
         )}
         {selectedKey && !selectedKey.key && (
-          <p className="text-xs text-amber-600 dark:text-amber-400 mt-3">
-            ⚠️ The full API key is only shown when first created. Replace <code className="font-mono text-violet-600">{selectedKey.key_prefix}…</code> in the snippet with your actual key.
+          <p className="text-xs text-gray-500 mt-3 italic">
+            Note: The full API key is hidden. Ensure you replace the prefix in the snippet with your full key.
           </p>
         )}
       </div>

@@ -135,6 +135,8 @@ class SMSWorkflowEngine:
             return
 
         try:
+            masked_to = f"{wf.customer_phone[:4]}...{wf.customer_phone[-2:]}" if wf.customer_phone and len(wf.customer_phone) > 6 else "***"
+            
             result = await handle_send_sms(
                 {"to": wf.customer_phone, "message": message},
                 self._tenant_config,
@@ -144,6 +146,7 @@ class SMSWorkflowEngine:
                 logger.info(
                     "sms_sent",
                     workflow_id=str(wf.id),
+                    to=masked_to,
                     event_type=event_type,
                     sid=result.get("sid"),
                 )
@@ -159,6 +162,7 @@ class SMSWorkflowEngine:
                 logger.error(
                     "sms_send_failed",
                     workflow_id=str(wf.id),
+                    to=masked_to,
                     event_type=event_type,
                     error=result.get("error"),
                 )
@@ -178,6 +182,7 @@ class SMSWorkflowEngine:
             logger.exception(
                 "sms_engine_exception",
                 workflow_id=str(wf.id),
+                to=masked_to,
                 event_type=event_type,
                 error=str(exc),
             )

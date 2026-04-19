@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     OTEL_ENDPOINT: str = ""      # e.g. "http://otel-collector:4317"
     OTEL_ENABLED: bool = False
     ENVIRONMENT: str = "production"
+    
+    # Trusted Proxies (for X-Forwarded-For validation)
+    TRUSTED_PROXY_IPS: List[str] = []
 
 
 @lru_cache()

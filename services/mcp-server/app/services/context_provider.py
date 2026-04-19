@@ -137,6 +137,8 @@ class ContextProvider:
         kb_id: Optional[str] = None,
     ) -> list[ContextItem]:
         """Search the tenant's knowledge base using pgvector cosine similarity."""
+        import time as _time
+        _t0 = _time.monotonic()
         try:
             query_vector = await _embed_text(query)
             
@@ -152,11 +154,12 @@ class ContextProvider:
             if kb_id:
                 filters.append(KnowledgeDocument.kb_id == uuid.UUID(kb_id))
 
+            # Phase 7: Over-fetch by 2x so the score filter doesn't starve the result
             stmt = (
                 select(KnowledgeDocument, score_col)
                 .where(and_(*filters))
                 .order_by(dist_col)
-                .limit(top_k)
+                .limit(top_k * 2)
             )
 
             result = await self.db.execute(stmt)
@@ -164,6 +167,13 @@ class ContextProvider:
 
             items = []
             for doc, score in rows:
+                # Phase 7 — Gap 2: Discard chunks below the minimum relevance threshold
+                if float(score) < settings.MIN_KNOWLEDGE_SCORE:
+                    continue
+                # Phase 7 — Gap 3: Suppress semantic duplicates from retrieval
+                doc_meta = doc.doc_metadata or {}
+                if doc_meta.get("is_semantic_duplicate") == "true":
+                    continue
                 items.append(
                     ContextItem(
                         type="knowledge",
@@ -177,12 +187,26 @@ class ContextProvider:
                         },
                     )
                 )
+                if len(items) >= top_k:
+                    break
+
+            _latency_ms = int((_time.monotonic() - _t0) * 1000)
+            logger.info(
+                "rag_search_complete",
+                tenant_id=tenant_id,
+                kb_id=kb_id,
+                results_returned=len(items),
+                latency_ms=_latency_ms,
+                min_score=settings.MIN_KNOWLEDGE_SCORE,
+            )
             return items
 
         except Exception as exc:
+            _latency_ms = int((_time.monotonic() - _t0) * 1000)
             logger.error(
                 "knowledge_search_failed",
                 tenant_id=tenant_id,
+                latency_ms=_latency_ms,
                 error=str(exc),
                 exc_info=exc,
             )
@@ -454,3 +478,51 @@ class ContextProvider:
             return False
         await self.db.delete(doc)
         return True
+
+    async def delete_documents_by_metadata(
+        self, tenant_id: str, kb_id: str, metadata_key: str, metadata_value: str
+    ) -> int:
+        """Delete all documents in a knowledge base matching a specific metadata key/value."""
+        from sqlalchemy import delete
+        
+        # PostgreSQL-specific JSONB containment or key access
+        # Since we use JSON column, we use ->> operator in raw text or cast
+        from sqlalchemy import text
+        
+        stmt = (
+            delete(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.tenant_id == uuid.UUID(tenant_id),
+                KnowledgeDocument.kb_id == uuid.UUID(kb_id),
+                KnowledgeDocument.doc_metadata[metadata_key].astext == metadata_value
+            )
+        )
+        
+        result = await self.db.execute(stmt)
+        return result.rowcount
+
+    async def delete_all_tenant_knowledge(self, tenant_id: str) -> int:
+        """Wipe all knowledge bases and documents for a specific tenant. High-performance operation for self-destruction."""
+        from sqlalchemy import delete
+        
+        # 1. Delete all documents (cascades or manual depending on schema, but let's be explicit)
+        doc_stmt = (
+            delete(KnowledgeDocument)
+            .where(KnowledgeDocument.tenant_id == uuid.UUID(tenant_id))
+        )
+        doc_result = await self.db.execute(doc_stmt)
+        
+        # 2. Delete all knowledge bases
+        kb_stmt = (
+            delete(KnowledgeBase)
+            .where(KnowledgeBase.tenant_id == uuid.UUID(tenant_id))
+        )
+        kb_result = await self.db.execute(kb_stmt)
+        
+        logger.info(
+            "tenant_knowledge_wiped",
+            tenant_id=tenant_id,
+            deleted_documents=doc_result.rowcount,
+            deleted_kbs=kb_result.rowcount
+        )
+        return doc_result.rowcount

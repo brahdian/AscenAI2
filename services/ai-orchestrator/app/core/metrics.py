@@ -143,3 +143,121 @@ CONTRACT_VALIDATION_ERRORS = Counter(
     "HTTP 422 request validation errors (API contract mismatches)",
     labelnames=["path"],
 )
+
+# ---------------------------------------------------------------------------
+# Zenith Compliance & Audit Metrics (Pillar 1, 2)
+# ---------------------------------------------------------------------------
+
+AUDIT_LOG_WRITES = Counter(
+    "zenith_audit_log_writes_total",
+    "Total audit log entries created",
+    ["tenant_id", "action", "category"]
+)
+
+PII_REDACTED = Counter(
+    "zenith_pii_redacted_total",
+    "Total PII instances redacted from prompts and logs",
+    ["tenant_id", "pii_type"]
+)
+
+DOCUMENT_ACCESSED = Counter(
+    "zenith_document_accessed_total",
+    "Total document accesses for RAG",
+    ["tenant_id", "agent_id"]
+)
+
+# ---------------------------------------------------------------------------
+# Zenith Cost Governance Metrics (Pillar 10)
+# ---------------------------------------------------------------------------
+
+LLM_COST_USD = Counter(
+    "zenith_llm_cost_usd_total",
+    "Total LLM cost in USD",
+    ["tenant_id", "model", "agent_id"]
+)
+
+TOOL_COST_USD = Counter(
+    "zenith_tool_cost_usd_total",
+    "Total tool execution cost in USD",
+    ["tenant_id", "tool_name", "agent_id"]
+)
+
+TENANT_QUOTA_EXCEEDED = Counter(
+    "zenith_tenant_quota_exceeded_total",
+    "Total times tenant exceeded plan limits",
+    ["tenant_id", "limit_type"]
+)
+
+# ---------------------------------------------------------------------------
+# Zenith Workflow & Determinism Metrics (Pillar 9)
+# ---------------------------------------------------------------------------
+
+WORKFLOW_EXECUTIONS = Counter(
+    "zenith_workflow_executions_total",
+    "Total workflow executions",
+    ["tenant_id", "agent_id", "workflow_id", "status"]
+)
+
+WORKFLOW_NODE_EXECUTIONS = Counter(
+    "zenith_workflow_node_executions_total",
+    "Total workflow node executions",
+    ["tenant_id", "workflow_id", "node_type", "status"]
+)
+
+WORKFLOW_RETRIES = Counter(
+    "zenith_workflow_retries_total",
+    "Total workflow node retries",
+    ["tenant_id", "workflow_id"]
+)
+
+# ---------------------------------------------------------------------------
+# Zenith SLO & Error Budget Metrics
+# ---------------------------------------------------------------------------
+
+SLO_ERROR_BUDGET_REMAINING = Gauge(
+    "zenith_slo_error_budget_remaining_percent",
+    "Remaining error budget for 99.9% SLO",
+    ["service"]
+)
+
+ERROR_BUDGET_CONSUMPTION = Counter(
+    "zenith_error_budget_consumption_total",
+    "Total error budget consumed",
+    ["service"]
+)
+
+# ---------------------------------------------------------------------------
+# Zenith Metric Helpers
+# ---------------------------------------------------------------------------
+
+def record_llm_usage(model: str, tenant_id: str, agent_id: str, prompt_tokens: int, completion_tokens: int, cost_usd: float):
+    """Record complete LLM usage with cost tracking"""
+    LLM_TOKENS.labels(provider="openai", model=model, type="prompt").inc(prompt_tokens)
+    LLM_TOKENS.labels(provider="openai", model=model, type="completion").inc(completion_tokens)
+    LLM_COST_USD.labels(tenant_id=tenant_id, model=model, agent_id=agent_id).inc(cost_usd)
+
+
+def record_workflow_execution(tenant_id: str, agent_id: str, workflow_id: str, status: str, duration: float):
+    """Record workflow execution metrics"""
+    WORKFLOW_EXECUTIONS.labels(tenant_id=tenant_id, agent_id=agent_id, workflow_id=workflow_id, status=status).inc()
+
+
+def record_audit_log(tenant_id: str, action: str, category: str):
+    """Record audit log creation"""
+    AUDIT_LOG_WRITES.labels(tenant_id=tenant_id, action=action, category=category).inc()
+
+
+def record_pii_redaction(tenant_id: str, pii_type: str, count: int = 1):
+    """Record PII redaction events"""
+    PII_REDACTED.labels(tenant_id=tenant_id, pii_type=pii_type).inc(count)
+
+
+async def metrics_endpoint():
+    """Prometheus /metrics endpoint with all Zenith metrics"""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from fastapi import Response
+    
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )

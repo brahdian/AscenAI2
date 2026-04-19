@@ -41,6 +41,11 @@ function createApiClient(): AxiosInstance {
   // The client relies strictly on HttpOnly cookies sent via withCredentials
   // No explicit Bearer tokens are attached from localStorage
   client.interceptors.request.use((config) => {
+    // Zenith Pillar 1: Trace Continuity
+    // Inject X-Trace-ID onto every API call so forensic logs correlate 1:1 with frontend actions
+    if (!config.headers['X-Trace-ID'] && typeof window !== 'undefined' && window.crypto?.randomUUID) {
+      config.headers['X-Trace-ID'] = window.crypto.randomUUID()
+    }
     return config
   })
 
@@ -159,6 +164,29 @@ export const authApi = {
 
   subscribe: (data: { email: string; plan: string }) =>
     api.post('/auth/subscribe', data).then((r) => r.data),
+
+  // ── Profile Security ──────────────────────────────────────────────────────
+  /** Upload a new avatar image (multipart/form-data). */
+  uploadAvatar: (formData: FormData) =>
+    api.post('/auth/avatar', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
+
+  /** Soft-delete the current user's account. */
+  deleteMe: () => api.delete('/auth/me'),
+
+  /** Revoke all other sessions by incrementing session_version. */
+  logoutOthers: () => api.post('/auth/logout-others').then((r) => r.data),
+
+  /** Request an email change (sends OTP to new email). */
+  requestEmailChange: (data: { new_email: string; password: string }) =>
+    api.post('/auth/request-email-change', data).then((r) => r.data),
+
+  /** Verify email change OTP and update the user's email. */
+  verifyEmailChange: (data: { otp: string }) =>
+    api.post('/auth/verify-email-change', data),
+
+  /** Accept a team invitation and set up an account. */
+  acceptInvite: (data: { token: string; full_name: string; password: string }) =>
+    api.post('/auth/accept-invite', data).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +198,7 @@ export const tenantApi = {
   updateMe: (data: Record<string, unknown>) =>
     api.patch('/tenants/me', data).then((r) => r.data),
   getUsage: () => api.get('/tenants/me/usage').then((r) => r.data),
+  selfDestruct: () => api.post('/tenants/me/self-destruct').then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +225,7 @@ export const agentsApi = {
       ivr_language_prompt,
       voice_system_prompt,
       escalation_config,
+      tone,
       ...rest
     } = data as Record<string, unknown>
     const payload: Record<string, unknown> = { ...rest }
@@ -206,6 +236,7 @@ export const agentsApi = {
     if (ivr_language_prompt !== undefined) agentConfig.ivr_language_prompt = ivr_language_prompt
     if (voice_system_prompt !== undefined) agentConfig.voice_system_prompt = voice_system_prompt
     if (escalation_config !== undefined) agentConfig.escalation_config = escalation_config
+    if (tone !== undefined) agentConfig.tone = tone
     if (Object.keys(agentConfig).length > 0) {
       payload.agent_config = agentConfig
     }
@@ -215,10 +246,11 @@ export const agentsApi = {
   restore: (id: string) => api.post(`/proxy/agents/${id}/restore`).then((r) => r.data),
   test: (id: string, message: string) =>
     api.post(`/proxy/agents/${id}/test`, { message }).then((r) => r.data),
-  getOpeningPreview: (id: string, language?: string, supportedLanguages?: string[]) => {
+  getOpeningPreview: (id: string, language?: string, supportedLanguages?: string[], greeting?: string) => {
     const params = new URLSearchParams()
     if (language) params.append('language', language)
-    if (supportedLanguages?.length) params.append('supported_languages', supportedLanguages.join(','))
+    if (supportedLanguages !== undefined) params.append('supported_languages', supportedLanguages.join(','))
+    if (greeting) params.append('greeting', greeting)
     return api.get(`/proxy/agents/${id}/opening-preview?${params.toString()}`).then((r) => r.data as { text: string })
   },
   uploadVoiceGreeting: (id: string, blob: Blob, ext: string) => {
@@ -232,6 +264,10 @@ export const agentsApi = {
   },
   deleteVoiceGreeting: (id: string) =>
     api.delete(`/proxy/agents/${id}/voice-greeting`).then((r) => r.data),
+  generateGreetingAudio: (id: string) =>
+    api.post(`/proxy/agents/${id}/generate-greeting-audio`).then((r) => r.data),
+  generateIvrAudio: (id: string) =>
+    api.post(`/proxy/agents/${id}/generate-ivr-audio`).then((r) => r.data),
   testEscalationConnector: (id: string) =>
     api.post(`/proxy/agents/${id}/escalation/test`).then((r) => r.data as {
       success: boolean
@@ -239,6 +275,19 @@ export const agentsApi = {
       message: string
       latency_ms: number
     }),
+  /** Activate/revive an agent (subject to slot capacity check at gateway). */
+  slotActivate: (id: string, body?: { stripe_subscription_id?: string; expires_at?: string }) =>
+    api.post(`/proxy/agents/${id}/slot-activate`, body ?? {}).then((r) => r.data),
+  /** Archive an agent to free its slot for reuse. */
+  slotArchive: (id: string) =>
+    api.post(`/proxy/agents/${id}/slot-archive`).then((r) => r.data),
+  /** Atomic archive and activate. */
+  slotSwap: (archiveId: string, activateId: string) =>
+    api.post("/proxy/agents/slot-swap", { archive_id: archiveId, activate_id: activateId }).then((r) => r.data),
+  /** List all active agents in the same tenant that are marked is_available_as_tool=true. */
+  listAvailableAsTools: (excludeId?: string) =>
+    api.get('/proxy/agents/available-as-tools', { params: excludeId ? { exclude_id: excludeId } : {} })
+      .then((r) => r.data as any[]),
 }
 
 
@@ -440,6 +489,8 @@ export const apiKeysApi = {
   create: (data: { name: string; scopes?: string[]; agent_id?: string }) =>
     api.post('/api-keys', data).then((r) => r.data),
   revoke: (id: string) => api.delete(`/api-keys/${id}`),
+  patch: (id: string, data: { name?: string; allowed_origins?: string[]; is_active?: boolean }) =>
+    api.patch(`/api-keys/${id}`, data).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -490,49 +541,54 @@ export const feedbackApi = {
 // Analytics (via proxy)
 // ---------------------------------------------------------------------------
 
-export const analyticsApi = {
-  overview: (params?: { days?: number; agent_id?: string }) =>
-    api.get('/proxy/analytics/overview', { params }).then((r) => r.data),
+export interface AgentAnalyticsSummary {
+  agent_id: string
+  agent_name: string
+  total_sessions: number
+  total_messages: number
+  total_chats: number
+  total_tokens: number
+  estimated_cost_usd: number
+  avg_latency_ms: number
+  total_voice_minutes: number
+  positive_feedback_pct: number | null
 }
 
-// ---------------------------------------------------------------------------
-// Playbook (via proxy)
-// ---------------------------------------------------------------------------
+export interface DailyAnalytics {
+  date: string
+  total_sessions: number
+  total_messages: number
+  total_chats: number
+  total_tokens: number
+  estimated_cost_usd: number
+  avg_latency_ms: number
+  tool_executions: number
+  escalations: number
+  successful_completions: number
+  total_voice_minutes: number
+}
 
-export const playbookApi = {
-  get: (agentId: string) =>
-    api.get(`/proxy/agents/${agentId}/playbook`).then((r) => r.data),
+export interface AnalyticsOverview {
+  period_days: number
+  total_sessions: number
+  total_messages: number
+  total_chats: number
+  total_tokens: number
+  /** Total estimated LLM token cost for the period (USD). */
+  total_cost_usd: number
+  avg_latency_ms: number
+  total_tool_executions: number
+  total_escalations: number
+  /** Total voice session minutes for the period. */
+  total_voice_minutes: number
+  feedback_positive_pct: number | null
+  daily: DailyAnalytics[]
+  by_agent: AgentAnalyticsSummary[]
+}
 
-  upsert: (agentId: string, data: {
-    greeting_message?: string
-    instructions?: string
-    tone?: string
-    dos?: string[]
-    donts?: string[]
-    scenarios?: { trigger: string; response: string }[]
-    out_of_scope_response?: string
-    fallback_response?: string
-    custom_escalation_message?: string
-    is_active?: boolean
-  }) => {
-    const payload = {
-      config: {
-        instructions: data.instructions,
-        tone: data.tone,
-        dos: data.dos,
-        donts: data.donts,
-        scenarios: data.scenarios,
-        out_of_scope_response: data.out_of_scope_response,
-        fallback_response: data.fallback_response,
-        custom_escalation_message: data.custom_escalation_message,
-      },
-      is_active: data.is_active,
-    }
-    return api.put(`/proxy/agents/${agentId}/playbook`, payload).then((r) => r.data)
-  },
-
-  delete: (agentId: string) =>
-    api.delete(`/proxy/agents/${agentId}/playbook`),
+export const analyticsApi = {
+  overview: (params?: { days?: number; agent_id?: string }) =>
+    api.get<AnalyticsOverview>('/proxy/analytics/overview', { params }).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +677,6 @@ export const playbooksApi = {
       name: data.name,
       description: data.description,
       intent_triggers: data.intent_triggers,
-      is_default: data.is_default,
       config: {
         instructions: data.instructions,
         tone: data.tone || 'professional',
@@ -643,7 +698,6 @@ export const playbooksApi = {
       name: data.name,
       description: data.description,
       intent_triggers: data.intent_triggers,
-      is_default: data.is_default,
       config: {
         instructions: data.instructions,
         tone: data.tone || 'professional',
@@ -660,8 +714,6 @@ export const playbooksApi = {
   },
   delete: (agentId: string, playbookId: string) =>
     api.delete(`/proxy/agents/${agentId}/playbooks/${playbookId}`),
-  setDefault: (agentId: string, playbookId: string) =>
-    api.post(`/proxy/agents/${agentId}/playbooks/${playbookId}/set-default`).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +734,8 @@ export const documentsApi = {
     api.post(`/proxy/agents/${agentId}/documents/text`, data).then((r) => r.data),
   updateText: (agentId: string, docId: string, data: { name?: string; content?: string; status?: 'draft' | 'published' }) =>
     api.put(`/proxy/agents/${agentId}/documents/${docId}`, data).then((r) => r.data),
+  retryIndexing: (agentId: string, docId: string) =>
+    api.post(`/proxy/agents/${agentId}/documents/${docId}/retry`).then((r) => r.data),
   delete: (agentId: string, docId: string) =>
     api.delete(`/proxy/agents/${agentId}/documents/${docId}`),
 }
@@ -698,6 +752,10 @@ export const variablesApi = {
     api.put(`/proxy/agents/${agentId}/variables/${varId}`, data).then((r) => r.data),
   delete: (agentId: string, varId: string) =>
     api.delete(`/proxy/agents/${agentId}/variables/${varId}`).then((r) => r.data),
+  exportUrl: (agentId: string, justificationId: string) => {
+    const qs = new URLSearchParams({ justification_id: justificationId }).toString()
+    return `${API_URL}/api/v1/proxy/agents/${agentId}/variables/export?${qs}`
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -706,11 +764,14 @@ export const variablesApi = {
 
 export const teamApi = {
   list: () => api.get('/team').then((r) => r.data),
+  listInvites: () => api.get('/team/invites').then((r) => r.data),
   invite: (data: { email: string; full_name: string; role: string }) =>
     api.post('/team/invite', data).then((r) => r.data),
   updateRole: (userId: string, role: string) =>
     api.patch(`/team/${userId}/role`, { role }).then((r) => r.data),
   remove: (userId: string) => api.delete(`/team/${userId}`),
+  reactivate: (userId: string) => api.post(`/team/${userId}/reactivate`).then((r) => r.data),
+  hardRemove: (userId: string) => api.delete(`/team/${userId}/hard`),
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +782,7 @@ export const billingApi = {
   overview: () => api.get('/billing/overview').then((r) => r.data),
   listPlans: () => api.get('/billing/plans').then((r) => r.data as Record<string, any>),
   agents: () => api.get('/billing/agents').then((r) => r.data),
-  createCheckoutSession: (data: { plan: string }) =>
+  createCheckoutSession: (data: { plan: string; billing_cycle?: string }) =>
     api.post('/billing/create-checkout-session', data).then((r) => r.data),
   createPortalSession: () =>
     api.post('/billing/portal-session').then((r) => r.data as { portal_url: string }),
@@ -733,6 +794,8 @@ export const billingApi = {
   toggleVoiceAddon: (enabled: boolean) =>
     api.post('/billing/voice-addon', { enabled }).then((r) => r.data),
   syncSubscription: () => api.post('/billing/sync-subscription').then((r) => r.data),
+  /** Alias for overview — includes purchased_slots / agent_slots for capacity indicator. */
+  getInfo: () => api.get('/billing/overview').then((r) => r.data),
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +810,7 @@ export const toolsApi = {
     name: string
     description: string
     category: string
+    endpoint_url?: string
     input_schema?: Record<string, unknown>
     output_schema?: Record<string, unknown>
     is_builtin?: boolean
@@ -827,7 +891,7 @@ export const workflowsApi = {
       .then((r) => r.data),
   getExecution: (agentId: string, flowId: string, sessionId: string) =>
     api
-      .get(`/proxy/agents/${agentId}/workflows/${flowId}/execution/${sessionId}`)
+      .get(`/proxy/agents/${agentId}/workflows/${flowId}/executions/${sessionId}`)
       .then((r) => r.data),
   advance: (agentId: string, flowId: string, data: Record<string, unknown>) =>
     api.post(`/proxy/agents/${agentId}/workflows/${flowId}/advance`, data).then((r) => r.data),
@@ -934,4 +998,6 @@ export const platformApi = {
     assist_prefixes: Record<string, string>
     phrases: Record<string, string>
   }> => api.get('/proxy/platform/language-config').then((r) => r.data),
+  getVoiceProtocols: (): Promise<Array<{ id: string; label: string; template: string }>> =>
+    api.get('/proxy/platform/voice-protocols').then((r) => r.data),
 }

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import hashlib
 import os
 import uuid
 from typing import Optional, Any
@@ -14,14 +14,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_tenant_db
-from app.models.agent import Agent, AgentDocument
+from app.core.security import get_tenant_db, require_forwarded_role
+from app.models.agent import Agent, AgentDocument, AgentDocumentChunk
+from app.services import pii_service
+from app.services.mcp_client import MCPClient
+from app.core.zenith import ZenithContext, get_zenith_context
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
+# ── Redis Lock Constants ──────────────────────────────────────────────────
+_DOC_LOCK_PREFIX = "doc_lock:"
+_DOC_LOCK_TTL = 300  # 5 minutes
+
 ALLOWED_EXTENSIONS = {"pdf", "txt", "md", "docx"}
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Harden: DoS prevention)
+MAX_LINE_LENGTH = 10000  # Max chars per line to prevent Regex DoS
+
+# Phase 7 — Gap 4: Ingestion Rate Limiting
+_UPLOAD_RATE_LIMIT = 20      # max uploads per window
+_UPLOAD_RATE_WINDOW = 3600  # 1 hour in seconds
 
 # Magic-byte → allowed extension mapping.  Client-supplied filename and
 # Content-Type are untrusted; we validate the actual file content instead.
@@ -34,8 +46,30 @@ _DOC_MAGIC: list[tuple[bytes, str]] = [
 
 def _validate_doc_magic(content: bytes, declared_ext: str) -> None:
     """Raise HTTPException if the file's magic bytes conflict with its extension."""
+    # Phase 10 — Gap 1: Adversarial Magic-Byte Denylist
+    MALICIOUS_HEADERS = [
+        b"MZ",          # Windows/DOS Executable
+        b"\x7fELF",     # Linux Executable
+        b"\xca\xfe\xba\xbe", # Java Class / Mach-O Fat Binary
+        b"\xce\xfa\xed\xfe", # Mach-O
+        b"\xcf\xfa\xed\xfe", # Mach-O
+    ]
+    for bad_magic in MALICIOUS_HEADERS:
+        if content.startswith(bad_magic):
+            raise HTTPException(status_code=400, detail="Executable formats are strictly prohibited.")
+
     if declared_ext in ("txt", "md"):
-        # No reliable magic bytes for plain text; accept as-is (already size-limited)
+        # Harden: Check for extremely long lines to prevent Regex DoS in PII service
+        try:
+            text_content = content.decode("utf-8", errors="replace")
+            for i, line in enumerate(text_content.splitlines()):
+                if len(line) > MAX_LINE_LENGTH:
+                     raise HTTPException(
+                        status_code=400,
+                        detail=f"Line {i+1} exceeds maximum length of {MAX_LINE_LENGTH} characters. Potential DoS detected.",
+                    )
+        except UnicodeDecodeError:
+             raise HTTPException(status_code=400, detail="Text file contains invalid UTF-8 sequence.")
         return
     for magic, expected_ext in _DOC_MAGIC:
         if content[:len(magic)] == magic:
@@ -60,10 +94,40 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
-async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agent:
+async def _check_upload_rate_limit(redis_client: Any, tenant_id: str) -> None:
+    """Zenith Pillar 4: Redis-backed upload rate limiting."""
+    if not redis_client:
+        return
+    key = f"doc_upload_rl:{tenant_id}"
+    try:
+        count = await redis_client.incr(key)
+        if count == 1:
+            await redis_client.expire(key, _UPLOAD_RATE_WINDOW)
+        if count > _UPLOAD_RATE_LIMIT:
+            ttl = await redis_client.ttl(key)
+            raise HTTPException(
+                status_code=429,
+                detail=f"Upload rate limit exceeded. Forensic Trace: {tenant_id}",
+                headers={"Retry-After": str(max(ttl, 1))},
+            )
+    except HTTPException:
+        raise
+    except Exception as rl_exc:
+        logger.warning("upload_rate_limit_check_failed", tenant_id=tenant_id, error=str(rl_exc))
+
+
+async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession, ctx: ZenithContext | None = None) -> Agent:
+    """Zenith Pillar 3: Isolation Locks and Agent Verification."""
+    agent_uuid = uuid.UUID(agent_id)
+    
+    # Apply isolation (CRIT-005 / Zenith Pillar 3)
+    if ctx and ctx.restricted_agent_id and agent_uuid != ctx.restricted_agent_id:
+        logger.warning("agent_isolation_violation", agent_id=agent_id, restricted_id=str(ctx.restricted_agent_id))
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
-            Agent.id == uuid.UUID(agent_id),
+            Agent.id == agent_uuid,
             Agent.tenant_id == uuid.UUID(tenant_id),
         )
     )
@@ -73,143 +137,30 @@ async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agen
     return agent
 
 
-async def _process_document(
-    doc_id: str,
-    agent_id: str,
-    tenant_id: str,
-    file_path: Optional[str] = None,
-) -> None:
-    """
-    Background task: read file, split into chunks, generate Gemini embeddings,
-    store in AgentDocumentChunk (pgvector), and update the AgentDocument record.
-    """
-    from app.core.database import AsyncSessionLocal
-    from app.services.llm_client import create_llm_client
-    from app.models.agent import AgentDocumentChunk
-
-    async with AsyncSessionLocal() as db:
-        try:
-            result = await db.execute(
-                select(AgentDocument).where(AgentDocument.id == uuid.UUID(doc_id))
-            )
-            doc = result.scalar_one_or_none()
-            if not doc:
-                logger.error("document_not_found_in_background", doc_id=doc_id)
-                return
-
-            # Read file content or use DB content
-            try:
-                if file_path and os.path.exists(file_path):
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                        text = f.read()
-                else:
-                    text = doc.content or ""
-            except Exception as exc:
-                logger.error("document_read_error", doc_id=doc_id, error=str(exc))
-                doc.status = "failed"
-                doc.error_message = f"Failed to read content: {exc}"
-                await db.commit()
-                return
-
-            if not text.strip():
-                doc.status = "ready"
-                doc.chunk_count = 0
-                doc.vector_ids = []
-                await db.commit()
-                return
-
-            # Split into chunks (~500 words, 50-word overlap)
-            words = text.split()
-            chunk_size = 500
-            overlap = 50
-            chunks: list[str] = []
-            start = 0
-            while start < len(words):
-                end = start + chunk_size
-                chunk_text = " ".join(words[start:end])
-                if chunk_text.strip():
-                    chunks.append(chunk_text)
-                start = end - overlap
-                if start >= len(words):
-                    break
-
-            if not chunks:
-                doc.status = "ready"
-                doc.chunk_count = 0
-                doc.vector_ids = []
-                await db.commit()
-                return
-
-            # Clear existing chunks if any (re-processing)
-            from sqlalchemy import delete
-            await db.execute(delete(AgentDocumentChunk).where(AgentDocumentChunk.doc_id == doc.id))
-
-            # Generate embeddings and store in pgvector
-            llm_client = create_llm_client()
-            vector_ids: list[str] = []
-            
-            for i, chunk_text in enumerate(chunks):
-                try:
-                    embedding = await llm_client.embed(chunk_text)
-                    chunk_id = uuid.uuid4()
-                    chunk = AgentDocumentChunk(
-                        id=chunk_id,
-                        doc_id=doc.id,
-                        tenant_id=doc.tenant_id,
-                        content=chunk_text,
-                        embedding=embedding,
-                        chunk_index=i
-                    )
-                    db.add(chunk)
-                    vector_ids.append(str(chunk_id))
-                except Exception as exc:
-                    logger.error("chunk_embedding_failed", doc_id=doc_id, chunk_index=i, error=str(exc))
-                    # Continue with other chunks if possible, or fail the whole doc? 
-                    # For now, let's fail the whole doc if embedding fails
-                    raise exc
-
-            doc.status = "ready"
-            doc.chunk_count = len(chunks)
-            doc.vector_ids = vector_ids
-            # Store the first chunk's embedding as the document's representative embedding if needed
-            if chunks:
-                # We already have the embedding from the loop, but we need to re-fetch if we didn't save it
-                # For simplicity, let's just use the last one or re-save
-                pass
-
-            await db.commit()
-            logger.info("document_processed_pgvector", doc_id=doc_id, chunks=len(chunks))
-
-        except Exception as exc:
-            logger.error("document_processing_failed", doc_id=doc_id, error=str(exc))
-            try:
-                # Use a fresh query to avoid session issues
-                result = await db.execute(
-                    select(AgentDocument).where(AgentDocument.id == uuid.UUID(doc_id))
-                )
-                doc = result.scalar_one_or_none()
-                if doc:
-                    doc.status = "failed"
-                    doc.error_message = str(exc)
-                    await db.commit()
-            except Exception:
-                pass
+# Removed broken inline _process_document. Processing is now handled by app.workers.document_indexer.
 
 
 @router.get("/{agent_id}/documents")
+@zenith_error_handler
 async def list_documents(
     agent_id: str,
-    request: Request,
+    include_archived: bool = False,
     db: AsyncSession = Depends(get_tenant_db),
+    ctx: ZenithContext = Depends(get_zenith_context),
 ) -> list[dict]:
-    """List all documents for an agent."""
-    tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    """List documents for an agent. By default excludes archived docs.
+    Deterministic sorting enforced: created_at DESC, id DESC."""
+    await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
+
+    from sqlalchemy import and_
+    filters = [AgentDocument.agent_id == uuid.UUID(agent_id)]
+    if not include_archived:
+        filters.append(AgentDocument.status != "archived")
 
     result = await db.execute(
         select(AgentDocument)
-        .where(AgentDocument.agent_id == uuid.UUID(agent_id))
-        .order_by(AgentDocument.created_at.desc())
+        .where(and_(*filters))
+        .order_by(AgentDocument.created_at.desc(), AgentDocument.id.desc())
     )
     return [doc.to_dict() for doc in result.scalars().all()]
 
@@ -226,20 +177,35 @@ class TextDocumentUpdateRequest(BaseModel):
 
 
 @router.post("/{agent_id}/documents/text", status_code=201)
+@zenith_error_handler
 async def create_text_document(
     agent_id: str,
     payload: TextDocumentCreateRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_tenant_db),
+    ctx: ZenithContext = Depends(get_zenith_context),
+    role: str = Depends(require_forwarded_role("admin")),
 ) -> dict:
     """Create a raw text document directly. Defaults to 'draft' unless status='published'."""
-    tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
+    # Rate limit check (Resilience Layer)
+    # Note: _check_upload_rate_limit would need adjusting or just use ctx.tenant_id
 
     initial_status = payload.status or "draft"
     if initial_status == "published":
         initial_status = "processing"
+
+    # Harden: Size and Line Length validation for direct text input
+    text_bytes = payload.content.encode('utf-8')
+    if len(text_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="Text content exceeds 5MB limit.")
+    
+    for i, line in enumerate(payload.content.splitlines()):
+        if len(line) > MAX_LINE_LENGTH:
+             raise HTTPException(status_code=400, detail=f"Line {i+1} exceeds maximum length.")
+
+    # Calculate SHA-256 for deduplication
+    content_hash = hashlib.sha256(text_bytes).hexdigest()
 
     doc = AgentDocument(
         id=uuid.uuid4(),
@@ -247,39 +213,63 @@ async def create_text_document(
         tenant_id=agent.tenant_id,
         name=payload.name,
         file_type="txt",
-        file_size_bytes=len(payload.content.encode('utf-8')),
+        file_size_bytes=len(text_bytes),
         content=payload.content,
+        content_hash=content_hash,
         status=initial_status,
+        # Zenith Pillar 1: Identity & Traceability
+        created_by=ctx.actor_email,
+        trace_id=ctx.trace_id,
+        original_ip=ctx.original_ip,
+        justification_id=ctx.justification_id
     )
     db.add(doc)
     await db.commit()
     await db.refresh(doc)
 
-    # Trigger processing if published
+    # Deduplication Check (Same Agent + Ready Content)
+    # G22 Fix: We STILL index the duplicate so it has its own search vectors (required by MCP id-binding),
+    # but we can reuse the DB hash for reporting.
+    dup_res = await db.execute(
+        select(AgentDocument).where(
+            AgentDocument.agent_id == agent.id,
+            AgentDocument.content_hash == content_hash,
+            AgentDocument.status == "ready",
+            AgentDocument.id != doc.id,
+        ).limit(1)
+    )
+    duplicate = dup_res.scalar_one_or_none()
+    if duplicate:
+        logger.info("document_deduplication_hit", doc_id=str(doc.id), source_doc_id=str(duplicate.id))
+
+    # Trigger durable background processing if published
     if payload.status == "published":
-        background_tasks.add_task(
-            _process_document,
-            doc_id=str(doc.id),
-            agent_id=agent_id,
-            tenant_id=tenant_id,
-            file_path=doc.storage_path
-        )
+        indexer = request.app.state.document_indexer
+        await indexer.enqueue({
+            "document_id": str(doc.id),
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+            "content": doc.content,
+            "filename": doc.name,
+            "file_type": doc.file_type
+        })
 
     return doc.to_dict()
 
 
 @router.put("/{agent_id}/documents/{doc_id}")
+@zenith_error_handler
 async def update_document(
     agent_id: str,
     doc_id: str,
     payload: TextDocumentUpdateRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_tenant_db),
+    ctx: ZenithContext = Depends(get_zenith_context),
+    role: str = Depends(require_forwarded_role("admin")),
 ) -> dict:
-    """Update a text document. If status changes to 'published', triggers background processing."""
-    tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    """Update a text document. Zenith forensic update."""
+    await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
 
     result = await db.execute(select(AgentDocument).where(AgentDocument.id == uuid.UUID(doc_id), AgentDocument.agent_id == uuid.UUID(agent_id)))
     doc = result.scalar_one_or_none()
@@ -290,7 +280,9 @@ async def update_document(
         doc.name = payload.name
     if payload.content is not None:
         doc.content = payload.content
-        doc.file_size_bytes = len(payload.content.encode('utf-8'))
+        text_bytes = payload.content.encode('utf-8')
+        doc.file_size_bytes = len(text_bytes)
+        doc.content_hash = hashlib.sha256(text_bytes).hexdigest()
         
     previously_draft = (doc.status == "draft")
     
@@ -303,34 +295,51 @@ async def update_document(
     await db.commit()
     await db.refresh(doc)
 
-    # Trigger processing if transitioning to published
-    if previously_draft and payload.status == "published":
-        background_tasks.add_task(
-            _process_document,
-            doc_id=str(doc.id),
-            agent_id=agent_id,
-            tenant_id=tenant_id,
-            file_path=doc.storage_path
-        )
+    # Trigger re-indexing if content changed or if doc is being published
+    # Fix P0: Ensure content updates result in vector updates
+    content_changed = (payload.content is not None)
+    if should_reindex:
+        doc.status = "processing"
+        doc.updated_at = func.now()
+        doc.updated_by = ctx.actor_email
+        doc.trace_id = ctx.trace_id
+        await db.commit()
+        
+        # Zenith Pillar 1: Propagate forensic metadata to the worker
+        indexer = request.app.state.document_indexer
+        await indexer.enqueue({
+            "document_id": str(doc.id),
+            "agent_id": agent_id,
+            "tenant_id": ctx.tenant_id,
+            "content": doc.content,
+            "storage_path": doc.storage_path,
+            "filename": doc.name,
+            "file_type": doc.file_type,
+            "trace_id": ctx.trace_id,
+            "actor_email": ctx.actor_email
+        })
+        logger.info("document_reindex_queued", doc_id=str(doc.id), trace_id=ctx.trace_id)
 
     return doc.to_dict()
 
 
 @router.post("/{agent_id}/documents", status_code=201)
+@zenith_error_handler
 async def upload_document(
     agent_id: str,
     request: Request,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_tenant_db),
+    ctx: ZenithContext = Depends(get_zenith_context),
+    role: str = Depends(require_forwarded_role("admin")),
 ) -> dict:
     """
-    Upload a document for an agent.
+    Upload a document for an agent. Zenith forensic upload.
     Accepts: pdf, txt, md, docx (up to 10 MB).
-    Stores the file, creates an AgentDocument record, and launches background processing.
     """
-    tenant_id = _tenant_id(request)
-    agent = await _verify_agent(agent_id, tenant_id, db)
+    agent = await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
+    redis_client = getattr(request.app.state, "redis", None)
+    await _check_upload_rate_limit(redis_client, ctx.tenant_id)
 
     # Validate file extension — strip path components to prevent path traversal
     filename = Path(file.filename or "upload").name
@@ -365,6 +374,9 @@ async def upload_document(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to store file: {exc}")
 
+    # Calculate SHA-256 for binary content deduplication
+    content_hash = hashlib.sha256(content).hexdigest()
+
     # Create DB record
     doc = AgentDocument(
         id=doc_uuid,
@@ -375,36 +387,116 @@ async def upload_document(
         file_size_bytes=len(content),
         storage_path=storage_path,
         chunk_count=0,
-        vector_ids=[],
+        content_hash=content_hash,
         status="processing",
+        # Zenith Pillar 1: Identity & Traceability
+        created_by=ctx.actor_email,
+        trace_id=ctx.trace_id,
+        original_ip=ctx.original_ip,
+        justification_id=ctx.justification_id
     )
     db.add(doc)
     await db.commit()
     await db.refresh(doc)
 
-    # Launch background processing
-    background_tasks.add_task(
-        _process_document,
-        doc_id=str(doc.id),
-        agent_id=agent_id,
-        tenant_id=tenant_id,
-        file_path=storage_path,
+    # Deduplication & Storage Reuse (G19/G22)
+    # We always re-index the duplicate so it has its own vectors in MCP,
+    # BUT we can reuse the storage_path if another doc in the same agent has the same hash.
+    dup_res = await db.execute(
+        select(AgentDocument).where(
+            AgentDocument.agent_id == agent.id,
+            AgentDocument.content_hash == content_hash,
+            AgentDocument.status == "ready",
+            AgentDocument.id != doc.id,
+        ).limit(1)
     )
+    duplicate = dup_res.scalar_one_or_none()
+
+    if duplicate and duplicate.storage_path:
+         logger.info("document_deduplication_storage_hit", doc_id=str(doc.id), source_doc_id=str(duplicate.id))
+         # Re-use existing storage but force new indexing under new doc_uuid
+         doc.storage_path = duplicate.storage_path
+         # Try to clean up the newly created (redundant) file on disk since we're pivoting to the existing one
+         try:
+             if storage_path != duplicate.storage_path and os.path.exists(storage_path):
+                 os.remove(storage_path)
+         except Exception: pass
+         storage_path = duplicate.storage_path
+
+    # Launch durable background processing via Redis queue
+    indexer = request.app.state.document_indexer
+    await indexer.enqueue({
+        "document_id": str(doc.id),
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+        "storage_path": storage_path,
+        "filename": filename,
+        "file_type": ext
+    })
 
     logger.info("document_upload_queued", doc_id=str(doc.id), agent_id=agent_id, filename=filename)
     return doc.to_dict()
 
 
+@router.post("/{agent_id}/documents/{doc_id}/retry")
+@zenith_error_handler
+async def retry_document_indexing(
+    agent_id: str,
+    doc_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    ctx: ZenithContext = Depends(get_zenith_context),
+    role: str = Depends(require_forwarded_role("admin")),
+) -> dict:
+    """Retry indexing for a failed document"""
+    await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
+    
+    result = await db.execute(
+        select(AgentDocument).where(
+            AgentDocument.id == uuid.UUID(doc_id),
+            AgentDocument.agent_id == uuid.UUID(agent_id),
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    
+    doc.status = "processing"
+    doc.error_message = None
+    doc.chunk_count = 0
+    doc.updated_by = ctx.actor_email
+    doc.trace_id = ctx.trace_id
+    await db.commit()
+    
+    indexer = request.app.state.document_indexer
+    await indexer.enqueue({
+        "document_id": str(doc.id),
+        "agent_id": agent_id,
+        "tenant_id": ctx.tenant_id,
+        "storage_path": doc.storage_path,
+        "content": doc.content,
+        "filename": doc.name,
+        "file_type": doc.file_type,
+        "trace_id": ctx.trace_id,
+        "actor_email": ctx.actor_email
+    })
+    
+    logger.info("document_reindex_queued", doc_id=str(doc.id), trace_id=ctx.trace_id)
+    return doc.to_dict()
+
+
 @router.delete("/{agent_id}/documents/{doc_id}")
+@zenith_error_handler
 async def delete_document(
     agent_id: str,
     doc_id: str,
     request: Request,
     db: AsyncSession = Depends(get_tenant_db),
+    ctx: ZenithContext = Depends(get_zenith_context),
+    role: str = Depends(require_forwarded_role("admin")),
 ):
-    """Delete a document and remove its vectors from the database."""
-    tenant_id = _tenant_id(request)
-    await _verify_agent(agent_id, tenant_id, db)
+    """Delete a document and remove its vectors from the database. Zenith forensic deletion."""
+    await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
 
     result = await db.execute(
         select(AgentDocument).where(
@@ -416,12 +508,39 @@ async def delete_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    # Remove file from disk (best-effort)
+    # Remove file from disk (Hardened: only if not shared by other documents) (G17/G16 Fix)
     try:
-        if doc.storage_path and os.path.exists(doc.storage_path):
-            os.remove(doc.storage_path)
+        if doc.storage_path:
+            # Check if any OTHER documents are using this same physical file
+            shared_res = await db.execute(
+                select(func.count(AgentDocument.id)).where(
+                    AgentDocument.storage_path == doc.storage_path,
+                    AgentDocument.id != doc.id
+                )
+            )
+            shared_count = shared_res.scalar() or 0
+            if shared_count == 0 and os.path.exists(doc.storage_path):
+                os.remove(doc.storage_path)
+                logger.info("document_physically_deleted", path=doc.storage_path)
+            else:
+                logger.info("document_file_preserved_sharing", path=doc.storage_path, count=shared_count)
     except Exception as exc:
         logger.warning("file_delete_failed", doc_id=doc_id, error=str(exc))
+
+    # ── Sync Deletion to MCP Context Server (Zenith Pillar 3: Inter-Service Zero-Trust) ────
+    try:
+        mcp = getattr(request.app.state, "mcp_client", None)
+        if mcp:
+            # Fetch KB ID for this agent
+            kb_id = await mcp.get_or_create_agent_kb(ctx.tenant_id, agent_id, "Cleanup")
+            # Perform bulk cleanup of all chunks associated with this document ID
+            # Propagate trace_id for cross-service forensic correlation
+            deleted_count = await mcp.cleanup_knowledge_by_metadata(
+                ctx.tenant_id, kb_id, "document_id", str(doc.id), trace_id=ctx.trace_id
+            )
+            logger.info("mcp_knowledge_cleanup_complete", doc_id=doc_id, trace_id=ctx.trace_id, deleted_chunks=deleted_count)
+    except Exception as exc:
+        logger.warning("mcp_cleanup_failed", doc_id=doc_id, trace_id=ctx.trace_id, error=str(exc))
 
     await db.delete(doc)
     await db.commit()

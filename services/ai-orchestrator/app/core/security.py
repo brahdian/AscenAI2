@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import AsyncGenerator, Optional, Tuple
+from typing import AsyncGenerator, Optional, Tuple, Dict, Any
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -96,6 +96,19 @@ async def get_current_tenant(
     # 1. Bearer token provided (JWT check)
     if credentials:
         try:
+            # First, check if it's a signed internal service token (Phase 13)
+            from app.core.internal_auth import verify_internal_token
+            if verify_internal_token(credentials.credentials):
+                # Trust the X-Tenant-ID header if it's an internal-service call
+                xtid = request.headers.get("X-Tenant-ID")
+                if xtid:
+                    return xtid
+                # Fallback to state if already stamped
+                state_tenant = getattr(request.state, "tenant_id", None)
+                if state_tenant:
+                    return str(state_tenant)
+            
+            # Otherwise, decode as a standard user access token
             payload = decode_access_token(credentials.credentials)
             tenant_id = payload.get("tenant_id")
             if tenant_id:
@@ -193,3 +206,44 @@ async def get_tenant_db(
     from app.core.database import get_db  # local import to avoid circular deps
     async for session in get_db(tenant_id=tenant_id):
         yield session
+async def require_internal_key(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Defense-in-depth: Verify that the request carries the shared internal secret
+    or a valid signed inter-service JWT.
+    """
+    # 1. Prefer Signed JWT (Phase 13 Standard)
+    if credentials:
+        from app.core.internal_auth import verify_internal_token
+        if verify_internal_token(credentials.credentials):
+            return True
+
+    # 2. Legacy check (X-Internal-Key)
+    presented = request.headers.get("X-Internal-Key", "")
+    if presented and settings.INTERNAL_API_KEY:
+        import hmac
+        if hmac.compare_digest(presented.encode(), settings.INTERNAL_API_KEY.encode()):
+            return True
+
+    logger.warning("unauthorized_internal_access_attempt", path=request.url.path)
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Internal service authentication required (JWT or valid key)."
+    )
+
+
+def get_actor_info(request: Request) -> Dict[str, Any]:
+    """
+    Zenith Forensics: Extract the full actor signature and trace continuity context
+    from the trusted headers forwarded by the API Gateway.
+    """
+    role = request.headers.get("X-Role") or getattr(request.state, "role", "viewer")
+    return {
+        "actor_email": request.headers.get("X-Actor-Email") or getattr(request.state, "actor_email", "unknown"),
+        "is_support_access": role == "super_admin",
+        "trace_id": request.headers.get("X-Trace-ID") or getattr(request.state, "trace_id", "none"),
+        "span_id": request.headers.get("X-Span-ID") or getattr(request.state, "span_id", "none"),
+        "original_ip": request.headers.get("X-Original-IP") or (request.client.host if request.client else "unknown"),
+    }

@@ -320,6 +320,7 @@ export default function AgentDetailPage() {
         personality: agent.personality || '',
         system_prompt: agent.system_prompt || '',
         greeting_message: (cfg.greeting_message as string) || (agent.greeting_message as string) || '',
+        tone: (cfg.tone as string) || '',
         voice_enabled: agent.voice_enabled ?? true,
         extension_number: (agent as any).extension_number || '',
         is_available_as_tool: (cfg.is_available_as_tool as boolean) ?? (agent as any).is_available_as_tool ?? true,
@@ -341,6 +342,7 @@ export default function AgentDetailPage() {
       agentsApi.update(id, { is_active: !agent?.is_active }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agent', id] })
+      qc.invalidateQueries({ queryKey: ['agents'] })
       toast.success(agent?.is_active ? 'Agent deactivated' : 'Agent activated')
     },
     onError: () => toast.error('Failed to update agent status'),
@@ -351,6 +353,7 @@ export default function AgentDetailPage() {
     try {
       await agentsApi.update(id, formData)
       qc.invalidateQueries({ queryKey: ['agent', id] })
+      qc.invalidateQueries({ queryKey: ['agents'] })
       toast.success('Agent updated!')
     } catch {
       toast.error('Failed to save changes')
@@ -367,7 +370,8 @@ export default function AgentDetailPage() {
       const { templatesApi } = await import('@/lib/api')
       await templatesApi.updateInstance(instance.id, { variable_values: variables })
       qc.invalidateQueries({ queryKey: ['agent-instance', id] })
-      qc.invalidateQueries({ queryKey: ['agent', id] }) // refetch agent to get updated prompt
+      qc.invalidateQueries({ queryKey: ['agent', id] })
+      qc.invalidateQueries({ queryKey: ['agents'] }) // refetch agent to get updated prompt
       toast.success('Template variables updated!')
     } catch {
       toast.error('Failed to update variables')
@@ -687,6 +691,25 @@ export default function AgentDetailPage() {
                 ))}
               </select>
             </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                Tone
+              </label>
+              <select
+                value={(formData.tone as string) || ''}
+                onChange={(e) => setFormData((p) => ({ ...p, tone: e.target.value }))}
+                className="w-full px-3 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-1 focus:ring-violet-500"
+              >
+                <option value="">Select a tone</option>
+                <option value="professional">Professional</option>
+                <option value="formal">Formal</option>
+                <option value="friendly">Friendly</option>
+                <option value="warm">Warm</option>
+                <option value="casual">Casual</option>
+                <option value="empathetic">Empathetic</option>
+                <option value="direct">Direct</option>
+              </select>
+            </div>
           </div>
 
           <div>
@@ -711,7 +734,7 @@ export default function AgentDetailPage() {
               tools={tools}
               variables={globalVariables}
               documents={documents}
-              placeholder="You are a helpful assistant for {business_name}..."
+              placeholder="You are a helpful assistant for $[vars:business_name]..."
             />
           </div>
 

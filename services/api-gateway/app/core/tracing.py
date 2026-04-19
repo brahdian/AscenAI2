@@ -70,25 +70,35 @@ class TracingMiddleware(BaseHTTPMiddleware):
             trace_id = _new_trace_id()
 
         span_id = _new_span_id()
+        
+        # ── Pillar 1: Forensic Traceability (Identity) ─────────────────────
+        # Capture the original client IP. Handle X-Forwarded-For for load balancers.
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if not client_ip and request.client:
+            client_ip = request.client.host
+        client_ip = client_ip or "unknown"
 
         # Expose on request.state so route handlers can read them
         request.state.trace_id = trace_id
         request.state.span_id = span_id
+        request.state.client_ip = client_ip
 
-        # Bind to structlog context for this request
+        # Bind to structlog context for this request (Zenith Pillar 1)
         structlog.contextvars.bind_contextvars(
             trace_id=trace_id,
             span_id=span_id,
+            client_ip=client_ip,
         )
 
         t0 = time.monotonic()
         try:
             response = await call_next(request)
         finally:
-            structlog.contextvars.unbind_contextvars(_TRACE_ID_KEY, _SPAN_ID_KEY)
+            structlog.contextvars.unbind_contextvars(_TRACE_ID_KEY, _SPAN_ID_KEY, "client_ip")
 
         latency_ms = int((time.monotonic() - t0) * 1000)
         response.headers["traceparent"] = _make_traceparent(trace_id, span_id)
         response.headers["X-Trace-ID"] = trace_id
+        response.headers["X-Original-IP"] = client_ip
         response.headers["X-Request-Latency-Ms"] = str(latency_ms)
         return response

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import get_tenant_db, get_current_tenant
 from app.core.redis_client import get_redis
-from app.models.agent import Agent, AgentGuardrails
+from app.models.agent import Agent, AgentGuardrails, AgentGuardrailChangeRequest
 from app.models.agent_custom_guardrail import AgentCustomGuardrail
 from app.schemas.chat import (
     GuardrailsUpsert,
@@ -61,7 +61,24 @@ def _custom_to_response(c: AgentCustomGuardrail) -> CustomGuardrailSchema:
     )
 
 
-async def _get_agent(agent_id: str, tenant_id: str, db: AsyncSession) -> Agent:
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
+async def _get_agent(agent_id: str, tenant_id: str, db: AsyncSession, request: Request | None = None) -> Agent:
+    # Apply isolation (CRIT-005)
+    if request:
+        raid = _restricted_agent_id(request)
+        if raid and uuid.UUID(agent_id) != raid:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -83,7 +100,7 @@ async def get_guardrails(
 ):
     """Get the guardrails config for an agent."""
     tenant_id = str(tenant)
-    await _get_agent(agent_id, tenant_id, db)
+    await _get_agent(agent_id, tenant_id, db, request=request)
 
     result = await db.execute(
         select(AgentGuardrails).where(AgentGuardrails.agent_id == uuid.UUID(agent_id))
@@ -104,7 +121,7 @@ async def upsert_guardrails(
 ):
     """Create or update guardrails for an agent."""
     tenant_id = str(tenant)
-    await _get_agent(agent_id, tenant_id, db)
+    await _get_agent(agent_id, tenant_id, db, request=request)
 
     result = await db.execute(
         select(AgentGuardrails).where(AgentGuardrails.agent_id == uuid.UUID(agent_id))
@@ -119,10 +136,21 @@ async def upsert_guardrails(
         )
         db.add(gr)
 
+    ALLOWED_CONFIG_KEYS = {
+        "content_filter_level", "blocked_keywords", "blocked_topics",
+        "allowed_topics", "profanity_filter", "pii_redaction",
+        "max_response_length", "require_disclaimer", "blocked_message",
+        "off_topic_message", "pii_pseudonymization"
+    }
+
     incoming_config = body.config or {}
     current_config = copy.deepcopy(gr.config) if gr.config else {}
 
+    # ONLY allow explicitly listed keys to prevent JSON injection
     for key, value in incoming_config.items():
+        if key not in ALLOWED_CONFIG_KEYS:
+            continue
+        
         if isinstance(value, dict) and key in current_config and isinstance(current_config[key], dict):
             current_config[key] = {**current_config[key], **value}
         else:
@@ -147,7 +175,7 @@ async def delete_guardrails(
 ):
     """Remove guardrails for an agent."""
     tenant_id = str(tenant)
-    await _get_agent(agent_id, tenant_id, db)
+    await _get_agent(agent_id, tenant_id, db, request=request)
 
     result = await db.execute(
         select(AgentGuardrails).where(AgentGuardrails.agent_id == uuid.UUID(agent_id))
@@ -162,10 +190,12 @@ async def delete_guardrails(
 @router.get("/{agent_id}/guardrails/custom", response_model=list[CustomGuardrailSchema])
 async def list_custom_guardrails(
     agent_id: str,
+    request: Request,
     tenant_id: str = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db)
 ):
     """List custom guardrails for an agent."""
+    await _get_agent(agent_id, str(tenant_id), db, request=request)
     result = await db.execute(
         select(AgentCustomGuardrail).where(AgentCustomGuardrail.agent_id == uuid.UUID(agent_id))
     )
@@ -177,10 +207,12 @@ async def list_custom_guardrails(
 async def create_custom_guardrail(
     agent_id: str,
     body: CustomGuardrailCreate,
+    request: Request,
     tenant_id: str = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db)
 ):
     """Add a new custom guardrail rule."""
+    await _get_agent(agent_id, str(tenant_id), db, request=request)
     item = AgentCustomGuardrail(
         agent_id=uuid.UUID(agent_id),
         tenant_id=uuid.UUID(tenant_id),
@@ -200,10 +232,12 @@ async def update_custom_guardrail(
     agent_id: str,
     custom_id: str,
     body: CustomGuardrailUpdate,
+    request: Request,
     tenant_id: str = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db)
 ):
     """Update a custom guardrail rule."""
+    await _get_agent(agent_id, str(tenant_id), db, request=request)
     result = await db.execute(
         select(AgentCustomGuardrail).where(
             AgentCustomGuardrail.id == uuid.UUID(custom_id),
@@ -231,10 +265,12 @@ async def update_custom_guardrail(
 async def delete_custom_guardrail(
     agent_id: str,
     custom_id: str,
+    request: Request,
     tenant_id: str = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db)
 ):
     """Delete a custom guardrail rule."""
+    await _get_agent(agent_id, str(tenant_id), db, request=request)
     result = await db.execute(
         select(AgentCustomGuardrail).where(
             AgentCustomGuardrail.id == uuid.UUID(custom_id),
@@ -272,19 +308,28 @@ async def create_guardrail_change_request(
     tenant=Depends(get_current_tenant),
 ):
     """Submit a request to change a global guardrail rule."""
-    import uuid as uuid_module
-    from datetime import datetime, timezone
-    change_request = {
-        "id": str(uuid_module.uuid4()),
-        "guardrail_id": body.guardrail_id,
-        "proposed_rule": body.proposed_rule,
-        "reason": body.reason,
-        "status": "pending",
-        # B14 FIX: Use real timestamp instead of hardcoded production stub
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    logger.info("guardrail_change_request_created", guardrail_id=body.guardrail_id, tenant_id=str(tenant))
-    return change_request
+    tenant_id = str(tenant)
+    change_request = AgentGuardrailChangeRequest(
+        tenant_id=uuid.UUID(tenant_id),
+        guardrail_id=body.guardrail_id,
+        proposed_rule=body.proposed_rule,
+        reason=body.reason,
+        status="pending"
+    )
+    db.add(change_request)
+    await db.commit()
+    await db.refresh(change_request)
+    
+    logger.info("guardrail_change_request_created", guardrail_id=body.guardrail_id, tenant_id=tenant_id, request_id=str(change_request.id))
+    
+    return GuardrailChangeRequest(
+        id=str(change_request.id),
+        guardrail_id=change_request.guardrail_id,
+        proposed_rule=change_request.proposed_rule,
+        reason=change_request.reason,
+        status=change_request.status,
+        created_at=change_request.created_at.isoformat()
+    )
 
 
 @router.get("/change-requests", response_model=list[GuardrailChangeRequest])
@@ -294,4 +339,21 @@ async def list_guardrail_change_requests(
     tenant=Depends(get_current_tenant),
 ):
     """List all guardrail change requests for this tenant."""
-    return []  # Placeholder - would query from DB in real implementation
+    tenant_id = str(tenant)
+    result = await db.execute(
+        select(AgentGuardrailChangeRequest).where(
+            AgentGuardrailChangeRequest.tenant_id == uuid.UUID(tenant_id)
+        ).order_by(AgentGuardrailChangeRequest.created_at.desc())
+    )
+    items = result.scalars().all()
+    
+    return [
+        GuardrailChangeRequest(
+            id=str(i.id),
+            guardrail_id=i.guardrail_id,
+            proposed_rule=i.proposed_rule,
+            reason=i.reason,
+            status=i.status,
+            created_at=i.created_at.isoformat()
+        ) for i in items
+    ]

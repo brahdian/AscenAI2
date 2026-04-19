@@ -11,6 +11,7 @@ from app.models.agent import Agent, AgentPlaybook, Session as AgentSession, Mess
 from app.schemas.chat import ChatResponse
 from app.services.llm_client import LLMClient
 from app.services.session_state_machine import SessionStateMachine
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -94,30 +95,8 @@ class PlaybookHandler:
         except Exception as e:
             logger.warning("intent_routing_failed", error=str(e))
             
-        return await self.get_default_playbook(agent_id)
+        return None
 
-    async def get_default_playbook(self, agent_id: str) -> Optional[AgentPlaybook]:
-        # Check cache/DB for "General Chat" or default flag
-        result = await self.db.execute(
-            select(AgentPlaybook).where(
-                AgentPlaybook.agent_id == uuid.UUID(agent_id),
-                AgentPlaybook.name == "General Chat",
-                AgentPlaybook.is_active.is_(True),
-            )
-        )
-        playbook = result.scalar_one_or_none()
-        
-        if playbook:
-            return playbook
-            
-        result = await self.db.execute(
-            select(AgentPlaybook).where(
-                AgentPlaybook.agent_id == uuid.UUID(agent_id),
-                AgentPlaybook.is_default.is_(True),
-                AgentPlaybook.is_active.is_(True),
-            )
-        )
-        return result.scalar_one_or_none()
 
     async def get_active_playbooks(self, agent_id: str) -> list[AgentPlaybook]:
         """
@@ -259,18 +238,39 @@ class PlaybookHandler:
                 action = "phone_transfer"
                 SessionStateMachine.escalate(session, reason="voice_escalation_no_number")
         elif chat_enabled:
-            message = (
-                f"I'm transferring you to {chat_agent_name} right now. "
-                f"One of our agents will be with you shortly."
-            )
-            action = "chat_handoff"
-            SessionStateMachine.escalate(session, reason="chat_handoff")
-            await self.fire_connector(
-                escalation_config=escalation_config,
-                agent=agent,
-                session=session,
-                trigger_message=user_message,
-            )
+            # P1 FIX: Check connector readiness before committing to handoff
+            from app.connectors.factory import get_connector
+            connector = get_connector(escalation_config)
+            
+            connector_ok = True
+            if connector:
+                connector_ok, _ = await connector.validate_credentials()
+            
+            if connector_ok:
+                message = (
+                    f"I'm transferring you to {chat_agent_name} right now. "
+                    f"One of our agents will be with you shortly."
+                )
+                action = "chat_handoff"
+                SessionStateMachine.escalate(session, reason="chat_handoff")
+                await self.fire_connector(
+                    escalation_config=escalation_config,
+                    agent=agent,
+                    session=session,
+                    trigger_message=user_message,
+                )
+            else:
+                # Fallback if connector is down or misconfigured
+                logger.warning("escalation_connector_validation_failed_during_handoff", agent_id=str(agent.id))
+                metadata = dict(session.metadata_ or {})
+                metadata["_escalation_state"] = "collecting_info"
+                session.metadata_ = metadata
+                message = (
+                    f"I'm having a bit of trouble reaching our live chat system right now. "
+                    f"However, I can arrange for {chat_agent_name} to call you back. "
+                    f"Could you share your name and phone number?"
+                )
+                action = "collect_info"
         else:
             # B2 FIX: Build a fresh dict so MutableDict tracker sees the change
             metadata = dict(session.metadata_ or {})
@@ -444,6 +444,13 @@ class PlaybookHandler:
         except Exception:
             history = []
 
+        # P0 FIX: Redact PII before sending payload to external connectors
+        redacted_trigger = pii_service.redact(trigger_message) if trigger_message else ""
+        redacted_history = [
+            {"role": m["role"], "content": pii_service.redact(m["content"])} 
+            for m in history
+        ]
+
         payload = EscalationPayload(
             tenant_id=str(session.tenant_id),
             session_id=str(session.id),
@@ -451,8 +458,8 @@ class PlaybookHandler:
             contact_name=contact_name,
             contact_phone=contact_phone,
             contact_email=contact_email,
-            history=history,
-            trigger_message=trigger_message,
+            history=redacted_history,
+            trigger_message=redacted_trigger,
             channel=session.channel or "web",
         )
 

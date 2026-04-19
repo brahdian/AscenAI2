@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import html
 import time
 import uuid
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services import pii_service
 from app.schemas.playbook import (
     AnyStep,
     ConditionStep,
@@ -88,9 +90,11 @@ def _substitute_vars(template: str, variables: dict[str, Any]) -> str:
                 value = value.get(part, "")
             else:
                 value = getattr(value, part, "")
-        return str(value) if value is not None else ""
+        # FIX-10: Apply XML structural isolation for safe UI/prompt rendering
+        return html.escape(str(value), quote=False) if value is not None else ""
 
-    return re.sub(r"\{\{([^}]+)\}\}", _resolve, template)
+    # FIX-09: Apply PII scrubbing to the final substituted string for defense-in-depth
+    return pii_service.redact(re.sub(r"\{\{([^}]+)\}\}", _resolve, template))
 
 
 def _safe_eval(expression: str, variables: dict[str, Any]) -> bool:

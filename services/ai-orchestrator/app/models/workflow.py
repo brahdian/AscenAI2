@@ -199,10 +199,21 @@ class WorkflowExecution(Base):
     customer_phone: Mapped[str] = mapped_column(String(32), nullable=False, default="")
 
     # How this execution was started
-    # "llm_tool_call" | "cron" | "webhook" | "event" | "manual_api"
+    # "llm_tool_call" | "cron" | "webhook" | "event" | "manual_api" | "sub_workflow"
     trigger_source: Mapped[str] = mapped_column(
         String(30), nullable=False, default="llm_tool_call"
     )
+
+    # Orchestrator: parent execution that spawned this sub-workflow (nullable)
+    parent_execution_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflow_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # WAIT_FOR_SIGNAL: the correlated signal name this execution is waiting for
+    signal_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
 
     # SMS reply routing — the customer's phone number IS the identity.
     # When SEND_SMS node awaits reply, worker stores phone→execution_id in Redis.

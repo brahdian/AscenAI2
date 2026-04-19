@@ -155,7 +155,9 @@ class WorkflowTriggerWorker:
         last_run_key = f"{_CRON_KEY_PREFIX}{wf.id}:last_run"
 
         last_run_bytes = await self.redis.get(last_run_key)
-        last_run = float(last_run_bytes.decode()) if last_run_bytes else 0.0
+        # Prevent "cron fast-forward explosion": if cache is erased, 
+        # do not start from 1970 (0.0). Start from exactly right now.
+        last_run = float(last_run_bytes.decode()) if last_run_bytes else now_epoch
 
         cron = croniter(schedule, last_run)
         next_run = cron.get_next(float)

@@ -37,7 +37,10 @@ class AuditLog(Base):
         Index("ix_audit_logs_resource", "resource_type", "resource_id"),
         # Fast lookup by action category
         Index("ix_audit_logs_action", "action"),
+        # Advanced composite index for common dashboard filter permutations (Pass 8)
+        Index("ix_audit_logs_advanced_filter", "tenant_id", "category", "status", "is_support_access", "created_at"),
     )
+
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -54,6 +57,10 @@ class AuditLog(Base):
     actor_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     actor_role: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # Forensic signature: True if the action was performed by a support person
+    # (using Impersonation or Admin access), False for normal tenant users.
+    is_support_access: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
 
     # Action performed.  Use namespaced dot-notation, e.g.:
     #   auth.login_success, auth.login_failed, auth.logout

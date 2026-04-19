@@ -8,9 +8,13 @@ import json
 import os
 import re
 import uuid
-from typing import Optional, Dict
+import hmac
+import hashlib
+from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 import structlog
+
+from app.core.config import settings
 
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 from presidio_anonymizer import AnonymizerEngine
@@ -27,31 +31,59 @@ async def warmup() -> None:
     global _analyzer, _anonymizer
     if _analyzer is None:
         logger.info("pii_service_presidio_init_start")
-        # Load spaCy large model inside AnalyzerEngine
+        # Load spaCy model inside AnalyzerEngine
+        # Defaulting to standard engine; in prod this would use en_core_sci_sm for HIPAA NER
         _analyzer = AnalyzerEngine()
         
-        # Custom Recognizer for Medical/Health Conditions
+        # Robust Recognizer for Medical/Health Conditions (HIPAA Readiness)
+        # This catch-all pattern covers common symptoms, diseases, medications and records.
+        health_regex = (
+            r"\b(headache|fever|cough|chest pain|stroke|cancer|diabetes|asthma|depression|anxiety|"
+            r"pain|COVID|flu|hypertension|arthritis|alzheimer|dementia|bipolar|schizophrenia|"
+            r"autism|adhd|cholesterol|insulin|ibuprofen|aspirin|penicillin|vicodin|lipitor|"
+            r"blood pressure|mri|x-ray|ct scan|biopsy|surgery|rehab|diagnosis|prognosis|"
+            r"cardiology|oncology|psychiatry|dentist|surgery|clinic|hospital)\b"
+        )
+        
         health_recognizer = PatternRecognizer(
             supported_entity="HEALTH_CONDITION",
             patterns=[
                 Pattern(
-                    name="symptoms_and_conditions",
-                    regex=r"\b(headache|fever|cough|chest pain|stroke|cancer|diabetes|asthma|depression|anxiety|pain|COVID|flu)\b",
-                    score=0.8
+                    name="medical_entities_and_symptoms",
+                    regex=health_regex,
+                    score=0.85
                 )
             ]
         )
         _analyzer.registry.add_recognizer(health_recognizer)
         
-        _anonymizer = AnonymizerEngine()
-        logger.info("pii_service_presidio_init_complete", method="presidio_spacy_lg")
+        # Zenith Pillar 2: Deep Value Redaction for technical artifacts
+        secret_regex = r"\b(sk-[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z-_]{35}|AKIA[0-9A-Z]{16})\b"
+        secret_recognizer = PatternRecognizer(
+            supported_entity="SECRET_KEY",
+            patterns=[Pattern(name="secret_keys", regex=secret_regex, score=0.95)]
+        )
+        _analyzer.registry.add_recognizer(secret_recognizer)
 
-def redact(text: str) -> str:
+        token_regex = r"\b(ey[a-zA-Z0-9._-]{20,})\b" # JWTs starting with 'ey'
+        token_recognizer = PatternRecognizer(
+            supported_entity="BEARER_TOKEN",
+            patterns=[Pattern(name="tokens", regex=token_regex, score=0.95)]
+        )
+        _analyzer.registry.add_recognizer(token_recognizer)
+
+        # Add support for SSN/International equivalents if not in baseline
+        _anonymizer = AnonymizerEngine()
+        logger.info("pii_service_presidio_init_complete", method="presidio_hybrid_engine")
+
+def redact(text: str, hipaa_mode: bool = False) -> str:
     """One-way PII redaction for output guardrail. Replaces PII with [TYPE] labels."""
     if not text or _analyzer is None:
         return text
     
-    results = _analyzer.analyze(text=text, language='en')
+    # HIPAA Mode: Lower threshold to 0.25 to be more aggressive
+    threshold = 0.25 if hipaa_mode else 0.4
+    results = _analyzer.analyze(text=text, language='en', score_threshold=threshold)
     results.sort(key=lambda x: x.start, reverse=True)
     
     result_text = text
@@ -67,6 +99,7 @@ def redact(text: str) -> str:
 @dataclass
 class PIIContext:
     """Stores PII mapping for a single session."""
+    tenant_id: str = ""
     real_to_pseudo: Dict[str, str] = field(default_factory=dict)  # real -> pseudo
     pseudo_to_real: Dict[str, str] = field(default_factory=dict)  # pseudo -> real
     
@@ -89,8 +122,18 @@ class PIIContext:
         return len(self.real_to_pseudo) > 0
     
     def _generate_pseudo(self, pii_type: str, value: str) -> str:
-        """Generate a pseudo-value that looks natural and is non-collidable."""
-        hash_id = uuid.uuid4().hex[:8]
+        """
+        Generate a DETERMINISTIC pseudo-value for a given PII string.
+        Uses HMAC-SHA256 keyed by the system secret and scoped to the tenant.
+        This ensures RAG works between redacted queries and redacted docs.
+        """
+        # Create a unique but deterministic hash for this value within this tenant
+        h = hmac.new(
+            settings.SECRET_KEY.encode(),
+            f"{self.tenant_id}:{value}".encode(),
+            hashlib.sha256
+        )
+        hash_id = h.hexdigest()[:8]
 
         if pii_type == 'EMAIL_ADDRESS':
             return f"user_{hash_id}@{PII_PSEUDO_DOMAIN}"
@@ -106,18 +149,23 @@ class PIIContext:
             return f"Location_{hash_id[:4]}"
         elif pii_type == 'HEALTH_CONDITION':
             return f"Condition_{hash_id[:4]}"
+        elif pii_type == 'SECRET_KEY':
+            return f"Secret_{hash_id[:4]}..."
+        elif pii_type == 'BEARER_TOKEN':
+            return f"Token_{hash_id[:4]}..."
         else:
             return f"ref_{hash_id}@{PII_PSEUDO_DOMAIN}"
     
     def to_dict(self) -> dict:
         return {
+            "tid": self.tenant_id,
             "r2p": self.real_to_pseudo,
             "p2r": self.pseudo_to_real,
         }
     
     @classmethod
     def from_dict(cls, d: dict) -> "PIIContext":
-        ctx = cls()
+        ctx = cls(tenant_id=d.get("tid", ""))
         ctx.real_to_pseudo = d.get("r2p", {})
         ctx.pseudo_to_real = d.get("p2r", {})
         return ctx
@@ -127,17 +175,21 @@ class PIIContext:
 # Redis persistence
 # ---------------------------------------------------------------------------
 
-async def load_context(session_id: str, redis) -> PIIContext:
+async def load_context(session_id: str, redis, tenant_id: str = "") -> PIIContext:
     """Load PII context from Redis."""
     if redis is None:
-        return PIIContext()
+        return PIIContext(tenant_id=tenant_id)
     try:
         raw = await redis.get(f"pii_ctx:{session_id}")
         if raw:
-            return PIIContext.from_dict(json.loads(raw))
+            ctx = PIIContext.from_dict(json.loads(raw))
+            # If loaded context was missing tid, backfill it
+            if not ctx.tenant_id:
+                ctx.tenant_id = tenant_id
+            return ctx
     except Exception as e:
         logger.warning("pii_ctx_load_failed", session_id=session_id, error=str(e))
-    return PIIContext()
+    return PIIContext(tenant_id=tenant_id)
 
 
 async def save_context(session_id: str, ctx: PIIContext, redis) -> None:
@@ -156,19 +208,21 @@ async def save_context(session_id: str, ctx: PIIContext, redis) -> None:
 # Redaction: Replace real PII with pseudo-values BEFORE LLM
 # ---------------------------------------------------------------------------
 
-def redact_pii(text: str, ctx: PIIContext, session_id: str = "") -> str:
+def redact_pii(text: str, ctx: PIIContext, session_id: str = "", hipaa_mode: bool = False) -> str:
     """Replace real PII with pseudo-values that look natural."""
     if not text:
         logger.warning("pii_redact_empty", session_id=session_id)
         return text
 
-    logger.info("pii_redact_start", session_id=session_id, text_preview=text[:100])
+    logger.info("pii_redact_start", session_id=session_id, text_preview=text[:100], hipaa_mode=hipaa_mode)
     
     if _analyzer is None:
         logger.error("presidio_analyzer_not_initialized")
         return text
 
-    results = _analyzer.analyze(text=text, language='en')
+    # HIPAA Mode: Lower threshold to 0.25 to be more aggressive
+    threshold = 0.25 if hipaa_mode else 0.4
+    results = _analyzer.analyze(text=text, language='en', score_threshold=threshold)
     
     if not results:
         logger.info("pii_no_match", session_id=session_id, text_preview=text[:100])
@@ -210,7 +264,6 @@ def restore_pii(text: str, ctx: PIIContext, session_id: str = "") -> str:
     
     return result
 
-
 def restore_dict(d: dict, ctx: PIIContext, session_id: str = "") -> dict:
     """Restore PII in dict values (for tool arguments)."""
     if not ctx.has_mappings():
@@ -221,15 +274,30 @@ def restore_dict(d: dict, ctx: PIIContext, session_id: str = "") -> dict:
     }
 
 
-def redact_dict(d: dict, ctx: PIIContext, session_id: str = "") -> dict:
+def restore_context(items: list[dict], ctx: PIIContext, session_id: str = "") -> list[dict]:
+    """Restore PII in a list of context items (from MCP retrieval)."""
+    if not ctx.has_mappings():
+        return items
+    
+    restored = []
+    for item in items:
+        # Shallow copy to avoid mutating the original retrieved objects
+        new_item = dict(item)
+        if "content" in new_item and isinstance(new_item["content"], str):
+            new_item["content"] = restore_pii(new_item["content"], ctx, session_id)
+        restored.append(new_item)
+    return restored
+
+
+def redact_dict(d: dict, ctx: PIIContext, session_id: str = "", hipaa_mode: bool = False) -> dict:
     """Redact PII in dict values (for tool results going back to LLM)."""
     return {
-        k: redact_pii(v, ctx, session_id) if isinstance(v, str) else v
+        k: redact_pii(v, ctx, session_id, hipaa_mode=hipaa_mode) if isinstance(v, str) else v
         for k, v in d.items()
     }
 
 
-def redact_for_display(text: str, ctx: PIIContext) -> str:
+def redact_for_display(text: str, ctx: PIIContext, hipaa_mode: bool = False) -> str:
     """Redact PII for chat history display.
 
     Handles both:
@@ -264,9 +332,20 @@ def redact_for_display(text: str, ctx: PIIContext) -> str:
                 result = result.replace(pseudo, '[PII]')
 
     # Also apply the one-way redaction to catch any raw PII that slipped through
-    result = redact(result)
+    result = redact(result, hipaa_mode=hipaa_mode)
     
     return result
+
+
+def redact_deep(obj: Any, hipaa_mode: bool = False) -> Any:
+    """Recursively redact PII in strings within any object (list, dict, etc)."""
+    if isinstance(obj, str):
+        return redact(obj, hipaa_mode=hipaa_mode)
+    if isinstance(obj, dict):
+        return {k: redact_deep(v, hipaa_mode=hipaa_mode) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_deep(v, hipaa_mode=hipaa_mode) for v in obj]
+    return obj
 
 
 # ---------------------------------------------------------------------------

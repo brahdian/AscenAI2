@@ -29,19 +29,21 @@ from __future__ import annotations
 
 
 # Mapping of ISO 639-1 codes to their respective "please speak in [language]" phrases.
-from app.services.settings_service import SettingsService
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.services import pii_service
+
 
 async def generate_multilingual_greeting(
     db: AsyncSession, 
     primary_language: str | None = None,
     supported_languages: list[str] | None = None,
+    custom_greeting: str | None = None,
 ) -> str:
     """
     Generate the audible MANDATORY OPENING string based on selected languages and platform settings.
-    primary_language: the agent's primary/default language (e.g. 'hi'). Used to localize the greeting prefix.
-    supported_languages: the list of all supported language codes (e.g. ['hi', 'en']).
+    Redacts PII from custom greetings for safety.
     """
+    import app.services.pii_service as pii_service
     # 1. Fetch config from Platform Settings (with cache in SettingsService)
     lang_config = await SettingsService.get_setting(db, "global_language_config", {})
     
@@ -78,7 +80,12 @@ async def generate_multilingual_greeting(
 
     # Pick the lead greeting prefix localized to the primary language
     lead_lang_base = primary_lang.split("-")[0]
-    greeting_prefix_phrase = greeting_map.get(lead_lang_base, greeting_map.get("en", "Thank you for calling.")).strip()
+    
+    if custom_greeting and custom_greeting.strip():
+        greeting_prefix_phrase = pii_service.redact(custom_greeting.strip())
+    else:
+        greeting_prefix_phrase = greeting_map.get(lead_lang_base, greeting_map.get("en", "Thank you for calling.")).strip()
+        
     if greeting_prefix_phrase.endswith("."):
         greeting_prefix_phrase = greeting_prefix_phrase[:-1]
 
@@ -104,7 +111,8 @@ async def generate_multilingual_greeting(
     if extra_phrases:
         greeting += " " + " ".join(extra_phrases)
     
-    return greeting.strip()
+    # Standardize redaction for audible strings (Round 9 Hardening)
+    return pii_service.redact(greeting.strip())
 
 # Mapping for "I didn't catch that" fallback phrases.
 LANGUAGE_FALLBACK_MAP = {
@@ -141,7 +149,53 @@ async def generate_multilingual_fallback(
         active_langs = ["en"]
 
     phrases = [merged_map[l] for l in active_langs if l in merged_map]
-    return " ".join(phrases)
+    # Standardize redaction for audible fallout strings
+    return pii_service.redact(" ".join(phrases))
+
+async def generate_ivr_language_prompt(
+    db: AsyncSession,
+    supported_languages: list[str] | None = None
+) -> str:
+    """
+    Generate an IVR language-selection prompt based on supported languages.
+    Example: "For English, press 1. Pour le français, appuyez sur 2."
+    """
+    if not supported_languages or len(supported_languages) <= 1:
+        return ""
+
+    lang_config = await SettingsService.get_setting(db, "global_language_config", {})
+    lang_data = lang_config.get("languages", [])
+    
+    # Map codes to labels (prefer native_label for speech)
+    lang_labels = {}
+    for item in lang_data:
+        code = item.get("code")
+        label = item.get("native_label") or item.get("label") or code
+        lang_labels[code] = label
+
+    prompts = []
+    for i, code in enumerate(supported_languages, 1):
+        label = lang_labels.get(code, code)
+        # Strip parentheticals
+        clean_label = label.split("(")[0].strip()
+        
+        # We assume a standard mapping for "index" to words in major languages or just use digits
+        # For now, we'll use a simple multi-lingual template
+        if code.startswith("en"):
+            prompts.append(f"For {clean_label}, press {i}.")
+        elif code.startswith("fr"):
+            prompts.append(f"Pour le {clean_label}, appuyez sur {i}.")
+        elif code.startswith("es"):
+            prompts.append(f"Para {clean_label}, presione {i}.")
+        elif code.startswith("hi"):
+            prompts.append(f"{clean_label} के लिए, {i} दबाएं।")
+        else:
+            # Generic fallback
+            prompts.append(f"For {clean_label}, press {i}.")
+
+    # Standardize redaction for IVR prompts
+    return pii_service.redact(" ".join(prompts))
+
 
 async def get_dynamic_voice_protocol(
     db: AsyncSession,
@@ -159,14 +213,14 @@ async def get_dynamic_voice_protocol(
         # Fallback to hardcoded if not in DB
         template = """\
 ## Multi-lingual & IVR Operational Protocol
-- **INITIAL GREETING (MANDATORY)**: You MUST begin every new voice session with the following opening:
-  "{opening}"
+- **ACTIVE SESSION CONTEXT**: The call has already been initialized with a greeting and language-selection prompt. Use the user's first response to confirm their preferred tongue.
 - **DYNAMIC LANGUAGE ADAPTATION**: You are globally configured to handle the following languages: {all_langs}.
 - **PROTOCOL**: Upon detecting ANY of the supported languages, pivot your response language immediately to match the user without requesting procedural confirmation (e.g., avoid "Would you like to speak French?").
 - **CONTEXTUAL METADATA**: Ensure the `language` field in your response metadata accurately identifies the communication language used in the current turn.
 """
 
-    return template.format(opening=opening, all_langs=all_langs)
+    # Standardize redaction for protocol templates (Round 9)
+    return pii_service.redact(template.replace("{all_langs}", all_langs))
 
 
 async def get_or_compute_voice_strings(
@@ -190,12 +244,18 @@ async def get_or_compute_voice_strings(
     supported_langs: list[str] = cfg.get("supported_languages") or []
     cached_langs: list[str] = cfg.get("_cached_langs") or []
 
-    # Cache hit: same language list and all three strings present
+    # Check if preset changed
+    current_preset_id = cfg.get("voice_protocol_preset_id")
+    cached_preset_id = cfg.get("_cached_preset_id")
+
+    # Cache hit: same language list, same preset ID, and all strings present
     if (
         cached_langs == supported_langs
+        and cached_preset_id == current_preset_id
         and cfg.get("_cached_greeting")
         and cfg.get("_cached_protocol")
         and cfg.get("_cached_fallback")
+        and cfg.get("_cached_preset_protocol")
     ):
         return (
             cfg["_cached_greeting"],
@@ -209,12 +269,21 @@ async def get_or_compute_voice_strings(
     protocol  = await get_dynamic_voice_protocol(db, supported_langs)
     fallback  = await generate_multilingual_fallback(db, supported_langs)
 
+    if current_preset_id:
+        global_presets = await SettingsService.get_setting(db, "global_voice_protocols", default=[])
+        for p in global_presets:
+            if p.get("id") == current_preset_id:
+                preset_protocol = p.get("template", "")
+                break
+
     # Write back into agent_config (JSONB MutableDict — SQLAlchemy tracks the mutation)
     new_cfg = dict(cfg)
     new_cfg["_cached_greeting"] = greeting
     new_cfg["_cached_protocol"] = protocol
     new_cfg["_cached_fallback"] = fallback
-    new_cfg["_cached_langs"]    = supported_langs
+    new_cfg["_cached_langs"] = supported_langs
+    new_cfg["_cached_preset_id"] = current_preset_id
+    new_cfg["_cached_preset_protocol"] = preset_protocol
     agent.agent_config = new_cfg
 
     return greeting, protocol, fallback

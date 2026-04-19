@@ -60,6 +60,9 @@ class Tenant(Base):
     trial_ends_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    
+    # Compliance
+    audit_retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=365)
 
     # Arbitrary metadata
     metadata_: Mapped[dict] = mapped_column(

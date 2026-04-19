@@ -13,7 +13,9 @@ from app.core.database import get_db
 from app.core.security import get_tenant_db, get_current_tenant
 from app.core.rbac import require_scope
 from app.models.user import User
+from app.models.invite import UserInvite
 from app.services.auth_service import auth_service
+from app.services.tenant_service import tenant_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/team")
@@ -40,6 +42,14 @@ class TeamMemberResponse(BaseModel):
     is_active: bool
     last_login_at: str | None
     created_at: str
+
+
+class InviteResponse(BaseModel):
+    id: str
+    email: str
+    role: str
+    token: str  # In production, we'd only return this if the actor is an admin/owner
+    expires_at: str
 
 
 def _require_tenant(request: Request) -> str:
@@ -96,14 +106,44 @@ async def list_team(
     result = await db.execute(
         select(User)
         .where(User.tenant_id == uuid.UUID(tenant_id))
-        .order_by(User.created_at.asc())
+        .order_by(User.is_active.desc(), User.created_at.asc())
         .limit(limit)
         .offset(offset)
     )
     return [_user_to_response(u) for u in result.scalars().all()]
 
 
-@router.post("/invite", response_model=TeamMemberResponse, status_code=201)
+@router.get("/invites", response_model=list[InviteResponse])
+async def list_pending_invites(
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """List pending invitations for the tenant."""
+    from datetime import datetime, timezone
+    _require_management(request)
+    
+    result = await db.execute(
+        select(UserInvite).where(
+            UserInvite.tenant_id == uuid.UUID(tenant_id),
+            UserInvite.accepted_at == None,
+            UserInvite.expires_at > datetime.now(timezone.utc)
+        )
+    )
+    invites = result.scalars().all()
+    return [
+        InviteResponse(
+            id=str(i.id),
+            email=i.email,
+            role=i.role,
+            token=i.token,
+            expires_at=i.expires_at.isoformat()
+        )
+        for i in invites
+    ]
+
+
+@router.post("/invite", response_model=InviteResponse, status_code=201)
 async def invite_user(
     body: InviteRequest,
     request: Request,
@@ -112,11 +152,10 @@ async def invite_user(
     tenant_id: str = Depends(get_current_tenant),
 ):
     """
-    Invite a new user to the tenant.
-    Creates a user with a random temporary password.
-    In production an invitation email would be sent.
+    Invite a new user to the tenant via secure token.
+    Enforces plan seat limits.
     """
-    tenant_id, _ = _require_management(request)
+    tenant_id, requestor_id = _require_management(request)
 
     if body.role not in _VALID_ROLES:
         raise HTTPException(
@@ -124,46 +163,37 @@ async def invite_user(
             detail=f"Invalid role '{body.role}'. Valid roles: {', '.join(sorted(_VALID_ROLES))}",
         )
 
-    # Normalize email to lowercase before any comparison or storage
-    normalized_email = body.email.lower()
-
-    # Check uniqueness WITHIN THIS TENANT ONLY (prevents cross-tenant enumeration)
-    existing = await db.execute(
-        select(User).where(
-            User.email == normalized_email,
-            User.tenant_id == uuid.UUID(tenant_id),
+    # REVENUE PROTECTION: Check seat limits
+    if not await tenant_service.check_team_seats(tenant_id, db):
+        raise HTTPException(
+            status_code=403,
+            detail="Team seat limit reached for your current plan. Please upgrade to invite more members."
         )
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A user with this email already exists.")
 
-    # Generate a random 12-character temp password
-    temp_password = secrets.token_urlsafe(9)  # ~12 chars
-
-    new_user = User(
-        id=uuid.uuid4(),
-        tenant_id=uuid.UUID(tenant_id),
-        email=normalized_email,
-        hashed_password=auth_service.hash_password(temp_password),
-        full_name=body.full_name,
+    # Use auth_service to create the secure invitation
+    invite = await auth_service.create_invite(
+        tenant_id=tenant_id,
+        email=body.email,
         role=body.role,
-        is_active=True,
-        is_email_verified=False,
+        invited_by=requestor_id,
+        db=db
     )
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
 
-    # In a real system, send an invite email with the temp password / magic link
     logger.info(
         "user_invited",
         invited_email=body.email,
         role=body.role,
         tenant_id=tenant_id,
-        # temp_password is intentionally NOT logged in production
+        requestor_id=requestor_id
     )
 
-    return _user_to_response(new_user)
+    return InviteResponse(
+        id=str(invite.id),
+        email=invite.email,
+        role=invite.role,
+        token=invite.token,
+        expires_at=invite.expires_at.isoformat()
+    )
 
 
 @router.patch("/{user_id}/role", response_model=TeamMemberResponse)
@@ -196,12 +226,17 @@ async def change_user_role(
 
     # If target is an owner and new role is not owner, verify another owner exists
     if target.role == "owner" and body.role != "owner":
+        # RACE CONDITION FIX: Use FOR UPDATE to lock active users in this tenant
+        # during the owner-count check.
         owner_count_result = await db.execute(
-            select(func.count()).select_from(User).where(
+            select(func.count())
+            .select_from(User)
+            .where(
                 User.tenant_id == uuid.UUID(tenant_id),
                 User.role == "owner",
                 User.is_active.is_(True),
             )
+            .with_for_update()
         )
         owner_count = owner_count_result.scalar() or 0
         if owner_count <= 1:
@@ -244,12 +279,16 @@ async def deactivate_user(
 
     # Cannot remove last owner
     if target.role == "owner":
+        # RACE CONDITION FIX: Use FOR UPDATE
         owner_count_result = await db.execute(
-            select(func.count()).select_from(User).where(
+            select(func.count())
+            .select_from(User)
+            .where(
                 User.tenant_id == uuid.UUID(tenant_id),
                 User.role == "owner",
                 User.is_active.is_(True),
             )
+            .with_for_update()
         )
         owner_count = owner_count_result.scalar() or 0
         if owner_count <= 1:
@@ -260,4 +299,99 @@ async def deactivate_user(
 
     target.is_active = False
     await db.commit()
-    logger.info("user_deactivated", user_id=user_id, tenant_id=tenant_id)
+    logger.info("user_deactivated", user_id=user_id, tenant_id=tenant_id, requestor_id=requestor_id)
+
+
+@router.post("/{user_id}/reactivate")
+async def reactivate_user(
+    user_id: str,
+    request: Request,
+    _scope=require_scope("team:write"),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """Reactivate a previously deactivated team member."""
+    tenant_id, requestor_id = _require_management(request)
+
+    # REVENUE PROTECTION: Check seat limits before reactivating
+    if not await tenant_service.check_team_seats(tenant_id, db):
+        raise HTTPException(
+            status_code=403,
+            detail="Team seat limit reached. Please upgrade or remove another member to reactivate."
+        )
+
+    result = await db.execute(
+        select(User).where(
+            User.id == uuid.UUID(user_id),
+            User.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    target.is_active = True
+    await db.commit()
+    logger.info("user_reactivated", user_id=user_id, tenant_id=tenant_id, requestor_id=requestor_id)
+    return {"message": "User reactivated."}
+
+
+@router.delete("/{user_id}/hard", status_code=204)
+async def delete_user_permanently(
+    user_id: str,
+    request: Request,
+    _scope=require_scope("team:write"),
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+):
+    """
+    Permanently delete a team member and clear their PII (GDPR compliance).
+    Only allowed for admins/owners.
+    """
+    tenant_id, requestor_id = _require_management(request)
+    
+    # Cannot remove yourself
+    if user_id == requestor_id:
+        raise HTTPException(status_code=400, detail="Use 'delete account' in profile to remove yourself.")
+
+    result = await db.execute(
+        select(User).where(
+            User.id == uuid.UUID(user_id),
+            User.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    target = result.scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    # Cannot remove last owner
+    if target.role == "owner":
+        owner_count_result = await db.execute(
+            select(func.count())
+            .select_from(User)
+            .where(
+                User.tenant_id == uuid.UUID(tenant_id),
+                User.role == "owner",
+                User.is_active.is_(True),
+            )
+            .with_for_update()
+        )
+        owner_count = owner_count_result.scalar() or 0
+        if owner_count <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete the last owner."
+            )
+
+    # Perform deletion
+    from sqlalchemy import delete
+    from app.models.user import APIKey
+    
+    # Clear PII from the user record before deletion if we were doing soft-delete, 
+    # but here we do hard delete of the user record.
+    # Note: Tenant isolation is guaranteed by get_tenant_db session!
+    await db.execute(delete(APIKey).where(APIKey.user_id == target.id))
+    await db.delete(target)
+    
+    await db.commit()
+    logger.info("user_hard_deleted", user_id=user_id, tenant_id=tenant_id, requestor_id=requestor_id)

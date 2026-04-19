@@ -8,7 +8,7 @@ MAX_STRING_LENGTH = 50_000
 MAX_LIST_ITEMS = 500
 
 class StrictAgentConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     tone: Optional[str] = None
     instructions: Optional[str] = None
@@ -39,6 +39,12 @@ class StrictAgentConfig(BaseModel):
     escalation_config: Optional[dict[str, Any]] = Field(default_factory=dict)
     escalation_extensions: Optional[dict[str, str]] = Field(default_factory=dict)
 
+    # Internal persistence for pending agent purchases from templates
+    template_context: Optional[dict[str, Any]] = Field(
+        default=None, 
+        description="Persistent store for template ID and variables during payment redirects."
+    )
+
 
 
 class LLMConfig(BaseModel):
@@ -56,7 +62,7 @@ class VoiceConfig(BaseModel):
 
 
 class EscalationConfig(BaseModel):
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="ignore")
     connector_type: Optional[str] = Field(None, max_length=50)
 
 
@@ -134,6 +140,13 @@ class ChatResponse(BaseModel):
     expiry_warning: bool = Field(
         False, description="True if session is within the warning threshold before expiry"
     )
+    # Phase 6: Grounding Verification
+    is_grounded: Optional[bool] = Field(
+        None, description="Whether the response was mathematically verified against the source citations using NLI."
+    )
+    grounding_explanation: Optional[str] = Field(
+        None, description="NLI explanation for why the response was or was not grounded."
+    )
 
 
 class StreamChatEvent(BaseModel):
@@ -176,6 +189,7 @@ class AgentCreate(BaseModel):
     is_active: Optional[bool] = None
     stripe_subscription_id: Optional[str] = None
     expires_at: Optional[str] = None
+    guardrails_config: Optional[dict] = Field(None, description="Initial guardrail settings (pii, profanity, etc.)")
 
     @field_validator("agent_config", mode="before")
     @classmethod
@@ -277,6 +291,7 @@ class AgentResponse(BaseModel):
     extension_number: Optional[str] = None
     is_available_as_tool: bool = True
     is_active: bool
+    status: str
     stripe_subscription_id: Optional[str] = None
     deleted_at: Optional[str] = None
     created_at: Optional[str]
@@ -428,7 +443,6 @@ class PlaybookUpsert(BaseModel):
     name: str = Field(default="Default", max_length=255)
     description: Optional[str] = None
     intent_triggers: list[str] = Field(default_factory=list)
-    is_default: bool = False
     config: dict = Field(
         default_factory=dict,
         description="Playbook configuration: instructions, tone, dos, donts, scenarios, etc."
@@ -459,7 +473,6 @@ class PlaybookResponse(BaseModel):
     name: str
     description: Optional[str]
     intent_triggers: list[str]
-    is_default: bool
     instructions: Optional[str] = None
     tone: str = "professional"
     dos: list[str] = Field(default_factory=list)

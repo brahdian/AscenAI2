@@ -47,6 +47,9 @@ class ConversationTrace(Base):
         ForeignKey("messages.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Shared identifier across all internal services for forensic log correlation
+    trace_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

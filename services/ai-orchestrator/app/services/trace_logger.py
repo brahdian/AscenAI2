@@ -28,6 +28,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.trace import ConversationTrace
+from app.services import pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -95,11 +96,12 @@ class TraceLogger:
         summary: str,
         long_term: Any,
     ) -> None:
-        self._memory_snapshot = {
+        # REDACT-DEEP: Ensure memory snapshots are scrubbed of PII before trace storage.
+        self._memory_snapshot = pii_service.redact_deep({
             "short_term": short_term or [],
             "summary": summary or "",
             "long_term": long_term or {},
-        }
+        })
 
     def set_retrieved_chunks(self, chunks: list) -> None:
         """
@@ -112,9 +114,9 @@ class TraceLogger:
     def set_messages_sent(self, messages: list) -> None:
         """
         Store the full messages array sent to the LLM.
-        PII must already be pseudonymized / redacted before calling this.
+        Enforces recursive PII redaction.
         """
-        self._messages_sent = messages or []
+        self._messages_sent = pii_service.redact_deep(messages or [])
 
     def set_message_id(self, message_id: uuid.UUID) -> None:
         """Link to the persisted assistant Message row (set after DB insert)."""
@@ -143,7 +145,8 @@ class TraceLogger:
     # ── LLM response ─────────────────────────────────────────────────────────
 
     def set_llm_response(self, raw: str, provider: str, model: str) -> None:
-        self._raw_llm_response = raw or ""
+        # PII Redaction: Scrub raw LLM content before persistent trace storage.
+        self._raw_llm_response = pii_service.redact(raw or "")
         self._llm_provider = provider or ""
         self._llm_model = model or ""
 

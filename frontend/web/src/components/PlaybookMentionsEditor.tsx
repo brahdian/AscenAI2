@@ -1,6 +1,6 @@
 'use client'
 
-import React from 'react'
+import React, { useMemo, useCallback, useEffect, useState } from 'react'
 import { MentionsInput, Mention, SuggestionDataItem } from 'react-mentions'
 
 export interface ToolItem {
@@ -25,11 +25,12 @@ export interface DocumentItem {
 export interface PlaybookMentionsEditorProps {
   value: string
   onChange: (value: string) => void
-  tools: ToolItem[]
-  variables: VariableItem[]
-  documents: DocumentItem[]
+  tools?: ToolItem[]
+  variables?: VariableItem[]
+  documents?: DocumentItem[]
   placeholder?: string
   minRows?: number
+  minHeight?: string
 }
 
 // Custom styles for react-mentions to match Tailwind
@@ -96,32 +97,33 @@ const darkStyle = {
 export function PlaybookMentionsEditor({
   value,
   onChange,
-  tools,
-  variables,
-  documents,
+  tools = [],
+  variables = [],
+  documents = [],
   placeholder = 'Type instructions... Use $tools: to reference tools, $vars: for variables, $rag: for documents.',
+  minHeight = '120px',
 }: PlaybookMentionsEditorProps) {
-  // Convert tools arrays to SuggestionDataItem format required by react-mentions
-  const toolData: SuggestionDataItem[] = tools.map((t) => ({
+  // Convert tools arrays to SuggestionDataItem format requested by react-mentions
+  const toolData: SuggestionDataItem[] = useMemo(() => tools.map((t) => ({
     id: t.name,
-    display: `$tools:${t.name}`,
+    display: `$[tools:${t.name}]`,
     description: t.description || 'Tool',
-  }))
+  })), [tools])
 
-  const varData: SuggestionDataItem[] = variables.map((v) => ({
+  const varData: SuggestionDataItem[] = useMemo(() => variables.map((v) => ({
     id: v.name,
-    display: `$vars:${v.name}`,
+    display: `$[vars:${v.name}]`,
     description: `[${v.scope === 'local' ? 'Playbook' : 'Global'}] ${v.data_type || 'string'}`,
-  }))
+  })), [variables])
 
-  const docData: SuggestionDataItem[] = documents.map((d) => ({
+  const docData: SuggestionDataItem[] = useMemo(() => documents.map((d) => ({
     id: d.id, // Or d.name if we want to refer to it by name
-    display: `$rag:${d.name || d.id.substring(0, 8)}`,
+    display: `$[rag:${d.name || d.id.substring(0, 8)}]`,
     description: 'Knowledge Document',
-  }))
+  })), [documents])
 
   // Generic render function for suggestions
-  const renderSuggestion = (
+  const renderSuggestion = useCallback((
     suggestion: SuggestionDataItem,
     search: string,
     highlightedDisplay: React.ReactNode,
@@ -131,21 +133,28 @@ export function PlaybookMentionsEditor({
     return (
       <div className={`flex flex-col gap-0.5 ${focused ? 'text-violet-900 dark:text-violet-100' : 'text-gray-900 dark:text-gray-100'}`}>
         <span className="font-semibold text-sm">{highlightedDisplay}</span>
-        {suggestion.description && (
+        {((suggestion as any).description) && (
           <span className="text-xs text-gray-500 dark:text-gray-400 truncate max-w-[300px]">
-            {suggestion.description}
+            {(suggestion as any).description}
           </span>
         )}
       </div>
     )
-  }
+  }, [])
 
-  // Detect dark mode roughly by checking document.documentElement
-  // In a real app we'd grab this from context/tailwind class, but this works client-side
-  const isDark = typeof window !== 'undefined' && document.documentElement.classList.contains('dark')
+  const [isDark, setIsDark] = useState(false)
+  useEffect(() => {
+    setIsDark(document.documentElement.classList.contains('dark'))
+    const observer = new MutationObserver(() => {
+      setIsDark(document.documentElement.classList.contains('dark'))
+    })
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
+
 
   return (
-    <div className="relative w-full text-base group" style={{ minHeight: '120px' }}>
+    <div className="relative w-full text-base group" style={{ minHeight }}>
       <MentionsInput
         value={value}
         onChange={(e, newValue) => onChange(newValue)}
@@ -156,10 +165,10 @@ export function PlaybookMentionsEditor({
         allowSuggestionsAboveCursor
       >
         <Mention
-          trigger="$tools:"
+          trigger="$[tools:"
           data={toolData}
           renderSuggestion={renderSuggestion}
-          markup="$tools:__id__"
+          markup="$[tools:__id__]"
           displayTransform={(id, display) => display}
           style={{
             backgroundColor: isDark ? '#4c1d95' : '#ede9fe', // violet-900 / violet-100
@@ -168,10 +177,10 @@ export function PlaybookMentionsEditor({
           }}
         />
         <Mention
-          trigger="$vars:"
+          trigger="$[vars:"
           data={varData}
           renderSuggestion={renderSuggestion}
-          markup="$vars:__id__"
+          markup="$[vars:__id__]"
           displayTransform={(id, display) => display}
           style={{
             backgroundColor: isDark ? '#1e3a8a' : '#dbeafe', // blue-900 / blue-100
@@ -180,10 +189,10 @@ export function PlaybookMentionsEditor({
           }}
         />
         <Mention
-          trigger="$rag:"
+          trigger="$[rag:"
           data={docData}
           renderSuggestion={renderSuggestion}
-          markup="$rag:__id__"
+          markup="$[rag:__id__]"
           displayTransform={(id, display) => display}
           style={{
             backgroundColor: isDark ? '#064e3b' : '#d1fae5', // emerald-900 / emerald-100

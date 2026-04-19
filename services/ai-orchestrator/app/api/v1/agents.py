@@ -11,13 +11,38 @@ from pathlib import Path
 from typing import Optional, List
 
 import structlog
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+
+from app.services.pii_service import redact
+
+def _has_variables(text: str | None) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r'\$\[vars:\w+\]|\$vars:\w+', text))
+
+def _delete_old_audio(url: str | None) -> None:
+    if not url:
+        return
+    try:
+        from pathlib import Path
+        import os
+        audio_dir = Path(os.environ.get("GREETING_AUDIO_PATH", "/tmp/voice-greetings"))
+        filename = Path(url).name
+        filepath = audio_dir / filename
+        if filepath.exists():
+            filepath.unlink(missing_ok=True)
+            import structlog
+            structlog.get_logger(__name__).info("deleted_old_audio", filepath=str(filepath))
+    except Exception as e:
+        import structlog
+        structlog.get_logger(__name__).warning("failed_to_delete_old_audio", url=url, error=str(e))
+
 from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant, require_forwarded_role
+from app.core.security import get_tenant_db, get_current_tenant, require_forwarded_role, require_internal_key
 from app.models.agent import Agent, AgentPlaybook, AgentGuardrails
 from app.schemas.chat import (
     AgentCreate,
@@ -33,8 +58,13 @@ from app.guardrails.voice_agent_guardrails import (
     generate_multilingual_greeting,
     generate_multilingual_fallback,
     get_or_compute_voice_strings,
+    generate_ivr_language_prompt,
 )
 from app.services.tts_generation_service import TTSGenerationService
+from app.utils.expansion import resolve_agent_variables
+from app.models.variable import AgentVariable
+from app.services.mcp_client import MCPClient
+from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -59,6 +89,23 @@ _PROMPT_INJECTION_RE = re.compile(
 _MAX_SYSTEM_PROMPT_LEN = 8_000
 
 
+async def _background_purge_agent_knowledge(agent_id: str, tenant_id: str):
+    """Purge all RAG chunks from MCP for a specific agent when archived or deleted."""
+    from app.services.mcp_client import MCPClient
+    from app.core.config import settings
+    mcp = MCPClient(base_url=settings.MCP_SERVER_URL, ws_url=settings.MCP_WS_URL)
+    try:
+        await mcp.initialize()
+        # Find the KB ID for this agent
+        kb_id = await mcp.get_or_create_agent_kb(tenant_id, agent_id, "unknown")
+        # Cleanup all chunks for this agent ID (the extra metadata layer)
+        count = await mcp.cleanup_knowledge_by_metadata(tenant_id, kb_id, "agent_id", agent_id)
+        logger.info("agent_knowledge_purged_on_lifecycle_event", agent_id=agent_id, chunks_purged=count)
+        await mcp.close()
+    except Exception as e:
+        logger.error("agent_knowledge_purge_failed", agent_id=agent_id, error=str(e))
+
+
 def _validate_system_prompt(prompt: str | None) -> None:
     if not prompt:
         return
@@ -79,6 +126,17 @@ def _tenant_id(request: Request) -> str:
     if not tid:
         raise HTTPException(status_code=401, detail="Tenant ID required.")
     return tid
+
+
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
 
 
 async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
@@ -119,6 +177,7 @@ async def _agent_to_response(agent: Agent, db: AsyncSession) -> AgentResponse:
         extension_number=agent.extension_number,
         is_available_as_tool=config.get("is_available_as_tool", True),
         is_active=agent.is_active,
+        status=agent.status or "DRAFT",
         stripe_subscription_id=agent.stripe_subscription_id,
         deleted_at=agent.deleted_at.isoformat() if agent.deleted_at else None,
         created_at=agent.created_at.isoformat() if agent.created_at else None,
@@ -132,7 +191,17 @@ async def get_platform_global_guardrails(
 ):
     """Get global guardrails from DB/Redis cache."""
     from app.services.settings_service import SettingsService
-    guardrails = await SettingsService.get_setting(db, "global_guardrails", default=[])
+    guardrails_setting = await SettingsService.get_setting(db, "platform_guardrails", default={})
+    # Handle both wrapped {rules: [...]} and direct list/dict formats
+    if isinstance(guardrails_setting, dict) and "rules" in guardrails_setting:
+        guardrails = guardrails_setting["rules"]
+    elif isinstance(guardrails_setting, list):
+        guardrails = guardrails_setting
+    elif isinstance(guardrails_setting, dict):
+        # Could be a map of {id: {enabled: bool}} as stored by admin.py
+        guardrails = guardrails_setting
+    else:
+        guardrails = []
     return {"guardrails": guardrails}
 
 
@@ -142,6 +211,7 @@ async def get_agent_opening_preview(
     request: Request,
     language: Optional[str] = None,
     supported_languages: Optional[str] = None,  # comma-separated
+    greeting: Optional[str] = None,
     db: AsyncSession = Depends(get_tenant_db),
 ):
     """
@@ -150,6 +220,12 @@ async def get_agent_opening_preview(
     Supports previewing un-saved changes via query parameters.
     """
     tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -162,14 +238,21 @@ async def get_agent_opening_preview(
 
     # Override with provided query params if any
     active_lang = language or agent.language
-    if supported_languages:
+    if supported_languages is not None:
         supported_langs = [l.strip() for l in supported_languages.split(",") if l.strip()]
     else:
         supported_langs = (agent.agent_config or {}).get("supported_languages", [])
     
-    full_text = await generate_multilingual_greeting(db, active_lang, supported_langs)
+    custom_greeting = greeting if greeting is not None else (agent.greeting_message or (agent.agent_config or {}).get("greeting_message"))
+    full_text = await generate_multilingual_greeting(db, active_lang, supported_langs, custom_greeting=custom_greeting)
     
-    return {"text": full_text}
+    # Resolve variables for preview
+    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+    variables = result_vars.scalars().all()
+    resolved_text = resolve_agent_variables(full_text, agent, variables, clean=True)
+    
+    # Standardize redaction for dashboard display
+    return {"text": pii_service.redact_for_display(resolved_text, None)}
 
 
 @router.put("/platform/global-guardrails")
@@ -182,13 +265,13 @@ async def update_platform_global_guardrails(
     guardrails = body.get("guardrails", [])
 
     await db.execute(
-        text("INSERT INTO platform_settings (key, value) VALUES ('global_guardrails', :value) "
+        text("INSERT INTO platform_settings (key, value) VALUES ('platform_guardrails', :value) "
              "ON CONFLICT (key) DO UPDATE SET value = :value"),
         {"value": json.dumps(guardrails)}
     )
     await db.commit()
 
-    await SettingsService.invalidate_cache("global_guardrails")
+    await SettingsService.invalidate_cache("platform_guardrails")
     logger.info("global_guardrails_updated", count=len(guardrails))
     return {"guardrails": guardrails}
 
@@ -198,7 +281,9 @@ async def create_agent(
     body: AgentCreate,
     request: Request,
     db: AsyncSession = Depends(get_tenant_db),
+    _internal: bool = Depends(require_internal_key),
 ):
+
     """Create a new AI agent for the tenant."""
     tenant_id = _tenant_id(request)
     _validate_system_prompt(body.system_prompt)
@@ -226,26 +311,16 @@ async def create_agent(
         agent_config=agent_config,
     )
     db.add(agent)
+    
+    # If the agent is inactive, it requires payment. Transition its lifecycle state.
+    if not agent.is_active:
+        from app.services.agent_state_machine import AgentStateMachine as _AgentStateMachine
+        await _AgentStateMachine.pending_payment(
+            agent, db=db, actor="user", reason="created_without_slot"
+        )
 
     tenant_uuid = uuid.UUID(tenant_id)
     
-    default_playbook = AgentPlaybook(
-        id=uuid.uuid4(),
-        agent_id=agent.id,
-        tenant_id=tenant_uuid,
-        name="Default",
-        description="Default playbook — edit to add instructions for your agent.",
-        is_default=True,
-        intent_triggers=[],
-        config={
-            "instructions": body.system_prompt or "",
-            "tone": body.personality or "professional",
-            "dos": [],
-            "donts": [],
-            "scenarios": [],
-        },
-    )
-    db.add(default_playbook)
 
     general_chat_playbook = AgentPlaybook(
         id=uuid.uuid4(),
@@ -265,16 +340,29 @@ async def create_agent(
     )
     db.add(general_chat_playbook)
 
+    # P0 Compliance: Force PII redaction for medical agents
+    pii_redaction_default = False
+    if body.business_type == "medical":
+        pii_redaction_default = True
+        logger.info("enforcing_pii_redaction_for_medical_agent", tenant_id=tenant_id)
+
+    # Merge any guardrails_config provided at creation time (e.g. from template instantiation)
+    initial_guardrails_cfg = {
+        "profanity_filter": True,
+        "pii_redaction": pii_redaction_default,
+        "pii_pseudonymization": True,
+        "is_active": True,
+    }
+    if body.guardrails_config:
+        # Caller-provided config wins, but defaults fill any gaps
+        initial_guardrails_cfg.update(body.guardrails_config)
+        logger.info("guardrails_config_from_request", tenant_id=tenant_id, keys=list(body.guardrails_config.keys()))
+
     default_guardrails = AgentGuardrails(
         id=uuid.uuid4(),
         agent_id=agent.id,
         tenant_id=tenant_uuid,
-        config={
-            "profanity_filter": True,
-            "pii_redaction": False,
-            "pii_pseudonymization": True,
-            "is_active": True,
-        },
+        config=initial_guardrails_cfg,
         is_active=True,
     )
     db.add(default_guardrails)
@@ -284,68 +372,154 @@ async def create_agent(
 
     # Auto-generate TTS audio for voice agents when greeting text is provided.
     # This runs after commit so the agent already has a stable ID in the DB.
+    
+    # 1. First, automatically predefine ivr_language_prompt if supported_languages provided but prompt is empty
+    cfg = agent.agent_config or {}
+    supported_langs = cfg.get("supported_languages", [])
+    if supported_langs and not cfg.get("ivr_language_prompt"):
+        new_prompt = await generate_ivr_language_prompt(db, supported_langs)
+        if new_prompt:
+            new_cfg = dict(agent.agent_config)
+            new_cfg["ivr_language_prompt"] = new_prompt
+            agent.agent_config = new_cfg
+            await db.commit()
+            await db.refresh(agent)
+            cfg = agent.agent_config
+            logger.info("ivr_prompt_auto_populated_on_create", agent_id=str(agent.id))
+
+    # --- TEMPLATE INSTANTIATION HOOK (Immediate Activation) ---
+    if agent.is_active and agent.agent_config and "template_context" in agent.agent_config:
+        ctx = agent.agent_config.pop("template_context")
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(agent, "agent_config")
+        try:
+            from app.api.v1.templates import process_template_instantiation
+            await process_template_instantiation(
+                t_uuid=uuid.UUID(ctx.get("template_id")),
+                v_uuid=uuid.UUID(ctx.get("template_version_id")),
+                agent=agent,
+                tenant=tenant_id,
+                db=db,
+                request=request,
+                variable_values=ctx.get("variable_values", {}),
+                tool_configs=ctx.get("tool_configs", {}),
+            )
+            logger.info("immediate_template_instantiated", agent_id=str(agent.id))
+        except Exception as e:
+            logger.error("failed_to_instantiate_immediate_template", error=str(e), agent_id=str(agent.id))
+
     if agent.voice_enabled:
-        cfg = agent.agent_config or {}
         voice_id = agent.voice_id or "alloy"
         tts_updated = False
 
         greeting_text = cfg.get("greeting_message")
         if greeting_text and not cfg.get("voice_greeting_url"):
-            url = await _tts_service.generate_greeting(
-                text=greeting_text,
-                voice_id=voice_id,
-                agent_id=str(agent.id),
-            )
-            if url:
-                new_cfg = dict(agent.agent_config)
-                new_cfg["voice_greeting_url"] = url
-                agent.agent_config = new_cfg
-                tts_updated = True
-                logger.info("voice_greeting_generated", agent_id=str(agent.id), url=url)
+            _validate_system_prompt(greeting_text)
+            if not _has_variables(greeting_text):
+                redacted_text = redact(greeting_text)
+                url = await _tts_service.generate_greeting(
+                    text=redacted_text,
+                    voice_id=voice_id,
+                    agent_id=str(agent.id),
+                )
+                if url:
+                    new_cfg = dict(agent.agent_config)
+                    new_cfg["voice_greeting_url"] = url
+                    agent.agent_config = new_cfg
+                    tts_updated = True
+                    logger.info("voice_greeting_generated", agent_id=str(agent.id), url=url)
 
         ivr_text = cfg.get("ivr_language_prompt")
         if ivr_text and not cfg.get("ivr_language_url"):
-            url = await _tts_service.generate_ivr_prompt(
-                text=ivr_text,
-                voice_id=voice_id,
-                agent_id=str(agent.id),
-            )
-            if url:
-                new_cfg = dict(agent.agent_config)
-                new_cfg["ivr_language_url"] = url
-                agent.agent_config = new_cfg
-                tts_updated = True
-                logger.info("ivr_prompt_generated", agent_id=str(agent.id), url=url)
+            if not _has_variables(ivr_text):
+                redacted_ivr = redact(ivr_text)
+                url = await _tts_service.generate_ivr_prompt(
+                    text=redacted_ivr,
+                    voice_id=voice_id,
+                    agent_id=str(agent.id),
+                )
+                if url:
+                    new_cfg = dict(agent.agent_config)
+                    new_cfg["ivr_language_url"] = url
+                    agent.agent_config = new_cfg
+                    tts_updated = True
+                    logger.info("ivr_prompt_generated", agent_id=str(agent.id), url=url)
 
         if tts_updated:
             await db.commit()
             await db.refresh(agent)
 
-        # Generate mandatory opening audio
-        # (Greeting + Language Assistance)
-        supported_langs = cfg.get("supported_languages", [])
-        opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs)
-        if opening_text:
-            url = await _tts_service.generate_opening(
-                text=opening_text,
-                voice_id=voice_id,
-                agent_id=str(agent.id),
-            )
-            if url:
-                new_cfg = dict(agent.agent_config)
-                new_cfg["opening_audio_url"] = url
-                agent.agent_config = new_cfg
-                await db.commit()
-                await db.refresh(agent)
-                logger.info("voice_opening_generated", agent_id=str(agent.id), url=url)
+        try:
+            # Generate mandatory opening audio
+            # (Greeting + Language Assistance)
+            supported_langs = cfg.get("supported_languages", [])
+            custom_greeting = agent.greeting_message or (agent.agent_config or {}).get("greeting_message")
+            opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs, custom_greeting=custom_greeting)
+            if opening_text:
+                if not _has_variables(opening_text):
+                    redacted_opening = redact(opening_text)
+                    url = await _tts_service.generate_opening(
+                        text=redacted_opening,
+                        voice_id=voice_id,
+                        agent_id=str(agent.id),
+                    )
+                    if url:
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg["opening_audio_url"] = url
+                        agent.agent_config = new_cfg
+                        await db.commit()
+                        await db.refresh(agent)
+                        logger.info("voice_opening_generated", agent_id=str(agent.id), url=url)
+        except Exception as tts_err:
+            logger.error("voice_opening_generation_failed", agent_id=str(agent.id), error=str(tts_err))
 
-    logger.info("agent_created", agent_id=str(agent.id), tenant_id=tenant_id)
+    logger.info(
+        "agent_created",
+        agent_id=str(agent.id),
+        tenant_id=tenant_id,
+        actor_email=request.headers.get("X-Actor-Email", "unknown"),
+    )
     return await _agent_to_response(agent, db)
+
+
+@router.get("/available-as-tools", response_model=list[AgentResponse])
+async def list_agents_available_as_tools(
+    exclude_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_tenant_db),
+    tenant_id: str = Depends(get_current_tenant),
+    request: Request = None, # Added request to access headers
+):
+    """
+    Return all ACTIVE agents in the tenant that are marked is_available_as_tool=True.
+    Optionally exclude a specific agent ID (e.g., the caller agent itself).
+    Used to populate the 'Agent Tools' section of the tools marketplace.
+    """
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request) if request else None
+
+    query = select(Agent).where(
+        Agent.tenant_id == uuid.UUID(tenant_id),
+        Agent.status == "ACTIVE",
+        Agent.is_available_as_tool == True,  # noqa: E712
+    )
+    if raid:
+        query = query.where(Agent.id == raid)
+
+    if exclude_id:
+        try:
+            query = query.where(Agent.id != uuid.UUID(exclude_id))
+        except ValueError:
+            pass
+
+    result = await db.execute(query.order_by(Agent.name))
+    agents = result.scalars().all()
+    return [await _agent_to_response(a, db) for a in agents]
 
 
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(
-    status: str = "active",  # active, archived, all
+    request: Request,
+    status: str = "active",  # active | archived | draft | pending_payment | all
     page: int = 1,
     limit: int = 50,
     db: AsyncSession = Depends(get_tenant_db),
@@ -353,8 +527,10 @@ async def list_agents(
 ):
     """
     List agents for the tenant (paginated).
-    - status=active (default): is_active=True
-    - status=archived: is_active=False AND deleted_at IS NOT NULL
+    - status=active (default): Agent.status=ACTIVE
+    - status=archived: Agent.status=ARCHIVED
+    - status=draft: Agent.status=DRAFT
+    - status=pending_payment: Agent.status=PENDING_PAYMENT
     - status=all: everything
     """
     page = max(1, page)
@@ -362,14 +538,28 @@ async def list_agents(
     offset = (page - 1) * limit
 
     query = select(Agent).where(Agent.tenant_id == uuid.UUID(tenant_id))
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request) if request else None
+    if raid:
+        query = query.where(Agent.id == raid)
 
-    if status == "active":
-        query = query.where(Agent.is_active.is_(True))
-    elif status == "archived":
-        query = query.where(Agent.is_active.is_(False), Agent.deleted_at.is_not(None))
+    status_upper = status.upper()
+    if status_upper == "ACTIVE":
+        query = query.where(Agent.status == "ACTIVE")
+    elif status_upper == "ARCHIVED":
+        query = query.where(Agent.status == "ARCHIVED")
+    elif status_upper == "DRAFT":
+        query = query.where(Agent.status == "DRAFT")
+    elif status_upper == "PENDING_PAYMENT":
+        query = query.where(Agent.status == "PENDING_PAYMENT")
+    elif status_upper == "INACTIVE":
+        # Legacy compat: inactive = any non-active state except archived
+        query = query.where(Agent.status.in_(["DRAFT", "PENDING_PAYMENT", "GRACE", "EXPIRED"]))
+    # else "ALL" — no filter
 
     result = await db.execute(
-        query.order_by(Agent.created_at.desc()).limit(limit).offset(offset)
+        query.order_by(Agent.created_at.desc(), Agent.id.desc()).limit(limit).offset(offset)
     )
     agents = result.scalars().all()
     return [await _agent_to_response(a, db) for a in agents]
@@ -383,6 +573,12 @@ async def get_agent(
 ):
     """Get a specific agent by ID."""
     tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -395,7 +591,143 @@ async def get_agent(
     return await _agent_to_response(agent, db)
 
 
+@router.post("/{agent_id}/archive", response_model=AgentResponse)
+async def archive_agent(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    _internal: bool = Depends(require_internal_key),
+):
+    """
+    Archive an agent, freeing its slot for reuse.
+
+    The agent retains all configuration and can be revived later.
+    Called by the API Gateway swap flow.
+    (Phase 8: Purges vector index to Cold Storage)
+    """
+    tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    if agent.status == "ARCHIVED":
+        return await _agent_to_response(agent, db)
+
+    ok = await AgentStateMachine.deactivate(
+        agent, db=db, actor="operator", reason="operator_archived_to_free_slot"
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot archive agent from state '{agent.status}'.",
+        )
+
+    await db.commit()
+    await db.refresh(agent)
+    
+    # Phase 8: Purge vector index for archived/cold agent
+    from fastapi import BackgroundTasks
+    tasks = BackgroundTasks()
+    tasks.add_task(_background_purge_agent_knowledge, agent_id, tenant_id)
+    
+    logger.info(
+        "agent_archived",
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        actor_email=request.headers.get("X-Actor-Email", "unknown"),
+    )
+    return await _agent_to_response(agent, db)
+
+
+@router.post("/{agent_id}/activate", response_model=AgentResponse)
+async def activate_agent(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+    _internal: bool = Depends(require_internal_key),
+):
+    """
+    Activate/revive an agent once a free slot is confirmed.
+    Requires X-Internal-Key validation (enforced by require_internal_key dependency).
+    """
+
+
+    tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    if agent.status == "ACTIVE":
+        return await _agent_to_response(agent, db)
+
+    ok = await AgentStateMachine.revive(
+        agent, db=db, actor="slot_manager", reason="operator_slot_assigned"
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot activate agent from state '{agent.status}'.",
+        )
+
+    # Optionally link the slot subscription details
+    try:
+        body = await request.json()
+        if body.get("stripe_subscription_id"):
+            agent.stripe_subscription_id = body["stripe_subscription_id"]
+        if body.get("expires_at"):
+            agent.expires_at = datetime.fromisoformat(body["expires_at"])
+    except Exception:
+        pass
+
+    await db.commit()
+    await db.refresh(agent)
+
+    # Notify any open SSE listeners
+    try:
+        from app.core.redis_client import get_redis as _get_redis
+        redis = await _get_redis()
+        await redis.publish(
+            f"agent:activated:{agent_id}",
+            json.dumps({"status": "active", "agent_id": agent_id}),
+        )
+    except Exception as pub_err:
+        logger.warning("agent_activate_redis_notify_failed", error=str(pub_err))
+
+    logger.info(
+        "agent_activated_via_slot",
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        actor_email=request.headers.get("X-Actor-Email", "unknown"),
+    )
+    return await _agent_to_response(agent, db)
+
+
 @router.get("/{agent_id}/activation-stream")
+
 async def agent_activation_stream(
     agent_id: str,
     request: Request,
@@ -413,8 +745,16 @@ async def agent_activation_stream(
     from app.core.redis_client import get_redis as _get_redis
 
     tenant_id = _tenant_id(request)
+    trace_id = request.headers.get("X-Trace-ID") or "unknown"
+    logger.info("agent_activation_stream_connected", agent_id=agent_id, tenant_id=tenant_id, trace_id=trace_id)
+
 
     # Verify the agent belongs to this tenant before opening the stream.
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -437,6 +777,16 @@ async def agent_activation_stream(
         redis = await _get_redis()
         pubsub = redis.pubsub()
         await pubsub.subscribe(channel)
+        
+        # RACE CONDITION FIX: Check if the agent became active in the window between 
+        # the initial check (line 429) and the Redis subscription (line 439).
+        await db.refresh(agent)
+        if agent.is_active:
+            yield f"data: {json.dumps({'status': 'active', 'agent_id': agent_id})}\n\n"
+            await pubsub.unsubscribe(channel)
+            await pubsub.aclose()
+            return
+
         try:
             deadline = asyncio.get_event_loop().time() + 40
             while True:
@@ -474,6 +824,12 @@ async def update_agent(
     tenant_id = _tenant_id(request)
     if body.system_prompt is not None:
         _validate_system_prompt(body.system_prompt)
+        
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -497,6 +853,32 @@ async def update_agent(
                 current_config[key] = value
         agent.agent_config = current_config
 
+        # P2 FIX: Validate extension routing targets
+        esc_cfg = current_config.get("escalation_config") or {}
+        ext_routes = esc_cfg.get("extension_routes", [])
+        if ext_routes:
+            for route in ext_routes:
+                if route.get("target_type") == "agent_id":
+                    target_id = route.get("target")
+                    if not target_id:
+                        continue
+                    try:
+                        target_uuid = uuid.UUID(target_id)
+                        # Check existence within the same tenant
+                        t_res = await db.execute(
+                            select(Agent.id).where(
+                                Agent.id == target_uuid,
+                                Agent.tenant_id == uuid.UUID(tenant_id)
+                            )
+                        )
+                        if not t_res.scalar():
+                            raise HTTPException(
+                                status_code=422,
+                                detail=f"Extension target agent {target_id} not found or belongs to another tenant."
+                            )
+                    except ValueError:
+                        raise HTTPException(status_code=422, detail=f"Invalid UUID for extension target: {target_id}")
+
     # Zero-trust: activating a PENDING_PAYMENT agent requires the billing webhook's
     # internal key — a regular user/frontend call must NOT bypass payment verification.
     from app.core.config import settings as _settings
@@ -519,6 +901,27 @@ async def update_agent(
                 await AgentStateMachine.activate(
                     agent, db=db, actor=_actor, reason="updated_via_api"
                 )
+
+                # --- TEMPLATE INSTANTIATION HOOK ---
+                if agent.agent_config and "template_context" in agent.agent_config:
+                    ctx = agent.agent_config.pop("template_context")
+                    flag_modified(agent, "agent_config")
+                    try:
+                        from app.api.v1.templates import process_template_instantiation
+                        await process_template_instantiation(
+                            t_uuid=uuid.UUID(ctx.get("template_id")),
+                            v_uuid=uuid.UUID(ctx.get("template_version_id")),
+                            agent=agent,
+                            tenant=tenant_id,
+                            db=db,
+                            request=request,
+                            variable_values=ctx.get("variable_values", {}),
+                            tool_configs=ctx.get("tool_configs", {}),
+                        )
+                        logger.info("pending_template_instantiated", agent_id=str(agent.id))
+                    except Exception as e:
+                        logger.error("failed_to_instantiate_pending_template", error=str(e), agent_id=str(agent.id))
+
                 # Notify any open activation-stream SSE connections for this agent.
                 if _is_internal_caller:
                     try:
@@ -557,6 +960,21 @@ async def update_agent(
     await db.commit()
     await db.refresh(agent)
 
+    # 1. Auto-populate IVR Language Prompt if supported_languages changed and prompt is empty
+    if ("supported_languages" in update_data or 
+        ("agent_config" in body.model_dump(exclude_unset=True) and "supported_languages" in (body.agent_config or {}))):
+        cfg = agent.agent_config or {}
+        supported_langs = cfg.get("supported_languages", [])
+        if supported_langs and not cfg.get("ivr_language_prompt"):
+            new_prompt = await generate_ivr_language_prompt(db, supported_langs)
+            if new_prompt:
+                new_cfg = dict(agent.agent_config)
+                new_cfg["ivr_language_prompt"] = new_prompt
+                agent.agent_config = new_cfg
+                await db.commit()
+                await db.refresh(agent)
+                logger.info("ivr_prompt_auto_populated", agent_id=str(agent.id))
+
     # Re-generate TTS audio whenever greeting or IVR prompt text changes.
     if agent.voice_enabled:
         cfg = agent.agent_config or {}
@@ -570,17 +988,36 @@ async def update_agent(
         ):
             greeting_text = cfg.get("greeting_message")
             if greeting_text:
-                url = await _tts_service.generate_greeting(
-                    text=greeting_text,
-                    voice_id=voice_id,
-                    agent_id=str(agent.id),
-                )
-                if url:
-                    new_cfg = dict(agent.agent_config)
-                    new_cfg["voice_greeting_url"] = url
-                    agent.agent_config = new_cfg
-                    tts_updated = True
-                    logger.info("voice_greeting_regenerated", agent_id=str(agent.id), url=url)
+                _validate_system_prompt(greeting_text)
+                if not _has_variables(greeting_text):
+                    # Resolve variables before generating audio
+                    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+                    variables = result_vars.scalars().all()
+                    resolved_greeting = resolve_agent_variables(greeting_text, agent, variables, clean=True)
+                    redacted_text = redact(resolved_greeting)
+                    
+                    old_url = agent.agent_config.get("voice_greeting_url")
+                    url = await _tts_service.generate_greeting(
+                        text=redacted_text,
+                        voice_id=voice_id,
+                        agent_id=str(agent.id),
+                    )
+                    if url:
+                        _delete_old_audio(old_url)
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg["voice_greeting_url"] = url
+                        agent.agent_config = new_cfg
+                        tts_updated = True
+                        logger.info("voice_greeting_regenerated", agent_id=str(agent.id), url=url)
+                else:
+                    old_url = agent.agent_config.get("voice_greeting_url")
+                    if old_url:
+                        _delete_old_audio(old_url)
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg.pop("voice_greeting_url", None)
+                        agent.agent_config = new_cfg
+                        tts_updated = True
+                        logger.info("voice_greeting_cleared", agent_id=str(agent.id))
 
         # Regenerate IVR audio when ivr_language_prompt changed
         if "ivr_language_prompt" in update_data or (
@@ -589,17 +1026,35 @@ async def update_agent(
         ):
             ivr_text = cfg.get("ivr_language_prompt")
             if ivr_text:
-                url = await _tts_service.generate_ivr_prompt(
-                    text=ivr_text,
-                    voice_id=voice_id,
-                    agent_id=str(agent.id),
-                )
-                if url:
-                    new_cfg = dict(agent.agent_config)
-                    new_cfg["ivr_language_url"] = url
-                    agent.agent_config = new_cfg
-                    tts_updated = True
-                    logger.info("ivr_prompt_regenerated", agent_id=str(agent.id), url=url)
+                if not _has_variables(ivr_text):
+                    # Resolve variables before generating IVR audio
+                    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+                    variables = result_vars.scalars().all()
+                    resolved_ivr = resolve_agent_variables(ivr_text, agent, variables, clean=True)
+                    redacted_ivr = redact(resolved_ivr)
+                    
+                    old_url = agent.agent_config.get("ivr_language_url")
+                    url = await _tts_service.generate_ivr_prompt(
+                        text=redacted_ivr,
+                        voice_id=voice_id,
+                        agent_id=str(agent.id),
+                    )
+                    if url:
+                        _delete_old_audio(old_url)
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg["ivr_language_url"] = url
+                        agent.agent_config = new_cfg
+                        tts_updated = True
+                        logger.info("ivr_prompt_regenerated", agent_id=str(agent.id), url=url)
+                else:
+                    old_url = agent.agent_config.get("ivr_language_url")
+                    if old_url:
+                        _delete_old_audio(old_url)
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg.pop("ivr_language_url", None)
+                        agent.agent_config = new_cfg
+                        tts_updated = True
+                        logger.info("ivr_prompt_cleared", agent_id=str(agent.id))
 
         # Regenerate mandatory opening audio when languages or voice changes
         if any(f in update_data for f in ["language", "supported_languages", "voice_id"]) or (
@@ -607,24 +1062,170 @@ async def update_agent(
             and any(f in (body.agent_config or {}) for f in ["supported_languages"])
         ):
             supported_langs = cfg.get("supported_languages", [])
-            opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs)
+            custom_greeting = agent.greeting_message or (agent.agent_config or {}).get("greeting_message")
+            opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs, custom_greeting=custom_greeting)
             if opening_text:
-                url = await _tts_service.generate_opening(
-                    text=opening_text,
-                    voice_id=voice_id,
-                    agent_id=str(agent.id),
-                )
-                if url:
-                    new_cfg = dict(agent.agent_config)
-                    new_cfg["opening_audio_url"] = url
-                    agent.agent_config = new_cfg
-                    tts_updated = True
-                    logger.info("voice_opening_regenerated", agent_id=str(agent.id), url=url)
+                if not _has_variables(opening_text):
+                    # Resolve variables in mandatory opening
+                    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+                    variables = result_vars.scalars().all()
+                    resolved_opening = resolve_agent_variables(opening_text, agent, variables, clean=True)
+                    redacted_opening = redact(resolved_opening)
+                    
+                    old_url = agent.agent_config.get("opening_audio_url")
+                    url = await _tts_service.generate_opening(
+                        text=redacted_opening,
+                        voice_id=voice_id,
+                        agent_id=str(agent.id),
+                    )
+                    if url:
+                        _delete_old_audio(old_url)
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg["opening_audio_url"] = url
+                        agent.agent_config = new_cfg
+                        tts_updated = True
+                        logger.info("voice_opening_regenerated", agent_id=str(agent.id), url=url)
+                else:
+                    old_url = agent.agent_config.get("opening_audio_url")
+                    if old_url:
+                        _delete_old_audio(old_url)
+                        new_cfg = dict(agent.agent_config)
+                        new_cfg.pop("opening_audio_url", None)
+                        agent.agent_config = new_cfg
+                        tts_updated = True
+                        logger.info("voice_opening_cleared", agent_id=str(agent.id))
 
-        if tts_updated:
-            await db.commit()
-            await db.refresh(agent)
+    logger.info(
+        "agent_updated",
+        agent_id=str(agent.id),
+        tenant_id=tenant_id,
+        actor_email=request.headers.get("X-Actor-Email", "unknown"),
+        updated_fields=list(update_data.keys()),
+    )
+    return await _agent_to_response(agent, db)
 
+
+@router.post("/{agent_id}/generate-greeting-audio", response_model=AgentResponse)
+async def generate_agent_greeting_audio(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Manually trigger TTS generation for the agent's current greeting_message."""
+    tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    cfg = agent.agent_config or {}
+    greeting_text = cfg.get("greeting_message")
+    if not greeting_text:
+        raise HTTPException(status_code=400, detail="No greeting message configured.")
+
+    voice_id = agent.voice_id or "alloy"
+    
+    _validate_system_prompt(greeting_text)
+    
+    if _has_variables(greeting_text):
+        raise HTTPException(status_code=400, detail="Cannot manually generate audio for a greeting with session variables.")
+
+    # Resolve variables for audio
+    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+    variables = result_vars.scalars().all()
+    resolved_text = resolve_agent_variables(greeting_text, agent, variables, clean=True)
+    redacted_text = redact(resolved_text)
+
+    old_url = agent.agent_config.get("voice_greeting_url")
+    url = await _tts_service.generate_greeting(
+        text=redacted_text,
+        voice_id=voice_id,
+        agent_id=str(agent.id),
+    )
+    if not url:
+        raise HTTPException(status_code=500, detail="TTS generation failed.")
+        
+    _delete_old_audio(old_url)
+
+    new_cfg = dict(agent.agent_config)
+    new_cfg["voice_greeting_url"] = url
+    agent.agent_config = new_cfg
+    await db.commit()
+    await db.refresh(agent)
+    
+    logger.info("voice_greeting_manually_generated", agent_id=agent_id, url=url)
+    return await _agent_to_response(agent, db)
+
+
+@router.post("/{agent_id}/generate-ivr-audio", response_model=AgentResponse)
+async def generate_agent_ivr_audio(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Manually trigger TTS generation for the agent's current ivr_language_prompt."""
+    tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    cfg = agent.agent_config or {}
+    ivr_text = cfg.get("ivr_language_prompt")
+    if not ivr_text:
+        raise HTTPException(status_code=400, detail="No IVR prompt configured.")
+
+    voice_id = agent.voice_id or "alloy"
+    
+    if _has_variables(ivr_text):
+        raise HTTPException(status_code=400, detail="Cannot manually generate audio for an IVR prompt with session variables.")
+
+    # Resolve variables for audio
+    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+    variables = result_vars.scalars().all()
+    resolved_text = resolve_agent_variables(ivr_text, agent, variables, clean=True)
+    redacted_text = redact(resolved_text)
+
+    old_url = agent.agent_config.get("ivr_language_url")
+    url = await _tts_service.generate_ivr_prompt(
+        text=redacted_text,
+        voice_id=voice_id,
+        agent_id=str(agent.id),
+    )
+    if not url:
+        raise HTTPException(status_code=500, detail="TTS generation failed.")
+        
+    _delete_old_audio(old_url)
+
+    new_cfg = dict(agent.agent_config)
+    new_cfg["ivr_language_url"] = url
+    agent.agent_config = new_cfg
+    await db.commit()
+    await db.refresh(agent)
+    
+    logger.info("ivr_prompt_manually_generated", agent_id=agent_id, url=url)
     return await _agent_to_response(agent, db)
 
 
@@ -632,11 +1233,12 @@ async def update_agent(
 async def delete_agent(
     agent_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     _role: str = require_forwarded_role("admin"),
     db: AsyncSession = Depends(get_tenant_db),
     tenant_id: str = Depends(get_current_tenant),
 ):
-    """Deactivate an agent (transition to ARCHIVED state)."""
+    """Deactivate an agent (transition to ARCHIVED state) and purge knowledge."""
     from app.services.agent_lifecycle import transition_agent, AgentLifecycleError
 
     result = await db.execute(
@@ -664,6 +1266,9 @@ async def delete_agent(
     agent.deleted_at = datetime.now(timezone.utc)
     await AgentStateMachine.archive(agent, db=db, actor="user", reason="deleted_via_api")
     await db.commit()
+    
+    # Phase 8: Proactive knowledge purge
+    background_tasks.add_task(_background_purge_agent_knowledge, agent_id, tenant_id)
 
 
 @router.post("/{agent_id}/restore", response_model=AgentResponse)
@@ -828,6 +1433,12 @@ async def upload_voice_greeting(
     Returns {"url": "..."}
     """
     tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -893,6 +1504,12 @@ async def delete_voice_greeting(
 ):
     """Remove the pre-recorded voice greeting from an agent."""
     tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),
@@ -928,6 +1545,12 @@ async def test_escalation_connector(
     from app.connectors.factory import get_connector
 
     tenant_id = _tenant_id(request)
+    
+    # Apply isolation (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(agent_id),

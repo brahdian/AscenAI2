@@ -11,6 +11,7 @@ class TemplateVariableSchema(BaseModel):
     default_value: Optional[Dict[str, Any]] = None
     validation_rules: Optional[Dict[str, Any]] = None
     is_required: bool
+    is_secret: bool
 
     class Config:
         from_attributes = True
@@ -22,7 +23,6 @@ class TemplatePlaybookSchema(BaseModel):
     description: Optional[str] = None
     trigger_condition: Optional[Dict[str, Any]] = None
     config: Optional[Dict[str, Any]] = None
-    is_default: bool = False
 
     class Config:
         from_attributes = True
@@ -44,6 +44,9 @@ class TemplateVersionSchema(BaseModel):
     orchestration_logic: Optional[Dict[str, Any]] = None
     playbooks: List[TemplatePlaybookSchema] = []
     tools: List[TemplateToolSchema] = []
+    compliance: Optional[Dict[str, Any]] = None
+    guardrails: Optional[Dict[str, Any]] = None
+    emergency_protocols: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True

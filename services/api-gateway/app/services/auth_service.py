@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.tenant import Tenant, TenantUsage
 from app.models.user import APIKey, User
+from app.models.invite import UserInvite
 from app.schemas.auth import (
     APIKeyCreatedResponse,
     LoginRequest,
@@ -57,8 +58,12 @@ class AuthService:
         normalized_email = request.email.lower()
 
         # 1. Handle idempotency for unverified users
-        existing_user_res = await db.execute(select(User).where(User.email == normalized_email))
-        user = existing_user_res.scalar_one_or_none()
+        result = await db.execute(
+            select(User)
+            .where(User.email == normalized_email)
+            .order_by(User.created_at.desc())
+        )
+        user = result.scalars().first()
 
         if user:
             from fastapi import HTTPException
@@ -72,7 +77,6 @@ class AuthService:
                     raise HTTPException(status_code=409, detail="Email already registered and active.")
                 
                 # ONBOARDING RECOVERY: User verified email but didn't pay.
-                # Update their info in case they chose a different plan/business name on retry
                 user.hashed_password = self.hash_password(request.password)
                 user.full_name = request.full_name
                 tenant.name = request.business_name
@@ -83,27 +87,17 @@ class AuthService:
                 tenant.plan_limits = await get_plan_limits(tenant.plan, db)
                 await db.commit()
 
-                payment_url = None
-                try:
-                    sub_resp = await self.create_subscription(normalized_email, tenant.plan, db, redis)
-                    payment_url = sub_resp.payment_url
-                except Exception as exc:
-                    logger.error("failed_to_generate_recovery_payment_link", email=normalized_email, error=str(exc))
-
-                logger.info("registration_recovery_verified_unpaid", user_id=str(user.id), email=normalized_email)
+                logger.info("registration_recovery", user_id=str(user.id), email=normalized_email)
                 
                 return RegisterResponse(
-                    message="Email already verified. Complete payment to activate your account." if payment_url else "Email already verified.",
+                    message="Email already verified. Please log in.",
                     email=normalized_email,
                     requires_verification=False,
-                    requires_payment=True,
-                    payment_url=payment_url,
                 )
-            # Re-use existing tenant/user for unverified accounts
-            # Update data to reflect latest registration attempt
+            
             user.hashed_password = self.hash_password(request.password)
             user.full_name = request.full_name
-            user.created_at = _utcnow() # Reset for cleanup task
+            user.created_at = _utcnow()
 
             tenant.name = request.business_name
             tenant.business_name = request.business_name
@@ -126,13 +120,10 @@ class AuthService:
                 business_type=request.business_type,
                 business_name=request.business_name,
                 email=normalized_email,
-                phone="",
-                address={},
                 timezone="UTC",
                 plan=plan,
                 plan_limits=await get_plan_limits(plan, db),
                 is_active=False,
-                metadata_={},
             )
             db.add(tenant)
             await db.flush()
@@ -151,6 +142,7 @@ class AuthService:
                 role="owner",
                 is_active=True,
                 is_email_verified=False,
+                session_version=0, # Initial version
             )
             db.add(user)
 
@@ -158,16 +150,13 @@ class AuthService:
         await db.refresh(user)
         await db.refresh(tenant)
 
-        # 3b. Create Stripe customer
-        stripe_customer_id = await _create_stripe_customer(tenant, user)
-        if stripe_customer_id:
-            tenant.stripe_customer_id = stripe_customer_id
-            await db.commit()
+        # NOTE: Stripe customer is now created lazily during subscription/provisioning
+        # to avoid record bloat for unverified/spam registrations.
 
         # 4. Generate OTP
         otp = self._generate_otp()
         if redis:
-            await redis.setex(f"otp:{normalized_email}", 1800, otp) # 30 minute TTL
+            await redis.setex(f"otp:{normalized_email}", 1800, otp)
 
         # 5. Store pending activation in Redis (30-min TTL)
         if redis:
@@ -181,10 +170,10 @@ class AuthService:
         asyncio.create_task(self._send_otp_email(request.email, request.full_name, otp))
 
         logger.info("user_registered_pending_verification", user_id=str(user.id), tenant_id=str(tenant.id))
-        return RegisterResponse(email=normalized_email, requires_payment=True)
+        return RegisterResponse(email=normalized_email)
 
     async def verify_email(self, email: str, otp: str, db: AsyncSession, redis=None) -> VerifyEmailResponse:
-        """Validate OTP and verify user email. Returns payment-required response."""
+        """Validate OTP and verify user email."""
         from fastapi import HTTPException
         normalized_email = email.lower()
         
@@ -193,112 +182,36 @@ class AuthService:
         
         stored_otp = await redis.get(f"otp:{normalized_email}")
 
-        # Mark user as verified
         result = await db.execute(select(User).where(User.email == normalized_email))
-        user = result.scalar_one_or_none()
+        users = result.scalars().all()
 
-        # Validate OTP *after* the DB lookup so both branches take the same
-        # code path and are not distinguishable by response time.
-        # Return the same generic error whether the email is unknown or the
-        # OTP is wrong — prevents email enumeration via error messages.
-        if not user or not stored_otp or stored_otp != otp:
+        if not users or not stored_otp or stored_otp != otp:
             raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
         
-        user.is_email_verified = True
-        
-        # Get tenant and activate it (allows login)
-        tenant_result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
-        tenant = tenant_result.scalar_one_or_none()
-        if not tenant:
-            raise HTTPException(status_code=404, detail="Tenant not found.")
-        
-        tenant.is_active = True
+        for user in users:
+            user.is_email_verified = True
+            
+            # Get tenant and activate it for the user
+            tenant_result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
+            tenant = tenant_result.scalar_one_or_none()
+            if tenant:
+                tenant.is_active = True
+                
         await db.commit()
         await redis.delete(f"otp:{normalized_email}")
         
-        logger.info("email_verified", user_id=str(user.id))
-
-        # Automatically create checkout session if not already paid
-        payment_url = None
-        # Check if the tenant has a valid subscription
-        if tenant.subscription_status != "active":
-            try:
-                sub_resp = await self.create_subscription(normalized_email, tenant.plan, db, redis)
-                payment_url = sub_resp.payment_url
-                # Cleanup pending activation as we are moving to payment
-                if redis:
-                    await redis.delete(f"pending_activation:{normalized_email}")
-            except Exception as exc:
-                logger.error("failed_to_generate_payment_link", email=normalized_email, error=str(exc))
-
-        return VerifyEmailResponse(
-            message="Email verified. Complete payment to activate your account." if payment_url else "Email verified.",
-            email=normalized_email,
-            tenant_id=str(tenant.id),
-            requires_payment=not tenant.is_active,
-            payment_url=payment_url,
-        )
-
-    async def create_subscription(self, email: str, plan: str, db: AsyncSession, redis=None) -> SubscribeResponse:
-        """Create Stripe Checkout session for the given plan."""
-        from fastapi import HTTPException
-        normalized_email = email.lower()
-
-        result = await db.execute(select(User).where(User.email == normalized_email))
-        user = result.scalar_one_or_none()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found.")
-
-        tenant_result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
-        tenant = tenant_result.scalar_one_or_none()
-        if not tenant:
-            raise HTTPException(status_code=404, detail="Tenant not found.")
-
-        if tenant.is_active:
-            raise HTTPException(status_code=400, detail="Account is already active.")
-
-        limits = await get_all_plan_limits(db)
-        if plan not in limits:
-            raise HTTPException(status_code=400, detail=f"Unknown plan: {plan}")
-
-        if not settings.STRIPE_SECRET_KEY:
-            raise HTTPException(status_code=500, detail="Stripe is not configured.")
-
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-
-        price_id = await _get_stripe_price_id_for_plan(plan)
-
-        success_url = f"{settings.FRONTEND_URL}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{settings.FRONTEND_URL}/payment/cancel"
-
-        checkout_session = stripe.checkout.Session.create(
-            customer=tenant.stripe_customer_id,
-            payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
-            mode="subscription",
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={
-                "tenant_id": str(tenant.id),
-                "user_id": str(user.id),
-                "email": normalized_email,
-                "plan": plan,
-            },
-        )
+        # We pick the latest user identity to return for login context
+        user = users[0]
+        
+        logger.info("email_verified_globally", email=normalized_email)
 
         if redis:
-            await redis.setex(
-                f"stripe_session:{checkout_session.id}",
-                1800,
-                json.dumps({"tenant_id": str(tenant.id), "email": normalized_email, "plan": plan}),
-            )
+            await redis.delete(f"pending_activation:{normalized_email}")
 
-        logger.info("stripe_checkout_created", session_id=checkout_session.id, email=normalized_email)
-        return SubscribeResponse(
-            payment_url=checkout_session.url,
-            session_id=checkout_session.id,
-            plan=plan,
+        return VerifyEmailResponse(
+            message="Email verified successfully. You can now log in.",
+            email=normalized_email,
+            tenant_id=str(tenant.id),
         )
 
     async def resend_otp(self, email: str, db: AsyncSession, redis=None) -> None:
@@ -310,8 +223,10 @@ class AuthService:
             return
             
         # Check if user exists and is not verified
-        result = await db.execute(select(User).where(User.email == normalized_email))
-        user = result.scalar_one_or_none()
+        result = await db.execute(
+            select(User).where(User.email == normalized_email).order_by(User.last_login_at.desc().nulls_last(), User.created_at.desc())
+        )
+        user = result.scalars().first()
         
         if user and user.is_email_verified:
             raise HTTPException(status_code=400, detail="Email is already verified. Please log in.")
@@ -324,17 +239,61 @@ class AuthService:
         logger.info("otp_resent", email=normalized_email)
 
     async def login(self, request: LoginRequest, db: AsyncSession, redis=None) -> TokenResponse:
-        """Authenticate user and return JWT tokens."""
-        result = await db.execute(select(User).where(User.email == request.email.lower()))
-        user: User | None = result.scalar_one_or_none()
-
+        """Authenticate user and return JWT tokens.
+        Includes Account Lockout protection (5 fails = 15m block).
+        """
         from fastapi import HTTPException
+        normalized_email = request.email.lower()
+        
+        # 1. Check Account Lockout (pre-emptive)
+        if redis:
+            lockout_key = f"auth:lockout:{normalized_email}"
+            is_locked = await redis.get(lockout_key)
+            if is_locked:
+                logger.warning("login_attempt_on_locked_account", email=normalized_email)
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Account is temporarily locked due to multiple failed login attempts. Please try again in 15 minutes."
+                )
+
+        result = await db.execute(
+            select(User)
+            .where(User.email == normalized_email)
+            .order_by(User.last_login_at.desc().nulls_last(), User.created_at.desc())
+        )
+        user: User | None = result.scalars().first()
+
         # Always run verify_password even when user is None to prevent timing-based
         # user enumeration (constant-time response regardless of whether email exists).
         candidate_hash = user.hashed_password if user else _DUMMY_HASH
         password_ok = self.verify_password(request.password, candidate_hash)
+        
         if not user or not password_ok:
+            # 2. Record Failure for Lockout
+            if redis:
+                fail_key = f"auth:fails:{normalized_email}"
+                fails = await redis.incr(fail_key)
+                if fails == 1:
+                    await redis.expire(fail_key, 600) # 10m window to hit limit
+                if fails >= 5:
+                    await redis.setex(f"auth:lockout:{normalized_email}", 900, "1") # 15m lockout
+                    await redis.delete(fail_key)
+                    logger.warning("account_locked_out", email=normalized_email)
+            
+            from app.services.audit_service import audit_log
+            await audit_log(
+                db=db,
+                action="auth.login_failed",
+                actor_user_id=str(user.id) if user else None,
+                category="security",
+                status="failure",
+                details={"email": normalized_email, "reason": "invalid_credentials"}
+            )
             raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        # 3. Success — Clear lockout counters
+        if redis:
+            await redis.delete(f"auth:fails:{normalized_email}")
 
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account is deactivated.")
@@ -347,9 +306,7 @@ class AuthService:
             )
 
         # Get tenant
-        tenant_result = await db.execute(
-            select(Tenant).where(Tenant.id == user.tenant_id)
-        )
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
         tenant: Tenant | None = tenant_result.scalar_one_or_none()
         if not tenant:
             raise HTTPException(status_code=403, detail="Tenant account not found.")
@@ -359,11 +316,22 @@ class AuthService:
         await db.commit()
 
         tokens = self._build_token_response(user, tenant)
+        
+        from app.services.audit_service import audit_log
+        await audit_log(
+            db=db,
+            action="auth.login_success",
+            tenant_id=str(tenant.id),
+            actor_user_id=str(user.id),
+            category="security",
+            status="success"
+        )
+        
         logger.info("user_logged_in", user_id=str(user.id), tenant_id=str(tenant.id))
         return tokens
 
-    async def refresh_token(self, refresh_token: str, db: AsyncSession) -> TokenResponse:
-        """Validate refresh token and issue a new token pair."""
+    async def refresh_token(self, refresh_token: str, db: AsyncSession, redis=None) -> TokenResponse:
+        """Validate refresh token and issue a NEW token pair (Refresh Token Rotation)."""
         from fastapi import HTTPException
         try:
             payload = self.verify_token(refresh_token)
@@ -372,6 +340,33 @@ class AuthService:
 
         if payload.get("type") != TOKEN_TYPE_REFRESH:
             raise HTTPException(status_code=401, detail="Token is not a refresh token.")
+
+        # --- Refresh Token Rotation Guard ---
+        # Detect if this refresh token has already been reused (standard OAuth2 hardening)
+        jti = payload.get("jti")
+        if jti and redis:
+            is_blacklisted = await redis.get(f"auth:refresh_token:used:{jti}")
+            if is_blacklisted:
+                # REUSE DETECTED: This token was already used to refresh.
+                # Significant security risk. Invalidate all sessions for this user.
+                user_id = payload.get("sub")
+                logger.warning("refresh_token_reuse_detected", user_id=user_id, jti=jti)
+                if user_id:
+                    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+                    user = result.scalar_one_or_none()
+                    if user:
+                        user.session_version += 1
+                        await db.commit()
+                        # Wipe cache
+                        async for key in redis.scan_iter(match=f"auth:jwt:{user.id}:*", count=100):
+                            await redis.delete(key)
+                raise HTTPException(status_code=401, detail="Token already used. Security invalidation triggered.")
+
+            # Mark this token as used for the duration of its remaining lifetime
+            exp = payload.get("exp")
+            if exp:
+                ttl = max(1, int(exp - _utcnow().timestamp()))
+                await redis.setex(f"auth:refresh_token:used:{jti}", ttl, "1")
 
         user_id = payload.get("sub")
         result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
@@ -386,6 +381,7 @@ class AuthService:
         if not tenant or not tenant.is_active:
             raise HTTPException(status_code=403, detail="Tenant account is inactive.")
 
+        # Build response issues a NEW refresh token (rotation)
         return self._build_token_response(user, tenant)
 
     async def request_password_reset(
@@ -415,8 +411,10 @@ class AuthService:
 
         # Normalize email before DB lookup
         normalized_email = email.lower()
-        result = await db.execute(select(User).where(User.email == normalized_email))
-        user: User | None = result.scalar_one_or_none()
+        result = await db.execute(
+            select(User).where(User.email == normalized_email).order_by(User.last_login_at.desc().nulls_last(), User.created_at.desc())
+        )
+        user: User | None = result.scalars().first()
         if not user or not user.is_active:
             return  # Silent success — don't reveal whether the email exists
 
@@ -455,7 +453,14 @@ class AuthService:
         if not user or not user.is_active:
             raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
 
-        user.hashed_password = self.hash_password(new_password)
+        # Zenith Pillar 7: If the user belongs to multiple tenants, reset the password for ALL of their accounts
+        all_users_res = await db.execute(select(User).where(User.email == user.email))
+        all_users = all_users_res.scalars().all()
+
+        for u in all_users:
+            u.hashed_password = self.hash_password(new_password)
+            u.session_version += 1
+            
         await db.commit()
 
         # Invalidate the reset token immediately (one-time use)
@@ -483,6 +488,8 @@ class AuthService:
         scopes: list[str],
         db: AsyncSession,
         expires_at: datetime | None = None,
+        agent_id: uuid.UUID | None = None,
+        allowed_origins: list[str] | None = None,
     ) -> tuple[str, APIKey]:
         """Generate a new API key. Returns (raw_key, APIKey) — raw_key shown once."""
         # Generate: sk_live_<32 random hex chars>
@@ -500,11 +507,31 @@ class AuthService:
             scopes=scopes,
             rate_limit_per_minute=60,
             expires_at=expires_at,
+            agent_id=agent_id,
+            allowed_origins=allowed_origins,
             is_active=True,
         )
         db.add(api_key)
         await db.commit()
         await db.refresh(api_key)
+
+        from app.services.audit_service import audit_log
+        await audit_log(
+            db=db,
+            action="api_key.created",
+            tenant_id=str(tenant_id),
+            actor_user_id=str(user_id),
+            category="security",
+            resource_type="api_key",
+            resource_id=str(api_key.id),
+            status="success",
+            details={
+                "name": name,
+                "key_prefix": key_prefix,
+                "scopes": scopes,
+                "agent_id": str(agent_id) if agent_id else None,
+            },
+        )
 
         logger.info(
             "api_key_created",
@@ -536,6 +563,17 @@ class AuthService:
             await db.rollback()
 
         return api_key
+
+    async def invalidate_api_key_cache(self, key_hash: str, redis=None) -> None:
+        """Instant revocation: remove cached API key from Redis."""
+        if not redis:
+            return
+        try:
+            cache_key = f"auth:api_key:{key_hash}"
+            await redis.delete(cache_key)
+            logger.info("api_key_cache_invalidated", key_hash=key_hash[:8] + "...")
+        except Exception as exc:
+            logger.warning("api_key_cache_invalidation_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # JWT helpers
@@ -575,6 +613,147 @@ class AuthService:
 
     def verify_password(self, password: str, hashed: str) -> bool:
         return pwd_context.verify(password, hashed)
+
+    async def create_invite(
+        self,
+        tenant_id: str,
+        email: str,
+        role: str,
+        invited_by: str,
+        db: AsyncSession,
+    ) -> UserInvite:
+        """Create a secure invitation token and send an email."""
+        from fastapi import HTTPException
+        
+        # Check if user already exists in THIS tenant
+        normalized_email = email.lower()
+        existing = await db.execute(
+            select(User).where(
+                User.tenant_id == uuid.UUID(tenant_id),
+                User.email == normalized_email
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="User already in team.")
+
+        # Generate secure token
+        token = secrets.token_urlsafe(32)
+        
+        invite = UserInvite(
+            id=uuid.uuid4(),
+            tenant_id=uuid.UUID(tenant_id),
+            email=normalized_email,
+            role=role,
+            token=token,
+            invited_by=uuid.UUID(invited_by),
+            expires_at=_utcnow() + timedelta(days=7),
+        )
+        db.add(invite)
+        await db.commit()
+        await db.refresh(invite)
+
+        # Send email
+        tenant_res = await db.execute(select(Tenant).where(Tenant.id == uuid.UUID(tenant_id)))
+        tenant = tenant_res.scalar_one_or_none()
+        
+        invite_url = f"{settings.FRONTEND_URL}/accept-invite?token={token}"
+        asyncio.create_task(self._send_invite_email(email, tenant.name if tenant else "a team", invite_url))
+        
+        logger.info("invite_created", tenant_id=tenant_id, email=normalized_email)
+        return invite
+
+    async def accept_invite(
+        self,
+        token: str,
+        full_name: str,
+        password: str,
+        db: AsyncSession,
+    ) -> User:
+        """Verify token, create user, and mark invite as accepted."""
+        from fastapi import HTTPException
+        
+        result = await db.execute(
+            select(UserInvite).where(
+                UserInvite.token == token,
+                UserInvite.accepted_at == None,
+                UserInvite.expires_at > _utcnow()
+            )
+        )
+        invite = result.scalar_one_or_none()
+        if not invite:
+            raise HTTPException(status_code=400, detail="Invalid or expired invitation.")
+
+        # Create the user
+        user = User(
+            id=uuid.uuid4(),
+            tenant_id=invite.tenant_id,
+            email=invite.email,
+            hashed_password=self.hash_password(password),
+            full_name=full_name,
+            role=invite.role,
+            is_active=True,
+            is_email_verified=True, # Trust the invitation link
+        )
+        db.add(user)
+        
+        invite.accepted_at = _utcnow()
+        
+        await db.commit()
+        await db.refresh(user)
+        
+        logger.info("invite_accepted", user_id=str(user.id), tenant_id=str(invite.tenant_id))
+        return user
+
+    @staticmethod
+    async def _send_invite_email(email: str, tenant_name: str, invite_url: str) -> None:
+        """Send an invitation email."""
+        html_body = f"""
+        <html><body>
+        <h2>You've been invited!</h2>
+        <p>You have been invited to join <strong>{tenant_name}</strong> on AscenAI.</p>
+        <p>Click the link below to set up your account and join the team:</p>
+        <p><a href="{invite_url}" style="background-color: #4f46e5; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Accept Invitation</a></p>
+        <p>If you don't have an account yet, you'll be asked to set a password.</p>
+        <p>This invitation expires in 7 days.</p>
+        </body></html>
+        """
+        await send_email(email, f"Invitation to join {tenant_name} on AscenAI", html_body)
+
+    async def delete_account(self, user_id_str: str, db: AsyncSession, redis=None) -> None:
+        """
+        Delete the user's account and associated tenant data to satisfy GDPR right to be forgotten.
+        If the user is an owner, this wipes the tenant completely.
+        """
+        from fastapi import HTTPException
+        from sqlalchemy import delete
+        
+        result = await db.execute(select(User).where(User.id == uuid.UUID(user_id_str)))
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        tenant_id = user.tenant_id
+        
+        if user.role == "owner":
+            logger.info("gdpr_deletion_owner", user_id=user_id_str, tenant_id=str(tenant_id))
+            await db.execute(delete(TenantUsage).where(TenantUsage.tenant_id == tenant_id))
+            await db.execute(delete(APIKey).where(APIKey.tenant_id == tenant_id))
+            await db.execute(delete(User).where(User.id == user.id))
+            await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
+        else:
+            logger.info("gdpr_deletion_member", user_id=user_id_str, tenant_id=str(tenant_id))
+            await db.execute(delete(User).where(User.id == user.id))
+            
+        await db.commit()
+        
+        if redis:
+            try:
+                pattern = f"auth:jwt:{user.id}:*"
+                async for cache_key in redis.scan_iter(match=pattern, count=100):
+                    await redis.delete(cache_key)
+            except Exception as exc:
+                logger.warning("jwt_cache_invalidation_failed", error=str(exc))
 
     async def cleanup_pending_accounts(self, db: AsyncSession, redis=None) -> int:
         """
@@ -685,6 +864,8 @@ class AuthService:
             "tenant_id": str(tenant.id),
             "role": user.role,
             "email": user.email,
+            "version": user.session_version,
+            "mfa": getattr(user, "mfa_enabled", False),
         }
         access_token = self.create_access_token(token_data)
         refresh_token = self.create_refresh_token({"sub": str(user.id)})
@@ -700,6 +881,7 @@ class AuthService:
                 full_name=user.full_name,
                 role=user.role,
                 tenant_id=str(tenant.id),
+                mfa_enabled=getattr(user, "mfa_enabled", False),
             ),
         )
 
@@ -746,74 +928,5 @@ class AuthService:
         await send_email(email, "Welcome to AscenAI!", html_body)
 
 
-async def _create_stripe_customer(tenant: Tenant, user: User) -> str | None:
-    """Create a Stripe customer and return the customer ID, or None if Stripe is not configured."""
-    if not settings.STRIPE_SECRET_KEY:
-        return None
-    
-    import stripe
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-    
-    try:
-        customer = stripe.Customer.create(
-            email=user.email,
-            name=tenant.name,
-            metadata={"tenant_id": str(tenant.id)},
-        )
-        return customer.id
-    except Exception as e:
-        logger.warning("stripe_customer_creation_failed", error=str(e))
-        return None
-
-
 # Singleton instance
 auth_service = AuthService()
-
-
-async def _get_stripe_price_id_for_plan(plan: str) -> str:
-    """Look up or create a Stripe Price ID for the given plan."""
-    from app.core.config import settings
-
-    # 1. First, try reading from environment variables
-    if plan == "text_growth" and settings.STRIPE_TEXT_GROWTH_PRICE_ID:
-        return settings.STRIPE_TEXT_GROWTH_PRICE_ID
-    if plan == "voice_growth" and settings.STRIPE_VOICE_GROWTH_PRICE_ID:
-        return settings.STRIPE_VOICE_GROWTH_PRICE_ID
-    if plan == "voice_business" and settings.STRIPE_VOICE_BUSINESS_PRICE_ID:
-        return settings.STRIPE_VOICE_BUSINESS_PRICE_ID
-
-    # 2. Fallback to lookup_key search if env var is missing
-    import stripe
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-
-    price_lookup_key = f"ascenai_{plan}"
-
-    try:
-        prices = stripe.Price.list(lookup_keys=[price_lookup_key], limit=1)
-        if prices.data:
-            return prices.data[0].id
-    except Exception as e:
-        logger.warning("stripe_price_lookup_failed", plan=plan, error=str(e))
-    try:
-        # 3. If lookup fails, dynamically create the Product and Price
-        logger.info("stripe_price_not_found_creating", plan=plan)
-        
-        product_name = f"AscenAI {plan.replace('_', ' ').title()}"
-        product = stripe.Product.create(name=product_name)
-        
-        # Default amounts based on plan heuristics (in cents)
-        amount = 9900  # $99 defaults
-        if "business" in plan:
-            amount = 29900 # $299
-
-        price = stripe.Price.create(
-            unit_amount=amount,
-            currency="usd",
-            recurring={"interval": "month"},
-            product=product.id,
-            lookup_key=price_lookup_key,
-        )
-        return price.id
-    except Exception as e2:
-        logger.error("stripe_dynamic_creation_failed", plan=plan, error=str(e2))
-        raise Exception(f"No Stripe price configured for plan '{plan}' and auto-creation failed: {str(e2)}")

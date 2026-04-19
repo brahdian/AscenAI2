@@ -26,35 +26,15 @@ import {
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
-const PLANS = {
-  starter: {
-    display_name: "Starter",
-    price_per_agent: 49.00,
-    chat_equivalents_included: 20_000,
-    voice_minutes_included: 0,
-    voice_enabled: false,
-  },
-  growth: {
-    display_name: "Growth",
-    price_per_agent: 99.00,
-    chat_equivalents_included: 80_000,
-    voice_minutes_included: 1500,
-    voice_enabled: true,
-  },
-  business: {
-    display_name: "Business",
-    price_per_agent: 199.00,
-    chat_equivalents_included: 170_000,
-    voice_minutes_included: 3500,
-    voice_enabled: true,
-  },
-  enterprise: {
-    display_name: "Enterprise",
-    price_per_agent: null,
-    chat_equivalents_included: null,
-    voice_minutes_included: null,
-    voice_enabled: true,
-  },
+// Plan definitions are now fetched from the API to prevent drift.
+// The local interface below reflects the expected structure from listPlans().
+interface PlanDefinition {
+  display_name: string
+  price_per_agent: number | null
+  price_per_agent_yearly: number | null
+  chat_equivalents_included: number | null
+  voice_minutes_included: number | null
+  voice_enabled: boolean
 }
 
 const PLAN_ORDER = ['starter', 'growth', 'business', 'enterprise']
@@ -118,6 +98,8 @@ export default function BillingPage() {
   const [overview, setOverview] = useState<BillingOverview | null>(null)
   const [agents, setAgents] = useState<AgentBilling[]>([])
   const [invoices, setInvoices] = useState<Invoice[]>([])
+  const [plans, setPlans] = useState<Record<string, PlanDefinition>>({})
+  const [billingCycle, setBillingCycle] = useState<'monthly' | 'yearly'>('monthly')
   const [loading, setLoading] = useState(true)
   const [portalLoading, setPortalLoading] = useState(false)
   const [selectedAgentId, setSelectedAgentId] = useState<string>('')
@@ -128,11 +110,13 @@ export default function BillingPage() {
     Promise.all([
       billingApi.overview(),
       billingApi.agents(),
+      billingApi.listPlans(),
       billingApi.getInvoices().then(r => r.invoices).catch(() => []),
     ])
-      .then(([ov, ag, inv]) => {
+      .then(([ov, ag, pl, inv]) => {
         setOverview(ov)
         setAgents(ag)
+        setPlans(pl)
         setInvoices(inv)
         if (ag.length > 0 && !selectedAgentId) {
           setSelectedAgentId(ag[0].agent_id || '')
@@ -174,7 +158,10 @@ export default function BillingPage() {
   const handleUpgrade = async (newPlan: string) => {
     setChangingPlan(true)
     try {
-      const data = await billingApi.createCheckoutSession({ plan: newPlan })
+      const data = await billingApi.createCheckoutSession({ 
+        plan: newPlan,
+        billing_cycle: billingCycle 
+      })
       if (data.checkout_url) {
         window.location.href = data.checkout_url
       }
@@ -196,13 +183,15 @@ export default function BillingPage() {
           toast.success('Subscription verified — all agents are already active.', { duration: 4000 })
         }
         // Reload billing data
-        const [ov, ag, inv] = await Promise.all([
+        const [ov, ag, pl, inv] = await Promise.all([
           billingApi.overview(),
           billingApi.agents(),
+          billingApi.listPlans(),
           billingApi.getInvoices().then(r => r.invoices).catch(() => []),
         ])
         setOverview(ov)
         setAgents(ag)
+        setPlans(pl)
         setInvoices(inv)
       } else if (result.status === 'no_subscription') {
         toast.error('No active subscription found. Please subscribe first.')
@@ -393,14 +382,14 @@ export default function BillingPage() {
                     used: overview?.usage.chats || 0, 
                     limit: overview?.limits.chat_messages, 
                     pct: overview?.usage.messages_pct,
-                    desc: 'Calculated as 10 regular messages per chat unit'
+                    desc: '1 Unit = 10 messages. Voice minutes convert at 1:100.'
                   },
                   { 
                     label: 'Voice Minutes', 
                     used: overview?.usage.voice_minutes || 0, 
                     limit: overview?.limits.voice_minutes, 
                     pct: overview?.usage.voice_pct,
-                    desc: 'Total duration of all AI-user voice calls'
+                    desc: 'Usage pooled with chat units (1 min = 100 units)'
                   },
                 ].map(({ label, used, limit, pct, desc }) => {
                   // Determine display values based on selected agent
@@ -411,10 +400,8 @@ export default function BillingPage() {
                     const agent = agents.find(a => a.agent_id === selectedAgentId)
                     if (agent) {
                       if (label === 'Chat Equivalents') {
-                        // Assuming 1 chat unit per session floor or messages? 
-                        // The backend 'billing_agents' returns 'chats'
-                        // interface AgentBilling has chats? wait let me check
-                        displayUsed = (agent as any).chats || (agent.messages / 10)
+                        // Trust backend-calculated chats from the agent-specific detail
+                        displayUsed = (agent as any).chats ?? (agent.messages / 10)
                         displayPct = limit ? (displayUsed / limit) * 100 : 0
                       } else {
                         displayUsed = agent.voice_minutes
@@ -640,11 +627,37 @@ export default function BillingPage() {
             <h2 className="text-xl font-bold text-gray-900 dark:text-white">Available Plans</h2>
             <p className="text-sm text-gray-500 mt-1">Scale your AI operations with predictable, per-agent pricing</p>
           </div>
-          <Zap size={24} className="text-amber-500 opacity-20" />
+          
+          {/* Billing Cycle Toggle */}
+          <div className="flex items-center gap-1 p-1 bg-gray-100 dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700">
+            <button
+              onClick={() => setBillingCycle('monthly')}
+              className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                billingCycle === 'monthly'
+                  ? 'bg-white dark:bg-gray-700 text-violet-600 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
+              }`}
+            >
+              Monthly
+            </button>
+            <button
+              onClick={() => setBillingCycle('yearly')}
+              className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-2 ${
+                billingCycle === 'yearly'
+                  ? 'bg-white dark:bg-gray-700 text-violet-600 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
+              }`}
+            >
+              Yearly
+              <span className="px-1.5 py-0.5 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 text-[10px] font-black rounded-md">
+                -20%
+              </span>
+            </button>
+          </div>
         </div>
         
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-          {Object.entries(PLANS).map(([key, plan]) => {
+          {Object.entries(plans).map(([key, plan]) => {
             // Only show "Current Plan" badge and state if the subscription is actually active/trialing
             const isCurrentPlan = key === currentPlanKey && isSubscribed
             const planIndex = PLAN_ORDER.indexOf(key)
@@ -668,9 +681,16 @@ export default function BillingPage() {
                 <h3 className="font-bold text-gray-900 dark:text-white text-lg mb-1">{plan.display_name}</h3>
                 <div className="mb-4">
                   <p className="text-3xl font-black text-gray-900 dark:text-white">
-                    {plan.price_per_agent ? `$${plan.price_per_agent}` : 'Custom'}
+                    {billingCycle === 'yearly' 
+                      ? (plan.price_per_agent_yearly ? `$${plan.price_per_agent_yearly}` : 'Custom')
+                      : (plan.price_per_agent ? `$${plan.price_per_agent}` : 'Custom')
+                    }
                   </p>
-                  {plan.price_per_agent && <p className="text-[10px] font-bold text-gray-400 uppercase tracking-tighter">Per Active Agent / Month</p>}
+                  {plan.price_per_agent && (
+                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-tighter">
+                      Per Active Agent / {billingCycle === 'yearly' ? 'Year' : 'Month'}
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-3 mb-8">

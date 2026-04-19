@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     EMBEDDING_MODEL: str = "text-embedding-004"
     EMBEDDING_DIMENSION: int = 768
+    # Phase 7: Minimum cosine similarity score for knowledge retrieval.
+    # Chunks below this threshold are discarded to prevent irrelevant context injection.
+    MIN_KNOWLEDGE_SCORE: float = 0.35
 
     # External Services
     OPENAI_API_KEY: Optional[str] = None

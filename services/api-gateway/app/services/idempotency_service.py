@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import hashlib
+import struct
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -47,29 +48,42 @@ class IdempotencyService:
     # Public interface
     # ------------------------------------------------------------------
 
-    async def is_already_processed(self, namespace: str, key: str) -> bool:
-        """Return True if this (namespace, key) pair was already processed."""
+    async def check_and_acquire_lock(self, namespace: str, key: str, lock_ttl: int = 300) -> bool:
+        """
+        Check if an event is processed. If not, acquire a temporary lock to process it.
+        Returns `True` if it's safe to process (lock acquired), `False` if already processing/processed.
+        """
         redis_key = self._redis_key(namespace, key)
 
-        # 1. Try Redis first (fast path)
+        # 1. Try to acquire lock in Redis
         if self.redis is not None:
             try:
-                result = await self.redis.get(redis_key)
-                if result is not None:
-                    logger.info(
-                        "idempotency_cache_hit",
-                        namespace=namespace,
-                        key=key[:16] + "…",
-                    )
-                    return True
+                # SETNX prevents concurrent identical webhooks from executing simultaneously
+                acquired = await self.redis.set(redis_key, "processing", nx=True, ex=lock_ttl)
+                if not acquired:
+                    logger.info("idempotency_locked_or_processed", namespace=namespace, key=key[:16] + "…")
+                    return False
             except Exception as redis_err:
-                logger.warning(
-                    "idempotency_redis_check_failed",
-                    error=str(redis_err),
-                    namespace=namespace,
-                )
+                logger.warning("idempotency_redis_lock_failed", error=str(redis_err), namespace=namespace)
 
-        # 2. Fallback: check DB
+        # 2. We acquired the lock (or Redis is down). Check DB fallback to ensure it wasn't
+        # processed in the past and merely evicted from Redis.
+        #
+        # Phase 9: Database advisory lock (concurrency control for DB check)
+        # Convert key to deterministic 64-bit int for Postgres
+        key_hash = hashlib.sha256(f"{namespace}:{key}".encode()).digest()
+        lock_id = struct.unpack("q", key_hash[:8])[0]
+        try:
+            lock_res = await self.db.execute(
+                text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_id}
+            )
+            if not lock_res.scalar():
+                logger.info("idempotency_db_lock_busy", namespace=namespace, key=key[:16] + "…")
+                return False
+        except Exception as lock_err:
+            logger.warning("idempotency_advisory_lock_skipped", error=str(lock_err))
+
         try:
             row = await self.db.execute(
                 text(
@@ -79,29 +93,19 @@ class IdempotencyService:
                 {"ns": namespace, "key": self._db_key(key)},
             )
             if row.first() is not None:
-                logger.info(
-                    "idempotency_db_hit",
-                    namespace=namespace,
-                    key=key[:16] + "…",
-                )
-                # Back-fill Redis so future checks are fast again
+                logger.info("idempotency_db_hit", namespace=namespace, key=key[:16] + "…")
+                # Back-fill Redis tombstone so future checks are fast
                 if self.redis is not None:
                     try:
                         await self.redis.setex(redis_key, _DEFAULT_TTL_SECONDS, "1")
                     except Exception:
                         pass
-                return True
+                return False
         except Exception as db_err:
-            logger.error(
-                "idempotency_db_check_failed",
-                error=str(db_err),
-                namespace=namespace,
-            )
-            # If both checks fail, allow processing to avoid blocking (the
-            # business logic must be idempotent itself as a last resort).
-            return False
+            logger.error("idempotency_db_check_failed", error=str(db_err), namespace=namespace)
+            # Proceed if DB query fails, allowing the business logic to handle partial failures
 
-        return False
+        return True
 
     async def mark_processed(self, namespace: str, key: str) -> None:
         """Record that (namespace, key) has been successfully processed."""

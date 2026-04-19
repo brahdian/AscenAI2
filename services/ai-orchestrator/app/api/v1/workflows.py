@@ -51,6 +51,17 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy."""
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
 async def _get_db_session(tenant_id: str) -> AsyncSession:
     """Helper to yield a tenant-scoped DB session inside endpoint logic."""
     from app.core.database import AsyncSessionLocal
@@ -63,7 +74,18 @@ async def _get_db_session(tenant_id: str) -> AsyncSession:
     return session
 
 
-async def _get_agent_or_404(db: AsyncSession, agent_id: uuid.UUID, tenant_id: uuid.UUID) -> Agent:
+async def _get_agent_or_404(
+    db: AsyncSession, 
+    agent_id: uuid.UUID, 
+    tenant_id: uuid.UUID,
+    request: Request | None = None,
+) -> Agent:
+    # Apply isolation (CRIT-005)
+    if request:
+        raid = _restricted_agent_id(request)
+        if raid and agent_id != raid:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+
     agent = await db.scalar(
         select(Agent).where(
             Agent.id == agent_id,
@@ -80,7 +102,14 @@ async def _get_workflow_or_404(
     workflow_id: uuid.UUID,
     agent_id: uuid.UUID,
     tenant_id: uuid.UUID,
+    request: Request | None = None,
 ) -> Workflow:
+    # Apply isolation (CRIT-005)
+    if request:
+        raid = _restricted_agent_id(request)
+        if raid and agent_id != raid:
+            raise HTTPException(status_code=404, detail="Workflow not found.")
+
     wf = await db.scalar(
         select(Workflow).where(
             Workflow.id == workflow_id,
@@ -119,7 +148,7 @@ async def create_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        await _get_agent_or_404(db, agent_id, tid)
+        await _get_agent_or_404(db, agent_id, tid, request=request)
 
         wf = Workflow(
             agent_id=agent_id,
@@ -165,7 +194,7 @@ async def list_workflows(
 
     db = await _get_db_session(tid_str)
     try:
-        await _get_agent_or_404(db, agent_id, tid)
+        await _get_agent_or_404(db, agent_id, tid, request=request)
 
         q = select(Workflow).where(
             Workflow.agent_id == agent_id,
@@ -196,7 +225,7 @@ async def get_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        return await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        return await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
     finally:
         await db.close()
 
@@ -217,7 +246,7 @@ async def update_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
         
         # Validate cron expression if trigger_type is cron (either updating type or config)
         if (body.trigger_type == "cron" or 
@@ -293,7 +322,7 @@ async def delete_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         if wf.is_active:
             registry = WorkflowRegistry(db)
@@ -324,7 +353,7 @@ async def clone_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        original_wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        original_wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
         
         # Create clone
         cloned_wf = Workflow(
@@ -373,7 +402,7 @@ async def activate_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         registry = WorkflowRegistry(db)
         await registry.register(wf)
@@ -408,7 +437,7 @@ async def deactivate_workflow(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         registry = WorkflowRegistry(db)
         await registry.deregister(wf)
@@ -424,6 +453,52 @@ async def deactivate_workflow(
         await db.rollback()
         logger.error("deactivate_workflow_error", error=str(exc))
         raise HTTPException(status_code=500, detail="Failed to deactivate workflow.")
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# List executions for a workflow
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{agent_id}/workflows/{flow_id}/executions",
+    response_model=list[WorkflowExecutionResponse],
+)
+async def list_executions(
+    agent_id: uuid.UUID,
+    flow_id: uuid.UUID,
+    request: Request,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """Return the most recent executions for a workflow, newest first.
+
+    Optionally filter by ``status`` (e.g. ``RUNNING``, ``COMPLETED``, ``FAILED``).
+    Capped at ``limit`` rows (max 200).
+    """
+    tid_str = _tenant_id(request)
+    tid = uuid.UUID(tid_str)
+    limit = min(limit, 200)
+
+    db = await _get_db_session(tid_str)
+    try:
+        await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
+
+        q = (
+            select(WorkflowExecution)
+            .where(
+                WorkflowExecution.workflow_id == flow_id,
+                WorkflowExecution.tenant_id == tid,
+            )
+            .order_by(WorkflowExecution.created_at.desc())
+            .limit(limit)
+        )
+        if status:
+            q = q.where(WorkflowExecution.status == status.upper())
+
+        result = await db.execute(q)
+        return result.scalars().all()
     finally:
         await db.close()
 
@@ -447,7 +522,7 @@ async def get_execution(
 
     db = await _get_db_session(tid_str)
     try:
-        await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         execution = await db.scalar(
             select(WorkflowExecution).where(
@@ -479,7 +554,7 @@ async def advance_execution(
 
     db = await _get_db_session(tid_str)
     try:
-        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid)
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
         engine = WorkflowEngine(db=db)
 

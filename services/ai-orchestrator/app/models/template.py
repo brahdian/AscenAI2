@@ -50,6 +50,9 @@ class AgentTemplate(Base):
 
 class TemplateVersion(Base):
     __tablename__ = "template_versions"
+    __table_args__ = (
+        Index("ix_template_versions_tpl_ver", "template_id", "version", unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -59,7 +62,11 @@ class TemplateVersion(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     system_prompt_template: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_greeting: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     orchestration_logic: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    compliance: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    guardrails: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    emergency_protocols: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -91,6 +98,7 @@ class TemplateVariable(Base):
     default_value: Mapped[Optional[dict]] = mapped_column("default_value", JSONB, nullable=True)
     validation_rules: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     is_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_secret: Mapped[bool] = mapped_column(Boolean, default=False)
 
     template: Mapped["AgentTemplate"] = relationship("AgentTemplate", back_populates="variables")
 

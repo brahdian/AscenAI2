@@ -23,21 +23,7 @@ router = APIRouter()
 # message was persisted before the orchestrator-level pseudonymization was
 # fully in place.
 # ---------------------------------------------------------------------------
-_EMAIL_RE = re.compile(r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b')
-_PHONE_RE = re.compile(r'\b(\+?[\d][\d\s\-().]{7,}\d)\b')
-_CARD_RE  = re.compile(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b')
-_SSN_RE   = re.compile(r'\b\d{3}[\-\s]?\d{2}[\-\s]?\d{4}\b')
-
-
-def _redact_pii(text: str | None) -> str | None:
-    """Redact common PII patterns from text before sending to the frontend."""
-    if not text:
-        return text
-    text = _EMAIL_RE.sub('[EMAIL]', text)
-    text = _PHONE_RE.sub('[PHONE]', text)
-    text = _CARD_RE.sub('[CARD]', text)
-    text = _SSN_RE.sub('[SSN]', text)
-    return text
+from app.services import pii_service
 
 
 def _tenant_id(request: Request) -> str:
@@ -59,37 +45,69 @@ def _tenant_id(request: Request) -> str:
     return tid
 
 
+def _restricted_agent_id(request: Request) -> uuid.UUID | None:
+    """Extract optional agent restriction passed by the API Gateway proxy.
+    
+    If present, this indicates that the caller (e.g., a Widget Key) is 
+    STRICTLY restricted to this specific agent.
+    """
+    raid = request.headers.get("X-Restricted-Agent-ID")
+    if raid:
+        try:
+            return uuid.UUID(raid)
+        except ValueError:
+            return None
+    return None
+
+
 def _session_to_response(
     sess: AgentSession,
     messages: list | None = None,
     feedback_map: dict | None = None,
+    request: Request | None = None,
 ) -> SessionResponse:
     msg_list = None
     if messages is not None:
         msg_list = []
         for m in messages:
             fb = (feedback_map or {}).get(str(m.id))
+            
+            # PII Redaction for complex fields (tool_calls, sources) using deep recursive logic
+            redacted_tool_calls = pii_service.redact_deep(m.tool_calls) if m.tool_calls else None
+            redacted_sources = pii_service.redact_deep(m.sources) if m.sources else None
+
             msg_list.append({
                 "id": str(m.id),
                 "role": m.role,
-                "content": _redact_pii(m.content),
+                "content": pii_service.redact_for_display(m.content, None),
                 "tokens_used": m.tokens_used,
                 "latency_ms": m.latency_ms,
-                "tool_calls": m.tool_calls,
+                "tool_calls": redacted_tool_calls,
                 "playbook_name": m.playbook_name,
-                "sources": m.sources,
+                "sources": redacted_sources,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "feedback": fb,
             })
     expiry_minutes = getattr(settings, "SESSION_EXPIRY_MINUTES", 30)
+    # Standardize redaction for restricted keys (Widget Keys)
+    raid = _restricted_agent_id(request) if request else None
+    
+    customer_id = sess.customer_identifier
+    metadata = sess.metadata_ if hasattr(sess, "metadata_") else {}
+    
+    if raid:
+        customer_id = pii_service.redact(customer_id) if customer_id else customer_id
+        # Redact any string values in metadata for safety
+        metadata = {k: (pii_service.redact(v) if isinstance(v, str) else v) for k, v in metadata.items()}
+
     return SessionResponse(
         id=str(sess.id),
         tenant_id=str(sess.tenant_id),
         agent_id=str(sess.agent_id),
-        customer_identifier=sess.customer_identifier,
+        customer_identifier=customer_id,
         channel=sess.channel,
         status=sess.status,
-        metadata=sess.metadata_ if hasattr(sess, "metadata_") else {},
+        metadata=metadata,
         started_at=sess.started_at.isoformat() if hasattr(sess, "started_at") and sess.started_at else None,
         ended_at=sess.ended_at.isoformat() if hasattr(sess, "ended_at") and sess.ended_at else None,
         last_activity_at=sess.last_activity_at.isoformat() if hasattr(sess, "last_activity_at") and sess.last_activity_at else None,
@@ -109,19 +127,23 @@ async def list_sessions(
 ):
     """List sessions for the tenant."""
     tenant_id = _tenant_id(request)
-    query = (
         select(AgentSession)
         .where(AgentSession.tenant_id == uuid.UUID(tenant_id))
-        .order_by(AgentSession.started_at.desc() if hasattr(AgentSession, "started_at") else AgentSession.id.desc())
+        .order_by(AgentSession.started_at.desc(), AgentSession.id.desc())
         .limit(min(limit, 200))
-    )
     if agent_id:
         query = query.where(AgentSession.agent_id == uuid.UUID(agent_id))
+    
+    # Apply deep isolation restriction if present (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid:
+        query = query.where(AgentSession.agent_id == raid)
+
     if status:
         query = query.where(AgentSession.status == status)
 
     result = await db.execute(query)
-    return [_session_to_response(s) for s in result.scalars().all()]
+    return [_session_to_response(s, request=request) for s in result.scalars().all()]
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
@@ -133,12 +155,18 @@ async def get_session(
 ):
     """Get a specific session, optionally with messages."""
     tenant_id = _tenant_id(request)
-    result = await db.execute(
-        select(AgentSession).where(
-            AgentSession.id == session_id,
-            AgentSession.tenant_id == uuid.UUID(tenant_id),
-        )
+
+    query = select(AgentSession).where(
+        AgentSession.id == session_id,
+        AgentSession.tenant_id == uuid.UUID(tenant_id),
     )
+    
+    # Apply deep isolation restriction if present (CRIT-005)
+    raid = _restricted_agent_id(request)
+    if raid:
+        query = query.where(AgentSession.agent_id == raid)
+
+    result = await db.execute(query)
     sess = result.scalar_one_or_none()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -169,12 +197,16 @@ async def get_session(
                     "id": str(fb.id),
                     "rating": fb.rating,
                     "labels": fb.labels or [],
-                    "comment": fb.comment,
+                    "comment": pii_service.redact_for_display(fb.comment, None),
+                    "ideal_response": pii_service.redact_for_display(fb.ideal_response, None),
+                    "correction_reason": pii_service.redact_for_display(fb.correction_reason, None),
+                    "playbook_correction": fb.playbook_correction,
+                    "tool_corrections": fb.tool_corrections or [],
                 }
                 for fb in fb_result.scalars().all()
             }
 
-    return _session_to_response(sess, messages, feedback_map)
+    return _session_to_response(sess, messages, feedback_map, request=request)
 
 
 @router.post("/{session_id}/end", response_model=SessionResponse)
@@ -185,12 +217,17 @@ async def end_session(
 ):
     """Mark a session as ended."""
     tenant_id = _tenant_id(request)
-    result = await db.execute(
-        select(AgentSession).where(
-            AgentSession.id == session_id,
-            AgentSession.tenant_id == uuid.UUID(tenant_id),
-        )
+    
+    query = select(AgentSession).where(
+        AgentSession.id == session_id,
+        AgentSession.tenant_id == uuid.UUID(tenant_id),
     )
+    
+    raid = _restricted_agent_id(request)
+    if raid:
+        query = query.where(AgentSession.agent_id == raid)
+
+    result = await db.execute(query)
     sess = result.scalar_one_or_none()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -201,7 +238,7 @@ async def end_session(
         sess.ended_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(sess)
-    return _session_to_response(sess)
+    return _session_to_response(sess, request=request)
 
 
 @router.get("/{session_id}/analytics", response_model=SessionAnalyticsResponse)
@@ -212,12 +249,17 @@ async def session_analytics(
 ):
     """Get analytics for a session."""
     tenant_id = _tenant_id(request)
-    result = await db.execute(
-        select(AgentSession).where(
-            AgentSession.id == session_id,
-            AgentSession.tenant_id == uuid.UUID(tenant_id),
-        )
+    
+    query = select(AgentSession).where(
+        AgentSession.id == session_id,
+        AgentSession.tenant_id == uuid.UUID(tenant_id),
     )
+    
+    raid = _restricted_agent_id(request)
+    if raid:
+        query = query.where(AgentSession.agent_id == raid)
+
+    result = await db.execute(query)
     sess = result.scalar_one_or_none()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found.")

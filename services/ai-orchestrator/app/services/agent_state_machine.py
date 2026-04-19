@@ -8,8 +8,8 @@ Legal state graph:
   PENDING_PAYMENT  → ACTIVE, ARCHIVED, DRAFT
   ACTIVE           → GRACE, EXPIRED, ARCHIVED
   GRACE            → ACTIVE, EXPIRED, ARCHIVED
-  EXPIRED          → GRACE, ARCHIVED
-  ARCHIVED         → (terminal — raise if raise_on_invalid=True)
+  EXPIRED          → GRACE, ARCHIVED, ACTIVE
+  ARCHIVED         → ACTIVE, DRAFT, PENDING_PAYMENT   ← revivable for slot re-use
 
 Every transition is persisted to `agent_state_transitions` for a full audit
 trail. The DB write is a fire-and-forget `db.add()` — the caller must commit.
@@ -47,8 +47,9 @@ _TRANSITIONS: dict[str, frozenset[str]] = {
     "PENDING_PAYMENT":  frozenset({"ACTIVE", "ARCHIVED", "DRAFT"}),
     "ACTIVE":           frozenset({"GRACE", "EXPIRED", "ARCHIVED"}),
     "GRACE":            frozenset({"ACTIVE", "EXPIRED", "ARCHIVED"}),
-    "EXPIRED":          frozenset({"GRACE", "ARCHIVED"}),
-    "ARCHIVED":         frozenset(),   # terminal
+    "EXPIRED":          frozenset({"GRACE", "ARCHIVED", "ACTIVE"}),
+    # ARCHIVED is now revivable — an operator can swap a slot to a different agent.
+    "ARCHIVED":         frozenset({"ACTIVE", "DRAFT", "PENDING_PAYMENT"}),
 }
 
 
@@ -141,7 +142,7 @@ class AgentStateMachine:
         # Maintain is_active flag in sync with state
         if target == "ACTIVE":
             agent.is_active = True
-        elif target in ("EXPIRED", "ARCHIVED"):
+        elif target in ("EXPIRED", "ARCHIVED", "PENDING_PAYMENT"):
             agent.is_active = False
 
         # Write audit record
@@ -213,4 +214,30 @@ class AgentStateMachine:
         """Transition agent to EXPIRED."""
         return await AgentStateMachine.transition(
             agent, "EXPIRED", db=db, reason=reason, actor=actor
+        )
+
+    @staticmethod
+    async def deactivate(
+        agent,
+        *,
+        db,
+        reason: Optional[str] = None,
+        actor: str = "system",
+    ) -> bool:
+        """Archive an agent to free its slot (the preferred deactivation path)."""
+        return await AgentStateMachine.transition(
+            agent, "ARCHIVED", db=db, reason=reason, actor=actor
+        )
+
+    @staticmethod
+    async def revive(
+        agent,
+        *,
+        db,
+        reason: Optional[str] = None,
+        actor: str = "system",
+    ) -> bool:
+        """Revive an archived/expired agent when a slot is available."""
+        return await AgentStateMachine.transition(
+            agent, "ACTIVE", db=db, reason=reason, actor=actor
         )

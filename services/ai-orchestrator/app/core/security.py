@@ -184,7 +184,7 @@ def require_forwarded_role(minimum_role: str):
             )
         return role
 
-    return Depends(_check)
+    return _check
 
 
 async def get_tenant_db(

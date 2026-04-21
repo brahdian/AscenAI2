@@ -18,7 +18,7 @@ from app.core.security import get_tenant_db, require_forwarded_role
 from app.models.agent import Agent, AgentDocument, AgentDocumentChunk
 from app.services import pii_service
 from app.services.mcp_client import MCPClient
-from app.core.zenith import ZenithContext, get_zenith_context, zenith_error_handler
+from app.core.zenith import ZenithContext, get_zenith_context
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -141,7 +141,6 @@ async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession, ctx: Ze
 
 
 @router.get("/{agent_id}/documents")
-@zenith_error_handler
 async def list_documents(
     agent_id: str,
     include_archived: bool = False,
@@ -177,7 +176,6 @@ class TextDocumentUpdateRequest(BaseModel):
 
 
 @router.post("/{agent_id}/documents/text", status_code=201)
-@zenith_error_handler
 async def create_text_document(
     agent_id: str,
     payload: TextDocumentCreateRequest,
@@ -258,7 +256,6 @@ async def create_text_document(
 
 
 @router.put("/{agent_id}/documents/{doc_id}")
-@zenith_error_handler
 async def update_document(
     agent_id: str,
     doc_id: str,
@@ -324,7 +321,6 @@ async def update_document(
 
 
 @router.post("/{agent_id}/documents", status_code=201)
-@zenith_error_handler
 async def upload_document(
     agent_id: str,
     request: Request,
@@ -439,7 +435,6 @@ async def upload_document(
 
 
 @router.post("/{agent_id}/documents/{doc_id}/retry")
-@zenith_error_handler
 async def retry_document_indexing(
     agent_id: str,
     doc_id: str,
@@ -486,7 +481,6 @@ async def retry_document_indexing(
 
 
 @router.delete("/{agent_id}/documents/{doc_id}")
-@zenith_error_handler
 async def delete_document(
     agent_id: str,
     doc_id: str,

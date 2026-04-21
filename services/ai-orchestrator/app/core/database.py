@@ -259,7 +259,7 @@ async def init_db() -> None:
             await conn.execute(_t("""
                 WITH duplicates AS (
                     SELECT
-                        MIN(id) AS keep_id,
+                        MIN(id::text)::uuid AS keep_id,
                         tenant_id, agent_id, date,
                         SUM(total_sessions)         AS s_sessions,
                         SUM(total_messages)         AS s_messages,
@@ -297,7 +297,7 @@ async def init_db() -> None:
             await conn.execute(_t("""
                 DELETE FROM agent_analytics
                 WHERE id NOT IN (
-                    SELECT MIN(id)
+                    SELECT MIN(id::text)::uuid
                     FROM agent_analytics
                     GROUP BY tenant_id, agent_id, date
                 )

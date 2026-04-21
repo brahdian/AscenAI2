@@ -71,8 +71,8 @@ class SessionBillingService:
         )
 
         if is_voice:
-            voice_greeting_url = agent_cfg.get(\"voice_greeting_url\")
-            custom_greeting_raw = agent_cfg.get(\"greeting_message\")
+            voice_greeting_url = agent_cfg.get("voice_greeting_url")
+            custom_greeting_raw = agent_cfg.get("greeting_message")
 
             # FIX-08: Single variable fetch — used by both the pre-generated and JIT branches.
             # Only query the DB when there's actually a text greeting to resolve.
@@ -84,34 +84,34 @@ class SessionBillingService:
                 variables = result_vars.scalars().all()
 
             if voice_greeting_url:
-                greeting_text = custom_greeting_raw or \"\"
+                greeting_text = custom_greeting_raw or ""
                 new_meta = dict(session.metadata_ or {})
-                new_meta[\"_voice_greeting_url\"] = voice_greeting_url
-                new_meta[\"_greeting_mode\"] = \"pre_generated\"
-                if agent_cfg.get(\"ivr_language_url\"):
-                    new_meta[\"_ivr_language_url\"] = agent_cfg[\"ivr_language_url\"]
+                new_meta["_voice_greeting_url"] = voice_greeting_url
+                new_meta["_greeting_mode"] = "pre_generated"
+                if agent_cfg.get("ivr_language_url"):
+                    new_meta["_ivr_language_url"] = agent_cfg["ivr_language_url"]
                 session.metadata_ = new_meta
 
                 if not greeting_text:
-                    greeting_text = f\"[Pre-generated greeting audio: {voice_greeting_url}]\"
+                    greeting_text = f"[Pre-generated greeting audio: {voice_greeting_url}]"
 
                 greeting = resolve_agent_variables(greeting_text, agent, variables, clean=True)
             elif custom_greeting_raw:
                 greeting = resolve_agent_variables(custom_greeting_raw, agent, variables, clean=True)
                 new_meta = dict(session.metadata_ or {})
-                new_meta[\"_greeting_mode\"] = \"jit_tts\"
+                new_meta["_greeting_mode"] = "jit_tts"
                 session.metadata_ = new_meta
                 logger.info(
-                    \"voice_greeting_jit\",
+                    "voice_greeting_jit",
                     agent_id=str(agent.id),
-                    reason=\"no_pre_generated_url\",
+                    reason="no_pre_generated_url",
                 )
             else:
                 # No custom greeting at all: fall back to computed multilingual opening.
                 from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
                 greeting, _, _ = await get_or_compute_voice_strings(self.db, agent)
                 new_meta = dict(session.metadata_ or {})
-                new_meta[\"_greeting_mode\"] = \"computed\"
+                new_meta["_greeting_mode"] = "computed"
                 session.metadata_ = new_meta
 
             # Ensure voice agents always have a greeting (platform requirement).

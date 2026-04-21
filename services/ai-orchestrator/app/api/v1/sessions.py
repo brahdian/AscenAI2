@@ -127,10 +127,12 @@ async def list_sessions(
 ):
     """List sessions for the tenant."""
     tenant_id = _tenant_id(request)
+    query = (
         select(AgentSession)
         .where(AgentSession.tenant_id == uuid.UUID(tenant_id))
         .order_by(AgentSession.started_at.desc(), AgentSession.id.desc())
         .limit(min(limit, 200))
+    )
     if agent_id:
         query = query.where(AgentSession.agent_id == uuid.UUID(agent_id))
     

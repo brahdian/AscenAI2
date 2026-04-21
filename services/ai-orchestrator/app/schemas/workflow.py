@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -90,41 +90,38 @@ class WorkflowDefinition(BaseModel):
             raise ValueError(f"entry_node_id '{v}' not found in nodes")
         return v
 
-    @field_validator("definition")
-    @classmethod
-    def validate_no_cycles(cls, v: WorkflowDefinition) -> WorkflowDefinition:
+    @model_validator(mode="after")
+    def validate_no_cycles(self) -> "WorkflowDefinition":
         """Validate workflow graph contains no cycles"""
-        node_ids = {n.id for n in v.nodes}
+        node_ids = {n.id for n in self.nodes}
         edge_map: dict[str, list[str]] = {}
-        
-        for edge in v.edges:
+
+        for edge in self.edges:
             if edge.source not in node_ids:
                 raise ValueError(f"Edge source '{edge.source}' not found in nodes")
             if edge.target not in node_ids:
                 raise ValueError(f"Edge target '{edge.target}' not found in nodes")
             edge_map.setdefault(edge.source, []).append(edge.target)
-        
-        visited = set()
-        recursion_stack = set()
-        
+
+        visited: set[str] = set()
+        recursion_stack: set[str] = set()
+
         def has_cycle(node_id: str) -> bool:
             visited.add(node_id)
             recursion_stack.add(node_id)
-            
             for neighbor in edge_map.get(node_id, []):
                 if neighbor not in visited:
                     if has_cycle(neighbor):
                         return True
                 elif neighbor in recursion_stack:
                     return True
-            
             recursion_stack.remove(node_id)
             return False
-        
-        if has_cycle(v.entry_node_id):
+
+        if self.nodes and has_cycle(self.entry_node_id):
             raise ValueError("Workflow graph contains a cycle which would cause infinite execution")
-        
-        return v
+
+        return self
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,22 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+
+def _validate_password_complexity(v: str) -> str:
+    """Enforce: 8+ chars, at least one uppercase, one lowercase, one digit.
+    Implemented as a plain validator instead of a regex pattern because
+    Pydantic V2 uses the Rust regex engine which does not support lookaheads.
+    """
+    if len(v) < 8:
+        raise ValueError("Password must be at least 8 characters")
+    if not any(c.islower() for c in v):
+        raise ValueError("Password must contain at least one lowercase letter")
+    if not any(c.isupper() for c in v):
+        raise ValueError("Password must contain at least one uppercase letter")
+    if not any(c.isdigit() for c in v):
+        raise ValueError("Password must contain at least one number")
+    return v
 
 
 class UserInfo(BaseModel):
@@ -18,7 +34,6 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(
         min_length=8,
-        pattern=r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$",
         description="Minimum 8 characters with at least one uppercase, lowercase, and number"
     )
     full_name: str = Field(min_length=1, max_length=255)
@@ -31,6 +46,11 @@ class RegisterRequest(BaseModel):
         default="voice_growth",
         description="Plan: text_growth, voice_growth, voice_business",
     )
+
+    @field_validator("password")
+    @classmethod
+    def password_complexity(cls, v: str) -> str:
+        return _validate_password_complexity(v)
 
 
 class RegisterResponse(BaseModel):
@@ -92,9 +112,13 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = Field(
         min_length=8,
-        pattern=r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$",
         description="Minimum 8 characters with at least one uppercase, lowercase, and number"
     )
+
+    @field_validator("new_password")
+    @classmethod
+    def password_complexity(cls, v: str) -> str:
+        return _validate_password_complexity(v)
 
 
 class APIKeyCreateRequest(BaseModel):
@@ -167,6 +191,10 @@ class AcceptInviteRequest(BaseModel):
     full_name: str = Field(min_length=1, max_length=255)
     password: str = Field(
         min_length=8,
-        pattern=r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$",
         description="Minimum 8 characters with at least one uppercase, lowercase, and number"
     )
+
+    @field_validator("password")
+    @classmethod
+    def password_complexity(cls, v: str) -> str:
+        return _validate_password_complexity(v)

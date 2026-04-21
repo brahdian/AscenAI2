@@ -84,7 +84,7 @@ class ComplianceWorker:
                 """
                 SELECT id, metadata, is_active 
                 FROM tenants 
-                WHERE is_active = True 
+                WHERE is_active = TRUE 
                    OR (metadata->>'deletion_status' IS NOT NULL)
                 """
             ))

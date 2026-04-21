@@ -14,10 +14,9 @@ from app.schemas.mcp import (
     MCPContextResult,
 )
 from app.services.context_provider import ContextProvider
-from app.api.v1.internal_auth import verify_internal_key
+from app.api.v1.internal_auth import verify_internal_token
 
 logger = structlog.get_logger(__name__)
-from app.api.v1.internal_auth import verify_internal_token
 
 router = APIRouter(prefix="/context", dependencies=[Depends(verify_internal_token)])
 
@@ -63,7 +62,6 @@ async def create_knowledge_base(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
-    _: None = Depends(verify_internal_key),
 ):
     """Create a new knowledge base."""
     provider = _get_provider(request, db)
@@ -95,7 +93,6 @@ async def add_document(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
-    _: None = Depends(verify_internal_key),
 ):
     """Add a document to a knowledge base."""
     body_dict = body.model_dump()
@@ -116,7 +113,6 @@ async def delete_document(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
-    _: None = Depends(verify_internal_key),
 ):
     """Delete a document from a knowledge base."""
     provider = _get_provider(request, db)
@@ -133,7 +129,6 @@ async def cleanup_documents(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
-    _: None = Depends(verify_internal_key),
 ):
     """Delete all documents matching metadata key/value."""
     # Phase 8 — Gap 3: Enforce metadata_key allowlist for security
@@ -154,7 +149,6 @@ async def bulk_wipe_knowledge(
     request: Request,
     tenant_id: str = Depends(_tenant_id),
     db: AsyncSession = Depends(_tenant_db),
-    _: None = Depends(verify_internal_key),
 ):
     """Wipe ALL knowledge bases and documents for the current tenant. Permanent erasure."""
     provider = _get_provider(request, db)

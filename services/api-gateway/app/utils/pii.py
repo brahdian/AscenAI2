@@ -118,6 +118,18 @@ def anonymize_email(email: str) -> str:
         return f"{local[0]}***@{domain}"
     return f"*@{domain}"
 
+def anonymize_identifier(identifier: str) -> str:
+    """Anonymize any identifier: auto-detects email, IP, or falls back to partial masking."""
+    if not identifier:
+        return identifier
+    if "@" in identifier:
+        return anonymize_email(identifier)
+    if re.match(PII_PATTERNS["IPV4"], identifier):
+        return anonymize_ip(identifier)
+    # Generic identifier: show first 4 and last 4 chars
+    return mask_technical_id(identifier)
+
+
 def anonymize_ip(ip: str) -> str:
     """Mask the last octet of an IP address for GDPR-compliant display."""
     if not ip or ip == "unknown":

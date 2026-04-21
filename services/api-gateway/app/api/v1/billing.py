@@ -7,6 +7,8 @@ import httpx
 from datetime import date, datetime, timezone, timedelta
 
 import structlog
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update as _sa_update

@@ -18,6 +18,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 
 from app.services.pii_service import redact
+from app.services import pii_service
 
 def _has_variables(text: str | None) -> bool:
     if not text:
@@ -35,13 +36,11 @@ def _delete_old_audio(url: str | None) -> None:
         filepath = audio_dir / filename
         if filepath.exists():
             filepath.unlink(missing_ok=True)
-            import structlog
-            structlog.get_logger(__name__).info("deleted_old_audio", filepath=str(filepath))
+            logger.info("deleted_old_audio", filepath=str(filepath))
     except Exception as e:
-        import structlog
-        structlog.get_logger(__name__).warning("failed_to_delete_old_audio", url=url, error=str(e))
+        logger.warning("failed_to_delete_old_audio", url=url, error=str(e))
 
-from app.core.database import get_db
+from app.core.database import get_db, AsyncSessionLocal
 from app.core.security import get_tenant_db, get_current_tenant, require_forwarded_role, require_internal_key
 from app.models.agent import Agent, AgentPlaybook, AgentGuardrails
 from app.schemas.chat import (
@@ -197,10 +196,9 @@ async def get_platform_global_guardrails(
         guardrails = guardrails_setting["rules"]
     elif isinstance(guardrails_setting, list):
         guardrails = guardrails_setting
-    elif isinstance(guardrails_setting, dict):
-        # Could be a map of {id: {enabled: bool}} as stored by admin.py
-        guardrails = guardrails_setting
     else:
+        # If it's a dict (like {} from defaults), just return an empty list
+        # since the frontend expects an array to call .reduce() on.
         guardrails = []
     return {"guardrails": guardrails}
 
@@ -238,21 +236,35 @@ async def get_agent_opening_preview(
 
     # Override with provided query params if any
     active_lang = language or agent.language
+    agent_primary_lang = agent.language or "en"
+
     if supported_languages is not None:
         supported_langs = [l.strip() for l in supported_languages.split(",") if l.strip()]
     else:
         supported_langs = (agent.agent_config or {}).get("supported_languages", [])
-    
-    custom_greeting = greeting if greeting is not None else (agent.greeting_message or (agent.agent_config or {}).get("greeting_message"))
-    full_text = await generate_multilingual_greeting(db, active_lang, supported_langs, custom_greeting=custom_greeting)
-    
-    # Resolve variables for preview
+
+    # Only forward the operator's custom greeting when we are previewing in the
+    # agent's own primary language.  For other languages the generator must use
+    # the built-in localised phrase from the platform language config so the
+    # preview accurately reflects what callers will actually hear.
+    base_lang = active_lang.split("-")[0]
+    primary_base = agent_primary_lang.split("-")[0]
+    if base_lang == primary_base:
+        custom_greeting = greeting if greeting is not None else (
+            (agent.agent_config or {}).get("greeting_message")
+        )
+    else:
+        custom_greeting = None  # Use the built-in localised phrase for this language
+
+    full_text = await generate_multilingual_greeting(db, active_lang, supported_langs, custom_greeting=custom_greeting, redact=False)
+
+    # Resolve variables for preview without PII scrubbing
     result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
     variables = result_vars.scalars().all()
-    resolved_text = resolve_agent_variables(full_text, agent, variables, clean=True)
-    
-    # Standardize redaction for dashboard display
-    return {"text": pii_service.redact_for_display(resolved_text, None)}
+    resolved_text = resolve_agent_variables(full_text, agent, variables, clean=True, redact=False)
+
+    # Return original text for preview as requested (redaction only happens for LLM prompts)
+    return {"text": resolved_text}
 
 
 @router.put("/platform/global-guardrails")
@@ -273,7 +285,7 @@ async def update_platform_global_guardrails(
 
     await SettingsService.invalidate_cache("platform_guardrails")
     logger.info("global_guardrails_updated", count=len(guardrails))
-    return {"guardrails": guardrails}
+    return guardrails
 
 
 @router.post("", response_model=AgentResponse, status_code=201)
@@ -394,6 +406,13 @@ async def create_agent(
         flag_modified(agent, "agent_config")
         try:
             from app.api.v1.templates import process_template_instantiation
+            from fastapi import BackgroundTasks as _BackgroundTasks
+            _bg_tasks = _BackgroundTasks()
+            _actor_info = {
+                "actor_email": request.headers.get("X-Actor-Email", "system"),
+                "is_support_access": request.headers.get("X-Is-Support-Access", "false").lower() == "true",
+                "trace_id": request.headers.get("X-Trace-ID", "unknown"),
+            }
             await process_template_instantiation(
                 t_uuid=uuid.UUID(ctx.get("template_id")),
                 v_uuid=uuid.UUID(ctx.get("template_version_id")),
@@ -401,8 +420,10 @@ async def create_agent(
                 tenant=tenant_id,
                 db=db,
                 request=request,
+                background_tasks=_bg_tasks,
                 variable_values=ctx.get("variable_values", {}),
                 tool_configs=ctx.get("tool_configs", {}),
+                actor_info=_actor_info,
             )
             logger.info("immediate_template_instantiated", agent_id=str(agent.id))
         except Exception as e:
@@ -453,7 +474,7 @@ async def create_agent(
             # Generate mandatory opening audio
             # (Greeting + Language Assistance)
             supported_langs = cfg.get("supported_languages", [])
-            custom_greeting = agent.greeting_message or (agent.agent_config or {}).get("greeting_message")
+            custom_greeting = (agent.agent_config or {}).get("greeting_message")
             opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs, custom_greeting=custom_greeting)
             if opening_text:
                 if not _has_variables(opening_text):
@@ -703,6 +724,37 @@ async def activate_agent(
     except Exception:
         pass
 
+    # --- TEMPLATE INSTANTIATION HOOK ---
+    # If the agent was created with a template and is now being activated,
+    # process the instantiation (populating playbooks, prompts, tools).
+    if agent.agent_config and "template_context" in agent.agent_config:
+        ctx = agent.agent_config.pop("template_context")
+        flag_modified(agent, "agent_config")
+        try:
+            from app.api.v1.templates import process_template_instantiation
+            from fastapi import BackgroundTasks as _BackgroundTasks
+            _bg_tasks = _BackgroundTasks()
+            _actor_info = {
+                "actor_email": request.headers.get("X-Actor-Email", "billing_webhook"),
+                "is_support_access": request.headers.get("X-Is-Support-Access", "false").lower() == "true",
+                "trace_id": request.headers.get("X-Trace-ID", "unknown"),
+            }
+            await process_template_instantiation(
+                t_uuid=uuid.UUID(ctx.get("template_id")),
+                v_uuid=uuid.UUID(ctx.get("template_version_id")),
+                agent=agent,
+                tenant=tenant_id,  # must be str, not uuid.UUID
+                db=db,
+                request=request,
+                background_tasks=_bg_tasks,
+                variable_values=ctx.get("variable_values", {}),
+                tool_configs=ctx.get("tool_configs", {}),
+                actor_info=_actor_info,
+            )
+            logger.info("activation_template_instantiated", agent_id=str(agent.id))
+        except Exception as e:
+            logger.error("failed_to_instantiate_template_on_activation", error=str(e), agent_id=str(agent.id))
+
     await db.commit()
     await db.refresh(agent)
 
@@ -779,27 +831,43 @@ async def agent_activation_stream(
         await pubsub.subscribe(channel)
         
         # RACE CONDITION FIX: Check if the agent became active in the window between 
-        # the initial check (line 429) and the Redis subscription (line 439).
-        await db.refresh(agent)
-        if agent.is_active:
-            yield f"data: {json.dumps({'status': 'active', 'agent_id': agent_id})}\n\n"
-            await pubsub.unsubscribe(channel)
-            await pubsub.aclose()
-            return
+        # the initial check and the Redis subscription.
+        async with AsyncSessionLocal() as check_db:
+            result = await check_db.execute(
+                select(Agent).where(Agent.id == uuid.UUID(agent_id))
+            )
+            fresh_agent = result.scalar_one_or_none()
+            if fresh_agent and fresh_agent.is_active:
+                yield f"data: {json.dumps({'status': 'active', 'agent_id': agent_id})}\n\n"
+                await pubsub.unsubscribe(channel)
+                await pubsub.aclose()
+                return
 
         try:
-            deadline = asyncio.get_event_loop().time() + 40
+            deadline = asyncio.get_event_loop().time() + 45
             while True:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     yield f"data: {json.dumps({'status': 'timeout'})}\n\n"
                     break
-                # Wait up to 1s for a message, then send a keepalive comment.
-                msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.0)
-                if msg and msg.get("type") == "message":
-                    yield f"data: {msg['data']}\n\n"
-                    break
-                else:
+
+                # Periodic DB check to catch state changes if Redis message is missed
+                async with AsyncSessionLocal() as poll_db:
+                    result = await poll_db.execute(
+                        select(Agent).where(Agent.id == uuid.UUID(agent_id))
+                    )
+                    polled_agent = result.scalar_one_or_none()
+                    if polled_agent and polled_agent.is_active:
+                        yield f"data: {json.dumps({'status': 'active', 'agent_id': agent_id})}\n\n"
+                        break
+
+                # Wait up to 1.5s for a message, then send a keepalive comment.
+                try:
+                    msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=1.5)
+                    if msg and msg.get("type") == "message":
+                        yield f"data: {msg['data']}\n\n"
+                        break
+                except asyncio.TimeoutError:
                     # SSE comment — keeps the connection alive through proxies.
                     yield ": keepalive\n\n"
         except asyncio.TimeoutError:
@@ -886,6 +954,13 @@ async def update_agent(
         request.headers.get("X-Internal-Key") == _settings.INTERNAL_API_KEY
     )
 
+    if "opening_preview" in update_data:
+        op = update_data.pop("opening_preview")
+        if agent.agent_config is None:
+            agent.agent_config = {}
+        agent.agent_config["_cached_greeting"] = op
+        flag_modified(agent, "agent_config")
+
     for field, value in update_data.items():
         if field == "is_active":
             if value is True:
@@ -908,6 +983,13 @@ async def update_agent(
                     flag_modified(agent, "agent_config")
                     try:
                         from app.api.v1.templates import process_template_instantiation
+                        from fastapi import BackgroundTasks as _BackgroundTasks
+                        _bg_tasks = _BackgroundTasks()
+                        _actor_info = {
+                            "actor_email": request.headers.get("X-Actor-Email", "billing_webhook"),
+                            "is_support_access": request.headers.get("X-Is-Support-Access", "false").lower() == "true",
+                            "trace_id": request.headers.get("X-Trace-ID", "unknown"),
+                        }
                         await process_template_instantiation(
                             t_uuid=uuid.UUID(ctx.get("template_id")),
                             v_uuid=uuid.UUID(ctx.get("template_version_id")),
@@ -915,8 +997,10 @@ async def update_agent(
                             tenant=tenant_id,
                             db=db,
                             request=request,
+                            background_tasks=_bg_tasks,
                             variable_values=ctx.get("variable_values", {}),
                             tool_configs=ctx.get("tool_configs", {}),
+                            actor_info=_actor_info,
                         )
                         logger.info("pending_template_instantiated", agent_id=str(agent.id))
                     except Exception as e:
@@ -1062,7 +1146,7 @@ async def update_agent(
             and any(f in (body.agent_config or {}) for f in ["supported_languages"])
         ):
             supported_langs = cfg.get("supported_languages", [])
-            custom_greeting = agent.greeting_message or (agent.agent_config or {}).get("greeting_message")
+            custom_greeting = (agent.agent_config or {}).get("greeting_message")
             opening_text = await generate_multilingual_greeting(db, agent.language, supported_langs, custom_greeting=custom_greeting)
             if opening_text:
                 if not _has_variables(opening_text):

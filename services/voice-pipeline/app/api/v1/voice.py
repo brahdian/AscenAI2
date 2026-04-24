@@ -65,17 +65,30 @@ async def text_to_speech(
     body: TTSRequest,
     request: Request,
 ):
-    """Convert text to speech audio."""
+    """Convert text to speech audio. Dispatches to the configured TTS_PROVIDER."""
     _tenant_id(request)
+    provider = settings.TTS_PROVIDER.lower()
     try:
-        audio_bytes = await _tts_service.synthesize(
-            text=body.text,
-            voice_id=body.voice_id,
-            speed=body.speed,
-            format=body.format,
-        )
+        if provider == "deepgram":
+            audio_bytes = await _tts_service.synthesize_deepgram_to_bytes(
+                text=body.text,
+                voice_id=body.voice_id or "aura-asteria-en",
+            )
+        elif provider == "cartesia":
+            audio_bytes = await _tts_service.synthesize_cartesia_to_bytes(
+                text=body.text,
+                voice_id=body.voice_id or settings.CARTESIA_VOICE_ID,
+            )
+        else:
+            # openai or any other provider
+            audio_bytes = await _tts_service.synthesize(
+                text=body.text,
+                voice_id=body.voice_id,
+                speed=body.speed,
+                format=body.format,
+            )
     except Exception as exc:
-        logger.error("tts_failed", error=str(exc))
+        logger.error("tts_failed", error=str(exc), provider=provider)
         raise HTTPException(status_code=500, detail=f"TTS failed: {exc}")
 
     return Response(
@@ -119,13 +132,26 @@ async def text_to_speech_stream(
         voice_id=body.voice_id,
     )
 
+    provider = settings.TTS_PROVIDER.lower()
+
     async def _audio_generator():
         for i, sentence in enumerate(sentences):
             try:
-                audio_iter = _tts_service.synthesize_stream(
-                    text=sentence,
-                    voice_id=body.voice_id or "alloy",
-                )
+                if provider == "deepgram":
+                    audio_iter = _tts_service.synthesize_deepgram_stream(
+                        text=sentence,
+                        voice_id=body.voice_id or "aura-asteria-en",
+                    )
+                elif provider == "cartesia":
+                    audio_iter = _tts_service.synthesize_cartesia_stream(
+                        text=sentence,
+                        voice_id=body.voice_id or settings.CARTESIA_VOICE_ID,
+                    )
+                else:
+                    audio_iter = _tts_service.synthesize_stream(
+                        text=sentence,
+                        voice_id=body.voice_id or "alloy",
+                    )
                 async for chunk in audio_iter:
                     if chunk:
                         yield chunk

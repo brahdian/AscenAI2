@@ -429,8 +429,12 @@ class TTSService:
         if not text.strip():
             return
 
-        # Deepgram's API URL requires query params for encoding
-        url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding={encoding}&sample_rate={sample_rate}"
+        # Deepgram TTS API: sample_rate is only valid for PCM-based encodings
+        # (linear16, mulaw, alaw). For mp3, omit it to avoid 400 Bad Request.
+        if encoding in ("mp3",):
+            url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding={encoding}"
+        else:
+            url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding={encoding}&sample_rate={sample_rate}"
         headers = {
             "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
             "Content-Type": "application/json",
@@ -549,7 +553,7 @@ class TTSService:
         if not text.strip():
             return b""
 
-        url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding=mp3&sample_rate=48000"
+        url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding=mp3"
         headers = {
             "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
             "Content-Type": "application/json",

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Any
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
@@ -82,11 +83,11 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # CORS — override in production with explicit origin list
-    ALLOWED_ORIGINS: any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
+    ALLOWED_ORIGINS: Any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
 
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
-    def validate_allowed_origins(cls, v: any) -> list[str]:
+    def validate_allowed_origins(cls, v: Any) -> list[str]:
         if isinstance(v, str):
             return [origin.strip() for origin in v.split(",")]
         return v

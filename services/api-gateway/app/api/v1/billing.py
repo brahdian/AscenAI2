@@ -1,26 +1,46 @@
 from __future__ import annotations
 
-import uuid
-import calendar
+import asyncio as _asyncio
+import hmac
 import math
+import time as _time
+import uuid
+import uuid as _uuid
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional
+
 import httpx
-from datetime import date, datetime, timezone, timedelta
-
+import stripe as _stripe
 import structlog
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update as _sa_update
+from sqlalchemy import select
+from sqlalchemy import text as _text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant, generate_internal_token
+from app.core.redis_client import get_redis as _get_redis
+from app.core.security import generate_internal_token, get_current_tenant, get_tenant_db
+from app.models.platform import PlatformSetting
+from app.models.tenant import PendingAgentPurchase, Tenant, TenantUsage
+from app.models.user import User
+from app.services.audit_service import audit_log
+from app.services.billing_service import BillingService
 from app.services.idempotency_service import IdempotencyService
+from app.services.tenant_service import get_plan_limits
+from app.utils.dates import enforce_temporal_cap
+from app.utils.dates import get_calendar_billing_period as _billing_period
+from app.utils.pii import mask_pii
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/billing")
+
+# Compatibility aliases
+_raw_text = _text
+text = _text
+stripe = _stripe
+asyncio = _asyncio
 
 
 class CheckoutSessionRequest(BaseModel):
@@ -32,11 +52,7 @@ class AgentSlotSessionRequest(BaseModel):
     agent_config: dict | None = Field(None, description="Optional agent configuration for auto-creation after success")
     return_path: str | None = Field(None, description="Optional return path (e.g., /dashboard/agents/new)")
 
-# ---------------------------------------------------------------------------
-# Plan definitions — update here when pricing changes
-# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
 # Fallback plans if DB is empty
 # ---------------------------------------------------------------------------
 
@@ -123,7 +139,6 @@ DEFAULT_PLANS: dict[str, dict] = {
 async def get_platform_plans(db: AsyncSession) -> dict[str, dict]:
     """Fetch plans from platform_settings."""
     try:
-        from app.models.platform import PlatformSetting
         result = await db.execute(
             select(PlatformSetting).where(PlatformSetting.key == "billing_plans")
         )
@@ -162,7 +177,6 @@ async def _check_billing_rate_limit(request: Request, action: str, limit: int = 
     Uses a per-tenant sliding window keyed as: billing_rl:{tenant_id}:{action}
     Raises HTTP 429 if the limit is exceeded. Fails open if Redis is unavailable.
     """
-    import math, time as _time
     redis = getattr(request.app.state, "redis", None)
     if not redis:
         return  # Fail open — no Redis, allow traffic
@@ -195,14 +209,10 @@ async def _check_billing_rate_limit(request: Request, action: str, limit: int = 
         # Fail open
 
 
-from app.utils.dates import get_calendar_billing_period as _billing_period
 
 
 async def _get_usage_summary_db(tenant_id: uuid.UUID, db: AsyncSession) -> dict[str, Any]:
     """Helper to fetch monthly usage summary from agent_analytics (source of truth)."""
-    from sqlalchemy import text as _text
-    from datetime import datetime, timedelta, timezone
-    from app.utils.dates import enforce_temporal_cap
     billing_start, _ = _billing_period()
     
     # Zenith Pillar 4: Resilience Wall - Cap analytical scans to 90 days
@@ -282,7 +292,6 @@ async def billing_overview(
 ) -> dict:
     tenant_uuid = uuid.UUID(tenant_id)
 
-    from app.models.tenant import Tenant, TenantUsage
 
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
@@ -330,6 +339,7 @@ async def billing_overview(
     active_agent_ids_count = 0
     try:
         # Count distinct agents with activity in agent_analytics
+        billing_start, _ = _billing_period()
         aa_count_res = await db.execute(
             _text("SELECT COUNT(DISTINCT agent_id) FROM agent_analytics WHERE tenant_id = :tenant_id AND date >= :start_date"),
             {"tenant_id": tenant_uuid, "start_date": billing_start}
@@ -371,8 +381,6 @@ async def billing_overview(
     portal_url = None
     if tenant and tenant.stripe_customer_id:
         try:
-            import stripe
-            import asyncio as _asyncio
             stripe.api_key = settings.STRIPE_SECRET_KEY
             
             # B11 FIX: Stripe SDK is synchronous — run in thread to not block the async event loop
@@ -440,7 +448,6 @@ async def billing_agents(
 ) -> list[dict]:
     tenant_uuid = uuid.UUID(tenant_id)
 
-    from app.models.tenant import Tenant, TenantUsage
 
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
@@ -449,9 +456,7 @@ async def billing_agents(
     price_per_agent = plan["price_per_agent"] or 0
 
     try:
-        from app.models.tenant import Tenant, TenantUsage
         # Actually, since orchestrator and gateway might have different model structures, let's use raw SQL for speed and safety.
-        from sqlalchemy import text
         
         # Get start/end of current month
         start_date, _ = _billing_period()
@@ -477,7 +482,8 @@ async def billing_agents(
         purchased_slots = usage_row.agent_count if usage_row else 0
 
         # Fetch actual agents from orchestrator
-        resp = await client.get(
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
             f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
             headers={"X-Tenant-ID": tenant_id, "Authorization": f"Bearer {generate_internal_token()}"}
         )
@@ -542,7 +548,6 @@ async def billing_agents(
                 "total_cost": price_per_agent,
             })
 
-        from app.utils.pii import mask_pii
         return mask_pii(results, deep=False)
     except Exception as exc:
         logger.warning("billing_agents_error", error=str(exc))
@@ -582,7 +587,6 @@ async def create_checkout_session(
     # Zenith Pillar 4: Resilience Wall - Rate throttle high-risk points
     await _check_billing_rate_limit(request, "checkout", limit=5, window=60)
 
-    from app.models.tenant import Tenant
 
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
@@ -603,7 +607,6 @@ async def create_checkout_session(
     if not price:
         raise HTTPException(status_code=400, detail="Invalid plan or price not available")
 
-    import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
     # Use the request's Origin header as the base URL so Stripe redirects back
@@ -648,8 +651,7 @@ async def create_checkout_session(
         )
 
         # Zenith Pillar 1: Audit every billing financial mutation
-        from app.services.audit_service import AuditService
-        await AuditService().audit_log(
+        await audit_log(
             db=db, request=request,
             action="billing.checkout_session.created",
             category="billing",
@@ -685,7 +687,6 @@ async def create_agent_slot_session(
     # Prevent duplicate concurrent checkout sessions (e.g., double-click).
     # Redis NX lock with 30-second TTL — a second request within the window returns 409.
     try:
-        from app.core.redis_client import get_redis as _get_redis
         _redis = await _get_redis()
         if _redis:
             lock_key = f"checkout_lock:{tenant_id}"
@@ -703,7 +704,6 @@ async def create_agent_slot_session(
     agent_config = payload.agent_config if payload else None
     return_path = payload.return_path if payload else "/dashboard/billing"
 
-    from app.models.tenant import Tenant, PendingAgentPurchase
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
     if not tenant:
@@ -712,8 +712,7 @@ async def create_agent_slot_session(
     # If agent_config is provided, create a pending purchase record
     pending_id = None
     if agent_config:
-        from app.core.pii import redact_pii
-        scrubbed_config = redact_pii(agent_config)
+        scrubbed_config = mask_pii(agent_config)
         
         # Phase 2: Use stripe_session_id for idempotency — but we don't have it yet
         # at checkout-creation time. We store a pending record and will set the
@@ -733,18 +732,15 @@ async def create_agent_slot_session(
     # Self-healing: if stripe_customer_id is missing, try to create one now.
     if not tenant.stripe_customer_id:
         logger.info("stripe_customer_id_missing_attempting_creation", tenant_id=str(tenant.id))
-        from app.models.user import User
         user_res = await db.execute(select(User).where(User.tenant_id == tenant.id, User.role == "owner"))
         owner = user_res.scalar_one_or_none()
         if owner:
-            from app.services.auth_service import _create_stripe_customer
-            stripe_customer_id = await _create_stripe_customer(tenant, owner)
+            stripe_customer_id = await BillingService(db).get_or_create_stripe_customer(tenant, owner)
             if stripe_customer_id:
                 tenant.stripe_customer_id = stripe_customer_id
                 await db.commit()
                 logger.info("stripe_customer_id_created_on_the_fly", tenant_id=str(tenant.id), customer_id=stripe_customer_id)
 
-    import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
     # Use the request's Origin header as the base URL so Stripe redirects back
@@ -828,10 +824,6 @@ async def create_reactivation_session(
     charged for days they already paid for. Billing resumes normally after
     trial_end.
     """
-    from app.models.tenant import Tenant
-    from app.models.user import User
-    from app.services.auth_service import _create_stripe_customer
-    import stripe
 
     tenant_uuid = uuid.UUID(tenant_id)
 
@@ -847,7 +839,7 @@ async def create_reactivation_session(
         )
         owner = user_res.scalar_one_or_none()
         if owner:
-            stripe_customer_id = await _create_stripe_customer(tenant, owner)
+            stripe_customer_id = await BillingService(db).get_or_create_stripe_customer(tenant, owner)
             if stripe_customer_id:
                 tenant.stripe_customer_id = stripe_customer_id
                 await db.commit()
@@ -942,7 +934,6 @@ async def create_portal_session(
 
     tenant_uuid = uuid.UUID(tenant_id)
     
-    from app.models.tenant import Tenant
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -951,7 +942,6 @@ async def create_portal_session(
     if not tenant.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer found")
     
-    import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
     
     session = stripe.billing_portal.Session.create(
@@ -973,11 +963,8 @@ async def cancel_subscription(
     """
     await _check_billing_rate_limit(request, "cancel", limit=3, window=300)
 
-    import asyncio as _asyncio, stripe as _stripe
     _stripe.api_key = settings.STRIPE_SECRET_KEY
 
-    from app.models.tenant import Tenant
-    from app.services.audit_service import AuditService
 
     tenant_uuid = uuid.UUID(tenant_id)
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
@@ -1002,7 +989,7 @@ async def cancel_subscription(
     tenant.subscription_status = "cancelling"
     await db.commit()
 
-    await AuditService().audit_log(
+    await audit_log(
         db=db, request=request,
         action="billing.subscription.cancel_requested",
         category="billing",
@@ -1027,8 +1014,7 @@ async def toggle_voice_addon(
     Currently returns 501 with a clear upgrade path message.
     Pillar 8: No backend feature should silently 404 when the UI calls it.
     """
-    from app.services.audit_service import AuditService
-    await AuditService().audit_log(
+    await audit_log(
         db=db, request=request,
         action="billing.voice_addon.toggle_attempted",
         category="billing",
@@ -1052,14 +1038,11 @@ async def list_invoices(
     """List recent invoices from Stripe."""
     tenant_uuid = uuid.UUID(tenant_id)
     
-    from app.models.tenant import Tenant
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = result.scalar_one_or_none()
     if not tenant or not tenant.stripe_customer_id:
         return {"invoices": []}
     
-    import stripe
-    import asyncio as _asyncio
     stripe.api_key = settings.STRIPE_SECRET_KEY
     
     # B12 FIX: Stripe SDK is synchronous — run in thread to not block the async event loop
@@ -1101,10 +1084,6 @@ async def sync_subscription(
     3. Update tenant.subscription_status and subscription_id in the DB.
     4. Return a summary: {"status", "agents_activated", "agents_skipped"}.
     """
-    import asyncio as _asyncio
-    import stripe as _stripe
-    from datetime import datetime, timezone, timedelta
-    from app.models.tenant import Tenant
 
     _stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -1314,7 +1293,6 @@ async def admin_sync_usage(
     if request.headers.get("X-Internal-Key") != settings.INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Internal key required")
 
-    from app.services.billing_service import BillingService
     
     if tenant_id:
         # Sync specific tenant
@@ -1323,7 +1301,6 @@ async def admin_sync_usage(
         return {"success": success, "tenant_id": tenant_id}
     else:
         # Sync all tenants in TenantUsage
-        from app.models.tenant import TenantUsage
         result = await db.execute(select(TenantUsage.tenant_id))
         tenant_ids = [str(tid) for tid in result.scalars().all()]
         
@@ -1342,9 +1319,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
     Handle Stripe webhook events at /api/v1/billing/webhook.
     Activates tenant accounts on successful payment.
     """
-    import uuid as _uuid
-    from app.models.tenant import Tenant
-    from app.services.tenant_service import get_plan_limits
 
     body = await request.body()
     sig_header = request.headers.get("stripe-signature")
@@ -1352,7 +1326,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
     if not sig_header:
         raise HTTPException(status_code=400, detail="Missing Stripe signature header.")
 
-    import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
 
     try:
@@ -1390,7 +1363,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
             # Phase 6: Single atomic transaction — "paid" and "activated" are inseparable.
             try:
                 async with db.begin():
-                    from app.models.tenant import TenantUsage
                     result = await db.execute(select(Tenant).where(Tenant.id == _uuid.UUID(tenant_id)))
                     tenant = result.scalar_one_or_none()
                     if tenant:
@@ -1505,7 +1477,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 # FLOW 2: LEGACY/FALLBACK Auto-create agent from config
                 pending_purchase_id = metadata.get("pending_agent_purchase_id")
                 if pending_purchase_id:
-                    from app.models.tenant import PendingAgentPurchase
                     pending_res = await db.execute(select(PendingAgentPurchase).where(PendingAgentPurchase.id == _uuid.UUID(pending_purchase_id)))
                     pending = pending_res.scalar_one_or_none()
                     if pending:
@@ -1537,7 +1508,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
 
                 if tenant and slot_delta:
                     # Atomic update to avoid race conditions with concurrent webhooks
-                    from sqlalchemy import text as _raw_text
                     await db.execute(
                         _raw_text("""
                             UPDATE tenant_usage 
@@ -1567,7 +1537,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
 
         if sub_id and tenant_id:
             try:
-                from app.models.tenant import TenantUsage
                 # Find the agent that holds this subscription
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(
@@ -1596,7 +1565,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                                 break
 
                 # Atomic decrement (floor at 0) — avoids race on concurrent cancellation webhooks
-                from sqlalchemy import text as _raw_text
                 t_uuid = _uuid.UUID(tenant_id)
                 await db.execute(
                     _raw_text("""
@@ -1630,7 +1598,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
 
         if tenant_id:
             try:
-                from app.models.tenant import TenantUsage
                 result = await db.execute(select(Tenant).where(Tenant.id == _uuid.UUID(tenant_id)))
                 tenant = result.scalar_one_or_none()
                 if tenant:
@@ -1659,7 +1626,6 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
         customer_id = invoice.get("customer")
         if customer_id:
             try:
-                from app.models.tenant import TenantUsage
                 result = await db.execute(select(Tenant).where(Tenant.stripe_customer_id == customer_id))
                 tenant = result.scalar_one_or_none()
                 if tenant:
@@ -1699,7 +1665,6 @@ async def report_overage(
     Triggers Stripe InvoiceItem creation for pending overages.
     """
     # 1. Verify internal key (Zenith Pillar 3: Zero-Trust Perimeter)
-    import hmac
     internal_key = request.headers.get("X-Internal-Key", "")
     if not internal_key or not settings.INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden: Missing internal key")
@@ -1713,8 +1678,6 @@ async def report_overage(
         raise HTTPException(status_code=400, detail="Missing X-Tenant-ID")
 
     # 3. Load Tenant
-    from app.models.tenant import Tenant
-    import uuid as _uuid
     tenant_uuid = _uuid.UUID(tenant_id)
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_uuid))
     tenant = tenant_result.scalar_one_or_none()
@@ -1740,10 +1703,8 @@ async def report_overage(
         return {"status": "idle", "cost": overage_cost, "reason": "below_threshold"}
 
     # 5. Report to Stripe as an InvoiceItem
-    import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
     try:
-        import asyncio
         start_date, _ = _billing_period()
         month_str = start_date.strftime("%Y-%m")
         

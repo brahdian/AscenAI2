@@ -12,8 +12,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.user import APIKey, User
 from app.models.tenant import Tenant
+from app.models.user import APIKey, User
 
 logger = structlog.get_logger(__name__)
 
@@ -60,7 +60,6 @@ PUBLIC_PATHS = {
     "/api/v1/auth/verify-email",
     "/api/v1/auth/resend-otp",
     "/api/v1/auth/subscribe",
-    "/api/v1/auth/me",
     "/api/v1/auth/refresh",
     "/api/v1/auth/forgot-password",
     "/api/v1/auth/reset-password",
@@ -280,8 +279,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     async def _authenticate_api_key(self, request: Request, raw_key: str) -> bool:
         import hashlib
-        from datetime import datetime, timezone
         import json
+        from datetime import datetime, timezone
 
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
         

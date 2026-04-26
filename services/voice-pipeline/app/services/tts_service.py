@@ -19,6 +19,16 @@ logger = structlog.get_logger(__name__)
 # Valid OpenAI TTS voices
 OPENAI_VOICES = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
 
+# Deepgram Voice Mapping (OpenAI Voice ID -> Deepgram Model ID)
+DEEPGRAM_VOICE_MAP = {
+    "alloy": "aura-asteria-en",
+    "echo": "aura-zeus-en",
+    "fable": "aura-stella-en",
+    "onyx": "aura-orion-en",
+    "nova": "aura-luna-en",
+    "shimmer": "aura-hera-en",
+}
+
 
 class TTSService:
     """
@@ -44,8 +54,12 @@ class TTSService:
             self._http_client = httpx.AsyncClient(timeout=60.0)
         return self._http_client
 
-    def _resolve_voice(self, voice_id: str) -> str:
-        """Return a valid OpenAI voice name, defaulting to 'alloy'."""
+    def _resolve_voice(self, voice_id: str, provider: str = "openai") -> str:
+        """Resolve voice ID to a provider-specific model name."""
+        if provider == "deepgram":
+            return DEEPGRAM_VOICE_MAP.get(voice_id, "aura-asteria-en")
+        
+        # Default to OpenAI logic
         return voice_id if voice_id in OPENAI_VOICES else "alloy"
 
     # ------------------------------------------------------------------
@@ -429,12 +443,15 @@ class TTSService:
         if not text.strip():
             return
 
+        # Map voice_id to Deepgram model if it's an OpenAI alias
+        voice = self._resolve_voice(voice_id, provider="deepgram")
+
         # Deepgram TTS API: sample_rate is only valid for PCM-based encodings
         # (linear16, mulaw, alaw). For mp3, omit it to avoid 400 Bad Request.
         if encoding in ("mp3",):
-            url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding={encoding}"
+            url = f"https://api.deepgram.com/v1/speak?model={voice}&encoding={encoding}"
         else:
-            url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding={encoding}&sample_rate={sample_rate}"
+            url = f"https://api.deepgram.com/v1/speak?model={voice}&encoding={encoding}&sample_rate={sample_rate}"
         headers = {
             "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
             "Content-Type": "application/json",
@@ -553,7 +570,8 @@ class TTSService:
         if not text.strip():
             return b""
 
-        url = f"https://api.deepgram.com/v1/speak?model={voice_id}&encoding=mp3"
+        voice = self._resolve_voice(voice_id, provider="deepgram")
+        url = f"https://api.deepgram.com/v1/speak?model={voice}&encoding=mp3"
         headers = {
             "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
             "Content-Type": "application/json",

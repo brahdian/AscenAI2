@@ -3,6 +3,7 @@ Safety and Compliance Framework for Agent Templates
 
 This module adds production-ready safety, compliance, and quality assurance features to the agent template system.
 """
+from __future__ import annotations
 
 import uuid
 from datetime import datetime, date
@@ -12,6 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.models.template import AgentTemplate
 
 from app.core.database import Base
 

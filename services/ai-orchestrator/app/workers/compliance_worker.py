@@ -79,48 +79,48 @@ class ComplianceWorker:
     async def _enforce_policies(self) -> None:
         """Fetch all tenants and enforce their specific compliance settings."""
         async with self.db_factory() as db:
-            # Fetch active tenants for regular maintenance AND inactive ones pending deletion
+            # Fetch all distinct tenant IDs that have data in the orchestrator
             result = await db.execute(text(
                 """
-                SELECT id, metadata, is_active 
-                FROM tenants 
-                WHERE is_active = TRUE 
-                   OR (metadata->>'deletion_status' IS NOT NULL)
+                SELECT DISTINCT tenant_id FROM agents
+                UNION
+                SELECT DISTINCT tenant_id FROM sessions
                 """
             ))
-            tenants = result.fetchall()
+            tenant_ids = [row[0] for row in result.fetchall()]
 
-            for t in tenants:
-                tid = str(t.id)
-                metadata = t.metadata or {}
-                compliance = metadata.get("compliance", {})
+            for tid in tenant_ids:
+                tid_str = str(tid)
+                # Since the auth service owns the tenants table, we use default compliance
+                # rules here. Alternatively, we could fetch them via an internal API.
+                compliance = {"data_retention_days": 365, "auto_anonymize_after_days": 730}
                 
                 try:
-                    # 1. Handle Self-Destruct if pending (Task 4)
-                    await self._process_tenant_self_destruct(db, tid, metadata, t.is_active)
+                    # 1. Regular retention/anonymization
+                    await self._process_tenant_retention(db, tid_str, compliance)
+                    await self._process_tenant_anonymization(db, tid_str, compliance)
                     
-                    # 2. Regular retention/anonymization for active tenants
-                    if t.is_active:
-                        await self._process_tenant_retention(db, tid, compliance)
-                        await self._process_tenant_anonymization(db, tid, compliance)
-                        
-                        # 3. Operational Robustness: Reconcile orphaned vectors (Task 3)
-                        # We only run this occasionally (e.g. 5% of the time) or once per loop
-                        await self._reconcile_orphaned_vectors(db, tid)
+                    # 2. Operational Robustness: Reconcile orphaned vectors
+                    await self._reconcile_orphaned_vectors(db, tid_str)
                     
-                    # 4. Reliability: Clear documents stuck in 'processing' (Task 3 / Phase 5)
-                    await self._reap_stuck_indexing_jobs(db, tid)
+                    # 3. Reliability: Clear documents stuck in 'processing'
+                    await self._reap_stuck_indexing_jobs(db, tid_str)
                     
-                    # 5. [NEW] File Scavenger: Cleanup physical binaries with no DB record
-                    await self._purge_orphaned_files(db)
-                    
-                    # 6. Temporal Integrity: Archive stale documents (Task 2 / Phase 6)
-                    await self._archive_stale_documents(db, tid)
+                    # 4. Temporal Integrity: Archive stale documents
+                    await self._archive_stale_documents(db, tid_str)
                     
                     await db.commit()
                 except Exception as e:
                     await db.rollback()
-                    logger.error("tenant_compliance_enforcement_failed", tenant_id=tid, error=str(e))
+                    logger.error("tenant_compliance_enforcement_failed", tenant_id=tid_str, error=str(e))
+            
+            # 5. Global File Scavenger: Cleanup physical binaries with no DB record
+            try:
+                await self._purge_orphaned_files(db)
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.error("file_scavenger_failed", error=str(e))
 
     async def _process_tenant_retention(self, db, tenant_id: str, settings: dict) -> None:
         """Purge data older than retention threshold."""
@@ -147,7 +147,7 @@ class ComplianceWorker:
                 DELETE FROM messages
                 WHERE session_id IN (
                     SELECT id FROM sessions
-                    WHERE tenant_id = :tid AND created_at < :cutoff
+                    WHERE tenant_id = :tid AND started_at < :cutoff
                 )
                 """
             ),
@@ -159,7 +159,7 @@ class ComplianceWorker:
             text(
                 """
                 DELETE FROM sessions
-                WHERE tenant_id = :tid AND created_at < :cutoff
+                WHERE tenant_id = :tid AND started_at < :cutoff
                 """
             ),
             {"tid": tenant_id, "cutoff": cutoff},
@@ -189,7 +189,7 @@ class ComplianceWorker:
                 WHERE content NOT LIKE '[REDACTED_%'
                   AND session_id IN (
                     SELECT id FROM sessions
-                    WHERE tenant_id = :tid AND created_at < :cutoff
+                    WHERE tenant_id = :tid AND started_at < :cutoff
                 )
                 """
             ),
@@ -227,39 +227,10 @@ class ComplianceWorker:
 
     async def _process_tenant_self_destruct(self, db, tenant_id: str, metadata: dict, is_active: bool) -> None:
         """
-        Task 4: Optimized Tenant Self-Destruct.
-        Execute hard-delete of tenant data once grace period expires using bulk-wipe.
+        Deprecated: Tenant self-destruct is now handled via webhook from the Auth Service 
+        since the AI Orchestrator does not own the tenants table.
         """
-        if is_active or metadata.get("deletion_status") != "pending_grace_period":
-            return
-
-        hard_delete_at_str = metadata.get("hard_delete_at")
-        if not hard_delete_at_str:
-            return
-
-        hard_delete_at = datetime.fromisoformat(hard_delete_at_str.replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) < hard_delete_at:
-            return
-
-        logger.info("executing_tenant_hard_delete_optimized", tenant_id=tenant_id)
-
-        # 1. Task 4: Optimized Bulk Wipe RAG data from MCP Server
-        if self._mcp:
-            try:
-                await self._mcp.initialize()
-                # Optimized: Call the new bulk wipe endpoint instead of iterating over agents
-                success = await self._mcp.wipe_tenant_knowledge(tenant_id)
-                if success:
-                    logger.info("mcp_tenant_bulk_wipe_complete", tenant_id=tenant_id)
-                else:
-                    logger.warning("mcp_tenant_bulk_wipe_partially_failed", tenant_id=tenant_id)
-                await self._mcp.close()
-            except Exception as mcp_err:
-                logger.error("mcp_tenant_purge_failed", tenant_id=tenant_id, error=str(mcp_err))
-
-        # 2. Finally, delete the tenant record (cascades handle Agents, Playbooks, etc.)
-        await db.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": tenant_id})
-        logger.info("tenant_hard_deleted_complete", tenant_id=tenant_id)
+        pass
 
     async def _purge_orphaned_files(self, db) -> None:
         """

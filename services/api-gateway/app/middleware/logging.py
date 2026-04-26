@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
+
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.services.audit_service import mask_sensitive_data
+from app.utils.pii import mask_pii as mask_sensitive_data
 
 logger = structlog.get_logger(__name__)
 

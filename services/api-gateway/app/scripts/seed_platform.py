@@ -1,17 +1,15 @@
 import asyncio
 import os
 import uuid
-import json
-from datetime import datetime, timezone
+
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal, init_db
-from app.models.user import User
-from app.models.tenant import Tenant, TenantUsage
 from app.models.platform import PlatformSetting
-from app.services.auth_service import auth_service
+from app.models.tenant import Tenant, TenantUsage
+from app.models.user import User
 from app.services.admin_service import DEFAULT_ROLES as ROLES
+from app.services.auth_service import auth_service
 
 # billing.py PLANS (copying here for seeding)
 PLANS = {

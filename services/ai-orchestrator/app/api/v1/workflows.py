@@ -23,10 +23,10 @@ from typing import Optional
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, AsyncSessionLocal
 from app.models.agent import Agent
 from app.models.workflow import Workflow, WorkflowExecution
 from app.schemas.workflow import (
@@ -64,8 +64,6 @@ def _restricted_agent_id(request: Request) -> uuid.UUID | None:
 
 async def _get_db_session(tenant_id: str) -> AsyncSession:
     """Helper to yield a tenant-scoped DB session inside endpoint logic."""
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import text
     session = AsyncSessionLocal()
     await session.execute(
         text("SELECT set_config('app.current_tenant_id', :tid, true)"),
@@ -187,7 +185,7 @@ async def create_workflow(
 async def list_workflows(
     agent_id: uuid.UUID,
     request: Request,
-    active_only: bool = False,
+    status: Optional[str] = "ACTIVE",
 ):
     tid_str = _tenant_id(request)
     tid = uuid.UUID(tid_str)
@@ -200,8 +198,13 @@ async def list_workflows(
             Workflow.agent_id == agent_id,
             Workflow.tenant_id == tid,
         )
-        if active_only:
-            q = q.where(Workflow.is_active.is_(True))
+        if status:
+            from app.models.workflow import WorkflowStatus
+            try:
+                q = q.where(Workflow.lifecycle_status == WorkflowStatus(status.upper()))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+        
         q = q.order_by(Workflow.created_at.desc())
 
         result = await db.execute(q)
@@ -311,32 +314,87 @@ async def update_workflow(
 # Delete (deactivate) workflow
 # ---------------------------------------------------------------------------
 
+@router.post("/{agent_id}/workflows/{flow_id}/archive", response_model=WorkflowResponse)
 @router.delete("/{agent_id}/workflows/{flow_id}", status_code=204)
-async def delete_workflow(
+async def archive_workflow(
     agent_id: uuid.UUID,
     flow_id: uuid.UUID,
     request: Request,
+    hard: bool = False,
 ):
+    """Archive or delete a workflow.
+    
+    If hard=True, permanently deletes. Default is soft-archive.
+    """
     tid_str = _tenant_id(request)
     tid = uuid.UUID(tid_str)
 
     db = await _get_db_session(tid_str)
     try:
+        from app.models.workflow import WorkflowStatus
         wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
 
+        # 1. Deregister MCP tool if active
         if wf.is_active:
             registry = WorkflowRegistry(db)
             await registry.deregister(wf)
             wf.is_active = False
 
+        if hard:
+            # 2. Permanent Delete
+            await db.delete(wf)
+            logger.info("workflow_hard_deleted", flow_id=str(flow_id), agent_id=str(agent_id))
+        else:
+            # 2. Update lifecycle state to ARCHIVED
+            wf.lifecycle_status = WorkflowStatus.ARCHIVED
+            logger.info("workflow_archived", flow_id=str(flow_id), agent_id=str(agent_id))
+        
         await db.commit()
+        if not hard:
+            await db.refresh(wf)
+        return wf
     except HTTPException:
         await db.rollback()
         raise
-    except Exception as exc:
+    except Exception as e:
         await db.rollback()
-        logger.error("delete_workflow_error", error=str(exc))
-        raise HTTPException(status_code=500, detail="Failed to delete workflow.")
+        logger.error("workflow_archive_failed", error=str(e), flow_id=str(flow_id))
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        await db.close()
+
+
+@router.post("/{agent_id}/workflows/{flow_id}/restore", response_model=WorkflowResponse)
+async def restore_workflow(
+    agent_id: uuid.UUID,
+    flow_id: uuid.UUID,
+    request: Request,
+):
+    """Restore an archived workflow to ACTIVE state."""
+    tid_str = _tenant_id(request)
+    tid = uuid.UUID(tid_str)
+
+    db = await _get_db_session(tid_str)
+    try:
+        from app.models.workflow import WorkflowStatus
+        wf = await _get_workflow_or_404(db, flow_id, agent_id, tid, request=request)
+
+        if wf.lifecycle_status != WorkflowStatus.ARCHIVED:
+            raise HTTPException(status_code=400, detail="Only archived workflows can be restored.")
+
+        wf.lifecycle_status = WorkflowStatus.ACTIVE
+        # Note: does NOT auto-activate (register tool). User must call /activate.
+        
+        await db.commit()
+        await db.refresh(wf)
+        return wf
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("workflow_restore_failed", error=str(e), flow_id=str(flow_id))
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         await db.close()
 

@@ -8,19 +8,21 @@ their configured 'audit_retention_days'.
 Usage:
     python3 app/scripts/purge_audit_logs.py [--dry-run]
 """
-import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import select, delete
-from sqlalchemy.ext.asyncio import AsyncSession
+
 import structlog
+from sqlalchemy import delete, func, select
+
+from app.core.database import AsyncSessionLocal
+from app.models.audit_log import AuditLog
+from app.models.tenant import Tenant
+from app.services.audit_service import audit_log
 
 logger = structlog.get_logger(__name__)
 
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import AsyncSessionLocal
-from app.models.tenant import Tenant
-from app.models.audit_log import AuditLog
+
+
 
 async def purge_logs(dry_run: bool = False):
     async with AsyncSessionLocal() as session:
@@ -38,7 +40,7 @@ async def purge_logs(dry_run: bool = False):
                 cutoff_date = now - timedelta(days=retention_days)
                 
                 # Count records to be deleted for logging
-                from sqlalchemy import func
+                # Count records to be deleted for logging
                 count_q = select(func.count(AuditLog.id)).where(
                     AuditLog.tenant_id == tenant.id,
                     AuditLog.created_at < cutoff_date
@@ -113,7 +115,7 @@ async def purge_logs(dry_run: bool = False):
         # ── 3. Audit of Audit ──────────────────────────────────────────────
         # Required by SOC 2 for integrity verification: log that a purge happened.
         if total_deleted > 0 and not dry_run:
-            from app.services.audit_service import audit_log
+
             # Re-init a session if needed or use internal helper
             await audit_log(
                 session,

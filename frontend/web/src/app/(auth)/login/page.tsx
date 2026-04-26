@@ -92,7 +92,7 @@ function LoginForm() {
             </div>
             <span className="text-2xl font-bold text-white">AscenAI</span>
           </Link>
-          <p className="text-gray-400 mt-3">Sign in to your account TEST forgot password link below</p>
+          <p className="text-gray-400 mt-3">Sign in to your account</p>
         </div>
 
         <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-8 backdrop-blur-sm">

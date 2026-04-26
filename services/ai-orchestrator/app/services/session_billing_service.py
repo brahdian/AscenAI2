@@ -54,6 +54,14 @@ class SessionBillingService:
         }
 
     async def maybe_send_greeting(self, agent: Agent, session: AgentSession, playbook: Optional[AgentPlaybook]) -> Optional[str]:
+        # If the session was initialized via the /init endpoint, the greeting was already
+        # surfaced to the client directly. Skip re-emitting it into the DB/memory,
+        # which would cause the LLM to regurgitate it at the start of its first response.
+        _raw_meta_check = getattr(session, "metadata_", None)
+        _meta_check = dict(_raw_meta_check) if isinstance(_raw_meta_check, dict) else {}
+        if _meta_check.get("_greeting_sent"):
+            return None
+
         count_result = await self.db.execute(
             select(func.count()).select_from(Message).where(
                 Message.session_id == session.id
@@ -71,21 +79,30 @@ class SessionBillingService:
         )
 
         if is_voice:
-            voice_greeting_url = agent_cfg.get("voice_greeting_url")
+            # V01: Voice agents prioritize the explicit IVR prompt (Greeting + Menu) if configured.
+            ivr_prompt_raw = agent_cfg.get("ivr_language_prompt")
             custom_greeting_raw = agent_cfg.get("greeting_message")
+            voice_greeting_url = agent_cfg.get("voice_greeting_url")
 
-            # FIX-08: Single variable fetch — used by both the pre-generated and JIT branches.
-            # Only query the DB when there's actually a text greeting to resolve.
-            variables = []
-            if voice_greeting_url or custom_greeting_raw:
-                result_vars = await self.db.execute(
-                    select(AgentVariable).where(AgentVariable.agent_id == agent.id)
-                )
-                variables = result_vars.scalars().all()
+            # Fetch variables once (used by all branches below)
+            result_vars = await self.db.execute(
+                select(AgentVariable).where(AgentVariable.agent_id == agent.id)
+            )
+            variables = result_vars.scalars().all()
 
-            if voice_greeting_url:
+            if ivr_prompt_raw:
+                # 1. Custom IVR prompt (contains both greeting and menu)
+                greeting = resolve_agent_variables(ivr_prompt_raw, agent, variables, clean=True)
+                _raw_meta = getattr(session, "metadata_", None)
+                new_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
+                new_meta["_greeting_mode"] = "custom_ivr"
+                session.metadata_ = new_meta
+                logger.info("voice_greeting_custom_ivr", agent_id=str(agent.id))
+            elif voice_greeting_url:
+                # 2. Pre-generated audio URL
                 greeting_text = custom_greeting_raw or ""
-                new_meta = dict(session.metadata_ or {})
+                _raw_meta = getattr(session, "metadata_", None)
+                new_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
                 new_meta["_voice_greeting_url"] = voice_greeting_url
                 new_meta["_greeting_mode"] = "pre_generated"
                 if agent_cfg.get("ivr_language_url"):
@@ -94,25 +111,29 @@ class SessionBillingService:
 
                 if not greeting_text:
                     greeting_text = f"[Pre-generated greeting audio: {voice_greeting_url}]"
-
                 greeting = resolve_agent_variables(greeting_text, agent, variables, clean=True)
+                logger.info("voice_greeting_pre_generated", agent_id=str(agent.id), url=voice_greeting_url)
             elif custom_greeting_raw:
-                greeting = resolve_agent_variables(custom_greeting_raw, agent, variables, clean=True)
-                new_meta = dict(session.metadata_ or {})
-                new_meta["_greeting_mode"] = "jit_tts"
+                # 3. Custom chat greeting + Generated IVR options
+                from app.guardrails.voice_agent_guardrails import generate_ivr_language_prompt
+                greeting_prefix = resolve_agent_variables(custom_greeting_raw, agent, variables, clean=True)
+                ivr_generated = await generate_ivr_language_prompt(self.db, agent_cfg.get("supported_languages"))
+                greeting = f"{greeting_prefix} {ivr_generated}".strip()
+                
+                _raw_meta = getattr(session, "metadata_", None)
+                new_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
+                new_meta["_greeting_mode"] = "jit_tts_combined"
                 session.metadata_ = new_meta
-                logger.info(
-                    "voice_greeting_jit",
-                    agent_id=str(agent.id),
-                    reason="no_pre_generated_url",
-                )
+                logger.info("voice_greeting_jit_combined", agent_id=str(agent.id))
             else:
-                # No custom greeting at all: fall back to computed multilingual opening.
+                # 4. Fallback to full platform-computed multilingual opening
                 from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
                 greeting, _, _ = await get_or_compute_voice_strings(self.db, agent)
-                new_meta = dict(session.metadata_ or {})
+                _raw_meta = getattr(session, "metadata_", None)
+                new_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
                 new_meta["_greeting_mode"] = "computed"
                 session.metadata_ = new_meta
+                logger.info("voice_greeting_computed", agent_id=str(agent.id))
 
             # Ensure voice agents always have a greeting (platform requirement).
             if not greeting:
@@ -152,7 +173,8 @@ class SessionBillingService:
         # If the caller disconnects before sending a message, turn_count stays 0
         # and update_analytics is never called — so no billing occurs.
         # This flag is read by the orchestrator to gate the is_new_session flag.
-        new_meta = dict(session.metadata_ or {})
+        _raw_meta = getattr(session, "metadata_", None)
+        new_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
         new_meta["_greeting_only"] = True
         session.metadata_ = new_meta
 

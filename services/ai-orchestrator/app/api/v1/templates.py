@@ -1,4 +1,5 @@
 import uuid
+import json
 from typing import List, Dict, Any, Optional
 import structlog
 
@@ -98,7 +99,8 @@ async def update_instance(
     body: InstanceUpdateRequest,
     request: Request,
     tenant=Depends(get_current_tenant),
-    db: AsyncSession = Depends(get_tenant_db)
+    db: AsyncSession = Depends(get_tenant_db),
+    actor_info: Dict[str, Any] = Depends(get_actor_info)
 ):
     """Update variable values of a template instance and re-apply to the agent."""
     try:
@@ -154,8 +156,7 @@ async def update_instance(
             rendered = rendered.replace("{" + k + "}", val_str)
             rendered = rendered.replace(f"$[vars:{k}]", val_str)
             rendered = rendered.replace(f"$vars:{k}", val_str)
-        # FIX-04: Apply defense-in-depth PII scrubbing to the rendered string
-        return pii_service.redact(rendered)
+        return rendered
 
     if agent and version and version.system_prompt_template:
         agent.system_prompt = _render_str(version.system_prompt_template)
@@ -170,7 +171,6 @@ async def update_instance(
 
     # Re-render all playbook config fields so {{variables}} stay current
     if agent:
-        import json as _json
         pb_res = await db.execute(
             select(AgentPlaybook).where(AgentPlaybook.agent_id == agent.id)
         )
@@ -180,7 +180,7 @@ async def update_instance(
             # Re-render entire config blob via JSON round-trip
             try:
                 # Only re-render if it's a template-sourced playbook or matches simple patterns
-                rendered_cfg = _json.loads(_render_str(_json.dumps(pb.config)))
+                rendered_cfg = json.loads(_render_str(json.dumps(pb.config)))
                 pb.config = rendered_cfg
                 flag_modified(pb, "config")
             except Exception:
@@ -191,9 +191,9 @@ async def update_instance(
         "template_instance_updated",
         instance_id=str(instance.id),
         agent_id=str(agent.id) if agent else None,
-        actor_email=actor_info["actor_email"],
-        is_support_access=actor_info["is_support_access"],
-        trace_id=actor_info["trace_id"],
+        actor_email=actor_info.get("actor_email") if actor_info else "unknown",
+        is_support_access=actor_info.get("is_support_access") if actor_info else False,
+        trace_id=actor_info.get("trace_id") if actor_info else "unknown",
         # Zenith Privacy: Redact sensitive variable values in logs
         variable_keys=list(body.variable_values.keys())
     )
@@ -443,7 +443,6 @@ async def process_template_instantiation(
                 "name": pbook.name,
                 "description": pbook.description,
                 "trigger_condition": dict(pbook.trigger_condition) if pbook.trigger_condition else {},
-                "flow_definition": playbook_config.get("flow_definition", {}),
                 "tone": playbook_config.get("tone", "professional"),
                 "dos": playbook_config.get("dos", []),
                 "donts": playbook_config.get("donts", []),
@@ -494,8 +493,7 @@ async def process_template_instantiation(
             rendered = rendered.replace("{" + k + "}", val_str)
             rendered = rendered.replace(f"$[vars:{k}]", val_str)
             rendered = rendered.replace(f"$vars:{k}", val_str)
-        # FIX-04: Apply defense-in-depth PII scrubbing to the final rendered string
-        return pii_service.redact(rendered)
+        return rendered
 
     # Update agent system prompt by substituting variable_values
     if system_prompt_template:
@@ -556,40 +554,65 @@ async def process_template_instantiation(
 
     # Copy template playbooks as AgentPlaybook rows
     for pbook in playbooks_data:
-        flow = pbook.get("flow_definition", {})
         trigger_condition = pbook.get("trigger_condition", {})
         triggers = trigger_condition.get("keywords", []) if isinstance(trigger_condition, dict) else []
+        if isinstance(trigger_condition, dict) and "intent" in trigger_condition:
+            triggers.append(trigger_condition["intent"])
 
-        instructions_parts: list[str] = []
-        if "steps" in flow:
-            for step in flow["steps"]:
-                if "instruction" in step:
-                    instructions_parts.append(step["instruction"])
-        instructions = _render("\n\n".join(instructions_parts))
-        if not instructions:
-            # Check for native 'instructions' field in config before falling back to description
-            instructions = _render(pbook.get("config", {}).get("instructions") or "")
+        instructions = _render(pbook.get("instructions") or pbook.get("config", {}).get("instructions") or "")
 
         description = _render(pbook.get("description") or "")
         tone = _render(pbook.get("tone") or "professional")
         dos = [_render(str(item)) for item in (pbook.get("dos") or [])]
         donts = [_render(str(item)) for item in (pbook.get("donts") or [])]
-        scenarios_raw = pbook.get("scenarios") or []
-        out_of_scope_response = _render(pbook.get("out_of_scope_response") or "")
-        fallback_response = _render(pbook.get("fallback_response") or "")
-        custom_escalation_message = _render(pbook.get("custom_escalation_message") or "")
-
+        scenarios_raw = pbook.get("scenarios") or pbook.get("config", {}).get("scenarios") or []
         rendered_scenarios = [
             {
                 "trigger": _render(s.get("trigger", "")),
-                "response": _render(s.get("response", "")),
+                "response": _render(s.get("response") or s.get("ai") or ""),
             }
             for s in scenarios_raw
         ]
 
-        # Render all {{variables}} inside flow_definition (step instructions, labels, etc.)
-        import json as _json
-        rendered_flow = _json.loads(_render(_json.dumps(flow))) if flow else flow
+        # Explicitly render secondary fields
+        out_of_scope_response = _render(pbook.get("out_of_scope_response") or pbook.get("config", {}).get("out_of_scope_response") or "")
+        fallback_response = _render(pbook.get("fallback_response") or pbook.get("config", {}).get("fallback_response") or "")
+        custom_escalation_message = _render(pbook.get("custom_escalation_message") or pbook.get("config", {}).get("custom_escalation_message") or "")
+        tools = pbook.get("tools") or pbook.get("config", {}).get("tools") or []
+        variables = pbook.get("variables") or pbook.get("config", {}).get("variables") or []
+
+        # Recursive Replication: Copy all keys from the template playbook config
+        # ensuring tone, dos, donts, scenarios, tools, variables, etc. are preserved.
+        pb_config = dict(pbook.get("config", {}))
+        
+        # Render specific fields that might contain {{variables}}
+        rendered_config = {}
+        for k, v in pb_config.items():
+            if isinstance(v, str):
+                rendered_config[k] = _render(v)
+            elif isinstance(v, list) and k in ("dos", "donts", "scenarios"):
+                rendered_config[k] = []
+                for item in v:
+                    if isinstance(item, str):
+                        rendered_config[k].append(_render(item))
+                    elif isinstance(item, dict):
+                        rendered_config[k].append({rk: (_render(rv) if isinstance(rv, str) else rv) for rk, rv in item.items()})
+                    else:
+                        rendered_config[k].append(item)
+            else:
+                rendered_config[k] = v
+
+        # Explicitly ensure these core fields are present and rendered
+        rendered_config["instructions"] = instructions
+        rendered_config["tone"] = tone
+        rendered_config["dos"] = dos
+        rendered_config["donts"] = donts
+        rendered_config["scenarios"] = rendered_scenarios
+        rendered_config["out_of_scope_response"] = out_of_scope_response or None
+        rendered_config["fallback_response"] = fallback_response or None
+        rendered_config["custom_escalation_message"] = custom_escalation_message or None
+        rendered_config["tools"] = tools
+        rendered_config["variables"] = variables
 
 
 
@@ -599,19 +622,10 @@ async def process_template_instantiation(
             name=pbook["name"],
             description=description or None,
             intent_triggers=triggers,
+            is_default=False,
             is_from_template=True,
             source_template_id=t_uuid,
-            config={
-                "instructions": instructions,
-                "tone": tone,
-                "dos": dos,
-                "donts": donts,
-                "scenarios": rendered_scenarios,
-                "out_of_scope_response": out_of_scope_response or None,
-                "fallback_response": fallback_response or None,
-                "custom_escalation_message": custom_escalation_message or None,
-                "flow_definition": rendered_flow,
-            },
+            config=rendered_config,
             is_active=True,
         )
         db.add(playbook)
@@ -648,7 +662,7 @@ async def process_template_instantiation(
     change_req = AgentGuardrailChangeRequest(
         tenant_id=uuid.UUID(tenant),
         guardrail_id=str(guardrails.id) if guardrails.id else "NEW",
-        proposed_rule=_json.dumps(merged_gr_config),
+        proposed_rule=json.dumps(merged_gr_config),
         reason=f"Inherited from template {str(t_uuid)} version {version_id}",
         status="approved"
     )

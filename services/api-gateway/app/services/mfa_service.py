@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import base64
+import io
+import uuid
+from datetime import datetime, timezone
+
 import pyotp
 import qrcode
-import io
-import base64
-import uuid
-from datetime import datetime, timedelta, timezone
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.models.user import MFASecret
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.config import settings
 from app.core.security import hash_secret
+from app.models.user import MFABackupCode, MFASecret
+
 
 class MFAService:
     """

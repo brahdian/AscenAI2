@@ -1,38 +1,33 @@
 import asyncio
-import time
-import uuid
+import os as _os
 from contextlib import asynccontextmanager
 
 import sentry_sdk
 import structlog
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
 from sentry_sdk.integrations.fastapi import FastApiIntegration
-from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from sentry_sdk.integrations.redis import RedisIntegration
-from starlette.middleware.base import BaseHTTPMiddleware
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
+from app.api.v1 import admin as admin_router
+from app.api.v1 import api_keys, auth, billing, compliance, proxy, team, tenants, webhooks
+from app.api.v1 import channels as channels_router
+from app.api.v1 import compliance_audit as compliance_audit_router
+from app.api.v1 import console as console_router
+from app.api.v1 import playbooks as playbooks_router
 from app.core.config import settings
 from app.core.database import close_db, init_db
 from app.core.scheduler import BACKGROUND_TASKS
 from app.core.tracing import TracingMiddleware
 from app.middleware.auth import AuthMiddleware
+from app.middleware.logging import RequestLoggingMiddleware
 from app.middleware.rate_limiter import RateLimitMiddleware
 from app.middleware.security import SecurityHeadersMiddleware
-from app.middleware.logging import RequestLoggingMiddleware
-
-from app.api.v1 import auth, tenants, api_keys, webhooks, proxy, team, billing, compliance
-from app.api.v1 import channels as channels_router
-from app.api.v1 import admin as admin_router
-from app.api.v1 import compliance_audit as compliance_audit_router
-from app.api.v1 import playbooks as playbooks_router
-from app.api.v1 import console as console_router
-from app.utils.pii import mask_sensitive_data
-
 
 logger = structlog.get_logger(__name__)
 
@@ -85,11 +80,11 @@ def _setup_opentelemetry(app: FastAPI) -> None:
         return
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
         resource = Resource.create({"service.name": "api-gateway", "service.version": settings.APP_VERSION})
         provider = TracerProvider(resource=resource)
@@ -242,7 +237,7 @@ app.include_router(playbooks_router.router, prefix="/api/v1", tags=["playbooks"]
 app.include_router(console_router.router, prefix="/api/v1", tags=["console"])
 
 # ── Static assets — widget.js served at /widget/widget.js ─────────────────
-import os as _os
+
 _static_dir = _os.path.join(_os.path.dirname(__file__), "..", "static")
 if _os.path.isdir(_static_dir):
     app.mount("/widget", StaticFiles(directory=_static_dir), name="widget")
@@ -276,8 +271,9 @@ async def health_startup(request: Request):
     failed = False
 
     try:
-        from app.core.database import AsyncSessionLocal
         from sqlalchemy import text
+
+        from app.core.database import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))
         checks["db"] = "ok"
@@ -306,8 +302,9 @@ async def health_ready(request: Request):
     failed = False
 
     try:
-        from app.core.database import AsyncSessionLocal
         from sqlalchemy import text
+
+        from app.core.database import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))
         checks["db"] = "ok"

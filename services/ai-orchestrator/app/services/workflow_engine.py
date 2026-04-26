@@ -1365,32 +1365,7 @@ class WorkflowEngine:
         cfg = node.config
         expression = cfg.get("expression", "False")
         output_variable = cfg.get("output_variable", "code_result")
-        
-        # Use safe simpleeval with restricted functions only
-        try:
-            from simpleeval import simple_eval
-            result = simple_eval(
-                expression,
-                names=dict(execution.context),
-                functions={
-                    "int": int,
-                    "float": float,
-                    "str": str,
-                    "bool": bool,
-                    "len": len,
-                    "sum": sum,
-                    "min": min,
-                    "max": max,
-                    "round": round,
-                }
-            )
-            return NodeResult(
-                output={output_variable: result},
-                next_node_id=self._resolve_next(edge_map, node.id, "default"),
-            )
-        except Exception as exc:
-            logger.warning("workflow_code_exec_failed", expr=expression, error=str(exc))
-            raise RuntimeError(f"Code execution failed: {exc}") from exc
+        on_error = cfg.get("on_error", "fail")
 
         try:
             from simpleeval import EvalWithCompoundTypes
@@ -1411,12 +1386,16 @@ class WorkflowEngine:
                 names=safe_names,
                 functions=safe_functions,
             )
-            result = evaluator.eval(code)
+            result = evaluator.eval(expression)
+            return NodeResult(
+                output={output_variable: result},
+                next_node_id=self._resolve_next(edge_map, node.id, "default"),
+            )
         except Exception as exc:
             logger.warning(
                 "workflow_code_exec_error",
                 node_id=node.id,
-                code=code[:200],
+                expr=expression[:200],
                 error=str(exc),
             )
             if on_error == "skip":
@@ -1425,11 +1404,6 @@ class WorkflowEngine:
                     next_node_id=self._resolve_next(edge_map, node.id, "default"),
                 )
             raise RuntimeError(f"CODE_EXEC failed: {exc}") from exc
-
-        return NodeResult(
-            output={output_variable: result},
-            next_node_id=self._resolve_next(edge_map, node.id, "default"),
-        )
 
 
     # ------------------------------------------------------------------

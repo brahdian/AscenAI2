@@ -1,5 +1,6 @@
-import redis.asyncio as aioredis
 from typing import Optional
+
+import redis.asyncio as aioredis
 import structlog
 
 from app.core.config import settings

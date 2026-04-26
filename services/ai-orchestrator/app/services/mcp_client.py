@@ -11,6 +11,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from app.core.config import settings
 from app.core.internal_auth import generate_internal_token
+from app.core.metrics import (
+    CONTEXT_RETRIEVALS,
+    CONTEXT_ITEMS_RETURNED,
+    TOOL_EXECUTIONS,
+    TOOL_LATENCY,
+    MCP_CIRCUIT_OPENS,
+)
 
 logger = structlog.get_logger(__name__)
 

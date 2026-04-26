@@ -157,63 +157,60 @@ class GuardrailService:
         return None
 
     async def apply_output_guardrails(
-        self, text: str, agent: Agent, guardrails: Optional[dict], 
-        platform_guardrails: Optional[dict], pii_ctx: PIIContext, 
+        self, text: str, agent: Agent, guardrails: Optional[dict],
+        platform_guardrails: Optional[dict], pii_ctx: PIIContext,
         session_id: str, hipaa_mode: bool = False,
         request_id: Optional[str] = None
     ) -> tuple[str, list[dict]]:
         """Apply output sanitization, PII restoration, and record triggers."""
-        actions_taken = []
-        final_text = text
+        actions_taken: list[dict] = []
+        response = text
 
+        # Step 1: Always restore PII pseudo-values back to real values in the output
+        if pii_ctx is not None and pii_ctx.has_mappings():
+            response = pii_service.restore_pii(response, pii_ctx, session_id)
+
+        # Step 2: Agent-level output guardrails
         if guardrails and guardrails.get("is_active", True):
-            # 1. PII Restoration
-            final_text = pii_service.restore_pii(final_text, pii_ctx, session_id, hipaa_mode=hipaa_mode)
-
-            # 2. Blocked Keywords in Output
-            for kw in guardrails.get("blocked_keywords", []):
-                if kw.lower() in final_text.lower():
-                    final_text = final_text.replace(kw, "[REDACTED]")
+            for kw in (guardrails.get("blocked_keywords") or []):
+                if kw.lower() in response.lower():
+                    response = response.replace(kw, "[REDACTED]")
                     actions_taken.append({"type": "blocked_keyword_redacted", "keyword": kw})
-                    await self.record_event(agent, session_id, "output_keyword_redacted", {"keyword": kw}, request_id=request_id)
-            for topic in (guardrails.get("blocked_topics", [])):
-                if topic.lower() in final_text.lower():
-                    await self.record_event(agent, session_id, "output_leak_prevented_topic", {"topic": topic}, request_id=request_id)
+                    await self.record_event(
+                        agent, session_id, "output_keyword_redacted",
+                        {"keyword": kw}, request_id=request_id
+                    )
+            for topic in (guardrails.get("blocked_topics") or []):
+                if topic.lower() in response.lower():
+                    await self.record_event(
+                        agent, session_id, "output_leak_prevented_topic",
+                        {"topic": topic}, request_id=request_id
+                    )
                     return "I cannot provide information on that topic.", [{"type": "output_blocked_topic"}]
-                    
+
+            max_len = guardrails.get("max_response_length")
+            if max_len and len(response) > max_len:
+                response = response[:max_len].rstrip() + "…"
+                actions_taken.append({"type": "length_cap"})
+
+
+
+            disclaimer = guardrails.get("require_disclaimer")
+            if disclaimer:
+                response = response + "\n\n" + disclaimer
+                actions_taken.append({"type": "disclaimer_appended"})
+
+        # Step 3: Platform-level output guardrails
         if platform_guardrails:
-            for kw in platform_guardrails.get("blocked_keywords", []):
-                if kw.lower() in msg_lower:
-                    await self.record_event(agent, session_id, "platform_output_leak_prevented", {"keyword": kw})
-                    return "I am unable to assist with this request.", ["platform_output_blocked"]
+            for kw in (platform_guardrails.get("blocked_keywords") or []):
+                if kw.lower() in response.lower():
+                    await self.record_event(
+                        agent, session_id, "platform_output_leak_prevented",
+                        {"keyword": kw}, request_id=request_id
+                    )
+                    return "I am unable to assist with this request.", [{"type": "platform_output_blocked"}]
 
-        # Step 1: Restore any remaining PII tokens in the response always if context exists
-        if pii_ctx is not None:
-            parser = pii_service.create_streaming_parser(pii_ctx, session_id)
-            restored = parser.process_chunk(response) + parser.flush()
-            if restored != response:
-                response = restored
-                actions.append("pii_pseudonymization_restored")
-
-        if not guardrails:
-            return response, actions
-
-        if guardrails.get("max_response_length") and len(response) > guardrails.get("max_response_length"):
-            response = response[:guardrails.get("max_response_length")].rstrip() + "…"
-            actions.append("length_cap")
-
-        if guardrails.get("pii_redaction"):
-            redacted = pii_service.redact(response, hipaa_mode=hipaa_mode)
-            if redacted != response:
-                response = redacted
-                actions.append("pii_redacted")
-                await self.record_event(agent, session_id, "output_pii_redacted", {"hipaa_mode": hipaa_mode})
-
-        if guardrails.get("require_disclaimer"):
-            response = response + "\n\n" + guardrails.get("require_disclaimer")
-            actions.append("disclaimer_appended")
-
-        return response, actions
+        return response, actions_taken
         
     async def check_emergency(self, user_message: str, agent: Agent, session_id: str, request_id: Optional[str] = None) -> Optional[str]:
         business_type = (agent.business_type or "").lower().replace(" ", "_")

@@ -83,6 +83,30 @@ services:
           memory: 256M
 
   # ---------------------------------------------------------------------------
+  # Observability (Jaeger for Distributed Tracing)
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Query UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=info
+    networks:
+      - backend-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
   # Backend Services
   # ---------------------------------------------------------------------------
   api-gateway:
@@ -194,6 +218,8 @@ services:
         condition: service_healthy
       mcp-server:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -f --max-time 10 http://localhost:8002/health || exit 1"]
       interval: 20s

@@ -70,6 +70,13 @@ class StepStatus(str, enum.Enum):
     SKIPPED   = "SKIPPED"
 
 
+class WorkflowStatus(str, enum.Enum):
+    DRAFT    = "DRAFT"
+    ACTIVE   = "ACTIVE"
+    ARCHIVED = "ARCHIVED"
+    DELETED  = "DELETED"  # Soft-delete for compliance/tombstoning
+
+
 # ---------------------------------------------------------------------------
 # Workflow — definition (the "program")
 # ---------------------------------------------------------------------------
@@ -84,6 +91,7 @@ class Workflow(Base):
     __table_args__ = (
         Index("ix_wf_agent_active", "agent_id", "is_active"),
         Index("ix_wf_tenant_id", "tenant_id"),
+        Index("ix_wf_lifecycle", "agent_id", "lifecycle_status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -100,7 +108,13 @@ class Workflow(Base):
     # Shown to the LLM as the tool description when is_active=True
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Lifecycle status (Zenith Pillar 4: Hardening)
+    lifecycle_status: Mapped[WorkflowStatus] = mapped_column(
+        SAEnum(WorkflowStatus), default=WorkflowStatus.ACTIVE, nullable=False
+    )
+
+    # Legacy flag for tool registration compatibility
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Bumped on every PUT — executions pin to the version at creation time
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 

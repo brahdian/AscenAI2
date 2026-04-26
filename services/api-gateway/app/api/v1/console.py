@@ -10,26 +10,21 @@ Endpoints:
 """
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import desc, select, func
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
-from app.core.rbac import require_role, _ROLE_LEVELS
-from app.services.audit_service import list_audit_logs, audit_log
-from app.utils.pii import mask_sensitive_data, anonymize_identifier
-
-
-
+from app.core.rbac import _ROLE_LEVELS, require_role
+from app.core.security import get_current_tenant, get_tenant_db
+from app.services.audit_service import audit_log, list_audit_logs
+from app.utils.pii import anonymize_identifier, mask_sensitive_data
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/console")
@@ -38,7 +33,7 @@ router = APIRouter(prefix="/console")
 
 
 
-def sanitize_csv_field(val: any) -> str:
+def sanitize_csv_field(val: Any) -> str:
     """Escape potential formula injection triggers in CSV fields."""
     s = str(val) if val is not None else ""
     # If the field starts with a formula trigger, prefix with a single quote.
@@ -202,6 +197,7 @@ async def get_tenant_audit_export(
 
     # 1. Fetch total count first (to settle the X-Export-Truncated header)
     from sqlalchemy import func as sqlfunc
+
     from app.services.audit_service import _build_audit_query
     
     count_q = select(sqlfunc.count()).select_from(
@@ -224,8 +220,8 @@ async def get_tenant_audit_export(
     from app.services.audit_service import stream_audit_logs
     
     async def csv_generator():
-        import io
         import csv
+        import io
         output = io.StringIO()
         writer = csv.writer(output)
         

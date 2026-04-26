@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List
+from typing import Any, List
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     # CORS — override with comma-separated list via ALLOWED_ORIGINS env var in production
     # Example: ALLOWED_ORIGINS="https://app.yourdomain.com,https://admin.yourdomain.com"
     FRONTEND_URL: str = "http://lvh.me:3000"
-    ALLOWED_ORIGINS: any = [
+    ALLOWED_ORIGINS: Any = [
         "http://lvh.me:3000",
         "http://admin.lvh.me:3000",
         "http://app.lvh.me:3000",
@@ -137,7 +137,7 @@ class Settings(BaseSettings):
 
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
-    def validate_allowed_origins(cls, v: any) -> list[str]:
+    def validate_allowed_origins(cls, v: Any) -> list[str]:
         if isinstance(v, str):
             return [i.strip() for i in v.split(",")]
         return v

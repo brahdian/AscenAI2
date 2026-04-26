@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import hmac
 import ipaddress
-import json
 import secrets
 import urllib.parse
 import uuid
@@ -14,11 +10,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog import get_logger
 
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
-from app.models.user import User, Webhook
-from app.schemas.auth import WebhookCreateRequest, WebhookCreatedResponse, WebhookResponse, WebhookUpdateRequest
-from app.services.auth_service import auth_service
+from app.core.security import get_current_tenant, get_tenant_db
+from app.models.user import Webhook
+from app.schemas.auth import (
+    WebhookCreatedResponse,
+    WebhookCreateRequest,
+    WebhookResponse,
+    WebhookUpdateRequest,
+)
 
 logger = get_logger(__name__)
 

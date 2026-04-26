@@ -78,6 +78,7 @@ class ChatRequest(BaseModel):
     agent_id: str = Field(..., description="UUID of the agent to use")
     message: str = Field(..., max_length=10_000, description="The user message")
     channel: str = Field("text", description="Channel: text, voice, or web")
+    test_mode: bool = Field(False, description="If True, bypasses log redaction for quality review")
     customer_identifier: Optional[str] = Field(
         None, description="Phone, email, or anonymous identifier"
     )
@@ -158,6 +159,33 @@ class StreamChatEvent(BaseModel):
     session_id: str
 
 
+class SessionInitRequest(BaseModel):
+    """Request body for POST /chat/init — creates a session and returns greetings."""
+    agent_id: str = Field(..., description="UUID of the agent to initialise a session for")
+    channel: str = Field("chat", description="Channel: chat or voice")
+    customer_identifier: Optional[str] = Field(
+        None, description="Phone, email, or anonymous identifier for the caller"
+    )
+    test_mode: bool = Field(False, description="If True, marks session as a test run")
+
+
+class SessionInitResponse(BaseModel):
+    """Response from POST /chat/init."""
+    session_id: str = Field(..., description="Newly created (or resumed) session ID")
+    # Greeting texts — display only the one matching the active channel
+    chat_greeting: str = Field(..., description="Greeting message to display in chat mode")
+    voice_greeting: str = Field(..., description="Greeting/IVR prompt to read in voice mode")
+    # Language configuration
+    language: str = Field("en", description="Primary agent language code")
+    supported_languages: list[str] = Field(
+        default_factory=list,
+        description="Additional language codes the agent can handle",
+    )
+    auto_detect_language: bool = Field(
+        False, description="Whether the agent auto-detects the caller's language"
+    )
+
+
 class AgentCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
@@ -233,6 +261,7 @@ class AgentUpdate(BaseModel):
     voice_greeting_url: Optional[str] = None
     ivr_language_url: Optional[str] = None
     voice_system_prompt: Optional[str] = None
+    opening_preview: Optional[str] = Field(None, description="Custom override for the pre-computed opening greeting.")
     tools: Optional[list[str]] = None
     knowledge_base_ids: Optional[list[str]] = None
     llm_config: Optional[LLMConfig] = None

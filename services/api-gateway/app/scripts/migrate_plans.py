@@ -1,8 +1,10 @@
 import asyncio
-import uuid
-from sqlalchemy import select, update
+
+from sqlalchemy import update
+
 from app.core.database import AsyncSessionLocal
 from app.models.tenant import Tenant
+
 
 async def migrate_plans():
     async with AsyncSessionLocal() as db:

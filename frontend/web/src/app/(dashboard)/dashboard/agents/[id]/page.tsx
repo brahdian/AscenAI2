@@ -98,6 +98,7 @@ export default function AgentDetailPage() {
   // Overview form state
   const [formData, setFormData] = useState<Record<string, unknown>>({})
   const [saving, setSaving] = useState(false)
+  const [testMode, setTestMode] = useState(false)
 
   // Template instance state
   const [variables, setVariables] = useState<Record<string, any>>({})
@@ -165,78 +166,110 @@ export default function AgentDetailPage() {
     return 'English'
   }
 
-  const handleChannelSelect = (channel: 'voice' | 'chat') => {
+  const getVoiceGreeting = () => {
+    if (!agent) return "Hi! How can I help you today?";
+    const cfg = agent.agent_config as Record<string, unknown> | undefined;
+    
+    // V01: Match backend prioritization (session_billing_service.py)
+    // 1. Explicit IVR prompt (Greeting + Menu)
+    if (cfg?.ivr_language_prompt) return cfg.ivr_language_prompt as string;
+    
+    // 2. Computed greeting from backend (includes auto-generated language options)
+    if (agent.computed_greeting) return agent.computed_greeting;
+    
+    // 3. Simple fallback to chat greeting or default
+    return agent.greeting_message || "Hi! How can I help you today?";
+  };
+
+  const getChatGreeting = () => {
+    if (!agent) return "Hi! How can I help you today?";
+    return agent.greeting_message || "Hi! How can I help you today?";
+  };
+
+  const initSession = async (channel: 'voice' | 'chat', isSwitch: boolean = false) => {
     if (!agent) return
+
+    setSelectedChannel(channel)
+
     // Cancel any in-flight TTS
     if (ttsCancelRef.current) {
       ttsCancelRef.current()
       ttsCancelRef.current = null
     }
-    setSelectedChannel(channel)
-    setSessionId(null)
-    setSessionStatus('active')
-    setMinutesUntilExpiry(null)
-    setShowExpiryWarning(false)
-    const greeting = agent.greeting_message || "Hi! How can I help you today?"
-    const langMsg = channel === 'voice'
-      ? "I'll be responding in English. Let me know if you'd prefer French or another language."
-      : null
 
-    const messages: ChatMessage[] = [{ role: 'assistant', content: greeting }]
-    if (langMsg) {
-      messages.push({ role: 'assistant', content: langMsg })
+    setChatLoading(true)
+    try {
+      const data = await chatApi.init({
+        agent_id: id,
+        channel,
+        test_mode: testMode,
+      })
+
+      setSessionId(data.session_id)
+      setSessionStatus('active')
+      setMinutesUntilExpiry(null)
+      setShowExpiryWarning(false)
+
+      const greetingContent = channel === 'voice' ? data.voice_greeting : data.chat_greeting
+
+      if (isSwitch) {
+        const switchMsg = channel === 'voice'
+          ? "Switched to Voice mode"
+          : "Switched to Chat mode"
+
+        setMessages((prev) => [
+          ...prev,
+          { role: 'system', content: switchMsg },
+          { role: 'assistant', content: greetingContent }
+        ])
+      } else {
+        setMessages([{ role: 'assistant', content: greetingContent }])
+      }
+    } catch (err) {
+      console.error("Init session failed:", err)
+      toast.error("Could not initialize session")
+      
+      // Fallback to local greeting logic if API fails
+      const greetingContent = channel === 'voice' ? getVoiceGreeting() : getChatGreeting();
+      if (isSwitch) {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'system', content: "Fallback mode (no session ID)" },
+          { role: 'assistant', content: greetingContent }
+        ])
+      } else {
+        setMessages([{ role: 'assistant', content: greetingContent }])
+      }
+    } finally {
+      setChatLoading(false)
     }
-    setMessages(messages)
+  }
+
+  const handleChannelSelect = (channel: 'voice' | 'chat') => {
+    initSession(channel)
   }
 
   const handleNewSession = () => {
-    // Cancel any in-flight TTS
-    if (ttsCancelRef.current) {
-      ttsCancelRef.current()
-      ttsCancelRef.current = null
-    }
-    setSessionId(null)
-    setSessionStatus('active')
-    setMinutesUntilExpiry(null)
-    setShowExpiryWarning(false)
-    if (selectedChannel && agent) {
-      const greeting = agent.greeting_message || "Hi! How can I help you today?"
-      const msgs: ChatMessage[] = [{ role: 'assistant', content: greeting }]
-      if (selectedChannel === 'voice') {
-        msgs.push({ role: 'assistant', content: "I'll be responding in English. Let me know if you'd prefer French or another language." })
-      }
-      setMessages(msgs)
+    if (selectedChannel) {
+      initSession(selectedChannel)
     } else {
       setMessages([])
+      setSessionId(null)
     }
   }
 
   const handleChannelSwitch = (newChannel: 'voice' | 'chat') => {
     if (newChannel === selectedChannel || !selectedChannel) return
-
-    // Cancel any in-flight TTS
-    if (ttsCancelRef.current) {
-      ttsCancelRef.current()
-      ttsCancelRef.current = null
-    }
-
-    const langMsg = newChannel === 'voice'
-      ? "I'll be responding in English. Let me know if you'd prefer French or another language."
-      : null
-
-    const switchMsg = newChannel === 'voice'
-      ? "Switched to Voice mode"
-      : "Switched to Chat mode"
-
-    setSelectedChannel(newChannel)
-    setMessages((prev) => {
-      const newMessages: ChatMessage[] = [...prev, { role: 'system', content: switchMsg }]
-      if (langMsg) {
-        newMessages.push({ role: 'assistant', content: langMsg })
-      }
-      return newMessages
-    })
+    initSession(newChannel, true)
   }
+
+  // Auto-initialize test session when clicking the Test tab
+  useEffect(() => {
+    if (activeTab === 'test' && messages.length === 0 && agent) {
+      // Default to chat for auto-init
+      initSession('chat')
+    }
+  }, [activeTab, messages.length, agent])
 
   const openFeedbackModal = (index: number, mode: 'rate' | 'correct') => {
     setFeedbackMessageIndex(index)
@@ -408,6 +441,7 @@ export default function AgentDetailPage() {
           message: userMsg,
           session_id: sessionId || undefined,
           channel: selectedChannel || 'chat',
+          test_mode: testMode,
         },
         (chunk, meta) => {
           streamed = true
@@ -451,6 +485,7 @@ export default function AgentDetailPage() {
           message: userMsg,
           session_id: sessionId || undefined,
           channel: selectedChannel || 'chat',
+          test_mode: testMode,
         })
         if (data.session_id) setSessionId(data.session_id)
         if (data.session_status) setSessionStatus(data.session_status)
@@ -851,7 +886,7 @@ export default function AgentDetailPage() {
           <div className="px-5 py-4 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between">
             <div>
               <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">
-                Test &quot;{agent.name}&quot;
+                Test &quot;{agent?.name}&quot;
               </h2>
               <div className="flex items-center gap-3 mt-0.5">
                 <p className="text-xs text-gray-500">Select a channel to start testing</p>
@@ -907,6 +942,23 @@ export default function AgentDetailPage() {
                   </button>
                 </div>
               )}
+              <div className="flex items-center gap-2 ml-4 pl-4 border-l border-gray-200 dark:border-gray-800">
+                <label className="flex items-center gap-2 cursor-pointer group" title="Enable unredacted log analysis for debugging">
+                  <div className="relative">
+                    <input
+                      type="checkbox"
+                      className="sr-only"
+                      checked={testMode}
+                      onChange={(e) => setTestMode(e.target.checked)}
+                    />
+                    <div className={`w-8 h-4 rounded-full transition-colors ${testMode ? 'bg-amber-500' : 'bg-gray-200 dark:bg-gray-700'}`} />
+                    <div className={`absolute left-0.5 top-0.5 w-3 h-3 bg-white rounded-full transition-transform ${testMode ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </div>
+                  <span className={`text-[10px] font-bold uppercase tracking-widest transition-colors ${testMode ? 'text-amber-600 dark:text-amber-400' : 'text-gray-400'}`}>
+                    Test Mode
+                  </span>
+                </label>
+              </div>
             </div>
           </div>
 

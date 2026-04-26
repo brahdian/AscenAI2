@@ -31,6 +31,7 @@ from __future__ import annotations
 # Mapping of ISO 639-1 codes to their respective "please speak in [language]" phrases.
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import pii_service
+from app.services.settings_service import SettingsService
 
 
 async def generate_multilingual_greeting(
@@ -38,6 +39,7 @@ async def generate_multilingual_greeting(
     primary_language: str | None = None,
     supported_languages: list[str] | None = None,
     custom_greeting: str | None = None,
+    redact: bool = True
 ) -> str:
     """
     Generate the audible MANDATORY OPENING string based on selected languages and platform settings.
@@ -58,9 +60,16 @@ async def generate_multilingual_greeting(
     prefix_map = lang_config.get("assist_prefixes", {})
     lang_data = lang_config.get("languages", [])
     
-    active_langs = [l for l in langs if l in greeting_map]
+    # Check against the base language (e.g., 'fr-CA' -> 'fr') to see if we have a phrase
+    active_langs = []
+    for l in langs:
+        base = l.split("-")[0]
+        if base in greeting_map and l not in active_langs:
+            active_langs.append(l)
+
     if not active_langs:
-        active_langs = [primary_lang] if primary_lang in greeting_map else ["en"]
+        base_primary = primary_lang.split("-")[0]
+        active_langs = [primary_lang] if base_primary in greeting_map else ["en"]
 
     # Map codes to labels (prefer native_label for speech)
     lang_labels = {}
@@ -82,37 +91,23 @@ async def generate_multilingual_greeting(
     lead_lang_base = primary_lang.split("-")[0]
     
     if custom_greeting and custom_greeting.strip():
-        greeting_prefix_phrase = pii_service.redact(custom_greeting.strip())
+        greeting_prefix_phrase = custom_greeting.strip()
+        if redact:
+            greeting_prefix_phrase = pii_service.redact(greeting_prefix_phrase)
     else:
         greeting_prefix_phrase = greeting_map.get(lead_lang_base, greeting_map.get("en", "Thank you for calling.")).strip()
         
     if greeting_prefix_phrase.endswith("."):
         greeting_prefix_phrase = greeting_prefix_phrase[:-1]
 
-    # Construction: "<Greeting>." or "<Greeting>. I can assist you in <Langs>."
-    if len(names) <= 1:
-        # Single language: skip the assist string to stay concise
-        return f"{greeting_prefix_phrase}."
-    
-    assist_prefix = prefix_map.get(lead_lang_base, prefix_map.get("en", "I can assist you in")).strip()
-    
-    if len(names) == 2:
-        assist_str = f"{assist_prefix} {names[0]} or {names[1]}."
-    else:
-        assist_str = f"{assist_prefix} {', '.join(names[:-1])}, and {names[-1]}."
-
-    # Build the full greeting: Primary Greeting + Assist String
-    greeting = f"{greeting_prefix_phrase}. {assist_str}"
-    
-    # Optionally append extra audible greetings for clarity in other supported tongues
-    # excluding the primary language phrase which was used as the prefix.
-    audible_langs = [l for l in active_langs[:3] if l.split("-")[0] != lead_lang_base]
-    extra_phrases = [greeting_map[l].strip() for l in audible_langs if l in greeting_map]
-    if extra_phrases:
-        greeting += " " + " ".join(extra_phrases)
+    # The Multi-lingual assist strings and extra phrases have been removed from the greeting.
+    # They are now properly handled by the IVR phase (generate_ivr_language_prompt)
+    greeting = greeting_prefix_phrase
     
     # Standardize redaction for audible strings (Round 9 Hardening)
-    return pii_service.redact(greeting.strip())
+    if redact:
+        return pii_service.redact(greeting.strip())
+    return greeting.strip()
 
 # Mapping for "I didn't catch that" fallback phrases.
 LANGUAGE_FALLBACK_MAP = {
@@ -129,7 +124,8 @@ LANGUAGE_FALLBACK_MAP = {
 
 async def generate_multilingual_fallback(
     db: AsyncSession, 
-    supported_languages: list[str] | None = None
+    supported_languages: list[str] | None = None,
+    redact: bool = True
 ) -> str:
     """
     Generate the multilingual "I didn't catch that" message based on selected languages and platform settings.
@@ -150,7 +146,21 @@ async def generate_multilingual_fallback(
 
     phrases = [merged_map[l] for l in active_langs if l in merged_map]
     # Standardize redaction for audible fallout strings
-    return pii_service.redact(" ".join(phrases))
+    if redact:
+        return pii_service.redact(" ".join(phrases))
+    return " ".join(phrases)
+
+# ---------------------------------------------------------------------------
+# 1.5 Mandatory Base Protocols
+# ---------------------------------------------------------------------------
+
+DEFAULT_CORE_VOICE_PROTOCOL = """\
+## CORE VOICE PERFORMANCE PROTOCOL
+- **STRICT CONCISION**: Prioritize brevity. Use short, punchy sentences. Avoid nested clauses.
+- **NATURAL TURN-TAKING**: End your turns with clear cues or questions to signal the user it is their turn to speak.
+- **AUDIO ADAPTATION**: Do not use markdown like bolding or bullet points in your speech as it may confuse the TTS engine. Use punctuation (commas, periods) to control cadence.
+- **CONFIRMATION FLOW**: For critical actions (payments, bookings), always repeat the key details back to the user for verbal confirmation before proceeding.
+"""
 
 async def generate_ivr_language_prompt(
     db: AsyncSession,
@@ -199,10 +209,11 @@ async def generate_ivr_language_prompt(
 
 async def get_dynamic_voice_protocol(
     db: AsyncSession,
-    supported_languages: list[str] | None = None
+    supported_languages: list[str] | None = None,
+    redact: bool = True
 ) -> str:
     """Return the IVR & Multi-lingual Protocol block using dynamic templates from Platform Settings."""
-    opening = await generate_multilingual_greeting(db, supported_languages)
+    opening = await generate_multilingual_greeting(db, supported_languages=supported_languages, redact=redact)
     all_langs = ", ".join(supported_languages) if supported_languages else "English"
 
     # Fetch template from settings
@@ -220,7 +231,10 @@ async def get_dynamic_voice_protocol(
 """
 
     # Standardize redaction for protocol templates (Round 9)
-    return pii_service.redact(template.replace("{all_langs}", all_langs))
+    result = template.replace("{all_langs}", all_langs)
+    if redact:
+        return pii_service.redact(result)
+    return result
 
 
 async def get_or_compute_voice_strings(
@@ -244,14 +258,9 @@ async def get_or_compute_voice_strings(
     supported_langs: list[str] = cfg.get("supported_languages") or []
     cached_langs: list[str] = cfg.get("_cached_langs") or []
 
-    # Check if preset changed
-    current_preset_id = cfg.get("voice_protocol_preset_id")
-    cached_preset_id = cfg.get("_cached_preset_id")
-
-    # Cache hit: same language list, same preset ID, and all strings present
+    # Cache hit: same language list and all strings present
     if (
         cached_langs == supported_langs
-        and cached_preset_id == current_preset_id
         and cfg.get("_cached_greeting")
         and cfg.get("_cached_protocol")
         and cfg.get("_cached_fallback")
@@ -263,18 +272,18 @@ async def get_or_compute_voice_strings(
             cfg["_cached_fallback"],
         )
 
-    # Cache miss: compute and persist
+    # Cache miss: compute and persist (Unredacted for TTS and Preview)
     primary_lang = getattr(agent, 'language', None) or 'en'
-    greeting  = await generate_multilingual_greeting(db, primary_lang, supported_langs)
-    protocol  = await get_dynamic_voice_protocol(db, supported_langs)
-    fallback  = await generate_multilingual_fallback(db, supported_langs)
-
-    if current_preset_id:
-        global_presets = await SettingsService.get_setting(db, "global_voice_protocols", default=[])
-        for p in global_presets:
-            if p.get("id") == current_preset_id:
-                preset_protocol = p.get("template", "")
-                break
+    greeting  = await generate_multilingual_greeting(db, primary_lang, supported_langs, redact=False)
+    protocol  = await get_dynamic_voice_protocol(db, supported_langs, redact=False)
+    fallback  = await generate_multilingual_fallback(db, supported_langs, redact=False)
+    
+    # Ensure Core Protocol is always injected (Mandatory)
+    preset_protocol = DEFAULT_CORE_VOICE_PROTOCOL
+    global_presets = await SettingsService.get_setting(db, "global_voice_protocols", default=[])
+    for p in global_presets:
+        if p.get("template"):
+            preset_protocol += "\n\n" + p.get("template", "")
 
     # Write back into agent_config (JSONB MutableDict — SQLAlchemy tracks the mutation)
     new_cfg = dict(cfg)
@@ -282,7 +291,6 @@ async def get_or_compute_voice_strings(
     new_cfg["_cached_protocol"] = protocol
     new_cfg["_cached_fallback"] = fallback
     new_cfg["_cached_langs"] = supported_langs
-    new_cfg["_cached_preset_id"] = current_preset_id
     new_cfg["_cached_preset_protocol"] = preset_protocol
     agent.agent_config = new_cfg
 
@@ -295,6 +303,26 @@ async def get_or_compute_voice_strings(
 #    safety layer; prompt-level is the secondary UX layer.
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# 3. Custom Guardrail Enforcement
+#    Rules authored by the operator via the dashboard per-agent.
+# ---------------------------------------------------------------------------
+
+def format_custom_guardrails(rules: list[dict]) -> str:
+    """Format custom rules into a system-prompt XML block."""
+    if not rules:
+        return ""
+    
+    active_rules = [r.get("rule") for r in rules if r.get("is_active", True) and r.get("rule")]
+    if not active_rules:
+        return ""
+    
+    rule_items = "\n".join(f"  - {rule}" for rule in active_rules)
+    return f"""<custom_guardrails>
+Always adhere to these specific operational rules:
+{rule_items}
+</custom_guardrails>"""
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +337,7 @@ def build_voice_system_prompt(
     out_of_scope_response: str = "I can only help with topics related to our service.",
     tone_description: str = "Be warm, concise, and natural.",
     voice_protocol: str = "",
+    custom_guardrails: list[dict] = None,
 ) -> str:
     """
     Return the voice-specific identity content string.

@@ -7,6 +7,7 @@ import structlog
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.responses import PlainTextResponse
+import httpx
 
 from app.core.config import settings
 from app.schemas.voice import STTResponse, TTSRequest
@@ -182,15 +183,9 @@ async def text_to_speech_stream(
 @router.post("/twilio/incoming")
 async def twilio_incoming_call(request: Request):
     """
-    TwiML response that connects an inbound Twilio call to our Media Streams
-    WebSocket endpoint for real-time AI voice handling.
-
-    Query parameters expected by Twilio when the webhook URL is configured:
-      ?agent_id=<id>&tenant_id=<id>&session_id=<id>&token=<jwt>
-
-    If any required parameter is missing, falls back to safe defaults so
-    Twilio can still establish a stream (the pipeline will reject the WS
-    with 4401 if the token is invalid).
+    TwiML response that connects an inbound Twilio call.
+    If the agent has a DTMF menu, it emits a <Gather> block first.
+    Otherwise, it immediately connects to the WebSocket Media Stream.
     """
     params = dict(request.query_params)
     agent_id = params.get("agent_id", "default")
@@ -198,10 +193,7 @@ async def twilio_incoming_call(request: Request):
     session_id = params.get("session_id") or str(uuid.uuid4())
     token = params.get("token", "")
 
-    # Build the WebSocket URL. Use the Host header so the TwiML is correct
-    # regardless of whether we are behind a reverse proxy or ngrok tunnel.
     host = request.headers.get("host", "localhost:8003")
-    # Twilio requires wss:// for secure WebSocket Media Streams
     ws_url = (
         f"wss://{host}/ws/voice/{agent_id}"
         f"?tenant_id={tenant_id}"
@@ -209,27 +201,213 @@ async def twilio_incoming_call(request: Request):
         f"&token={token}"
     )
 
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        "<Connect>"
-        f'<Stream url="{ws_url}" />'
-        "</Connect>"
-        "</Response>"
-    )
+    # 1. Fetch agent config to check for DTMF menu
+    menu = None
+    greeting_url = None
+    try:
+        url = f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"X-Tenant-ID": tenant_id}, timeout=3.0)
+            if resp.status_code == 200:
+                agent_data = resp.json()
+                cfg = agent_data.get("agent_config", {})
+                menu = cfg.get("ivr_dtmf_menu")
+                
+                # Figure out which audio to play for the Gather prompt
+                if cfg.get("opening_audio_url"):
+                    greeting_url = cfg.get("opening_audio_url")
+                elif cfg.get("voice_greeting_url"):
+                    greeting_url = cfg.get("voice_greeting_url")
+                elif cfg.get("ivr_language_url"):
+                    greeting_url = cfg.get("ivr_language_url")
+                    
+                if greeting_url and greeting_url.startswith("/"):
+                    greeting_url = f"{settings.AI_ORCHESTRATOR_URL}{greeting_url}"
+    except Exception as exc:
+        logger.warning("failed_to_fetch_agent_for_dtmf", error=str(exc))
 
-    logger.info(
-        "twilio_incoming_call_twiml",
-        agent_id=agent_id,
-        tenant_id=tenant_id,
-        session_id=session_id,
-    )
+    has_menu = menu and isinstance(menu.get("entries"), list) and len(menu["entries"]) > 0
 
-    return Response(
-        content=twiml,
-        media_type="text/xml",
-        headers={"Cache-Control": "no-cache"},
+    if has_menu:
+        # Phase 4: DTMF Menu present. Use <Gather>
+        timeout = menu.get("timeout_seconds", 10)
+        # Pass context forward so /gather knows what to do
+        gather_url = (
+            f"https://{host}/api/v1/voice/twilio/gather"
+            f"?agent_id={agent_id}"
+            f"&tenant_id={tenant_id}"
+            f"&session_id={session_id}"
+            f"&token={token}"
+            f"&retry_count=0"
+        )
+        
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Response>\n'
+            f'  <Gather action="{gather_url}" method="POST" numDigits="1" timeout="{timeout}">\n'
+        )
+        if greeting_url:
+            twiml += f'    <Play>{greeting_url}</Play>\n'
+        twiml += '  </Gather>\n'
+        # If Gather times out, Twilio continues to the next verb.
+        # So we just redirect back to the gather endpoint with a timeout flag.
+        timeout_url = f"{gather_url}&timeout=true"
+        twiml += f'  <Redirect method="POST">{timeout_url}</Redirect>\n'
+        twiml += '</Response>'
+    else:
+        # Standard flow: immediately connect to stream
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Response>\n'
+            '  <Connect>\n'
+            f'    <Stream url="{ws_url}" />\n'
+            '  </Connect>\n'
+            '</Response>'
+        )
+
+    logger.info("twilio_incoming_call_twiml", agent_id=agent_id, session_id=session_id, dtmf_menu=has_menu)
+
+    return Response(content=twiml, media_type="text/xml", headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/twilio/gather")
+async def twilio_gather(request: Request):
+    """
+    Handles the digit collected by <Gather> or a Gather timeout.
+    """
+    params = dict(request.query_params)
+    agent_id = params.get("agent_id")
+    tenant_id = params.get("tenant_id", "")
+    session_id = params.get("session_id")
+    token = params.get("token", "")
+    retry_count = int(params.get("retry_count", 0))
+    is_timeout = params.get("timeout") == "true"
+
+    form = await request.form()
+    digit = form.get("Digits", "")
+
+    host = request.headers.get("host", "localhost:8003")
+    ws_url = (
+        f"wss://{host}/ws/voice/{agent_id}"
+        f"?tenant_id={tenant_id}"
+        f"&session_id={session_id}"
+        f"&token={token}"
     )
+    
+    # helper to generate the connect twiml
+    def connect_twiml() -> str:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Response>\n'
+            '  <Connect>\n'
+            f'    <Stream url="{ws_url}" />\n'
+            '  </Connect>\n'
+            '</Response>'
+        )
+
+    # 1. Fetch agent config to read the menu
+    menu = None
+    try:
+        url = f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents/{agent_id}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"X-Tenant-ID": tenant_id}, timeout=3.0)
+            if resp.status_code == 200:
+                agent_data = resp.json()
+                menu = agent_data.get("agent_config", {}).get("ivr_dtmf_menu")
+    except Exception as exc:
+        logger.warning("failed_to_fetch_agent_for_gather", error=str(exc))
+
+    if not menu:
+        # Failsafe: if menu is gone, just connect to LLM
+        return Response(content=connect_twiml(), media_type="text/xml")
+
+    max_retries = menu.get("max_retries", 3)
+
+    if is_timeout or not digit:
+        if retry_count < max_retries:
+            # Re-prompt
+            gather_url = (
+                f"https://{host}/api/v1/voice/twilio/gather"
+                f"?agent_id={agent_id}&tenant_id={tenant_id}&session_id={session_id}&token={token}&retry_count={retry_count + 1}"
+            )
+            twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<Response>\n'
+                # Notice we don't have the audio URL here easily. We'd have to fetch it again.
+                # Actually, Twilio <Gather> without <Play> just waits. To play the prompt again,
+                # we should redirect back to /twilio/incoming to start over, but with retry_count.
+            )
+            # Actually, we can just redirect to incoming to restart the whole block
+            incoming_url = f"https://{host}/api/v1/voice/twilio/incoming?agent_id={agent_id}&tenant_id={tenant_id}&session_id={session_id}&token={token}"
+            # But we need to track retry_count. Instead of complex state, if it times out, let's just proceed to agent.
+            # The user said: "default 10s. On timeout exhaustion, the call automatically proceeds to the AI."
+            # Wait, if we want to loop the audio, it's hard without the audio URL.
+            # Let's fetch the audio URL again.
+            cfg = agent_data.get("agent_config", {})
+            greeting_url = cfg.get("opening_audio_url") or cfg.get("voice_greeting_url") or cfg.get("ivr_language_url")
+            if greeting_url and greeting_url.startswith("/"):
+                greeting_url = f"{settings.AI_ORCHESTRATOR_URL}{greeting_url}"
+                
+            timeout_url = f"{gather_url}&timeout=true"
+            
+            twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<Response>\n'
+                f'  <Gather action="{gather_url}" method="POST" numDigits="1" timeout="{menu.get("timeout_seconds", 10)}">\n'
+            )
+            if greeting_url:
+                twiml += f'    <Play>{greeting_url}</Play>\n'
+            twiml += '  </Gather>\n'
+            twiml += f'  <Redirect method="POST">{timeout_url}</Redirect>\n'
+            twiml += '</Response>'
+            return Response(content=twiml, media_type="text/xml")
+        else:
+            # Exhausted retries -> proceed to agent
+            return Response(content=connect_twiml(), media_type="text/xml")
+
+    # We got a digit. Find the entry.
+    entries = menu.get("entries", [])
+    entry = next((e for e in entries if e.get("digit") == digit), None)
+
+    if not entry:
+        # Invalid digit. You could play an error message, but proceeding to agent is safest.
+        return Response(content=connect_twiml(), media_type="text/xml")
+
+    action = entry.get("action")
+    
+    if action == "proceed_to_agent":
+        return Response(content=connect_twiml(), media_type="text/xml")
+        
+    elif action == "end_call":
+        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+        return Response(content=twiml, media_type="text/xml")
+        
+    elif action == "play_audio":
+        twiml = '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n'
+        audio_url = entry.get("audio_url")
+        if audio_url:
+            if audio_url.startswith("/"):
+                audio_url = f"{settings.AI_ORCHESTRATOR_URL}{audio_url}"
+            twiml += f'  <Play>{audio_url}</Play>\n'
+            
+        after = entry.get("after_playback", "proceed_to_agent")
+        if after == "end_call":
+            twiml += '  <Hangup/>\n'
+        else:
+            twiml += '  <Connect>\n'
+            twiml += f'    <Stream url="{ws_url}" />\n'
+            twiml += '  </Connect>\n'
+        twiml += '</Response>'
+        return Response(content=twiml, media_type="text/xml")
+        
+    elif action == "repeat_menu":
+        # Loop back to incoming
+        incoming_url = f"https://{host}/api/v1/voice/twilio/incoming?agent_id={agent_id}&tenant_id={tenant_id}&session_id={session_id}&token={token}"
+        twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Redirect method="POST">{incoming_url}</Redirect></Response>'
+        return Response(content=twiml, media_type="text/xml")
+
+    # Fallback
+    return Response(content=connect_twiml(), media_type="text/xml")
 
 
 @router.post("/twilio/status")

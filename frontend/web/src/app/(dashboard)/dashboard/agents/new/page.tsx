@@ -102,6 +102,10 @@ export default function NewAgentPage() {
       // the Stripe webhook fires — no repeated round-trips.
       const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
       const waitForActivation = async () => {
+        // Fire a deep sync immediately in parallel. This guarantees the agent 
+        // activates instantly even if Stripe webhooks are delayed or not running locally.
+        billingApi.syncSubscription().catch(() => {})
+
         try {
           const resp = await fetch(
             `${API_URL}/api/v1/proxy/agents/${agentIdParam}/activation-stream`,
@@ -131,12 +135,6 @@ export default function NewAgentPage() {
           }
         } catch { /* stream unavailable */ }
         
-        // Fallback: webhook may still be in-flight or stream failed.
-        // Trigger an explicit sync to "self-heal" the agent state immediately.
-        try {
-          await billingApi.syncSubscription()
-        } catch { /* ignore sync failure */ }
-
         toast.success('Payment confirmed! Your agent will be active shortly.', { id: 'post-payment' })
         qc.invalidateQueries({ queryKey: ['agents'] })
         qc.invalidateQueries({ queryKey: ['billing-overview'] })
@@ -166,6 +164,9 @@ export default function NewAgentPage() {
         
         agentsApi.create(agentConfig)
           .then(async (agent: any) => {
+            try {
+              await billingApi.syncSubscription()
+            } catch {}
             toast.success('Agent deployed successfully!', { id: 'post-payment' })
             qc.invalidateQueries({ queryKey: ['agents'] })
             router.push(`/dashboard/agents/${agent.id}`)
@@ -190,9 +191,15 @@ export default function NewAgentPage() {
       }
     } else {
       // PATH C: Generic slot purchase (no specific agent)
-      toast.success('Payment successful! Your new agent slot is ready.')
-      qc.invalidateQueries({ queryKey: ['billing-overview'] })
-      setTimeout(() => router.push('/dashboard/agents'), 2000)
+      const finishGenericPurchase = async () => {
+        try {
+          await billingApi.syncSubscription()
+        } catch {}
+        toast.success('Payment successful! Your new agent slot is ready.')
+        qc.invalidateQueries({ queryKey: ['billing-overview'] })
+        setTimeout(() => router.push('/dashboard/agents'), 2000)
+      }
+      finishGenericPurchase()
     }
   }, [success, router, qc, searchParams])
 

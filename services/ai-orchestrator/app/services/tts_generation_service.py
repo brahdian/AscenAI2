@@ -16,7 +16,7 @@ import uuid
 import structlog
 from pathlib import Path
 from typing import Optional
-
+import json
 import httpx
 
 from app.core.config import settings
@@ -197,7 +197,7 @@ class TTSGenerationService:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
-                    f"{self.voice_pipeline_url}/voice/tts",
+                    f"{self.voice_pipeline_url}/api/v1/voice/tts",
                     json={
                         "text": text,
                         "voice_id": voice_id,

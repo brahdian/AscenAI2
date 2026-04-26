@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { guardrailsApi, agentsApi } from '@/lib/api'
+import { guardrailsApi, agentsApi, platformApi, GlobalGuardrail } from '@/lib/api'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
 import {
@@ -13,24 +13,13 @@ import {
 
 // ─── Fetch global guardrails from platform settings (admin-controlled) ──
 
-interface GlobalGuardrail {
-  id: string
-  category: string
-  rule: string
-  fix_ref: string
-}
-
 async function fetchPlatformGlobalGuardrails(): Promise<GlobalGuardrail[]> {
   try {
-    const res = await fetch('/api/v1/proxy/agents/platform/global-guardrails')
-    if (res.ok) {
-      const data = await res.json()
-      return data.guardrails || []
-    }
+    const data = await platformApi.getGlobalGuardrails()
+    return data.guardrails || []
   } catch {
-    // fallback to empty
+    return []
   }
-  return []
 }
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -847,8 +836,8 @@ export default function GuardrailsPage() {
             <Toggle
               checked={piiRedaction}
               onChange={(v) => { setPiiRedaction(v); mark() }}
-              label="PII Redaction in Responses"
-              description="Automatically redact PII types from agent responses using Microsoft Presidio NLP."
+              label="Redact PII in Chat History"
+              description="Automatically redact sensitive information (PII) from the saved chat history to protect user privacy."
             />
           </div>
 

@@ -24,8 +24,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import uuid
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import datetime, timezone
 
 import structlog
 from sqlalchemy import text

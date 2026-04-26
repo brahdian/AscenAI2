@@ -1,6 +1,6 @@
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional, Any
 
 _WEAK_KEYS = frozenset({
     "change-this-secret-key-in-production-min-32-chars",
@@ -32,13 +32,13 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
     # CORS
-    ALLOWED_ORIGINS: any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
+    ALLOWED_ORIGINS: Any = ["http://lvh.me:3000", "http://admin.lvh.me:3000"]
     ALLOWED_METHODS: str = "GET,POST,PUT,DELETE,OPTIONS"
     ALLOWED_HEADERS: str = "*"
 
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
-    def validate_allowed_origins(cls, v: any) -> list[str]:
+    def validate_allowed_origins(cls, v: Any) -> list[str]:
         if isinstance(v, str):
             return [origin.strip() for origin in v.split(",")]
         return v

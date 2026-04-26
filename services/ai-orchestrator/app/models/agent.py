@@ -1,9 +1,10 @@
+from __future__ import annotations
 import uuid
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 from sqlalchemy import (
     String, Boolean, Text, Integer, Float, Date,
-    DateTime, ForeignKey, func, Index
+    DateTime, ForeignKey, func, Index, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from app.models.tool import AgentTool
     from app.models.variable import AgentVariable
 
+from app.services import pii_service
 from app.core.database import Base
 
 
@@ -434,7 +436,7 @@ class AgentPlaybook(Base):
         }
 
 
-from sqlalchemy import UniqueConstraint
+
 
 class AgentDocument(Base):
     __tablename__ = "agent_documents"

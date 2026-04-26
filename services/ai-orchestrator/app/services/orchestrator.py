@@ -27,6 +27,7 @@ from app.services.settings_service import SettingsService
 from app.core.metrics import CONTEXT_RETRIEVALS
 from app.services.session_state_machine import SessionStateMachine
 from app.services.trace_logger import TraceLogger
+from app.prompts.system_prompts import resolve_response_placeholders
 
 logger = structlog.get_logger(__name__)
 
@@ -152,10 +153,37 @@ class Orchestrator:
             )
 
     # ------------------------------------------------------------------
+    # Streaming path
+    # ------------------------------------------------------------------
+
+    async def stream_response(
+        self,
+        agent: Agent,
+        session: Session,
+        user_message: str,
+        test_mode: bool = False,
+        request_id: Optional[str] = None,
+    ) -> AsyncGenerator[StreamChatEvent, None]:
+        import traceback
+        try:
+            async for event in self._stream_response_impl(agent, session, user_message, test_mode, request_id):
+                yield event
+        except TypeError as te:
+            logger.error("stream_type_error_forensic", error=str(te), stack=traceback.format_exc(), session_id=session.id)
+            raise
+        except Exception as exc:
+            logger.error("stream_exception_forensic", error=str(exc), stack=traceback.format_exc(), session_id=session.id)
+            raise
+
+
+    # ------------------------------------------------------------------
     # Non-streaming path
     # ------------------------------------------------------------------
 
-    async def process_message(self, agent: Agent, session: Session, user_message: str, stream: bool = False, request_id: Optional[str] = None) -> ChatResponse | AsyncGenerator:
+    async def process_message(
+        self, agent: Agent, session: Session, user_message: str, stream: bool = False,
+        request_id: Optional[str] = None, test_mode: bool = False
+    ) -> ChatResponse | AsyncGenerator:
         if stream:
             return self.stream_response(agent, session, user_message, request_id=request_id)
 
@@ -171,7 +199,8 @@ class Orchestrator:
 
         user_message = self.guardrail_service.sanitize_user_message(user_message)
 
-        session_meta = dict(session.metadata_ or {})
+        _raw_meta = getattr(session, "metadata_", None)
+        session_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
         escalation_state = session_meta.get("_escalation_state")
         if escalation_state:
             return await self.playbook_handler.handle_escalation_info_collection(
@@ -195,6 +224,29 @@ class Orchestrator:
         if self.intent_detector.should_escalate_immediately(user_message):
             return await self.playbook_handler.build_escalation_response(agent, session, user_message, start_time)
 
+        # GREETING & INITIALIZATION: Handle initial connection and empty messages.
+        # If it's the first turn, we MUST send the configured greeting and language prompt.
+        voice_opening = await self.billing_service.maybe_send_greeting(agent, session, None)
+        if voice_opening:
+            # Refresh metadata to include flags set by the billing service (e.g. _greeting_only)
+            session_meta = dict(session.metadata_ or {})
+            
+            # If the user message is empty (initialization call), we return the greeting as the final message.
+            if not user_message:
+                session.turn_count += 1 # Mark session as initialized
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                return ChatResponse(
+                    session_id=session_id,
+                    message=voice_opening,
+                    tool_calls_made=[],
+                    suggested_actions=[],
+                    escalate_to_human=False,
+                    latency_ms=latency_ms,
+                    tokens_used=0,
+                )
+            # If it's NOT empty, the greeting was already added to the DB/history by maybe_send_greeting,
+            # so we continue and let the LLM generate a response to the user's message.
+
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
 
         # Derive intent from the routed playbook name (free — no extra I/O).
@@ -208,12 +260,6 @@ class Orchestrator:
 
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), str(session.id), playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
-        voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
-        if voice_opening and "_voice_opening" not in session_meta:
-            new_meta = dict(session_meta)
-            new_meta["_voice_opening"] = voice_opening
-            session.metadata_ = new_meta
-            session_meta = new_meta
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
         custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
@@ -254,6 +300,11 @@ class Orchestrator:
             tracer.set_retrieved_chunks([c for c in context_items if getattr(c, "type", c.get("type")) == "knowledge"])
             CONTEXT_RETRIEVALS.labels(status="success").inc()
             
+            # TYPE GUARD: Ensure context_items is a list before iteration
+            if not isinstance(context_items, list):
+                logger.warning("mcp_retrieve_context_invalid_type", type=type(context_items).__name__, session_id=session_id)
+                context_items = []
+
             # G10: Sanitize knowledge chunks to prevent "Poisoned Knowledge" role-injection
             for item in context_items:
                 if item.get("type") == "knowledge" and "content" in item:
@@ -261,10 +312,8 @@ class Orchestrator:
                         item["content"], agent, session_id, metadata=item.get("metadata"), request_id=request_id
                     )
 
-            if "pii_ctx" in locals() and pii_ctx:
+            if pii_ctx:
                 context_items = pii_service.restore_context(context_items, pii_ctx, session_id)
-            elif "stream_pii_ctx" in locals() and stream_pii_ctx:
-                context_items = pii_service.restore_context(context_items, stream_pii_ctx, session_id)
 
         except Exception as _rag_exc:
             logger.error("rag_retrieval_failed_degraded_state", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
@@ -318,8 +367,10 @@ class Orchestrator:
         )
         
         tracer.set_system_prompt(pii_service.redact(system_prompt))
+        # TYPE GUARD: history must be a list
+        safe_history = history if isinstance(history, list) else []
         tracer.set_memory(
-            short_term=pii_service.redact_deep(history or []),
+            short_term=pii_service.redact_deep(safe_history),
             summary=pii_service.redact(summary or ""),
             long_term=pii_service.redact_deep(customer_profile or {})
         )
@@ -329,7 +380,8 @@ class Orchestrator:
         messages = [{"role": "system", "content": system_prompt}]
         if summary:
             messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
-        messages.extend(history)
+        # TYPE GUARD: messages.extend requires an iterable
+        messages.extend(safe_history)
         messages.append({"role": "user", "content": llm_user_message})
 
         if not await self.billing_service.check_token_budget(tenant_id):
@@ -343,8 +395,12 @@ class Orchestrator:
 
         final_response = None
         iterations = 0
-        system_tools = agent_cfg.get("tools", []) or []
-        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
+        system_tools = agent_cfg.get("tools") or []
+        if not isinstance(system_tools, list): system_tools = []
+        
+        playbook_tools = (playbook.config or {}).get("tools") if playbook else []
+        if not isinstance(playbook_tools, list): playbook_tools = []
+        
         enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         tracer.set_messages_sent(pii_service.redact_deep(messages))
@@ -441,6 +497,7 @@ class Orchestrator:
             await self.guardrail_service.save_pii_context(session_id, pii_ctx)
 
         final_response = self.guardrail_service.check_professional_claims(final_response)
+        final_response = resolve_response_placeholders(final_response)
         is_fallback = self.playbook_handler.is_fallback_response(final_response, playbook)
 
         if is_fallback:
@@ -476,7 +533,7 @@ class Orchestrator:
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="user",
-            content=pii_service.redact_for_display(user_message, pii_ctx, hipaa_mode=hipaa_mode) if (pii_ctx and guardrails and guardrails.pii_redaction) else user_message,
+            content=pii_service.redact_for_display(llm_user_message, pii_ctx, hipaa_mode=hipaa_mode) if (pii_ctx and guardrails and guardrails.pii_redaction and not test_mode) else llm_user_message,
             tokens_used=0,
             latency_ms=0
         )
@@ -484,7 +541,7 @@ class Orchestrator:
             session_id=session_id,
             tenant_id=session.tenant_id,
             role="assistant",
-            content=pii_service.redact_for_display(final_response, pii_ctx, hipaa_mode=hipaa_mode) if (pii_ctx and guardrails and guardrails.pii_redaction) else final_response,
+            content=pii_service.redact_for_display(pseudo_final_response, pii_ctx, hipaa_mode=hipaa_mode) if (pii_ctx and guardrails and guardrails.pii_redaction and not test_mode) else pseudo_final_response,
             tool_calls=tool_calls_made if tool_calls_made else None, tokens_used=total_tokens, latency_ms=latency_ms,
             is_fallback=is_fallback, playbook_name=playbook.name if playbook else None,
             sources=json.loads(json.dumps([c.model_dump() for c in source_citations])) if source_citations else [],
@@ -544,7 +601,7 @@ class Orchestrator:
 
         return ChatResponse(
             session_id=session_id, message=final_response, tool_calls_made=tool_calls_made,
-            source_citations=source_citations if source_citations else None,
+            sources=source_citations or [],
             suggested_actions=self.billing_service.extract_suggested_actions(final_response, intent),
             escalate_to_human=should_escalate, latency_ms=latency_ms, tokens_used=total_tokens,
             playbook_executed=playbook.name if playbook else None,
@@ -559,7 +616,14 @@ class Orchestrator:
     # Streaming path
     # ------------------------------------------------------------------
 
-    async def stream_response(self, agent: Agent, session: Session, user_message: str, request_id: Optional[str] = None) -> AsyncGenerator:
+    async def _stream_response_impl(
+        self,
+        agent: Agent,
+        session: Session,
+        user_message: str,
+        test_mode: bool = False,
+        request_id: Optional[str] = None,
+    ) -> AsyncGenerator[StreamChatEvent, None]:
         start_time = time.monotonic()
         tenant_id = str(session.tenant_id)
         session_id = session.id
@@ -572,7 +636,8 @@ class Orchestrator:
 
         user_message = self.guardrail_service.sanitize_user_message(user_message)
 
-        session_meta = dict(session.metadata_ or {})
+        _raw_meta = getattr(session, "metadata_", None)
+        session_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
         escalation_state = session_meta.get("_escalation_state")
         if escalation_state:
             info_collection_response = await self.playbook_handler.handle_escalation_info_collection(
@@ -602,6 +667,31 @@ class Orchestrator:
             yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": escalation_response.latency_ms, "tokens_used": 0, "escalate_to_human": True, "escalation_action": escalation_response.escalation_action}, session_id=session_id)
             return
 
+        # GREETING & INITIALIZATION: Handle initial connection and empty messages.
+        # If it's the first turn, we MUST send the configured greeting and language prompt.
+        if not session_meta.get("_voice_opening"):
+            voice_opening = await self.billing_service.maybe_send_greeting(agent, session, None)
+            if voice_opening:
+                if "_voice_opening" not in session_meta:
+                    if hasattr(session, "metadata_"):
+                        # Refresh metadata to include flags set by the billing service (e.g. _greeting_only)
+                        new_meta = dict(session.metadata_ or {})
+                        new_meta["_voice_opening"] = voice_opening
+                        session.metadata_ = new_meta
+                        session_meta = new_meta
+
+                # Emit the greeting to the stream
+                yield StreamChatEvent(type="text_delta", data=voice_opening, session_id=session_id)
+                # GREETING PERSISTENCE: Flush immediately so the "greeted" state is saved to DB
+                # even if the orchestrator crashes later in this turn.
+                await self.db.flush()
+
+            # If the user message is empty (initialization call), we've done our job.
+            if not user_message:
+                session.turn_count += 1 # Mark session as initialized
+                yield StreamChatEvent(type="done", data={"session_id": session_id, "latency_ms": int((time.monotonic() - start_time) * 1000), "tokens_used": 0, "turn_count": session.turn_count}, session_id=session_id)
+                return
+
         playbook = await self.playbook_handler.route_active_playbook(str(agent.id), user_message)
 
         # Derive intent from the routed playbook name (free — no extra I/O).
@@ -613,12 +703,6 @@ class Orchestrator:
 
         playbook_exec, local_vars = await self.playbook_handler.ensure_playbook_execution(str(agent.id), session_id, playbook)
         corrections = await self.context_builder.load_corrections(str(agent.id))
-        voice_opening = await self.billing_service.maybe_send_greeting(agent, session, playbook)
-        if voice_opening and "_voice_opening" not in session_meta:
-            new_meta = dict(session_meta)
-            new_meta["_voice_opening"] = voice_opening
-            session.metadata_ = new_meta
-            session_meta = new_meta
 
         guardrails = await self.context_builder.load_guardrails(str(agent.id))
         custom_guardrails = await self.context_builder.load_custom_guardrails(str(agent.id))
@@ -659,6 +743,11 @@ class Orchestrator:
             )
             CONTEXT_RETRIEVALS.labels(status="success").inc()
 
+            # TYPE GUARD: Ensure context_items is a list before iteration
+            if not isinstance(context_items, list):
+                logger.warning("mcp_retrieve_context_invalid_type", type=type(context_items).__name__, session_id=session_id)
+                context_items = []
+
             # G10: Sanitize knowledge chunks in streaming path
             for item in context_items:
                 if item.get("type") == "knowledge" and "content" in item:
@@ -666,9 +755,7 @@ class Orchestrator:
                         item["content"], agent, session_id, metadata=item.get("metadata")
                     )
 
-            if "pii_ctx" in locals() and pii_ctx:
-                context_items = pii_service.restore_context(context_items, pii_ctx, session_id)
-            elif "stream_pii_ctx" in locals() and stream_pii_ctx:
+            if stream_pii_ctx:
                 context_items = pii_service.restore_context(context_items, stream_pii_ctx, session_id)
 
         except Exception as _stream_rag_exc:
@@ -681,13 +768,13 @@ class Orchestrator:
                 "metadata": {"source": "system", "error": str(_stream_rag_exc)}
             }]
 
-        stream_source_citations = [
+        source_citations = [
             SourceCitation(
                 type=item.get("type", "knowledge"), title=item.get("metadata", {}).get("title"), source_url=item.get("metadata", {}).get("source_url"),
                 excerpt=(item.get("content", "") or "")[:150], score=float(item.get("score", 1.0)),
                 document_id=str(item.get("metadata", {}).get("document_id")) if item.get("metadata", {}).get("document_id") else None,
                 chunk_id=str(item.get("metadata", {}).get("chunk_id")) if item.get("metadata", {}).get("chunk_id") else None,
-            ) for item in context_items
+            ) for item in (context_items if isinstance(context_items, list) else [])
             if isinstance(item, dict) and item.get("type") != "system_warning"
         ]
         stream_llm_config = stream_agent_cfg.get("llm_config", {}) or {}
@@ -696,7 +783,8 @@ class Orchestrator:
         if session.customer_identifier:
             customer_profile = await self.memory.get_long_term_customer_memory(tenant_id, session.customer_identifier)
 
-        session_meta = dict(session.metadata_ or {}) if hasattr(session, "metadata_") else {}
+        _raw_meta = getattr(session, "metadata_", None)
+        session_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
         session_language = session_meta.get("language")
 
         voice_sys_prompt_setting = await SettingsService.get_setting(self.db, "voice_agent_system_prompt", {})
@@ -714,31 +802,40 @@ class Orchestrator:
         )
         
         tracer.set_system_prompt(pii_service.redact(system_prompt))
-        tracer.set_memory(short_term=pii_service.redact_deep(history or []), summary=pii_service.redact(summary or ""), long_term=pii_service.redact_deep(customer_profile or {}))
+        # TYPE GUARD: history must be a list
+        safe_history = history if isinstance(history, list) else []
+        tracer.set_memory(short_term=pii_service.redact_deep(safe_history), summary=pii_service.redact(summary or ""), long_term=pii_service.redact_deep(customer_profile or {}))
 
         tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
 
         messages = [{"role": "system", "content": system_prompt}]
         if summary:
             messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
-        messages.extend(history)
+        # TYPE GUARD: messages.extend requires an iterable
+        messages.extend(safe_history)
         messages.append({"role": "user", "content": llm_user_message})
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         
         # Calculate Chat Units and New Session flags (TC-B01)
-        is_new = (session.turn_count == 0)
+        is_new = ((session.turn_count or 0) == 0)
         chat_unit_increment = 0
         if is_new:
             chat_unit_increment = 1
-        elif session.turn_count > 0 and (session.turn_count + 1) % 10 == 0:
+        elif (session.turn_count or 0) > 0 and ((session.turn_count or 0) + 1) % 10 == 0:
             chat_unit_increment = 1
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         temperature = stream_llm_config.get("temperature", 0.7)
         max_tokens = stream_llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
-        system_tools = stream_agent_cfg.get("tools", []) or []
-        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
+        
+        # TYPE GUARD: ensure tool lists are iterable
+        system_tools = stream_agent_cfg.get("tools") or []
+        if not isinstance(system_tools, list): system_tools = []
+        
+        playbook_tools = (playbook.config or {}).get("tools") if playbook else []
+        if not isinstance(playbook_tools, list): playbook_tools = []
+        
         enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         full_response_text = ""
@@ -753,19 +850,45 @@ class Orchestrator:
                 messages=messages, tools=tool_schemas if tool_schemas else None, temperature=temperature, max_tokens=max_tokens, stream=False, session_id=session_id
             )
             tracer.stop_timer("llm")
+
+            # TYPE SAFETY: Critical check to prevent 'bool' object is not iterable
+            if not isinstance(llm_response, LLMResponse):
+                logger.error("orchestrator_llm_response_invalid_type", type=type(llm_response).__name__, session_id=session_id)
+                yield StreamChatEvent(type="error", data="Error: The AI returned an invalid response type. Please try again.", session_id=session_id)
+                return
+
+            logger.info(
+                "llm_response_received",
+                session_id=session_id,
+                content=llm_response.content,
+                tool_calls=[tc.model_dump() for tc in llm_response.tool_calls] if llm_response.tool_calls else None
+            )
+
             tracer.set_llm_response(raw=llm_response.content or "", provider=stream_agent_cfg.get("llm_provider", ""), model=stream_agent_cfg.get("llm_model", ""))
-            total_tokens += llm_response.usage.total_tokens
+            
+            # TYPE SAFETY: Ensure usage and tokens are valid
+            resp_usage = getattr(llm_response, "usage", None)
+            total_tokens += int(getattr(resp_usage, "total_tokens", 0) or 0)
 
             if llm_response.finish_reason == "timeout":
                 full_response_text = llm_response.content or "I'm sorry, I'm taking longer than expected."
                 break
+
 
             if not llm_response.tool_calls:
                 full_response_text = llm_response.content or ""
                 break
 
             iterations += 1
-            allowed_calls = self.tool_executor.filter_unauthorized_tool_calls(llm_response.tool_calls, enabled_tools)
+            
+            # TYPE SAFETY: Guard against non-iterable tool_calls
+            llm_tool_calls = llm_response.tool_calls
+            if llm_tool_calls is not None and not isinstance(llm_tool_calls, list):
+                logger.warning("orchestrator_tool_calls_not_list", type=type(llm_tool_calls).__name__, session_id=session_id)
+                llm_tool_calls = []
+
+            allowed_calls = self.tool_executor.filter_unauthorized_tool_calls(llm_tool_calls or [], enabled_tools)
+
             if not allowed_calls:
                 full_response_text = llm_response.content or "I wasn't able to complete that action."
                 break
@@ -850,6 +973,7 @@ class Orchestrator:
             await self.guardrail_service.save_pii_context(session_id, stream_pii_ctx)
 
         full_response_text = self.guardrail_service.check_professional_claims(full_response_text)
+        full_response_text = resolve_response_placeholders(full_response_text)
         is_fallback = self.playbook_handler.is_fallback_response(full_response_text, playbook)
 
         if is_fallback:
@@ -876,15 +1000,15 @@ class Orchestrator:
         except Exception as _mem_exc:
             logger.warning("stream_memory_post_turn_error", error=str(_mem_exc))
 
-        user_msg_content = pii_service.redact_for_display(user_message, stream_pii_ctx, hipaa_mode=hipaa_mode) if stream_pii_ctx else user_message
-        assistant_msg_content = pii_service.redact_for_display(full_response_text, stream_pii_ctx, hipaa_mode=hipaa_mode) if stream_pii_ctx else full_response_text
+        user_msg_content = pii_service.redact_for_display(llm_user_message, stream_pii_ctx, hipaa_mode=hipaa_mode) if (stream_pii_ctx and not test_mode) else llm_user_message
+        assistant_msg_content = pii_service.redact_for_display(pseudo_full_response, stream_pii_ctx, hipaa_mode=hipaa_mode) if (stream_pii_ctx and not test_mode) else pseudo_full_response
 
         user_msg = Message(session_id=session_id, tenant_id=session.tenant_id, role="user", content=user_msg_content, tokens_used=0, latency_ms=0)
         assistant_msg = Message(
             session_id=session_id, tenant_id=session.tenant_id, role="assistant", content=assistant_msg_content,
             tool_calls=tool_calls_made if tool_calls_made else None, tokens_used=total_tokens, latency_ms=latency_ms,
             is_fallback=is_fallback, playbook_name=playbook.name if playbook else None,
-            sources=json.loads(json.dumps([c.model_dump() for c in stream_source_citations])) if stream_source_citations else [],
+            sources=json.loads(json.dumps([c.model_dump() for c in source_citations])) if source_citations else [],
         )
         self.db.add(user_msg)
         self.db.add(assistant_msg)
@@ -922,8 +1046,8 @@ class Orchestrator:
         if should_escalate:
             SessionStateMachine.escalate(session, reason="stream_should_escalate_check")
 
-        if stream_source_citations:
-            yield StreamChatEvent(type="sources", data=[c.model_dump() for c in stream_source_citations], session_id=session_id)
+        if source_citations:
+            yield StreamChatEvent(type="sources", data=[c.model_dump() for c in source_citations], session_id=session_id)
 
         yield StreamChatEvent(
             type="done",
@@ -938,16 +1062,21 @@ class Orchestrator:
     # Async streaming (non-SSE)
     # ------------------------------------------------------------------
 
-    async def stream_response_async(self, agent_id: str, session_id: str, user_message: str, request_id: Optional[str] = None) -> ChatResponse:
+    async def stream_response_async(
+        self, agent: Agent, session: Session, user_message: str, 
+        request_id: Optional[str] = None, test_mode: bool = False
+    ) -> ChatResponse:
         start_time = time.monotonic()
         tenant_id = str(session.tenant_id)
         session_id = session.id
+        tracer = TraceLogger(session_id, session.tenant_id, agent.id, session.turn_count)
         tool_calls_made: list = []
         total_tokens = 0
 
         user_message = self.guardrail_service.sanitize_user_message(user_message)
 
-        session_meta = dict(session.metadata_ or {})
+        _raw_meta = getattr(session, "metadata_", None)
+        session_meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
         escalation_state = session_meta.get("_escalation_state")
         if escalation_state:
             return await self.playbook_handler.handle_escalation_info_collection(
@@ -1015,6 +1144,11 @@ class Orchestrator:
             )
             CONTEXT_RETRIEVALS.labels(status="success").inc()
 
+            # TYPE GUARD: Ensure context_items is a list before iteration
+            if not isinstance(context_items, list):
+                logger.warning("mcp_retrieve_context_invalid_type", type=type(context_items).__name__, session_id=session_id)
+                context_items = []
+
             # G10: Sanitize knowledge chunks for Zero Trust RAG safety
             for item in context_items:
                 if item.get("type") == "knowledge" and "content" in item:
@@ -1022,10 +1156,8 @@ class Orchestrator:
                         item["content"], agent, session_id, metadata=item.get("metadata")
                     )
 
-            if "pii_ctx" in locals() and pii_ctx:
+            if pii_ctx:
                 context_items = pii_service.restore_context(context_items, pii_ctx, session_id)
-            elif "stream_pii_ctx" in locals() and stream_pii_ctx:
-                context_items = pii_service.restore_context(context_items, stream_pii_ctx, session_id)
 
         except Exception as _rag_exc:
             logger.warning("rag_retrieval_failed_async_stream", session_id=str(session_id), tenant_id=tenant_id, error=str(_rag_exc))
@@ -1068,10 +1200,14 @@ class Orchestrator:
 
         tool_schemas = await self.context_builder.get_agent_tools_schema(agent, playbook, tenant_id)
 
+        # TYPE GUARD: history must be a list
+        safe_history = history if isinstance(history, list) else []
+
         messages = [{"role": "system", "content": system_prompt}]
         if summary:
             messages.append({"role": "system", "content": f"[Conversation summary so far]: {summary}"})
-        messages.extend(history)
+        # TYPE GUARD: messages.extend requires an iterable
+        messages.extend(safe_history)
         messages.append({"role": "user", "content": llm_user_message})
 
         if not await self.billing_service.check_token_budget(tenant_id):
@@ -1080,8 +1216,12 @@ class Orchestrator:
         llm_config = agent_cfg.get("llm_config", {}) or {}
         temperature = llm_config.get("temperature", 0.7)
         max_tokens = llm_config.get("max_tokens", settings.MAX_RESPONSE_TOKENS)
-        system_tools = agent_cfg.get("tools", []) or []
-        playbook_tools = (playbook.config or {}).get("tools", []) if playbook else []
+        system_tools = agent_cfg.get("tools") or []
+        if not isinstance(system_tools, list): system_tools = []
+        
+        playbook_tools = (playbook.config or {}).get("tools") if playbook else []
+        if not isinstance(playbook_tools, list): playbook_tools = []
+        
         enabled_tools = list(dict.fromkeys(system_tools + playbook_tools))
 
         full_response_text = ""
@@ -1170,6 +1310,7 @@ class Orchestrator:
             await self.guardrail_service.save_pii_context(session_id, pii_ctx)
 
         full_response_text = self.guardrail_service.check_professional_claims(full_response_text)
+        full_response_text = resolve_response_placeholders(full_response_text)
         is_fallback = self.playbook_handler.is_fallback_response(full_response_text, playbook)
 
         if is_fallback:
@@ -1240,17 +1381,17 @@ class Orchestrator:
         # Phase 6: Non-blocking NLI Grounding Verification
         is_grounded: Optional[bool] = None
         grounding_explanation: Optional[str] = None
-        if stream_source_citations and full_response_text:
+        if source_citations and full_response_text:
             try:
                 is_grounded, grounding_explanation = await self.grounding_service.verify_grounding(
-                    full_response_text, stream_source_citations
+                    full_response_text, source_citations
                 )
             except Exception as _grounding_exc:
                 logger.warning("stream_grounding_check_error", error=str(_grounding_exc))
 
         return ChatResponse(
             session_id=session_id, message=full_response_text, tool_calls_made=tool_calls_made,
-            source_citations=stream_source_citations if stream_source_citations else None,
+            sources=source_citations or [],
             suggested_actions=self.billing_service.extract_suggested_actions(full_response_text, intent),
             escalate_to_human=should_escalate, latency_ms=latency_ms, tokens_used=total_tokens,
             playbook_executed=playbook.name if playbook else None,

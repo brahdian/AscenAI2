@@ -114,9 +114,9 @@ function schemaToParams(schema: Record<string, any> | undefined): InputParam[] {
   }))
 }
 
-// ─── Advanced Webhook Modal ───────────────────────────────────────────────────
+// ─── Dynamic Tool Configuration Modal ───────────────────────────────────────
 
-function WebhookModal({
+function ToolModal({
   entry,
   tool,
   onClose,
@@ -127,279 +127,373 @@ function WebhookModal({
   onClose: () => void
   onSaved: () => void
 }) {
+  const isCustom = entry.id === 'webhook'
   const existingMeta = tool?.tool_metadata || {}
   const existingAuth = tool?.auth_config || {}
 
   const [name, setName] = useState(tool?.name || entry.name.toLowerCase().replace(/\s+/g, '_'))
   const [description, setDescription] = useState(tool?.description || entry.description || '')
+  
+  // Custom Webhook state
   const [url, setUrl] = useState(tool?.endpoint_url || existingMeta.url || '')
   const [method, setMethod] = useState(existingMeta.method || 'POST')
   const [authType, setAuthType] = useState(existingAuth.type || 'none')
+  const [params, setParams] = useState<InputParam[]>(schemaToParams(tool?.input_schema))
+
+  // Auth fields (Unified)
+  const [apiKey, setApiKey] = useState(existingAuth.value?.replace(/^Bearer /, '') || existingMeta.api_key || existingMeta.access_token || '')
+  const [username, setUsername] = useState(existingAuth.username || existingMeta.username || '')
+  const [password, setPassword] = useState(existingAuth.password || existingMeta.password || '')
+  const [tokenUrl, setTokenUrl] = useState(existingAuth.token_url || existingMeta.token_url || '')
+  const [clientId, setClientId] = useState(existingAuth.client_id || existingMeta.client_id || '')
+  const [clientSecret, setClientSecret] = useState(existingAuth.client_secret || existingMeta.client_secret || '')
+
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({})
   const [saving, setSaving] = useState(false)
-  
-  // Auth fields
-  const [apiKey, setApiKey] = useState(existingAuth.value?.replace(/^Bearer /, '') || '')
-  const [username, setUsername] = useState(existingAuth.username || '')
-  const [password, setPassword] = useState(existingAuth.password || '')
-  const [tokenUrl, setTokenUrl] = useState(existingAuth.token_url || '')
-  const [clientId, setClientId] = useState(existingAuth.client_id || '')
-  const [clientSecret, setClientSecret] = useState(existingAuth.client_secret || '')
-
-  // Parameters
-  const [params, setParams] = useState<InputParam[]>(schemaToParams(tool?.input_schema))
-  
-  // Testing
-  const [isTesting, setIsTesting] = useState(false)
-  const [testInput, setTestInput] = useState('{\n  \n}')
-  const [testOutput, setTestOutput] = useState<any>(null)
-  const [testError, setTestError] = useState<string | null>(null)
-
-  const toggle = (field: string) => setShowSecrets((p) => ({ ...p, [field]: !p[field] }))
-  const addParam = () => setParams((p) => [...p, { name: '', type: 'string', description: '', required: false }])
-  const removeParam = (i: number) => setParams((p) => p.filter((_, idx) => idx !== i))
-  const updateParam = (i: number, key: keyof InputParam, value: any) =>
-    setParams((p) => p.map((row, idx) => (idx === i ? { ...row, [key]: value } : row)))
 
   const buildAuthConfig = (): Record<string, any> => {
-    const authConfig: Record<string, any> = { type: authType }
+    const auth: Record<string, any> = { type: authType }
     if (authType === 'api_key') {
-      authConfig.header = 'X-API-Key'
-      authConfig.value = apiKey
+      auth.header = 'X-API-Key'
+      auth.value = apiKey
     } else if (authType === 'bearer') {
-      authConfig.header = 'Authorization'
-      authConfig.value = `Bearer ${apiKey}`
+      auth.header = 'Authorization'
+      auth.value = `Bearer ${apiKey}`
     } else if (authType === 'basic') {
-      authConfig.username = username
-      authConfig.password = password
+      auth.username = username
+      auth.password = password
     } else if (authType === 'oauth2_cc') {
-      authConfig.token_url = tokenUrl
-      authConfig.client_id = clientId
-      authConfig.client_secret = clientSecret
+      auth.token_url = tokenUrl
+      auth.client_id = clientId
+      auth.client_secret = clientSecret
     }
-    return authConfig
+    return auth
   }
 
-  const getPayload = () => ({
-    name,
-    description,
-    category: entry.category,
-    is_builtin: false,
-    endpoint_url: url,
-    input_schema: buildInputSchema(params),
-    tool_metadata: { catalog_id: entry.id, method },
-    auth_config: buildAuthConfig(),
-  })
-
   const handleSave = async () => {
-    if (!name) { toast.error('Tool name is required'); return }
-    if (!url) { toast.error('Endpoint URL is required'); return }
-    setSaving(true)
+    if (!name.trim()) return toast.error('Name is required')
+    if (isCustom && !url.trim()) return toast.error('Endpoint URL is required')
+
     try {
-      const payload = getPayload()
-      if (tool) await toolsApi.update(tool.name, payload)
-      else await toolsApi.register(payload)
-      toast.success('Integration saved')
+      setSaving(true)
+      const payload: any = {
+        name,
+        description,
+        category: entry.category,
+        is_builtin: entry.is_builtin,
+      }
+
+      if (isCustom) {
+        payload.endpoint_url = url
+        payload.input_schema = buildInputSchema(params)
+        payload.tool_metadata = { method }
+        payload.auth_config = buildAuthConfig()
+      } else {
+        // Builtin integration
+        const meta: any = {}
+        // Map common fields from state
+        if (apiKey) meta.api_key = apiKey
+        if (username) meta.username = username
+        if (password) meta.password = password
+        if (clientId) meta.client_id = clientId
+        if (clientSecret) meta.client_secret = clientSecret
+        
+        payload.tool_metadata = meta
+        
+        // Auto-generate auth_config based on detected fields
+        if (apiKey) payload.auth_config = { type: 'api_key', value: apiKey, header: 'X-API-Key' }
+        else if (username && password) payload.auth_config = { type: 'basic', username, password }
+      }
+
+      if (tool) {
+        await toolsApi.update(tool.id, payload)
+        toast.success('Tool updated')
+      } else {
+        await toolsApi.register(payload)
+        toast.success('Tool installed')
+      }
       onSaved()
       onClose()
     } catch (e: any) {
-      toast.error(e.response?.data?.detail || 'Save failed')
+      toast.error(e.response?.data?.detail || 'Failed to save tool')
     } finally {
       setSaving(false)
     }
   }
 
-  const handleTest = async () => {
-    let parsedInput = {}
-    try { if (testInput.trim()) parsedInput = JSON.parse(testInput) }
-    catch { toast.error('Invalid JSON tool input'); return }
-    
-    setIsTesting(true)
-    setTestError(null)
-    setTestOutput(null)
-    try {
-      const res = await toolsApi.testExecute({ tool_config: getPayload(), parameters: parsedInput })
-      if (res.status === 'failed' || res.status === 'timeout') setTestError(res.error || 'Execution failed')
-      setTestOutput(res)
-    } catch (e: any) {
-      setTestError(e.response?.data?.detail || e.message || 'Test failed')
-    } finally {
-      setIsTesting(false)
-    }
-  }
-
-  const inputCls = 'w-full px-4 py-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all'
-  const labelCls = 'block text-xs font-bold text-gray-400 uppercase tracking-widest mb-2'
-
   return (
-    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
-      <div className="bg-white dark:bg-gray-900 rounded-[2.5rem] shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in duration-300">
-        <div className="flex items-center justify-between px-10 py-8 border-b border-gray-100 dark:border-gray-800 flex-shrink-0">
-          <div>
-            <h2 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight flex items-center gap-3">
-              <Zap className="text-violet-600" />
-              {tool ? 'Customize' : 'Configure'} {entry.name}
-            </h2>
-            <p className="text-sm text-gray-500 mt-1">Fine-tune your custom integration and test it live.</p>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+      <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+        <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-violet-100 dark:bg-violet-900/30 flex items-center justify-center text-violet-600 dark:text-violet-400">
+              <Settings size={20} />
+            </div>
+            <div>
+              <h2 className="text-lg font-bold text-gray-900 dark:text-white">
+                {tool ? 'Edit' : 'Install'} {entry.name}
+              </h2>
+              <p className="text-sm text-gray-500">Configure your integration credentials</p>
+            </div>
           </div>
-          <button onClick={onClose} className="p-3 rounded-2xl hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 transition-colors">
-            <X size={24} />
+          <button onClick={onClose} className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+            <X size={20} />
           </button>
         </div>
 
-        <div className="overflow-y-auto flex-1 px-10 py-8 space-y-10 custom-scrollbar">
-          {/* Section 1: Endpoint & Logic */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
-            <div className="space-y-6">
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {/* General */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Tool ID Name (Internal)</label>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value.toLowerCase().replace(/\s+/g, '_'))}
+                placeholder="e.g. check_calendar"
+                className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:ring-2 focus:ring-violet-500 outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Category</label>
+              <input
+                value={CATEGORY_LABELS[entry.category] || entry.category}
+                disabled
+                className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 text-sm opacity-60"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Description (for LLM context)</label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={2}
+              className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:ring-2 focus:ring-violet-500 outline-none resize-none"
+            />
+          </div>
+
+          {/* Config Fields */}
+          {isCustom ? (
+            <div className="space-y-4 pt-4 border-t border-gray-100 dark:border-gray-800">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white uppercase tracking-wider">Webhook Configuration</h3>
               <div>
-                <label className={labelCls}>Unique Identifier</label>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Endpoint URL</label>
                 <input
-                  type="text"
-                  disabled={!!tool}
-                  value={name}
-                  onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9_\-]/g, '_'))}
-                  placeholder="my_webhook"
-                  className={inputCls + (tool ? ' opacity-50 cursor-not-allowed' : '')}
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://api.yourservice.com/webhook"
+                  className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm outline-none focus:ring-2 focus:ring-violet-500"
                 />
               </div>
-              <div className="flex gap-4">
-                <div className="w-32 shrink-0">
-                  <label className={labelCls}>Method</label>
-                  <select value={method} onChange={(e) => setMethod(e.target.value)} className={inputCls + ' appearance-none'}>
-                    <option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Method</label>
+                  <select
+                    value={method}
+                    onChange={(e) => setMethod(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                  >
+                    <option value="POST">POST (Default)</option>
+                    <option value="GET">GET</option>
+                    <option value="PUT">PUT</option>
+                    <option value="PATCH">PATCH</option>
                   </select>
                 </div>
-                <div className="flex-1">
-                  <label className={labelCls}>Endpoint URL</label>
-                  <input type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://api.acme.com/hook" className={inputCls} />
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">Auth Type</label>
+                  <select
+                    value={authType}
+                    onChange={(e) => setAuthType(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                  >
+                    {AUTH_TYPES.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                  </select>
                 </div>
               </div>
-              <div>
-                <label className={labelCls}>Instructions (For AI LLM)</label>
-                <textarea
-                  rows={4}
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Tell the AI exactly when to trigger this tool..."
-                  className={inputCls + ' resize-none'}
-                />
-              </div>
-            </div>
 
-            <div className="space-y-6">
-              <label className={labelCls}>Authentication</label>
-              <select value={authType} onChange={(e) => setAuthType(e.target.value)} className={inputCls}>
-                {AUTH_TYPES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
-              </select>
-
+              {/* Dynamic Auth Inputs for Custom Webhook */}
               {authType !== 'none' && (
-                <div className="p-6 bg-gray-50/50 dark:bg-gray-800/50 rounded-2xl border border-gray-100 dark:border-gray-800 space-y-4">
-                  {(authType === 'api_key' || authType === 'bearer') && (
+                <div className="p-4 rounded-xl bg-gray-50 dark:bg-gray-800/50 space-y-4 border border-gray-100 dark:border-gray-800">
+                  {authType === 'api_key' || authType === 'bearer' ? (
                     <div>
-                      <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 block">Secret Token</label>
+                      <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1.5">
+                        {authType === 'api_key' ? 'API Key' : 'Bearer Token'}
+                      </label>
                       <div className="relative">
-                        <input type={showSecrets.apiKey ? 'text' : 'password'} value={apiKey} onChange={(e) => setApiKey(e.target.value)} className={inputCls} />
-                        <button type="button" onClick={() => toggle('apiKey')} className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400">
-                          {showSecrets.apiKey ? <EyeOff size={16} /> : <Eye size={16} />}
+                        <input
+                          type={showSecrets.key ? 'text' : 'password'}
+                          value={apiKey}
+                          onChange={(e) => setApiKey(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-1 focus:ring-violet-500 pr-10"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowSecrets(p => ({ ...p, key: !p.key }))}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                        >
+                          {showSecrets.key ? <EyeOff size={16} /> : <Eye size={16} />}
                         </button>
                       </div>
                     </div>
-                  )}
-                  {authType === 'basic' && (
+                  ) : authType === 'basic' ? (
                     <div className="grid grid-cols-2 gap-4">
-                      <div><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 block">User</label><input type="text" value={username} onChange={(e) => setUsername(e.target.value)} className={inputCls} /></div>
-                      <div><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 block">Pass</label><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} className={inputCls} /></div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1.5">Username</label>
+                        <input
+                          value={username}
+                          onChange={(e) => setUsername(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1.5">Password</label>
+                        <input
+                          type="password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                        />
+                      </div>
                     </div>
-                  )}
-                  {authType === 'oauth2_cc' && (
-                    <div className="space-y-3">
-                      <input type="url" placeholder="Token URL" value={tokenUrl} onChange={(e) => setTokenUrl(e.target.value)} className={inputCls} />
-                      <input type="text" placeholder="Client ID" value={clientId} onChange={(e) => setClientId(e.target.value)} className={inputCls} />
-                      <input type="password" placeholder="Client Secret" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} className={inputCls} />
+                  ) : authType === 'oauth2_cc' && (
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1.5">Token URL</label>
+                        <input
+                          value={tokenUrl}
+                          onChange={(e) => setTokenUrl(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1.5">Client ID</label>
+                          <input
+                            value={clientId}
+                            onChange={(e) => setClientId(e.target.value)}
+                            className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1.5">Client Secret</label>
+                          <input
+                            type="password"
+                            value={clientSecret}
+                            onChange={(e) => setClientSecret(e.target.value)}
+                            className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm"
+                          />
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
               )}
-            </div>
-          </div>
 
-          {/* Section 2: Parameters */}
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <label className={labelCls}>Field Definitions</label>
-              <button onClick={addParam} className="text-xs font-bold text-violet-600 hover:text-violet-700 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-50 dark:bg-violet-900/20 transition-all">
-                <Plus size={14} /> Add Field
-              </button>
+              {/* Input Parameters */}
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Input Parameters</label>
+                  <button
+                    onClick={() => setParams([...params, { name: '', type: 'string', description: '', required: false }])}
+                    className="text-xs text-violet-600 hover:text-violet-700 font-bold flex items-center gap-1"
+                  >
+                    <Plus size={14} /> Add Parameter
+                  </button>
+                </div>
+                {params.map((p, i) => (
+                  <div key={i} className="flex gap-2 items-center bg-gray-50 dark:bg-gray-800/50 p-3 rounded-xl border border-gray-100 dark:border-gray-800">
+                    <input
+                      value={p.name}
+                      onChange={(e) => setParams(params.map((x, idx) => idx === i ? { ...x, name: e.target.value } : x))}
+                      placeholder="name"
+                      className="w-1/4 px-2 py-1.5 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-xs"
+                    />
+                    <select
+                      value={p.type}
+                      onChange={(e) => setParams(params.map((x, idx) => idx === i ? { ...x, type: e.target.value } : x))}
+                      className="w-1/4 px-2 py-1.5 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-xs"
+                    >
+                      {PARAM_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                    <input
+                      value={p.description}
+                      onChange={(e) => setParams(params.map((x, idx) => idx === i ? { ...x, description: e.target.value } : x))}
+                      placeholder="description"
+                      className="flex-1 px-2 py-1.5 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-xs"
+                    />
+                    <button onClick={() => setParams(params.filter((_, idx) => idx !== i))} className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg">
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {params.map((p, i) => (
-                <div key={i} className="group flex items-center gap-3 bg-gray-50/50 dark:bg-gray-800/30 p-4 rounded-2xl border border-gray-100 dark:border-gray-800 hover:border-violet-200 transition-all">
-                  <div className="flex-1 space-y-2">
-                    <div className="flex gap-2">
-                      <input type="text" value={p.name} onChange={(e) => updateParam(i, 'name', e.target.value)} placeholder="key" className="flex-1 bg-transparent text-sm font-bold border-none focus:ring-0 p-0" />
-                      <select value={p.type} onChange={(e) => updateParam(i, 'type', e.target.value)} className="bg-transparent text-[10px] uppercase font-black text-gray-400 border-none focus:ring-0 p-0">
-                        {PARAM_TYPES.map(t => <option key={t}>{t}</option>)}
-                      </select>
+          ) : (
+            <div className="space-y-4 pt-4 border-t border-gray-100 dark:border-gray-800">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white uppercase tracking-wider">Authentication</h3>
+              <div className="grid gap-4">
+                {entry.credentials.map((cred) => (
+                  <div key={cred.field}>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">{cred.label}</label>
+                    <div className="relative">
+                      <input
+                        type={cred.type === 'password' && !showSecrets[cred.field] ? 'password' : 'text'}
+                        value={
+                          cred.field === 'api_key' ? apiKey :
+                          cred.field === 'username' ? username :
+                          cred.field === 'password' ? password :
+                          cred.field === 'client_id' ? clientId :
+                          cred.field === 'client_secret' ? clientSecret :
+                          ''
+                        }
+                        onChange={(e) => {
+                          const v = e.target.value
+                          if (cred.field === 'api_key') setApiKey(v)
+                          else if (cred.field === 'username') setUsername(v)
+                          else if (cred.field === 'password') setPassword(v)
+                          else if (cred.field === 'client_id') setClientId(v)
+                          else if (cred.field === 'client_secret') setClientSecret(v)
+                        }}
+                        className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm outline-none focus:ring-2 focus:ring-violet-500"
+                        placeholder={`Enter ${cred.label.toLowerCase()}…`}
+                      />
+                      {cred.type === 'password' && (
+                        <button
+                          type="button"
+                          onClick={() => setShowSecrets(p => ({ ...p, [cred.field]: !p[cred.field] }))}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                        >
+                          {showSecrets[cred.field] ? <EyeOff size={16} /> : <Eye size={16} />}
+                        </button>
+                      )}
                     </div>
-                    <input type="text" value={p.description} onChange={(e) => updateParam(i, 'description', e.target.value)} placeholder="Usage instructions..." className="w-full bg-transparent text-xs text-gray-500 border-none focus:ring-0 p-0" />
                   </div>
-                  <div className="flex flex-col items-center gap-2">
-                    <input type="checkbox" checked={p.required} onChange={(e) => updateParam(i, 'required', e.target.checked)} className="h-4 w-4 bg-transparent border-gray-300 rounded accent-violet-600" />
-                    <button onClick={() => removeParam(i)} className="text-gray-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={14} /></button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Section 3: Live Testing */}
-          <div className="pt-10 border-t border-gray-100 dark:border-gray-800 space-y-6">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-full bg-emerald-50 dark:bg-emerald-900/20 flex items-center justify-center text-emerald-600">
-                <ShieldCheck size={18} />
-              </div>
-              <h3 className="text-lg font-black text-gray-900 dark:text-white tracking-tight">Live Test Environment</h3>
-            </div>
-            
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-              <div className="space-y-3">
-                <label className="text-[10px] font-black text-gray-400 tracking-[0.2em] uppercase">Test Payload (JSON)</label>
-                <textarea
-                  rows={6}
-                  value={testInput}
-                  onChange={(e) => setTestInput(e.target.value)}
-                  className="w-full p-4 bg-gray-950 text-emerald-400 font-mono text-xs rounded-2xl border border-gray-800 focus:ring-2 focus:ring-emerald-500/20 outline-none transition-all resize-none"
-                />
-              </div>
-              <div className="space-y-3">
-                <label className="text-[10px] font-black text-gray-400 tracking-[0.2em] uppercase">Terminal Output</label>
-                <div className="w-full h-[148px] p-4 bg-gray-900 rounded-2xl border border-gray-800 font-mono text-xs overflow-auto">
-                  {isTesting && <div className="text-violet-400 animate-pulse flex items-center gap-2"><ArrowLeft size={12} className="animate-spin" /> Verifying connection...</div>}
-                  {testError && <div className="text-red-400">Error: {testError}</div>}
-                  {testOutput?.result && <pre className="text-gray-300">{JSON.stringify(testOutput.result, null, 2)}</pre>}
-                  {!isTesting && !testError && !testOutput && <div className="text-gray-600 italic">No execution data...</div>}
-                </div>
+                ))}
               </div>
             </div>
-          </div>
+          )}
         </div>
 
-        <div className="px-10 py-6 bg-gray-50/50 dark:bg-gray-800/50 border-t border-gray-100 dark:border-gray-800 flex justify-between items-center flex-shrink-0">
-          <button
-            onClick={handleTest}
-            disabled={isTesting || !url}
-            className="flex items-center gap-2 px-6 py-3 border border-violet-200 dark:border-violet-800 rounded-2xl text-xs font-black text-violet-700 dark:text-violet-400 hover:bg-white dark:hover:bg-gray-900 transition-all disabled:opacity-50"
-          >
-            <Play size={14} fill="currentColor" /> Run Test Execution
-          </button>
-          <div className="flex gap-4">
-            <button onClick={onClose} className="px-6 py-3 text-sm font-bold text-gray-500 hover:text-gray-900 transition-colors">Cancel</button>
+        <div className="px-6 py-4 bg-gray-50 dark:bg-gray-800/50 border-t border-gray-200 dark:border-gray-800 flex items-center justify-between rounded-b-2xl">
+          <p className="text-xs text-gray-500 flex items-center gap-1.5">
+            <ShieldCheck size={14} className="text-emerald-500" />
+            Credentials are encrypted at rest.
+          </p>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+            >
+              Cancel
+            </button>
             <button
               onClick={handleSave}
-              disabled={saving || !name || !url}
-              className="px-10 py-3 bg-violet-600 text-white rounded-2xl text-sm font-black hover:bg-violet-700 hover:shadow-xl hover:shadow-violet-500/20 transition-all active:scale-95 disabled:opacity-50"
+              disabled={saving}
+              className="flex items-center gap-2 px-6 py-2 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-sm font-semibold shadow-lg shadow-violet-500/20 transition-all disabled:opacity-50"
             >
-              {saving ? 'Syncing...' : tool ? 'Save Changes' : 'Connect Agent'}
+              {saving ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Plus size={16} />}
+              {tool ? 'Update Tool' : 'Install Tool'}
             </button>
           </div>
         </div>
@@ -408,157 +502,199 @@ function WebhookModal({
   )
 }
 
-// ─── Marketplace Page ──────────────────────────────────────────────────────────
-
 export default function MarketplacePage() {
-  const { id: agentId } = useParams<{ id: string }>()
+  const params = useParams()
   const router = useRouter()
   const qc = useQueryClient()
-  
-  const [search, setSearch] = useState('')
-  const [webhookModal, setWebhookModal] = useState<{ entry: CatalogEntry; tool?: ToolRecord } | null>(null)
+  const agentId = params.id as string
 
-  const { data: catalog = [], isLoading: isLoadingCatalog } = useQuery<CatalogEntry[]>({
-    queryKey: ['catalog'],
-    queryFn: () => toolsApi.catalog(),
+  const [search, setSearch] = useState('')
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
+  const [showConfig, setShowConfig] = useState<{ entry: CatalogEntry; tool?: ToolRecord } | null>(null)
+
+  const { data: catalog = [] } = useQuery({
+    queryKey: ['tool-catalog'],
+    queryFn: () => toolsApi.getCatalog(),
   })
 
-  const { data: registeredTools = [] } = useQuery<ToolRecord[]>({
+  const { data: installedTools = [] } = useQuery({
     queryKey: ['tools', agentId],
     queryFn: () => toolsApi.list(agentId),
     enabled: !!agentId,
   })
 
   const filteredCatalog = useMemo(() => {
-    if (!search) return catalog
-    const s = search.toLowerCase()
-    return catalog.filter(c => 
-      c.name.toLowerCase().includes(s) || 
-      c.description.toLowerCase().includes(s) ||
-      c.category.toLowerCase().includes(s)
-    )
-  }, [catalog, search])
+    return catalog.filter((entry: CatalogEntry) => {
+      const matchesSearch = entry.name.toLowerCase().includes(search.toLowerCase()) ||
+                          entry.description.toLowerCase().includes(search.toLowerCase())
+      const matchesCat = !selectedCategory || entry.category === selectedCategory
+      return matchesSearch && matchesCat
+    })
+  }, [catalog, search, selectedCategory])
 
-  const grouped = useMemo(() => {
-    return filteredCatalog.reduce((acc, entry) => {
-      const cat = entry.category || 'other'
-      if (!acc[cat]) acc[cat] = []
-      acc[cat].push(entry)
-      return acc
-    }, {} as Record<string, CatalogEntry[]>)
-  }, [filteredCatalog])
-
-  const registeredInstances = useMemo(() => {
-    return registeredTools.reduce((acc, t) => {
-      const cid = t.tool_metadata?.catalog_id 
-      if (cid) { if (!acc[cid]) acc[cid] = []; acc[cid].push(t) }
-      return acc
-    }, {} as Record<string, ToolRecord[]>)
-  }, [registeredTools])
+  const categories = useMemo(() => {
+    const cats = new Set(catalog.map((e: any) => e.category))
+    return Array.from(cats).sort()
+  }, [catalog])
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-950 p-6">
-      {/* Back nav */}
-      <Link
-        href={`/dashboard/agents/${agentId}/tools`}
-        className="inline-flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 hover:text-violet-600 dark:hover:text-violet-400 mb-6"
-      >
-        <ChevronLeft size={16} /> Intelligence
-      </Link>
-      
+    <div className="p-8 w-full max-w-7xl mx-auto">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
-            <Wrench className="text-violet-500" size={24} /> Marketplace
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-10">
+        <div className="space-y-1">
+          <Link
+            href={`/dashboard/agents/${agentId}/tools`}
+            className="flex items-center gap-2 text-sm text-gray-500 hover:text-violet-600 transition-colors mb-2 w-fit"
+          >
+            <ArrowLeft size={16} />
+            Back to Tools
+          </Link>
+          <h1 className="text-3xl font-bold text-gray-900 dark:text-white flex items-center gap-3">
+            <Zap className="text-violet-600" />
+            Tool Marketplace
           </h1>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-            Expand your agent's capabilities with secure native integrations and webhooks
-          </p>
+          <p className="text-gray-500">Discover and install ready-made integrations for your AI Agent.</p>
         </div>
-        
-        <div className="relative w-full md:w-64 shrink-0">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
-          <input
-            type="text"
-            placeholder="Search modules..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500 transition-all"
-          />
+
+        <div className="flex items-center gap-3">
+          <div className="relative group">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-violet-500 transition-colors" size={18} />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search integrations…"
+              className="pl-10 pr-4 py-2.5 w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 text-sm focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 outline-none transition-all shadow-sm"
+            />
+          </div>
         </div>
       </div>
 
-      <div className="space-y-8">
-        {Object.entries(grouped).map(([category, entries]) => (
-          <div key={category}>
-            <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
-              {CATEGORY_LABELS[category] || category}
-            </h3>
+      <div className="flex flex-col lg:flex-row gap-8">
+        {/* Sidebar Filters */}
+        <div className="lg:w-64 flex-shrink-0 space-y-6">
+          <div>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-4">Categories</h3>
+            <div className="flex flex-wrap lg:flex-col gap-2">
+              <button
+                onClick={() => setSelectedCategory(null)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all text-left ${
+                  !selectedCategory
+                    ? 'bg-violet-600 text-white shadow-lg shadow-violet-500/30'
+                    : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+                }`}
+              >
+                All Categories
+              </button>
+              {categories.map((cat: any) => (
+                <button
+                  key={cat}
+                  onClick={() => setSelectedCategory(cat)}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-all text-left ${
+                    selectedCategory === cat
+                      ? 'bg-violet-600 text-white shadow-lg shadow-violet-500/30'
+                      : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  {CATEGORY_LABELS[cat] || cat}
+                </button>
+              ))}
+            </div>
+          </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-              {entries.map((entry) => {
-                const instances = registeredInstances[entry.id] || []
-                const isRegistered = instances.length > 0
-                
+          <div className="p-5 rounded-2xl bg-gradient-to-br from-violet-600 to-indigo-700 text-white shadow-xl shadow-violet-500/20">
+            <h4 className="font-bold mb-2 flex items-center gap-2">
+              <Zap size={18} />
+              Custom Tools?
+            </h4>
+            <p className="text-xs text-white/80 leading-relaxed mb-4">
+              Can&apos;t find what you need? Create a custom webhook integration to connect any API.
+            </p>
+            <button
+              onClick={() => {
+                const webhookEntry = catalog.find((e: any) => e.id === 'webhook')
+                if (webhookEntry) setShowConfig({ entry: webhookEntry })
+              }}
+              className="w-full py-2 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-bold transition-colors border border-white/20"
+            >
+              Configure Webhook
+            </button>
+          </div>
+        </div>
+
+        {/* Results Grid */}
+        <div className="flex-1">
+          {filteredCatalog.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-20 bg-gray-50 dark:bg-gray-900/50 rounded-3xl border-2 border-dashed border-gray-200 dark:border-gray-800">
+              <Search size={48} className="text-gray-300 mb-4" />
+              <h3 className="text-lg font-medium text-gray-900 dark:text-white">No integrations found</h3>
+              <p className="text-gray-500 text-sm">Try adjusting your search or filters.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+              {filteredCatalog.map((entry: CatalogEntry) => {
+                const isInstalled = installedTools.some((t: any) => t.is_builtin && t.name.startsWith(entry.id))
                 return (
-                  <div key={entry.id} className="relative bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 hover:border-violet-300 dark:hover:border-violet-700 transition-colors p-5 flex flex-col gap-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <Wrench size={16} className="text-violet-500 shrink-0" />
-                          <span className="font-semibold text-gray-900 dark:text-white truncate">
-                            {entry.name}
-                          </span>
+                  <div
+                    key={entry.id}
+                    className="group flex flex-col bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 hover:border-violet-500/50 hover:shadow-2xl hover:shadow-violet-500/5 transition-all duration-300 overflow-hidden"
+                  >
+                    <div className="p-6 flex-1">
+                      <div className="flex items-start justify-between mb-4">
+                        <div className="w-12 h-12 rounded-xl bg-violet-50 dark:bg-violet-900/20 flex items-center justify-center group-hover:scale-110 transition-transform">
+                          <Settings className="text-violet-600 dark:text-violet-400" size={24} />
                         </div>
-                        <p className="text-sm text-gray-500 dark:text-gray-400 line-clamp-2">
-                          {entry.description}
-                        </p>
-                      </div>
-                      
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {isRegistered && (
-                          <span className="flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-0.5 rounded-full">
-                            <CheckCircle2 size={11} /> Connected
+                        {isInstalled && (
+                          <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-1 rounded-full">
+                            <CheckCircle2 size={12} />
+                            Installed
                           </span>
                         )}
                       </div>
+                      <h3 className="text-lg font-bold text-gray-900 dark:text-white mb-2 group-hover:text-violet-600 transition-colors">
+                        {entry.name}
+                      </h3>
+                      <p className="text-sm text-gray-500 line-clamp-3 leading-relaxed">
+                        {entry.description}
+                      </p>
                     </div>
-
-                    <div className="flex items-center justify-between pt-3 border-t border-gray-100 dark:border-gray-800 mt-auto">
-                      <div className="flex flex-wrap gap-1.5">
-                        {isRegistered && instances.map(i => (
-                          <button 
-                            key={i.id} 
-                            onClick={() => setWebhookModal({ entry, tool: i })}
-                            className="px-2 py-1 bg-gray-100 dark:bg-gray-800 rounded-lg text-xs font-medium text-gray-600 dark:text-gray-300 hover:bg-violet-50 hover:text-violet-600 dark:hover:bg-violet-900/20 dark:hover:text-violet-400 transition-all truncate max-w-[120px]"
-                          >
-                            {i.name}
-                          </button>
-                        ))}
-                      </div>
-
+                    <div className="px-6 py-4 bg-gray-50/50 dark:bg-gray-800/30 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
+                      <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                        {CATEGORY_LABELS[entry.category] || entry.category}
+                      </span>
                       <button
-                        onClick={() => setWebhookModal({ entry })}
-                        className="flex items-center gap-1 px-3 py-1.5 rounded-xl bg-violet-50 text-violet-600 dark:bg-violet-900/20 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-900/40 text-xs font-semibold transition-all ml-auto shrink-0"
+                        onClick={() => setShowConfig({ entry })}
+                        className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-bold transition-all ${
+                          isInstalled
+                            ? 'text-violet-600 hover:bg-violet-50 dark:hover:bg-violet-900/20'
+                            : 'bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:scale-105 active:scale-95'
+                        }`}
                       >
-                        <Plus size={14} />
-                        {isRegistered && entry.allow_multiple ? 'Add' : isRegistered ? 'Configure' : 'Initialize'}
+                        {isInstalled ? (
+                          <>
+                            <Settings size={16} />
+                            Configure
+                          </>
+                        ) : (
+                          <>
+                            <Plus size={16} />
+                            Install
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
                 )
               })}
             </div>
-          </div>
-        ))}
+          )}
+        </div>
       </div>
 
-      {webhookModal && (
-        <WebhookModal
-          entry={webhookModal.entry}
-          tool={webhookModal.tool}
-          onClose={() => setWebhookModal(null)}
+      {showConfig && (
+        <ToolModal
+          entry={showConfig.entry}
+          tool={showConfig.tool}
+          onClose={() => setShowConfig(null)}
           onSaved={() => qc.invalidateQueries({ queryKey: ['tools', agentId] })}
         />
       )}

@@ -8,21 +8,19 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from jose import JWTError, jwt
+from jose import jwt
 from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.invite import UserInvite
 from app.models.tenant import Tenant, TenantUsage
 from app.models.user import APIKey, User
-from app.models.invite import UserInvite
 from app.schemas.auth import (
-    APIKeyCreatedResponse,
     LoginRequest,
     RegisterRequest,
     RegisterResponse,
-    SubscribeResponse,
     TokenResponse,
     UserInfo,
     VerifyEmailResponse,
@@ -393,7 +391,7 @@ class AuthService:
         Rate-limited to 3 requests per email per hour to prevent abuse.
         """
         import hashlib
-        from fastapi import HTTPException as _HTTPException
+
 
         # Rate-limit: max 3 reset requests per email per hour
         if redis:
@@ -437,6 +435,7 @@ class AuthService:
         Raises HTTPException if token is invalid or expired.
         """
         import hashlib
+
         from fastapi import HTTPException
 
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
@@ -766,7 +765,7 @@ class AuthService:
         
         Returns the number of cleaned-up accounts.
         """
-        from sqlalchemy import text, delete
+        from sqlalchemy import delete
         
         cutoff = _utcnow() - timedelta(minutes=30)
         

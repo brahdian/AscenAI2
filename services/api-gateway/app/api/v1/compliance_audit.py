@@ -16,9 +16,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
 from app.core.redis_client import get_redis
+from app.core.security import get_tenant_db
 from app.services.compliance_auditor import ComplianceAuditor
 
 router = APIRouter(prefix="/compliance-audit")

@@ -96,6 +96,8 @@ def extract_tenant_from_token(token: str) -> Optional[str]:
         if sub.startswith("tenant:"):
             return sub.split("tenant:", 1)[1]
         # sub may directly be the tenant_id UUID
+        if sub == "internal-service-call":
+            return None
         return sub if sub else None
     except JWTError:
         return None

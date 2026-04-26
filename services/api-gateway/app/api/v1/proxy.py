@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import json as _json
 import re
+import uuid
+
 import httpx
 import stripe
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant, generate_internal_token
-from app.core.rbac import require_role, require_scope
+from app.core.security import generate_internal_token, get_current_tenant, get_tenant_db
 from app.services.billing_service import create_agent_checkout_session
 
 logger = structlog.get_logger(__name__)
@@ -24,8 +24,9 @@ router = APIRouter(prefix="/proxy")
 
 async def _get_tenant_and_usage(tenant_id: str, db: AsyncSession):
     """Load Tenant + TenantUsage in a single round-trip."""
-    from app.models.tenant import Tenant, TenantUsage
     import uuid as _uuid
+
+    from app.models.tenant import Tenant, TenantUsage
     tid = _uuid.UUID(tenant_id)
     t_res = await db.execute(select(Tenant).where(Tenant.id == tid))
     u_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tid))
@@ -99,7 +100,7 @@ async def _check_agent_limit(tenant_id: str, db: AsyncSession) -> None:
 
 async def _check_message_limit(tenant_id: str, db: AsyncSession) -> None:
     """Raise 429 if tenant has exhausted their monthly message quota."""
-    from app.services.tenant_service import get_plan_limits, check_limit
+    from app.services.tenant_service import check_limit, get_plan_limits
     tenant, usage = await _get_tenant_and_usage(tenant_id, db)
     if tenant is None:
         return
@@ -115,8 +116,9 @@ async def _check_message_limit(tenant_id: str, db: AsyncSession) -> None:
 
 async def _increment_agent_count(tenant_id: str, delta: int, db: AsyncSession) -> None:
     """Increment or decrement the agent_count on TenantUsage."""
-    from app.models.tenant import TenantUsage
     import uuid as _uuid
+
+    from app.models.tenant import TenantUsage
     tid = _uuid.UUID(tenant_id)
     usage_res = await db.execute(select(TenantUsage).where(TenantUsage.tenant_id == tid))
     usage = usage_res.scalar_one_or_none()
@@ -219,10 +221,10 @@ async def _proxy_request(
     if api_agent_id:
         headers["X-Restricted-Agent-ID"] = str(api_agent_id)
 
-    # Attach shared internal secret so the ai-orchestrator can verify this
-    # request originated from the trusted api-gateway (CRIT-002 defense).
+    # Attach shared internal secret and signed JWT for inter-service authentication (CRIT-002 defense).
     if settings.INTERNAL_API_KEY:
         headers["X-Internal-Key"] = settings.INTERNAL_API_KEY
+    headers["Authorization"] = f"Bearer {generate_internal_token()}"
     # Propagate W3C traceparent so downstream services continue the same trace
     if _trace_id and _span_id:
         headers["traceparent"] = f"00-{_trace_id}-{_span_id}-01"

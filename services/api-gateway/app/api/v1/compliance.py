@@ -15,12 +15,12 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.database import get_db, engine as _db_engine
-from app.core.security import get_tenant_db, get_current_tenant
+from app.core.database import engine as _db_engine
+from app.core.security import get_current_tenant, get_tenant_db
 from app.services.tenant_service import tenant_service
 
 logger = structlog.get_logger(__name__)

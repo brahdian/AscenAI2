@@ -19,18 +19,18 @@ Calculates:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Optional
 
+import httpx
+import stripe
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-import httpx
 
-import uuid
-import stripe
 from app.core.config import settings
 from app.models.tenant import Tenant
 from app.services.tenant_service import get_plan_limits
@@ -81,8 +81,9 @@ async def _get_overage_rates(
     2. _DEFAULT_OVERAGE_RATES fallback (startup bootstrap)
     """
     try:
-        from app.models.platform import PlatformSetting
         from sqlalchemy import select as _sel
+
+        from app.models.platform import PlatformSetting
         result = await db.execute(
             _sel(PlatformSetting).where(PlatformSetting.key == "billing_plans")
         )
@@ -418,6 +419,7 @@ class BillingService:
         """Report metered usage to Stripe."""
         try:
             import stripe
+
             from app.core.config import settings
 
             stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -455,7 +457,7 @@ class BillingService:
                     resp = await client.get(
                         f"{settings.AI_ORCHESTRATOR_URL}/api/v1/agents",
                         params={"tenant_id": str(tenant.id), "status": "PENDING_PAYMENT"},
-                        headers={"X-Internal-Secret": settings.INTERNAL_API_SECRET}
+                        headers={"X-Internal-Key": settings.INTERNAL_API_KEY}
                     )
                     if resp.status_code != 200:
                         continue
@@ -484,7 +486,7 @@ class BillingService:
                         sync_resp = await client.post(
                             f"{settings.INTERNAL_BASE_URL}/api/v1/billing/sync-subscription",
                             json={"tenant_id": str(tenant.id)},
-                            headers={"X-Internal-Secret": settings.INTERNAL_API_SECRET}
+                            headers={"X-Internal-Key": settings.INTERNAL_API_KEY}
                         )
                         if sync_resp.status_code == 200:
                             data = sync_resp.json()
@@ -507,10 +509,13 @@ class BillingService:
             return False
             
         try:
-            from app.models.tenant import TenantUsage
-            from app.models.analytics import AgentAnalytics
-            from sqlalchemy import func, update as _update
             import uuid as _uuid
+
+            from sqlalchemy import func
+            from sqlalchemy import update as _update
+
+            from app.models.analytics import AgentAnalytics
+            from app.models.tenant import TenantUsage
             
             t_uuid = _uuid.UUID(tenant_id)
             
@@ -733,6 +738,7 @@ class BillingService:
 async def get_db_usage_summary(tenant_id: str, db: AsyncSession) -> dict[str, Any]:
     """Fetch usage from the TenantUsage table (authoritative monthly counters)."""
     import uuid as _uuid
+
     from app.models.tenant import TenantUsage
 
     result = await db.execute(
@@ -778,6 +784,7 @@ async def create_agent_checkout_session(
     Forces monthly subscription mode.
     """
     import uuid as _uuid
+
     from fastapi import HTTPException
     tenant_uuid = _uuid.UUID(tenant_id)
     

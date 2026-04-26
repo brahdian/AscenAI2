@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
+import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
+from app.core.config import settings
+from app.core.security import get_current_tenant, get_tenant_db
 from app.services.tenant_service import tenant_service
 
 router = APIRouter(prefix="/tenants")
@@ -165,7 +168,6 @@ async def self_destruct_tenant(
     # 2. Cancel Stripe subscription if applicable
     if tenant.subscription_id:
         try:
-            import stripe
             stripe.api_key = settings.STRIPE_SECRET_KEY
             # Cancel at period end to avoid immediate access loss, or cancel now?
             # SaaS pattern usually cancels at end of period for UX, but suspends app access now.
@@ -177,7 +179,6 @@ async def self_destruct_tenant(
             _comp_logger.warning("stripe_cancellation_failed_during_self_destruct", tenant_id=tenant_id, error=str(e))
 
     # 3. Mark as inactive and set deletion metadata
-    from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
     hard_delete_at = now + timedelta(days=30)
     

@@ -137,6 +137,13 @@ class ExecutionStatusEnum(str, enum.Enum):
     EXPIRED          = "EXPIRED"
 
 
+class WorkflowStatusEnum(str, enum.Enum):
+    DRAFT    = "DRAFT"
+    ACTIVE   = "ACTIVE"
+    ARCHIVED = "ARCHIVED"
+    DELETED  = "DELETED"
+
+
 # ---------------------------------------------------------------------------
 # API request / response schemas
 # ---------------------------------------------------------------------------
@@ -174,6 +181,7 @@ class WorkflowResponse(BaseModel):
     description: str
     trigger_type: str
     trigger_config: dict
+    lifecycle_status: WorkflowStatusEnum
     is_active: bool
     version: int
     definition: dict

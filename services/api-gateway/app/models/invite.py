@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timezone
+
 from sqlalchemy import (
     DateTime,
     ForeignKey,
@@ -7,10 +8,11 @@ from sqlalchemy import (
     String,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)

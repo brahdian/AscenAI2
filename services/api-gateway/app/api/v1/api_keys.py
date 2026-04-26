@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant, get_current_user
+from app.core.security import get_current_tenant, get_current_user, get_tenant_db
 from app.models.user import APIKey
-from app.schemas.auth import APIKeyCreateRequest, APIKeyCreatedResponse, APIKeyResponse, APIKeyUpdateRequest
+from app.schemas.auth import (
+    APIKeyCreatedResponse,
+    APIKeyCreateRequest,
+    APIKeyResponse,
+    APIKeyUpdateRequest,
+)
 from app.services.auth_service import auth_service
 
 router = APIRouter(prefix="/api-keys")
@@ -42,8 +46,8 @@ async def create_api_key(
     # Auth is handled by get_tenant_db dependency
 
     # Check plan limit: max_api_keys
-    from app.models.tenant import Tenant, TenantUsage
-    from app.services.tenant_service import get_plan_limits, check_limit
+    from app.models.tenant import Tenant
+    from app.services.tenant_service import check_limit, get_plan_limits
     t_res = await db.execute(select(Tenant).where(Tenant.id == uuid.UUID(tenant_id)))
     tenant = t_res.scalar_one_or_none()
     limits = await get_plan_limits(tenant.plan if tenant else "professional", db)

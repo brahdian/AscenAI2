@@ -76,6 +76,26 @@ async def warmup() -> None:
         _anonymizer = AnonymizerEngine()
         logger.info("pii_service_presidio_init_complete", method="presidio_hybrid_engine")
 
+def _remove_overlaps(results):
+    if not results:
+        return []
+    sorted_res = sorted(results, key=lambda x: (x.start, -x.end))
+    filtered = []
+    for r in sorted_res:
+        if not filtered:
+            filtered.append(r)
+            continue
+        last = filtered[-1]
+        if r.start >= last.end:
+            filtered.append(r)
+        else:
+            if r.score > last.score:
+                filtered[-1] = r
+            elif r.score == last.score:
+                if (r.end - r.start) > (last.end - last.start):
+                    filtered[-1] = r
+    return filtered
+
 def redact(text: str, hipaa_mode: bool = False) -> str:
     """One-way PII redaction for output guardrail. Replaces PII with [TYPE] labels."""
     if not text or _analyzer is None:
@@ -84,6 +104,7 @@ def redact(text: str, hipaa_mode: bool = False) -> str:
     # HIPAA Mode: Lower threshold to 0.25 to be more aggressive
     threshold = 0.25 if hipaa_mode else 0.4
     results = _analyzer.analyze(text=text, language='en', score_threshold=threshold)
+    results = _remove_overlaps(results)
     results.sort(key=lambda x: x.start, reverse=True)
     
     result_text = text
@@ -228,6 +249,7 @@ def redact_pii(text: str, ctx: PIIContext, session_id: str = "", hipaa_mode: boo
         logger.info("pii_no_match", session_id=session_id, text_preview=text[:100])
         return text
 
+    results = _remove_overlaps(results)
     # Sort results in reverse so offsets don't change during replacement
     results.sort(key=lambda x: x.start, reverse=True)
     

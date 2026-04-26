@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict
 
 import structlog
 from sqlalchemy import text

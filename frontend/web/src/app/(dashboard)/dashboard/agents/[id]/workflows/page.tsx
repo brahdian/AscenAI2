@@ -24,6 +24,7 @@ import {
   XCircle,
   AlertCircle,
   Calendar,
+  RefreshCw,
 } from 'lucide-react'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -33,6 +34,7 @@ interface Flow {
   name: string
   description: string
   is_active: boolean
+  is_archived: boolean
   trigger_type: 'none' | 'cron' | 'webhook' | 'event'
   trigger_config: Record<string, unknown>
   tags: string[]
@@ -181,12 +183,16 @@ function FlowCard({
   flow,
   agentId,
   onDelete,
+  onArchive,
+  onRestore,
   onClone,
   onToggle,
 }: {
   flow: Flow
   agentId: string
   onDelete: () => void
+  onArchive: () => void
+  onRestore: () => void
   onClone: () => void
   onToggle: () => void
 }) {
@@ -277,11 +283,26 @@ function FlowCard({
                   >
                     <Copy size={13} /> Clone
                   </button>
+                  {flow.is_archived ? (
+                    <button
+                      onClick={() => { onRestore(); setMenuOpen(false) }}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                    >
+                      <RefreshCw size={13} /> Restore
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => { onArchive(); setMenuOpen(false) }}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20"
+                    >
+                      <XCircle size={13} /> Archive
+                    </button>
+                  )}
                   <button
                     onClick={() => { onDelete(); setMenuOpen(false) }}
                     className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
                   >
-                    <Trash2 size={13} /> Delete
+                    <Trash2 size={13} /> Hard Delete
                   </button>
                 </div>
               </>
@@ -300,6 +321,7 @@ export default function FlowsPage() {
   const router = useRouter()
   const qc = useQueryClient()
   const [showCreate, setShowCreate] = useState(false)
+  const [activeTab, setActiveTab] = useState<'active' | 'archived'>('active')
 
   const { data: agent } = useQuery({
     queryKey: ['agent', id],
@@ -307,14 +329,29 @@ export default function FlowsPage() {
   })
 
   const { data: flows = [], isLoading } = useQuery<Flow[]>({
-    queryKey: ['workflows', id],
-    queryFn: () => workflowsApi.list(id),
+    queryKey: ['workflows', id, activeTab],
+    queryFn: () => workflowsApi.list(id, { include_archived: activeTab === 'archived' }),
   })
+
+  // Filter based on activeTab (just in case the API doesn't filter strictly)
+  const filteredFlows = flows.filter(f => activeTab === 'archived' ? f.is_archived : !f.is_archived)
 
   const deleteMutation = useMutation({
     mutationFn: (flowId: string) => workflowsApi.delete(id, flowId),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['workflows', id] }); toast.success('Workflow deleted') },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['workflows', id] }); toast.success('Workflow permanently deleted') },
     onError: () => toast.error('Failed to delete workflow'),
+  })
+
+  const archiveMutation = useMutation({
+    mutationFn: (flowId: string) => workflowsApi.archive(id, flowId),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['workflows', id] }); toast.success('Workflow archived') },
+    onError: () => toast.error('Failed to archive workflow'),
+  })
+
+  const restoreMutation = useMutation({
+    mutationFn: (flowId: string) => workflowsApi.restore(id, flowId),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['workflows', id] }); toast.success('Workflow restored') },
+    onError: () => toast.error('Failed to restore workflow'),
   })
 
   const cloneMutation = useMutation({
@@ -337,9 +374,17 @@ export default function FlowsPage() {
   })
 
   const confirmDelete = (flow: Flow) => {
-    if (confirm(`Delete "${flow.name}"? This cannot be undone.`)) {
+    if (confirm(`PERMANENTLY delete "${flow.name}"? This will erase all history and cannot be undone.`)) {
       deleteMutation.mutate(flow.id)
     }
+  }
+
+  const handleArchive = (flow: Flow) => {
+    archiveMutation.mutate(flow.id)
+  }
+
+  const handleRestore = (flow: Flow) => {
+    restoreMutation.mutate(flow.id)
   }
 
   return (
@@ -353,7 +398,7 @@ export default function FlowsPage() {
       </Link>
 
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
             <Zap className="text-violet-500" size={24} /> Workflows
@@ -362,12 +407,28 @@ export default function FlowsPage() {
             Automated workflows triggered by schedule, webhook, event, or LLM tool call
           </p>
         </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700 transition-colors"
-        >
-          <Plus size={16} /> New Workflow
-        </button>
+        <div className="flex items-center gap-3">
+          <div className="bg-gray-100 dark:bg-gray-800 p-1 rounded-xl flex gap-1">
+            <button
+              onClick={() => setActiveTab('active')}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${activeTab === 'active' ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm' : 'text-gray-500'}`}
+            >
+              Active
+            </button>
+            <button
+              onClick={() => setActiveTab('archived')}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${activeTab === 'archived' ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm' : 'text-gray-500'}`}
+            >
+              Archived
+            </button>
+          </div>
+          <button
+            onClick={() => setShowCreate(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700 transition-colors shadow-lg shadow-violet-500/20"
+          >
+            <Plus size={16} /> New Workflow
+          </button>
+        </div>
       </div>
 
       {/* Content */}
@@ -375,28 +436,36 @@ export default function FlowsPage() {
         <div className="flex justify-center py-20">
           <Loader2 size={28} className="animate-spin text-violet-500" />
         </div>
-      ) : flows.length === 0 ? (
-        <div className="text-center py-20">
-          <Zap size={40} className="text-gray-300 dark:text-gray-700 mx-auto mb-4" />
-          <p className="text-gray-500 dark:text-gray-400 font-medium mb-2">No workflows yet</p>
-          <p className="text-sm text-gray-400 dark:text-gray-500 mb-6">
-            Create a workflow to automate actions — send SMS, call tools, run logic, and more.
+      ) : filteredFlows.length === 0 ? (
+        <div className="text-center py-20 bg-white dark:bg-gray-900/50 rounded-2xl border-2 border-dashed border-gray-100 dark:border-gray-800">
+          <Zap size={40} className="text-gray-200 dark:text-gray-700 mx-auto mb-4" />
+          <p className="text-gray-500 dark:text-gray-400 font-medium mb-2">
+            {activeTab === 'active' ? 'No workflows yet' : 'No archived workflows'}
           </p>
-          <button
-            onClick={() => setShowCreate(true)}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700"
-          >
-            <Plus size={16} /> Create your first workflow
-          </button>
+          <p className="text-sm text-gray-400 dark:text-gray-500 mb-6">
+            {activeTab === 'active' 
+              ? 'Create a workflow to automate actions — send SMS, call tools, run logic, and more.'
+              : 'Workflows you archive will appear here.'}
+          </p>
+          {activeTab === 'active' && (
+            <button
+              onClick={() => setShowCreate(true)}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700"
+            >
+              <Plus size={16} /> Create your first workflow
+            </button>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-          {flows.map((flow) => (
+          {filteredFlows.map((flow) => (
             <FlowCard
               key={flow.id}
               flow={flow}
               agentId={id}
               onDelete={() => confirmDelete(flow)}
+              onArchive={() => handleArchive(flow)}
+              onRestore={() => handleRestore(flow)}
               onClone={() => cloneMutation.mutate(flow.id)}
               onToggle={() => toggleMutation.mutate(flow)}
             />

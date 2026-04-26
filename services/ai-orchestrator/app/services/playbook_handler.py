@@ -53,7 +53,12 @@ class PlaybookHandler:
                 return None
             
             playbook_summaries = [
-                {"id": str(p.id), "name": p.name, "description": p.description or ""}
+                {
+                    "id": str(p.id), 
+                    "name": p.name, 
+                    "description": p.description or "",
+                    "triggers": p.intent_triggers or []
+                }
                 for p in playbooks
             ]
             
@@ -74,7 +79,8 @@ class PlaybookHandler:
             "AVAILABLE PLAYBOOKS:\n"
         )
         for p in playbook_summaries:
-            system_prompt += f"ID: {p['id']}\nName: {p['name']}\nDescription: {p['description']}\n\n"
+            triggers = ", ".join(p.get("triggers", []))
+            system_prompt += f"ID: {p['id']}\nName: {p['name']}\nDescription: {p['description']}\nTriggers: {triggers}\n\n"
             
         messages = [
             {"role": "system", "content": system_prompt},

@@ -1,6 +1,6 @@
 import re
 import uuid
-from typing import Any, Dict, List, Union
+from typing import Any, Union
 
 # Robust regex-based patterns for common PII
 # These are used as a first-line defense in the Gateway before storage.

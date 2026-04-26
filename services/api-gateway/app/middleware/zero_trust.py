@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import ssl
 import hmac
-from typing import Optional
-from fastapi import Request, HTTPException
+import ssl
+
+from fastapi import HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
+
 from app.core.config import settings
+
 
 class ZeroTrustMiddleware(BaseHTTPMiddleware):
     """

@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import secrets
 import uuid
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.security import get_tenant_db, get_current_tenant
 from app.core.rbac import require_scope
-from app.models.user import User
+from app.core.security import get_current_tenant, get_tenant_db
 from app.models.invite import UserInvite
+from app.models.user import User
 from app.services.auth_service import auth_service
 from app.services.tenant_service import tenant_service
 
@@ -385,6 +383,7 @@ async def delete_user_permanently(
 
     # Perform deletion
     from sqlalchemy import delete
+
     from app.models.user import APIKey
     
     # Clear PII from the user record before deletion if we were doing soft-delete, 

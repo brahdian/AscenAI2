@@ -19,7 +19,7 @@ async def verify_internal_token(
         payload = jwt.decode(
             token, 
             settings.SECRET_KEY, 
-            algorithms=[settings.JWT_ALGORITHM]
+            algorithms=[settings.ALGORITHM]
         )
         
         # Verify specific internal claims

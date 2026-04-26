@@ -1,9 +1,11 @@
 import asyncio
+
 import structlog
+
 from app.core.database import AsyncSessionLocal
+from app.scripts.purge_audit_logs import purge_logs
 from app.services.auth_service import auth_service
 from app.services.billing_service import BillingService
-from app.scripts.purge_audit_logs import purge_logs
 
 logger = structlog.get_logger(__name__)
 

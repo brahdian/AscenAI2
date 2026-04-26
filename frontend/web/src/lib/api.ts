@@ -246,13 +246,22 @@ export const agentsApi = {
   restore: (id: string) => api.post(`/proxy/agents/${id}/restore`).then((r) => r.data),
   test: (id: string, message: string) =>
     api.post(`/proxy/agents/${id}/test`, { message }).then((r) => r.data),
-  getOpeningPreview: (id: string, language?: string, supportedLanguages?: string[], greeting?: string) => {
+  getOpeningPreview: (id: string, language?: string, supportedLanguages?: string[], greeting?: string, ivrPrompt?: string) => {
     const params = new URLSearchParams()
     if (language) params.append('language', language)
     if (supportedLanguages !== undefined) params.append('supported_languages', supportedLanguages.join(','))
     if (greeting) params.append('greeting', greeting)
+    if (ivrPrompt !== undefined) params.append('ivr_prompt', ivrPrompt)
     return api.get(`/proxy/agents/${id}/opening-preview?${params.toString()}`).then((r) => r.data as { text: string })
   },
+  
+  // IVR DTMF Menu
+  getIvrDtmfMenu: (id: string) => api.get(`/proxy/agents/${id}/ivr-dtmf-menu`).then((r) => r.data),
+  updateIvrDtmfMenu: (id: string, menu: any) =>
+    api.patch(`/proxy/agents/${id}/ivr-dtmf-menu`, { ivr_dtmf_menu: menu }).then((r) => r.data),
+  generateDtmfEntryAudio: (id: string, digit: string) =>
+    api.post(`/proxy/agents/${id}/ivr-dtmf-menu/${digit}/generate-audio`).then((r) => r.data),
+
   uploadVoiceGreeting: (id: string, blob: Blob, ext: string) => {
     const form = new FormData()
     form.append('audio', blob, `greeting.${ext}`)
@@ -312,11 +321,26 @@ export const templatesApi = {
 // ---------------------------------------------------------------------------
 
 export const chatApi = {
+  init: (data: {
+    agent_id: string
+    channel: 'chat' | 'voice'
+    customer_identifier?: string
+    test_mode?: boolean
+  }) => api.post('/proxy/chat/init', data).then((r) => r.data as {
+    session_id: string
+    chat_greeting: string
+    voice_greeting: string
+    language: string
+    supported_languages: string[]
+    auto_detect_language: boolean
+  }),
+
   send: (data: {
     agent_id: string
     message: string
     session_id?: string
     channel?: string
+    test_mode?: boolean
   }) => api.post('/proxy/chat', data).then((r) => r.data),
 
   agentCall: (data: {
@@ -331,6 +355,7 @@ export const chatApi = {
     message: string
     session_id?: string
     channel?: string
+    test_mode?: boolean
   }, onChunk: (chunk: string, meta?: Record<string, any>) => void, onSession?: (sessionId: string) => void) => {
     const response = await fetch(`${API_URL}/api/v1/proxy/chat/stream`, {
       method: 'POST',
@@ -803,7 +828,7 @@ export const billingApi = {
 // ---------------------------------------------------------------------------
 
 export const toolsApi = {
-  catalog: () => api.get('/proxy/tools/catalog').then((r) => r.data),
+  getCatalog: () => api.get('/proxy/tools/catalog').then((r) => r.data),
   list: (agentId?: string) => api.get('/proxy/tools', { params: { agent_id: agentId } }).then((r) => r.data),
   get: (name: string) => api.get(`/proxy/tools/${name}`).then((r) => r.data),
   register: (data: {
@@ -867,8 +892,8 @@ export const complianceApi = {
 // ---------------------------------------------------------------------------
 
 export const workflowsApi = {
-  list: (agentId: string) =>
-    api.get(`/proxy/agents/${agentId}/workflows`).then((r) => r.data),
+  list: (agentId: string, params?: { include_archived?: boolean }) =>
+    api.get(`/proxy/agents/${agentId}/workflows`, { params }).then((r) => r.data),
   create: (agentId: string, data: Record<string, unknown>) =>
     api.post(`/proxy/agents/${agentId}/workflows`, data).then((r) => r.data),
   get: (agentId: string, flowId: string) =>
@@ -879,6 +904,10 @@ export const workflowsApi = {
     api.patch(`/proxy/agents/${agentId}/workflows/${flowId}`, data).then((r) => r.data),
   delete: (agentId: string, flowId: string) =>
     api.delete(`/proxy/agents/${agentId}/workflows/${flowId}`),
+  archive: (agentId: string, flowId: string) =>
+    api.post(`/proxy/agents/${agentId}/workflows/${flowId}/archive`).then((r) => r.data),
+  restore: (agentId: string, flowId: string) =>
+    api.post(`/proxy/agents/${agentId}/workflows/${flowId}/restore`).then((r) => r.data),
   activate: (agentId: string, flowId: string) =>
     api.post(`/proxy/agents/${agentId}/workflows/${flowId}/activate`).then((r) => r.data),
   deactivate: (agentId: string, flowId: string) =>
@@ -991,6 +1020,13 @@ export const adminApi = {
 // Platform Configuration
 // ---------------------------------------------------------------------------
 
+export interface GlobalGuardrail {
+  id: string
+  category: string
+  rule: string
+  fix_ref: string
+}
+
 export const platformApi = {
   getLanguageConfig: (): Promise<{
     languages: Array<{ code: string; label: string }>
@@ -1000,4 +1036,6 @@ export const platformApi = {
   }> => api.get('/proxy/platform/language-config').then((r) => r.data),
   getVoiceProtocols: (): Promise<Array<{ id: string; label: string; template: string }>> =>
     api.get('/proxy/platform/voice-protocols').then((r) => r.data),
+  getGlobalGuardrails: (): Promise<{ guardrails: GlobalGuardrail[] }> =>
+    api.get('/proxy/platform/global-guardrails').then((r) => r.data),
 }

@@ -1,10 +1,11 @@
-import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, String, Boolean, func
+
+from sqlalchemy import DateTime, String, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)

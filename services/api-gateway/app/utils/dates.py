@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
+
 
 def utcnow() -> datetime:
     """Return the current datetime in UTC (timezone-aware)."""
@@ -42,8 +43,8 @@ def sanitize_for_csv(value: Any) -> str:
 
 def get_calendar_billing_period():
     """Return the (start_date, end_date) for the current calendar month."""
-    from datetime import date
     import calendar
+    from datetime import date
     today = date.today()
     start = date(today.year, today.month, 1)
     last_day = calendar.monthrange(today.year, today.month)[1]

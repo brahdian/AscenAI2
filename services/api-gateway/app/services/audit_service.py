@@ -17,18 +17,21 @@ Usage (inside a route or service):
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import structlog
 from fastapi import Request
 from prometheus_client import Counter
 from sqlalchemy import desc, select
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
-from app.utils.pii import mask_sensitive_data, anonymize_ip
+from app.utils.pii import (
+    anonymize_email,
+    anonymize_ip,
+    mask_pii,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -241,7 +244,7 @@ async def list_audit_logs(
     rows = result.scalars().all()
 
     return {
-        "items": [_serialize(row, mask_pii=mask_pii) for row in rows],
+        "items": [_serialize(row, do_mask_pii=mask_pii) for row in rows],
         "total": total,
         "page": page,
         "per_page": per_page,
@@ -250,17 +253,17 @@ async def list_audit_logs(
 
 
 
-def _serialize(log: AuditLog, mask_pii: bool = True) -> dict[str, Any]:
+def _serialize(log: AuditLog, do_mask_pii: bool = True) -> dict[str, Any]:
     ip = log.ip_address
-    if mask_pii and ip:
+    if do_mask_pii and ip:
         ip = anonymize_ip(ip)
 
     email = log.actor_email
-    if mask_pii and email:
+    if do_mask_pii and email:
         email = anonymize_email(email)
 
     res_id = log.resource_id
-    if mask_pii and res_id:
+    if do_mask_pii and res_id:
         # Mask if it looks like an email
         if "@" in res_id:
             res_id = anonymize_email(res_id)
@@ -281,7 +284,7 @@ def _serialize(log: AuditLog, mask_pii: bool = True) -> dict[str, Any]:
         "resource_type": log.resource_type,
         "resource_id": res_id,
         "status": log.status,
-        "details": mask_pii(log.details, deep=mask_pii) if log.details else None,
+        "details": mask_pii(log.details, deep=do_mask_pii) if log.details else None,
         "ip_address": ip,
         "user_agent": log.user_agent,
         "created_at": log.created_at.isoformat() if log.created_at else None,
@@ -346,18 +349,9 @@ async def stream_audit_logs(
     stream = await db.stream(query)
     async for row in stream:
         # row is a result tuple, the first element is the AuditLog object
-        yield _serialize(row[0], mask_pii=mask_pii)
+        yield _serialize(row[0], do_mask_pii=mask_pii)
 
 
 
 
 # ─── Data Masking (Imported from Utils) ──────────────────────────────────────
-
-from app.utils.pii import (
-    mask_pii,
-    anonymize_email,
-    anonymize_ip,
-)
-
-
-

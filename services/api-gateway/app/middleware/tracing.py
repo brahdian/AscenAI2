@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import uuid
 import time
-from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi import Request
+import uuid
+
 import structlog
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = structlog.get_logger(__name__)
 

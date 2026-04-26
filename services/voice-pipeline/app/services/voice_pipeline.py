@@ -243,6 +243,17 @@ class VoicePipeline:
             # Play pre-recorded greeting (zero TTS cost per call) or TTS-synthesise
             # the text greeting before entering the listening loop.
             await self._play_greeting(websocket, state)
+
+            # Phase 4: DTMF Phase Simulation
+            menu = (state.agent_config or {}).get("ivr_dtmf_menu")
+            has_menu = menu and isinstance(menu.get("entries"), list) and len(menu["entries"]) > 0
+            if has_menu and not state.twilio_stream_sid:
+                # Only simulate DTMF over WS if this isn't a Twilio call. 
+                # (Twilio handles DTMF via <Gather> before bridging to WS).
+                proceed = await self._run_dtmf_phase(websocket, state, menu)
+                if not proceed:
+                    return
+
             await self._run_voice_loop(websocket, state)
         except WebSocketDisconnect:
             logger.info("voice_session_disconnected", session_id=session_id)
@@ -258,6 +269,104 @@ class VoicePipeline:
     # ------------------------------------------------------------------
     # Main voice loop
     # ------------------------------------------------------------------
+
+    async def _run_dtmf_phase(
+        self, websocket: WebSocket, state: SessionState, menu: dict
+    ) -> bool:
+        """
+        Simulate the DTMF gathering phase over WebSocket for browser testing.
+        Waits for a text message like {"type": "dtmf", "digit": "1"}.
+        Returns True to proceed to AI loop, False to end the session.
+        """
+        timeout = menu.get("timeout_seconds", 10)
+        max_retries = menu.get("max_retries", 3)
+        entries = menu.get("entries", [])
+
+        import time
+        import json
+
+        for retry_count in range(max_retries + 1):
+            start_time = time.time()
+            dtmf_received = False
+            
+            while time.time() - start_time < timeout:
+                time_left = timeout - (time.time() - start_time)
+                if time_left <= 0:
+                    break
+                    
+                try:
+                    raw = await asyncio.wait_for(websocket.receive(), timeout=time_left)
+                except asyncio.TimeoutError:
+                    break
+
+                if raw.get("type") == "websocket.disconnect":
+                    return False
+
+                if "text" in raw and raw["text"]:
+                    try:
+                        ctrl = json.loads(raw["text"])
+                        if ctrl.get("type") == "end_session":
+                            await websocket.close(code=1000)
+                            return False
+                            
+                        if ctrl.get("type") == "dtmf":
+                            digit = ctrl.get("digit")
+                            entry = next((e for e in entries if e.get("digit") == digit), None)
+                            
+                            if not entry:
+                                # Invalid digit -> just proceed to agent for simplicity
+                                return True
+                                
+                            action = entry.get("action")
+                            if action == "proceed_to_agent":
+                                return True
+                            elif action == "end_call":
+                                await websocket.close(code=1000)
+                                return False
+                            elif action == "repeat_menu":
+                                await self._play_greeting(websocket, state)
+                                dtmf_received = True # handled
+                                break
+                            elif action == "play_audio":
+                                audio_url = entry.get("audio_url")
+                                if audio_url:
+                                    if audio_url.startswith("/"):
+                                        audio_url = f"{self.orchestrator_url}{audio_url}"
+                                    state.is_speaking = True
+                                    try:
+                                        client = await self._get_http_client()
+                                        async with client.stream("GET", audio_url, timeout=10.0) as audio_resp:
+                                            async for chunk in audio_resp.aiter_bytes(4096):
+                                                if websocket.client_state == WebSocketState.CONNECTED:
+                                                    await websocket.send_bytes(chunk)
+                                    finally:
+                                        state.is_speaking = False
+                                        
+                                after = entry.get("after_playback", "proceed_to_agent")
+                                if after == "end_call":
+                                    await websocket.close(code=1000)
+                                    return False
+                                else:
+                                    return True
+                    except json.JSONDecodeError:
+                        pass
+                
+                # if we get audio bytes during DTMF simulation, we just drop them
+
+            if dtmf_received:
+                # We handled 'repeat_menu' inside the loop and broke out.
+                # Continue the outer for loop to wait again.
+                continue
+                
+            # If we get here and didn't break early, it's a timeout.
+            if retry_count < max_retries:
+                # Re-play prompt
+                await self._play_greeting(websocket, state)
+            else:
+                # Exhausted
+                return True
+
+        return True
 
     async def _run_voice_loop(
         self, websocket: WebSocket, state: SessionState
@@ -815,66 +924,54 @@ class VoicePipeline:
             greeting_text: str = agent_data.get("greeting_message") or ""
             computed_greeting: str = agent_data.get("computed_greeting") or ""
 
-            # 1. Play mandatory opening (if pre-rendered and no full greeting exists)
-            # If voice_greeting_url exists, we assume it already includes the opening or
-            # the user wants to override everything with their manual recording.
-            if opening_audio_url and not voice_greeting_url:
-                if opening_audio_url.startswith("/"):
-                    open_url = f"{self.orchestrator_url}{opening_audio_url}"
-                else:
-                    open_url = opening_audio_url
+            agent_config = agent_data.get("agent_config") or {}
+            ivr_language_url: str = agent_config.get("ivr_language_url") or ""
+            ivr_language_prompt: str = agent_config.get("ivr_language_prompt") or ""
+
+            # Prioritize explicitly generated Voice Greetings
+            audio_to_play = ivr_language_url or voice_greeting_url or opening_audio_url
+
+            if audio_to_play:
+                if audio_to_play.startswith("/"):
+                    audio_to_play = f"{self.orchestrator_url}{audio_to_play}"
                 
-                logger.info("playing_preformatted_opening", session_id=state.session_id, url=open_url)
+                logger.info("playing_prerecorded_greeting", session_id=state.session_id, url=audio_to_play)
                 state.is_speaking = True
                 try:
-                    async with client.stream("GET", open_url, timeout=10.0) as audio_resp:
+                    async with client.stream("GET", audio_to_play, timeout=10.0) as audio_resp:
                         async for chunk in audio_resp.aiter_bytes(4096):
                             if websocket.client_state == WebSocketState.CONNECTED:
                                 await websocket.send_bytes(chunk)
                 finally:
                     state.is_speaking = False
+                await self._send_json(websocket, {"type": "greeting_complete"})
 
-            # 2. Play custom greeting (Audio or TTS)
-            if voice_greeting_url:
-                # Resolve relative URL against orchestrator base
-                if voice_greeting_url.startswith("/"):
-                    audio_url = f"{self.orchestrator_url}{voice_greeting_url}"
-                else:
-                    audio_url = voice_greeting_url
-
-                logger.info(
-                    "playing_prerecorded_greeting",
-                    session_id=state.session_id,
-                    url=audio_url,
-                )
+            elif ivr_language_prompt:
+                # Voice Greeting (JIT Synthesis)
+                logger.info("synthesising_ivr_greeting", session_id=state.session_id)
                 state.is_speaking = True
                 try:
-                    async with client.stream("GET", audio_url, timeout=10.0) as audio_resp:
-                        async for chunk in audio_resp.aiter_bytes(4096):
-                            if websocket.client_state == WebSocketState.CONNECTED:
-                                await websocket.send_bytes(chunk)
+                    await self._tts_and_send(ivr_language_prompt, websocket, state)
+                finally:
+                    state.is_speaking = False
+                await self._send_json(websocket, {"type": "greeting_complete"})
+
+            elif computed_greeting:
+                # Fallback to backend-computed opening (Highest Cost)
+                logger.info("synthesising_computed_greeting", session_id=state.session_id)
+                state.is_speaking = True
+                try:
+                    await self._tts_and_send(computed_greeting, websocket, state)
                 finally:
                     state.is_speaking = False
                 await self._send_json(websocket, {"type": "greeting_complete"})
 
             elif greeting_text:
-                logger.info(
-                    "synthesising_greeting",
-                    session_id=state.session_id,
-                )
+                # Fallback to chat greeting for backwards compatibility
+                logger.info("synthesising_chat_greeting", session_id=state.session_id)
                 state.is_speaking = True
                 try:
                     await self._tts_and_send(greeting_text, websocket, state)
-                finally:
-                    state.is_speaking = False
-                await self._send_json(websocket, {"type": "greeting_complete"})
-            
-            elif not opening_audio_url and computed_greeting:
-                # Last resort: compute greeting in real-time (highest cost)
-                logger.info("synthesising_computed_greeting", session_id=state.session_id)
-                state.is_speaking = True
-                try:
-                    await self._tts_and_send(computed_greeting, websocket, state)
                 finally:
                     state.is_speaking = False
                 await self._send_json(websocket, {"type": "greeting_complete"})

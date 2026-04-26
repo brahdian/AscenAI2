@@ -4,7 +4,6 @@ import time
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +21,6 @@ from app.schemas.auth import (
     SubscribeRequest,
     SubscribeResponse,
     TokenResponse,
-    UserInfo,
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
@@ -222,11 +220,12 @@ async def subscribe(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a Stripe Checkout session for the given plan."""
-    from app.services.billing_service import BillingService
-    from app.models.user import User
-    from app.models.tenant import Tenant
-    from sqlalchemy import select
     from fastapi import HTTPException
+    from sqlalchemy import select
+
+    from app.models.tenant import Tenant
+    from app.models.user import User
+    from app.services.billing_service import BillingService
     
     # Resolve user by email. Use ordered first() to handle multi-tenant membership
     # without crashing on MultipleResultsFound.
@@ -292,9 +291,10 @@ async def get_me(
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
-    from app.models.user import User
-    from app.models.tenant import Tenant
     import uuid
+
+    from app.models.tenant import Tenant
+    from app.models.user import User
     
     user_res = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     user = user_res.scalar_one_or_none()
@@ -326,8 +326,9 @@ async def update_me(
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    from app.models.user import User
     import uuid
+
+    from app.models.user import User
 
     try:
         body = await request.json()
@@ -387,9 +388,10 @@ async def change_password(
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    import uuid
+
     from app.models.user import User
     from app.services.audit_service import audit_log
-    import uuid
 
     try:
         body = await request.json()

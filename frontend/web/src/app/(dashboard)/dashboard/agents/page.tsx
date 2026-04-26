@@ -105,9 +105,18 @@ export default function AgentsPage() {
   // Handle Stripe return after reactivation checkout
   useEffect(() => {
     if (searchParams.get('reactivated') === 'true') {
-      toast.success('Agent reactivated — your subscription is now active!')
-      qc.invalidateQueries({ queryKey: ['agents'] })
-      router.replace('/dashboard/agents')
+      const finishReactivation = async () => {
+        toast.loading('Confirming payment...', { id: 'reactivation-toast' })
+        try {
+          await billingApi.syncSubscription()
+        } catch {
+          // ignore
+        }
+        toast.success('Agent reactivated — your subscription is now active!', { id: 'reactivation-toast' })
+        qc.invalidateQueries({ queryKey: ['agents'] })
+        router.replace('/dashboard/agents')
+      }
+      finishReactivation()
     }
   }, [searchParams, qc, router])
 

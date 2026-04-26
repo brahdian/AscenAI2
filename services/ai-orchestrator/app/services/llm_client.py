@@ -14,6 +14,68 @@ import structlog
 from pydantic import BaseModel
 
 from app.core.config import settings
+
+
+def _record_llm_error(
+    provider: str,
+    model: str,
+    error_type: str,
+    error_msg: str,
+    session_id: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """
+    Dual-destination LLM error recorder.
+
+    1. **Docker logs (structlog)** — always emitted, picked up by `docker logs`
+       and any log-shipper (Loki, CloudWatch, etc.).
+    2. **Jaeger / any OTEL backend (span event)** — attached to the *current*
+       active span so the error appears inline on the Jaeger trace timeline.
+       Jaeger is a *tracing* tool, not a log aggregator; the correct primitive
+       is a span event (recorded_exception), not a log message.
+       This is a no-op when OTEL is disabled or no span is active.
+    """
+    fields: dict = {
+        "provider": provider,
+        "model": model,
+        "error_type": error_type,
+        "error": error_msg,
+    }
+    if session_id:
+        fields["session_id"] = session_id
+    if extra:
+        fields.update(extra)
+
+    # 1. Docker / stdout via structlog
+    logger.error("llm_api_error", **fields)
+
+    # 2. OTEL span event → Jaeger (graceful no-op when OTEL not initialised)
+    try:
+        from opentelemetry import trace as _otel_trace
+        span = _otel_trace.get_current_span()
+        if span and span.is_recording():
+            span.set_attribute("llm.provider", provider)
+            span.set_attribute("llm.model", model)
+            span.set_attribute("llm.error_type", error_type)
+            if session_id:
+                span.set_attribute("session.id", session_id)
+            span.record_exception(
+                RuntimeError(error_msg),
+                attributes={
+                    "llm.error_type": error_type,
+                    "llm.provider": provider,
+                    **(extra or {}),
+                },
+            )
+            span.set_status(
+                _otel_trace.Status(
+                    _otel_trace.StatusCode.ERROR,
+                    description=f"{provider}/{model}: {error_type}",
+                )
+            )
+    except Exception:
+        # Never let observability code crash the request path
+        pass
 from app.core.metrics import (
     LLM_TOKENS, LLM_LATENCY, LLM_ERRORS, LLM_CIRCUIT_OPENS,
 )
@@ -164,26 +226,33 @@ class LLMClient:
             return result
         except asyncio.TimeoutError:
             LLM_ERRORS.labels(provider=self.provider, model=self.model, error_type="timeout").inc()
-            logger.error(
-                "llm_call_timeout",
+            _record_llm_error(
                 provider=self.provider,
                 model=self.model,
-                timeout=settings.LLM_TIMEOUT_SECONDS,
+                error_type="timeout",
+                error_msg=f"LLM call timed out after {settings.LLM_TIMEOUT_SECONDS}s",
+                extra={"timeout_s": settings.LLM_TIMEOUT_SECONDS},
             )
             raise TimeoutError(
                 f"LLM call to {self.provider}/{self.model} timed out "
                 f"after {settings.LLM_TIMEOUT_SECONDS}s"
             )
-        except CircuitOpenError:
+        except CircuitOpenError as exc:
             LLM_ERRORS.labels(provider=self.provider, model=self.model, error_type="circuit_open").inc()
+            _record_llm_error(
+                provider=self.provider,
+                model=self.model,
+                error_type="circuit_open",
+                error_msg=str(exc),
+            )
             raise
         except Exception as exc:
             LLM_ERRORS.labels(provider=self.provider, model=self.model, error_type="api_error").inc()
-            logger.error(
-                "llm_call_failed",
+            _record_llm_error(
                 provider=self.provider,
                 model=self.model,
-                error=type(exc).__name__,
+                error_type=type(exc).__name__,
+                error_msg=str(exc),
             )
             raise
 
@@ -268,29 +337,50 @@ class LLMClient:
             return self._gemini_stream_generator(client, contents, generate_config)
 
         loop = asyncio.get_event_loop()
-        response = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model=self.model,
-                    contents=contents,
-                    config=generate_config,
+        try:
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: client.models.generate_content(
+                        model=self.model,
+                        contents=contents,
+                        config=generate_config,
+                    ),
                 ),
-            ),
-            timeout=settings.LLM_TIMEOUT_SECONDS,
-        )
+                timeout=settings.LLM_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.error("gemini_generate_content_failed", error=str(exc))
+            raise
+
+        # TYPE SAFETY: Gemini SDK can return None or True in certain error/edge cases
+        if response is None or isinstance(response, bool):
+            logger.error("gemini_returned_boolean_or_none", type=type(response).__name__, response=str(response))
+            raise ValueError(f"Gemini API returned invalid {type(response).__name__} instead of response object")
 
         tool_calls = []
         text_content = None
-        for candidate in (response.candidates or []):
-            for part in (candidate.content.parts if candidate.content else []):
+        
+        # TYPE SAFETY: Ensure candidates is iterable
+        candidates = getattr(response, "candidates", [])
+        if not isinstance(candidates, list):
+            logger.warning("gemini_candidates_not_list", type=type(candidates).__name__, session_id=session_id)
+            candidates = []
+
+        for candidate in candidates:
+            if not hasattr(candidate, "content") or not candidate.content:
+                continue
+            parts = getattr(candidate.content, "parts", [])
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
                 if hasattr(part, "function_call") and part.function_call and part.function_call.name:
                     args = dict(part.function_call.args or {})
                     tool_calls.append(ToolCall(id=str(uuid.uuid4()), name=part.function_call.name, arguments=args))
                 elif hasattr(part, "text") and part.text:
                     text_content = (text_content or "") + str(part.text)
 
-        usage_meta = response.usage_metadata
+        usage_meta = getattr(response, "usage_metadata", None)
         usage = TokenUsage(
             prompt_tokens=int(getattr(usage_meta, "prompt_token_count", 0) or 0),
             completion_tokens=int(getattr(usage_meta, "candidates_token_count", 0) or 0),

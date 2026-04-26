@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Optional
 
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -142,7 +141,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # If it's an API key, we MUST rate limit by the specific key to prevent
         # one leaked/abused key from taking down the entire tenant's quota.
         if auth_method == "api_key":
-            import hashlib
             # We don't have the raw key here ideally, but AuthMiddleware 
             # might have put a prefix or ID in state. 
             # Actually, let's use the resource ID if we can.

@@ -186,3 +186,60 @@ class Webhook(Base):
 
     def __repr__(self) -> str:
         return f"<Webhook url={self.url} tenant={self.tenant_id}>"
+
+
+class MFASecret(Base):
+    __tablename__ = "mfa_secrets"
+    __table_args__ = (
+        Index("ix_mfa_secrets_user_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Encrypted base32 secret
+    secret: Mapped[str] = mapped_column(String(512), nullable=False)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+        server_default=func.now(),
+    )
+
+    user: Mapped["User"] = relationship("User")
+
+
+class MFABackupCode(Base):
+    __tablename__ = "mfa_backup_codes"
+    __table_args__ = (
+        Index("ix_mfa_backup_codes_user_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Hashed backup code
+    code_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+        server_default=func.now(),
+    )
+
+    user: Mapped["User"] = relationship("User")

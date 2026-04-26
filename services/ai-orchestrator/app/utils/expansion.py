@@ -14,7 +14,8 @@ def resolve_agent_variables(
     text: str,
     agent: "Agent",
     variables: list["AgentVariable"] = None,
-    clean: bool = True
+    clean: bool = True,
+    redact: bool = True
 ) -> str:
     """
     Expand $vars:name placeholders in a string using agent attributes and variables.
@@ -68,7 +69,9 @@ def resolve_agent_variables(
             # FIX-06: Scrub PII from variable values before they leave this function.
             # This protects greetings, IVR text, and preview API results — none of
             # which go through the system_prompts.py <variables> block redaction.
-            scrubbed = pii_service.redact(str(val))
+            scrubbed = str(val)
+            if redact:
+                scrubbed = pii_service.redact(scrubbed)
             # FIX-06: Apply XML structural isolation for transcript safety.
             # While TTS handles raw text, these strings are saved to the Message
             # table and rendered in the dashboard.
@@ -86,6 +89,5 @@ def resolve_agent_variables(
         return f"[unknown variable: {name}]"
 
     # Support both $[vars:name] and $vars:name - ensured name starts with a letter.
-    # FIX-06: Apply a final PII pass to the fully-substituted string for fallback safety.
     result = re.sub(r'\$\[vars:([a-zA-Z][a-zA-Z0-9_]*)\]|\$vars:([a-zA-Z][a-zA-Z0-9_]*)', var_sub, text)
-    return pii_service.redact(result)
+    return result

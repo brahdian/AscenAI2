@@ -23,22 +23,21 @@ import json
 import os
 import time
 from typing import Optional
+from xml.sax.saxutils import escape
 
 import httpx
 import structlog
-from xml.sax.saxutils import escape
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Settings pulled from environment — these are GLOBAL defaults and can be
-# overridden per-tenant via a future ChannelCredentials DB lookup.
-from app.core.config import settings
+
+# Dedup cache TTL (seconds) — prevents duplicate webhook deliveries
+
 _WHATSAPP_VERIFY_TOKEN = settings.WHATSAPP_VERIFY_TOKEN
 _WHATSAPP_APP_SECRET = settings.WHATSAPP_APP_SECRET
 _TWILIO_AUTH_TOKEN = settings.TWILIO_AUTH_TOKEN
@@ -602,13 +601,14 @@ def _verify_sendgrid_signature(signing_key: str, payload: bytes, timestamp: str,
     SendGrid signs: timestamp + payload using ECDSA P-256 + SHA256.
     """
     try:
+        import base64
+
         from cryptography.hazmat.primitives.asymmetric.ec import (
             ECDSA,
             EllipticCurvePublicKey,
         )
         from cryptography.hazmat.primitives.hashes import SHA256
         from cryptography.hazmat.primitives.serialization import load_pem_public_key
-        import base64
 
         # SendGrid provides the public key in PEM format in the dashboard
         pem = f"-----BEGIN PUBLIC KEY-----\n{signing_key}\n-----END PUBLIC KEY-----\n"

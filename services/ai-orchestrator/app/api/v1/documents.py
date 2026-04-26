@@ -3,22 +3,22 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
-from typing import Optional, Any
 from pathlib import Path
+from typing import Any, Optional
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from pydantic import BaseModel, Field
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_tenant_db, require_forwarded_role
+from app.core.zenith import ZenithContext, get_zenith_context
 from app.models.agent import Agent, AgentDocument, AgentDocumentChunk
 from app.services import pii_service
 from app.services.mcp_client import MCPClient
-from app.core.zenith import ZenithContext, get_zenith_context
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -119,7 +119,7 @@ async def _check_upload_rate_limit(redis_client: Any, tenant_id: str) -> None:
 async def _verify_agent(agent_id: str, tenant_id: str, db: AsyncSession, ctx: ZenithContext | None = None) -> Agent:
     """Zenith Pillar 3: Isolation Locks and Agent Verification."""
     agent_uuid = uuid.UUID(agent_id)
-    
+
     # Apply isolation (CRIT-005 / Zenith Pillar 3)
     if ctx and ctx.restricted_agent_id and agent_uuid != ctx.restricted_agent_id:
         logger.warning("agent_isolation_violation", agent_id=agent_id, restricted_id=str(ctx.restricted_agent_id))
@@ -151,7 +151,6 @@ async def list_documents(
     Deterministic sorting enforced: created_at DESC, id DESC."""
     await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
 
-    from sqlalchemy import and_
     filters = [AgentDocument.agent_id == uuid.UUID(agent_id)]
     if not include_archived:
         filters.append(AgentDocument.status != "archived")
@@ -197,7 +196,7 @@ async def create_text_document(
     text_bytes = payload.content.encode('utf-8')
     if len(text_bytes) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(status_code=413, detail="Text content exceeds 5MB limit.")
-    
+
     for i, line in enumerate(payload.content.splitlines()):
         if len(line) > MAX_LINE_LENGTH:
              raise HTTPException(status_code=400, detail=f"Line {i+1} exceeds maximum length.")
@@ -246,7 +245,7 @@ async def create_text_document(
         await indexer.enqueue({
             "document_id": str(doc.id),
             "agent_id": agent_id,
-            "tenant_id": tenant_id,
+            "tenant_id": ctx.tenant_id,
             "content": doc.content,
             "filename": doc.name,
             "file_type": doc.file_type
@@ -280,9 +279,9 @@ async def update_document(
         text_bytes = payload.content.encode('utf-8')
         doc.file_size_bytes = len(text_bytes)
         doc.content_hash = hashlib.sha256(text_bytes).hexdigest()
-        
+
     previously_draft = (doc.status == "draft")
-    
+
     if payload.status is not None:
         if payload.status == "published":
             doc.status = "processing"
@@ -295,13 +294,15 @@ async def update_document(
     # Trigger re-indexing if content changed or if doc is being published
     # Fix P0: Ensure content updates result in vector updates
     content_changed = (payload.content is not None)
+    should_reindex = content_changed or (previously_draft and doc.status == "processing")
+
     if should_reindex:
         doc.status = "processing"
         doc.updated_at = func.now()
         doc.updated_by = ctx.actor_email
         doc.trace_id = ctx.trace_id
         await db.commit()
-        
+
         # Zenith Pillar 1: Propagate forensic metadata to the worker
         indexer = request.app.state.document_indexer
         await indexer.enqueue({
@@ -359,7 +360,7 @@ async def upload_document(
 
     # Store file — use persistent storage path (configure DOCUMENT_STORAGE_PATH env var)
     doc_uuid = uuid.uuid4()
-    storage_dir = Path(settings.DOCUMENT_STORAGE_PATH) / tenant_id / agent_id
+    storage_dir = Path(settings.DOCUMENT_STORAGE_PATH) / ctx.tenant_id / agent_id
     storage_dir.mkdir(parents=True, exist_ok=True)
     safe_filename = f"{doc_uuid}_{filename}"
     storage_path = str(storage_dir / safe_filename)
@@ -416,7 +417,8 @@ async def upload_document(
          try:
              if storage_path != duplicate.storage_path and os.path.exists(storage_path):
                  os.remove(storage_path)
-         except Exception: pass
+         except Exception:
+             pass
          storage_path = duplicate.storage_path
 
     # Launch durable background processing via Redis queue
@@ -424,7 +426,7 @@ async def upload_document(
     await indexer.enqueue({
         "document_id": str(doc.id),
         "agent_id": agent_id,
-        "tenant_id": tenant_id,
+        "tenant_id": ctx.tenant_id,
         "storage_path": storage_path,
         "filename": filename,
         "file_type": ext
@@ -445,7 +447,7 @@ async def retry_document_indexing(
 ) -> dict:
     """Retry indexing for a failed document"""
     await _verify_agent(agent_id, ctx.tenant_id, db, ctx=ctx)
-    
+
     result = await db.execute(
         select(AgentDocument).where(
             AgentDocument.id == uuid.UUID(doc_id),
@@ -455,14 +457,14 @@ async def retry_document_indexing(
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
-    
+
     doc.status = "processing"
     doc.error_message = None
     doc.chunk_count = 0
     doc.updated_by = ctx.actor_email
     doc.trace_id = ctx.trace_id
     await db.commit()
-    
+
     indexer = request.app.state.document_indexer
     await indexer.enqueue({
         "document_id": str(doc.id),
@@ -475,7 +477,7 @@ async def retry_document_indexing(
         "trace_id": ctx.trace_id,
         "actor_email": ctx.actor_email
     })
-    
+
     logger.info("document_reindex_queued", doc_id=str(doc.id), trace_id=ctx.trace_id)
     return doc.to_dict()
 

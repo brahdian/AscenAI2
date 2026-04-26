@@ -15,9 +15,16 @@ from app.core.database import get_db
 from app.core.security import get_tenant_db
 from app.core.metrics import MESSAGES_PROCESSED, SESSIONS_CREATED
 from app.models.agent import Agent, Session as AgentSession
-from app.schemas.chat import ChatRequest, ChatResponse, StreamChatEvent
+from app.schemas.chat import (
+    ChatRequest, 
+    ChatResponse, 
+    StreamChatEvent, 
+    SessionInitRequest, 
+    SessionInitResponse
+)
 from app.services.memory_manager import MemoryManager
 from app.services.orchestrator import Orchestrator
+from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/chat")
@@ -183,6 +190,7 @@ async def chat(
         session=session,
         user_message=body.message,
         stream=False,
+        test_mode=body.test_mode,
     )
     await db.commit()
 
@@ -193,6 +201,63 @@ async def chat(
         await _store_idempotency(body.idempotency_key, tenant_id, response, redis_client)
 
     return response
+
+
+@router.post("/init", response_model=SessionInitResponse)
+async def session_init(
+    body: SessionInitRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Initialize a session and return greetings and language options."""
+    tenant_id = _tenant_id(request)
+    agent = await _load_agent(tenant_id, body.agent_id, db, request=request)
+    
+    # Create or resume session
+    session = await _get_or_create_session(
+        session_id=None,  # Always start fresh for init or let the caller provide it if they want to resume?
+                          # The requirement says "init api for session init", so usually fresh.
+        tenant_id=tenant_id,
+        agent_id=body.agent_id,
+        channel=body.channel,
+        customer_identifier=body.customer_identifier,
+        db=db,
+        ip_address=request.headers.get("X-Original-IP"),
+    )
+    # Mark the session as already greeted so that maybe_send_greeting() is a no-op
+    # when the first real user message arrives via /stream. Without this flag the
+    # billing service would detect msg_count==0, re-emit the greeting into DB/memory,
+    # and the LLM would regurgitate it prepended to its first real reply.
+    from sqlalchemy.orm.attributes import flag_modified
+    session.metadata_ = {"_greeting_sent": True}
+    flag_modified(session, "metadata_")
+    await db.commit()
+
+    # Determine greetings (Authority logic)
+    # Chat greeting
+    agent_config = agent.agent_config or {}
+    chat_greeting = agent_config.get("greeting_message") or "Hi! How can I help you today?"
+    
+    # Voice greeting prioritization
+    # Use the same computation logic as the Agents API for consistency
+    computed_greeting, _, _ = await get_or_compute_voice_strings(db, agent)
+    
+    voice_greeting = "Hi! How can I help you today?"
+    if agent_config.get("ivr_language_prompt"):
+        voice_greeting = agent_config["ivr_language_prompt"]
+    elif computed_greeting:
+        voice_greeting = computed_greeting
+    else:
+        voice_greeting = chat_greeting
+
+    return SessionInitResponse(
+        session_id=str(session.id),
+        chat_greeting=chat_greeting,
+        voice_greeting=voice_greeting,
+        language=agent.language or "en",
+        supported_languages=agent_config.get("supported_languages") or [],
+        auto_detect_language=agent_config.get("auto_detect_language") or False,
+    )
 
 
 @router.post("/agent-call")
@@ -327,12 +392,13 @@ async def chat_stream(
             # Emit session id immediately so the frontend can correlate the stream
             yield f"data: {_json.dumps({'type': 'session', 'data': str(session.id), 'session_id': str(session.id)})}\n\n"
             async for event in orchestrator.stream_response(
-                agent=agent, session=session, user_message=body.message
+                agent=agent, session=session, user_message=body.message,
+                test_mode=body.test_mode
             ):
                 yield f"data: {_json.dumps({'type': event.type, 'data': event.data, 'session_id': event.session_id})}\n\n"
         except Exception as exc:
             logger.error("stream_error", session_id=str(session.id), error=str(exc))
-            yield f"data: {_json.dumps({'type': 'error', 'data': 'An internal error occurred', 'session_id': str(session.id)})}\n\n"
+            yield f"data: {_json.dumps({'type': 'error', 'data': f'Error: {str(exc)}', 'session_id': str(session.id)})}\n\n"
         finally:
             # Always commit — whether the stream succeeded or raised an exception.
             # This ensures partial writes (user message, session state) are persisted.

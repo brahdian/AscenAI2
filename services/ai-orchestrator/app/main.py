@@ -133,11 +133,14 @@ async def lifespan(app: FastAPI):
     app.state.llm_client = _llm_client
     logger.info("llm_client_ready", provider=settings.LLM_PROVIDER, model=settings.GEMINI_MODEL if settings.LLM_PROVIDER == "gemini" else settings.OPENAI_MODEL)
 
-    # Initialize MCP client
+    # Initialize MCP client — wire redis immediately so circuit breakers
+    # (_breaker and _context_breaker) are ready before the first request.
     _mcp_client = MCPClient(
         base_url=settings.MCP_SERVER_URL,
         ws_url=settings.MCP_WS_URL,
+        redis_client=redis_client,
     )
+    _mcp_client.set_redis(redis_client)  # initializes _breaker + _context_breaker
     await _mcp_client.initialize()
     app.state.mcp_client = _mcp_client
     logger.info("mcp_client_ready", url=settings.MCP_SERVER_URL)

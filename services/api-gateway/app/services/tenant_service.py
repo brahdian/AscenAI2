@@ -4,12 +4,12 @@ import uuid
 from typing import Optional
 
 import structlog
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.invite import UserInvite
 from app.models.tenant import Tenant, TenantUsage
 from app.models.user import User
-from app.models.invite import UserInvite
 
 logger = structlog.get_logger(__name__)
 

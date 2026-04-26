@@ -636,6 +636,24 @@ async def seed_prebuilt_workflows() -> None:
 
     async with AsyncSessionLocal() as db:
         try:
+            # Ensure the System Agent exists
+            from app.models.agent import Agent
+            system_agent_record = await db.scalar(
+                select(Agent).where(Agent.id == system_agent)
+            )
+            if not system_agent_record:
+                sys_agent = Agent(
+                    id=system_agent,
+                    tenant_id=system_tenant,
+                    name="System Templates Agent",
+                    description="Internal agent used to hold platform-level prebuilt workflows.",
+                    business_type="system",
+                    status="active",
+                    is_available_as_tool=False,
+                )
+                db.add(sys_agent)
+                await db.commit()
+
             for defn in _PREBUILTS:
                 key = defn["prebuilt_key"]
                 fixed_id = _uuid.UUID(_PREBUILT_IDS[key])

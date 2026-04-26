@@ -6,15 +6,18 @@ import re
 import time
 import uuid
 import json
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List
+from fastapi.responses import StreamingResponse as _StreamingResponse
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter,BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
+from app.core.redis_client import get_redis as _get_redis
 
 
 from app.services.pii_service import redact
@@ -210,6 +213,7 @@ async def get_agent_opening_preview(
     language: Optional[str] = None,
     supported_languages: Optional[str] = None,  # comma-separated
     greeting: Optional[str] = None,
+    ivr_prompt: Optional[str] = None,
     db: AsyncSession = Depends(get_tenant_db),
 ):
     """
@@ -234,7 +238,18 @@ async def get_agent_opening_preview(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
-    # Override with provided query params if any
+    # Resolve variables for preview without PII scrubbing
+    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+    variables = result_vars.scalars().all()
+
+    # If the operator has provided a specific IVR prompt (even if it's currently unsaved in the UI),
+    # we preview that EXACTLY. This prevents the "double-greeting" bug where the preview
+    # prepends the chat greeting to a voice greeting that already contains it.
+    if ivr_prompt:
+        resolved_text = resolve_agent_variables(ivr_prompt, agent, variables, clean=True, redact=False)
+        return {"text": resolved_text}
+
+    # Otherwise, compute the automatic combination
     active_lang = language or agent.language
     agent_primary_lang = agent.language or "en"
 
@@ -243,10 +258,6 @@ async def get_agent_opening_preview(
     else:
         supported_langs = (agent.agent_config or {}).get("supported_languages", [])
 
-    # Only forward the operator's custom greeting when we are previewing in the
-    # agent's own primary language.  For other languages the generator must use
-    # the built-in localised phrase from the platform language config so the
-    # preview accurately reflects what callers will actually hear.
     base_lang = active_lang.split("-")[0]
     primary_base = agent_primary_lang.split("-")[0]
     if base_lang == primary_base:
@@ -254,16 +265,17 @@ async def get_agent_opening_preview(
             (agent.agent_config or {}).get("greeting_message")
         )
     else:
-        custom_greeting = None  # Use the built-in localised phrase for this language
+        custom_greeting = None
 
     full_text = await generate_multilingual_greeting(db, active_lang, supported_langs, custom_greeting=custom_greeting, redact=False)
+    ivr_generated = await generate_ivr_language_prompt(db, supported_langs)
+    
+    combined_text = full_text
+    if ivr_generated:
+        combined_text += f" {ivr_generated}"
 
-    # Resolve variables for preview without PII scrubbing
-    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
-    variables = result_vars.scalars().all()
-    resolved_text = resolve_agent_variables(full_text, agent, variables, clean=True, redact=False)
+    resolved_text = resolve_agent_variables(combined_text, agent, variables, clean=True, redact=False)
 
-    # Return original text for preview as requested (redaction only happens for LLM prompts)
     return {"text": resolved_text}
 
 
@@ -402,12 +414,10 @@ async def create_agent(
     # --- TEMPLATE INSTANTIATION HOOK (Immediate Activation) ---
     if agent.is_active and agent.agent_config and "template_context" in agent.agent_config:
         ctx = agent.agent_config.pop("template_context")
-        from sqlalchemy.orm.attributes import flag_modified
         flag_modified(agent, "agent_config")
         try:
             from app.api.v1.templates import process_template_instantiation
-            from fastapi import BackgroundTasks as _BackgroundTasks
-            _bg_tasks = _BackgroundTasks()
+            _bg_tasks = BackgroundTasks()
             _actor_info = {
                 "actor_email": request.headers.get("X-Actor-Email", "system"),
                 "is_support_access": request.headers.get("X-Is-Support-Access", "false").lower() == "true",
@@ -659,7 +669,6 @@ async def archive_agent(
     await db.refresh(agent)
     
     # Phase 8: Purge vector index for archived/cold agent
-    from fastapi import BackgroundTasks
     tasks = BackgroundTasks()
     tasks.add_task(_background_purge_agent_knowledge, agent_id, tenant_id)
     
@@ -732,8 +741,7 @@ async def activate_agent(
         flag_modified(agent, "agent_config")
         try:
             from app.api.v1.templates import process_template_instantiation
-            from fastapi import BackgroundTasks as _BackgroundTasks
-            _bg_tasks = _BackgroundTasks()
+            _bg_tasks = BackgroundTasks()
             _actor_info = {
                 "actor_email": request.headers.get("X-Actor-Email", "billing_webhook"),
                 "is_support_access": request.headers.get("X-Is-Support-Access", "false").lower() == "true",
@@ -792,9 +800,6 @@ async def agent_activation_stream(
     The frontend subscribes here instead of polling GET /{agent_id} repeatedly.
     Times out after 40 s and sends {"status":"timeout"} so the client can fall back.
     """
-    import asyncio
-    from fastapi.responses import StreamingResponse as _StreamingResponse
-    from app.core.redis_client import get_redis as _get_redis
 
     tenant_id = _tenant_id(request)
     trace_id = request.headers.get("X-Trace-ID") or "unknown"
@@ -983,8 +988,7 @@ async def update_agent(
                     flag_modified(agent, "agent_config")
                     try:
                         from app.api.v1.templates import process_template_instantiation
-                        from fastapi import BackgroundTasks as _BackgroundTasks
-                        _bg_tasks = _BackgroundTasks()
+                        _bg_tasks = BackgroundTasks()
                         _actor_info = {
                             "actor_email": request.headers.get("X-Actor-Email", "billing_webhook"),
                             "is_support_access": request.headers.get("X-Is-Support-Access", "false").lower() == "true",
@@ -1311,6 +1315,166 @@ async def generate_agent_ivr_audio(
     
     logger.info("ivr_prompt_manually_generated", agent_id=agent_id, url=url)
     return await _agent_to_response(agent, db)
+
+
+
+# ---------------------------------------------------------------------------
+# IVR DTMF Menu  (Phase 4: Pre-LLM Static DTMF Routing)
+# ---------------------------------------------------------------------------
+
+@router.get("/{agent_id}/ivr-dtmf-menu")
+async def get_ivr_dtmf_menu(
+    agent_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Retrieve the DTMF menu configuration for this agent."""
+    tenant_id = _tenant_id(request)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    menu = (agent.agent_config or {}).get("ivr_dtmf_menu", {
+        "timeout_seconds": 10,
+        "max_retries": 3,
+        "entries": [],
+    })
+    return {"ivr_dtmf_menu": menu}
+
+
+@router.patch("/{agent_id}/ivr-dtmf-menu")
+async def update_ivr_dtmf_menu(
+    agent_id: str,
+    request: Request,
+    body: dict,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Save the DTMF menu configuration for this agent."""
+    tenant_id = _tenant_id(request)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    menu = body.get("ivr_dtmf_menu", body)
+
+    # Validate basic structure
+    if not isinstance(menu.get("entries", []), list):
+        raise HTTPException(status_code=400, detail="ivr_dtmf_menu.entries must be a list.")
+
+    valid_actions = {"play_audio", "proceed_to_agent", "end_call", "repeat_menu"}
+    for entry in menu.get("entries", []):
+        if entry.get("action") not in valid_actions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid action '{entry.get('action')}'. Must be one of: {valid_actions}",
+            )
+
+    new_cfg = dict(agent.agent_config or {})
+    new_cfg["ivr_dtmf_menu"] = menu
+    agent.agent_config = new_cfg
+    flag_modified(agent, "agent_config")
+    await db.commit()
+    await db.refresh(agent)
+
+    logger.info("ivr_dtmf_menu_updated", agent_id=agent_id, entries=len(menu.get("entries", [])))
+    return {"ivr_dtmf_menu": new_cfg["ivr_dtmf_menu"]}
+
+
+@router.post("/{agent_id}/ivr-dtmf-menu/{digit}/generate-audio")
+async def generate_dtmf_entry_audio(
+    agent_id: str,
+    digit: str,
+    request: Request,
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Generate TTS audio for a specific DTMF menu entry identified by its digit key."""
+    tenant_id = _tenant_id(request)
+    raid = _restricted_agent_id(request)
+    if raid and uuid.UUID(agent_id) != raid:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == uuid.UUID(agent_id),
+            Agent.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    cfg = agent.agent_config or {}
+    menu = cfg.get("ivr_dtmf_menu", {})
+    entries = menu.get("entries", [])
+
+    # Find the entry for this digit
+    entry = next((e for e in entries if e.get("digit") == digit), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"No DTMF entry found for digit '{digit}'.")
+
+    audio_text = entry.get("audio_text", "").strip()
+    if not audio_text:
+        raise HTTPException(status_code=400, detail="No audio_text configured for this entry.")
+
+    if _has_variables(audio_text):
+        raise HTTPException(status_code=400, detail="Cannot pre-generate audio for text containing session variables.")
+
+    voice_id = agent.voice_id or "alloy"
+
+    # Resolve agent variables
+    result_vars = await db.execute(select(AgentVariable).where(AgentVariable.agent_id == agent.id))
+    variables = result_vars.scalars().all()
+    resolved_text = resolve_agent_variables(audio_text, agent, variables, clean=True)
+    redacted_text = redact(resolved_text)
+
+    # Delete old audio file for this digit if it exists
+    old_url = entry.get("audio_url")
+    _delete_old_audio(old_url)
+
+    url = await _tts_service.generate_ivr_prompt(
+        text=redacted_text,
+        voice_id=voice_id,
+        agent_id=f"{str(agent.id)}_dtmf_{digit}",
+    )
+    if not url:
+        raise HTTPException(status_code=500, detail="TTS generation failed.")
+
+    # Persist the audio_url back into the DTMF menu entry
+    new_cfg = dict(cfg)
+    new_menu = dict(menu)
+    new_entries = [dict(e) for e in entries]
+    for e in new_entries:
+        if e.get("digit") == digit:
+            e["audio_url"] = url
+    new_menu["entries"] = new_entries
+    new_cfg["ivr_dtmf_menu"] = new_menu
+    agent.agent_config = new_cfg
+    flag_modified(agent, "agent_config")
+    await db.commit()
+    await db.refresh(agent)
+
+    logger.info("dtmf_entry_audio_generated", agent_id=agent_id, digit=digit, url=url)
+    return {"digit": digit, "audio_url": url, "ivr_dtmf_menu": new_menu}
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)

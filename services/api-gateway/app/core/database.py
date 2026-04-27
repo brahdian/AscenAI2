@@ -49,13 +49,16 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-async def get_db(tenant_id: str | None = None) -> AsyncGenerator[AsyncSession, None]:
+async def get_db(tenant_id: str | None = None, bypass_rls: bool = False) -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:
             # SECURITY: Set the per-session Postgres variable that RLS policies
             # use to filter rows by tenant. SET LOCAL scopes this to the
             # current transaction only — it cannot leak across connections.
-            if tenant_id:
+            if bypass_rls:
+                logger.warning("rls_bypassed", tenant_id=tenant_id, action="database_access")
+                await session.execute(text("SET LOCAL row_security = 'off'"))
+            elif tenant_id:
                 await session.execute(
                     text("SELECT set_config('app.current_tenant_id', :tid, true)"),
                     {"tid": str(tenant_id)},

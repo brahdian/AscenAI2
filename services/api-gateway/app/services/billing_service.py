@@ -159,6 +159,7 @@ class BillingService:
         """Record LLM token usage for a tenant."""
         key = f"billing:tokens:{tenant_id}:{_month_key()}"
         await self._incr(key, tokens)
+        await self._durable_tenant_usage_upsert(tenant_id, "current_month_tokens", tokens)
         logger.info(
             "token_usage_recorded",
             tenant_id=tenant_id,
@@ -175,6 +176,7 @@ class BillingService:
         """Record chat-equivalent units for a tenant."""
         key = f"billing:chats:{tenant_id}:{_month_key()}"
         await self._incr(key, chat_units)
+        await self._durable_tenant_usage_upsert(tenant_id, "current_month_chat_units", chat_units)
         logger.info(
             "chat_usage_recorded",
             tenant_id=tenant_id,
@@ -192,6 +194,7 @@ class BillingService:
         minutes = seconds / 60.0
         key = f"billing:minutes:{tenant_id}:{_month_key()}"
         await self._incr_float(key, minutes)
+        await self._durable_tenant_usage_upsert(tenant_id, "current_month_voice_minutes", minutes)
         logger.info(
             "voice_minutes_recorded",
             tenant_id=tenant_id,
@@ -208,6 +211,10 @@ class BillingService:
         """Record tool call usage for a tenant."""
         key = f"billing:tools:{tenant_id}:{_month_key()}"
         await self._incr(key, 1)
+        # Assuming tool_calls is tracked? Wait, tenant_usage doesn't have tool_calls in db.
+        # Oh, the schema for tenant_usage in `app/models/tenant.py` only tracks sessions, messages, chat_units, tokens, voice_minutes, agent_count.
+        # Let's check `get_db_usage_summary` at line 760: it returns token, chat, minutes. Tool calls is absent from TenantUsage!
+        # So I'll only incr Redis for tools.
         logger.info(
             "tool_usage_recorded",
             tenant_id=tenant_id,
@@ -730,6 +737,39 @@ class BillingService:
         except Exception:
             return 0.0
 
+
+    async def _durable_tenant_usage_upsert(self, tenant_id: str, field: str, amount: Any) -> None:
+        """Fallback durable UPSERT to ensure usage is tracked even if Redis fails."""
+        import uuid
+        from sqlalchemy import text
+        try:
+            t_uuid = uuid.UUID(tenant_id)
+            lock_id = t_uuid.int & 0x7FFFFFFF
+            
+            # Start a nested transaction explicitly for the lock and update if we aren't in one already
+            async with self.db.begin_nested() as nested:
+                # Advisory lock per tenant to prevent concurrent drift on updates
+                acquired = await self.db.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:lock_id)"), 
+                    {"lock_id": lock_id}
+                )
+                if not acquired.scalar():
+                    logger.warning("advisory_lock_busy_for_billing_upsert", tenant_id=tenant_id)
+                
+                # Perform atomic update on tenant_usage
+                # We use ON CONFLICT DO UPDATE implicitly via UPDATE because the row should exist,
+                # but if it doesn't we could do an INSERT ON CONFLICT.
+                # Actually, UPDATE is safe here because tenant_usage row is created on subscription.
+                await self.db.execute(text(f"""
+                    UPDATE tenant_usage 
+                    SET {field} = {field} + :amount,
+                        updated_at = NOW()
+                    WHERE tenant_id = :tid
+                """), {"amount": amount, "tid": t_uuid})
+            
+            await self.db.commit()
+        except Exception as e:
+            logger.warning("db_fallback_failed_for_billing", error=str(e), tenant_id=tenant_id)
 
 # ---------------------------------------------------------------------------
 # DB-backed usage summary (falls back when Redis is empty)

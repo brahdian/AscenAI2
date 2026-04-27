@@ -915,6 +915,14 @@ async def update_agent(
 
     update_data = body.model_dump(exclude_unset=True)
 
+    if "version" in update_data:
+        expected_version = update_data.pop("version")
+        if expected_version is not None and agent.version != expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Conflict: Agent was modified by another request. Expected version {expected_version}, got {agent.version}."
+            )
+
     if "agent_config" in update_data and update_data["agent_config"] is not None:
         incoming_config = update_data.pop("agent_config")
         current_config = copy.deepcopy(agent.agent_config) if agent.agent_config else {}
@@ -1045,7 +1053,15 @@ async def update_agent(
         elif field != "agent_config":
             setattr(agent, field, value)
 
-    await db.commit()
+    from sqlalchemy.orm.exc import StaleDataError
+    try:
+        await db.commit()
+    except StaleDataError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Conflict: Agent was modified by another request. Please reload and try again."
+        )
     await db.refresh(agent)
 
     # 1. Auto-populate IVR Language Prompt if supported_languages changed and prompt is empty

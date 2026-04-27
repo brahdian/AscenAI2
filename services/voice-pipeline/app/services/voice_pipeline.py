@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
+from pydantic import BaseModel, Field
+
 import httpx
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
@@ -210,6 +212,31 @@ class SessionState:
 
 
 
+class VoiceSessionRedisModel(BaseModel):
+    session_id: str
+    tenant_id: str
+    agent_id: str
+    twilio_stream_sid: Optional[str] = None
+    call_sid: Optional[str] = None
+    caller_phone: Optional[str] = None
+    started_at: float
+    agent_config: Optional[dict] = None
+    extension_map: dict = Field(default_factory=dict)
+    
+    @classmethod
+    def from_session_state(cls, state: SessionState) -> "VoiceSessionRedisModel":
+        return cls(
+            session_id=state.session_id,
+            tenant_id=state.tenant_id,
+            agent_id=state.agent_id,
+            twilio_stream_sid=state.twilio_stream_sid,
+            call_sid=state.call_sid,
+            caller_phone=state.caller_phone,
+            started_at=state.started_at,
+            agent_config=state.agent_config,
+            extension_map=state.extension_map,
+        )
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -234,6 +261,19 @@ class VoicePipeline:
         self.active_sessions: dict[str, SessionState] = {}
         self._http_client: Optional[httpx.AsyncClient] = None
 
+    async def _snapshot_session(self, state: SessionState) -> None:
+        """Persist session metadata to Redis for externalization/telemetry."""
+        if not self.redis:
+            return
+        try:
+            model = VoiceSessionRedisModel.from_session_state(state)
+            await self.redis.setex(
+                f"voice_session:{state.session_id}",
+                3600,
+                model.model_dump_json()
+            )
+        except Exception as e:
+            logger.warning("voice_session_snapshot_failed", session_id=state.session_id, error=str(e))
 
     # ------------------------------------------------------------------
     # Public WebSocket entry point
@@ -317,6 +357,8 @@ class VoicePipeline:
             agent_id=agent_id,
             silero_vad=state.vad_stream is not None,
         )
+
+        await self._snapshot_session(state)
 
         try:
             await self._play_greeting(websocket, state)
@@ -515,6 +557,7 @@ class VoicePipeline:
                             stream_sid=state.twilio_stream_sid,
                             call_sid=state.call_sid,
                         )
+                        asyncio.create_task(self._snapshot_session(state))
                         continue
 
                     elif event_type == "media" and "payload" in ctrl.get("media", {}):

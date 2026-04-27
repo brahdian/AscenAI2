@@ -62,6 +62,12 @@ class Agent(Base):
     # CRM Integration - Mapping to a specific company/workspace in Twenty
     crm_workspace_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    __mapper_args__ = {
+        "version_id_col": version
+    }
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -106,6 +112,7 @@ class Agent(Base):
             "is_available_as_tool": self.is_available_as_tool,
             "status": self.status,
             "crm_workspace_id": str(self.crm_workspace_id) if self.crm_workspace_id else None,
+            "version": self.version,
             "stripe_subscription_id": self.stripe_subscription_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -441,6 +448,43 @@ class AgentPlaybook(Base):
         }
 
 
+class AgentPlaybookHistory(Base):
+    """
+    Snapshot of a playbook configuration at a point in time before an update.
+    """
+    __tablename__ = "agent_playbook_history"
+    __table_args__ = (
+        Index("ix_playbook_history_playbook_id", "playbook_id"),
+        Index("ix_playbook_history_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agent_playbooks.id", ondelete="CASCADE"), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    intent_triggers: Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSONB), nullable=True)
+    config: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), nullable=False)
+    
+    snapshot_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def to_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "playbook_id": str(self.playbook_id),
+            "tenant_id": str(self.tenant_id),
+            "agent_id": str(self.agent_id),
+            "name": self.name,
+            "description": self.description,
+            "intent_triggers": self.intent_triggers or [],
+            "config": self.config or {},
+            "snapshot_reason": self.snapshot_reason,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
 
 
 class AgentDocument(Base):

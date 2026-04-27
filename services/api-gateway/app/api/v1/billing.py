@@ -189,7 +189,11 @@ async def _check_billing_rate_limit(request: Request, action: str, limit: int = 
     """
     redis = getattr(request.app.state, "redis", None)
     if not redis:
-        return  # Fail open — no Redis, allow traffic
+        logger.error("billing_rate_limit_redis_unavailable_fail_closed", action=action)
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable due to rate limiter dependency failure"
+        )
     tenant_id = getattr(request.state, "tenant_id", "anon")
     key = f"billing_rl:{tenant_id}:{action}"
     window_end = math.ceil(_time.time() / window) * window
@@ -1349,7 +1353,13 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
 
     event_type = event.get("type", "unknown")
     event_id = event.get("id", "")
+    event_created = event.get("created", 0)
     logger.info("billing_webhook_received", event_type=event_type, event_id=event_id)
+
+    # Replay protection: Reject events older than 5 minutes (300 seconds)
+    if event_created < _time.time() - 300:
+        logger.warning("billing_webhook_replay_rejected", event_id=event_id, created=event_created)
+        raise HTTPException(status_code=400, detail="Webhook event too old (replay protection)")
 
     # Phase 2: Defence-in-depth idempotency (Redis primary + DB fallback).
     # We acquire a temporary lock (5 min TTL) to prevent concurrent identical webhooks
@@ -1653,7 +1663,7 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                 logger.error("billing_webhook_subscription_error", error=str(e), tenant_id=tenant_id)
                 raise HTTPException(status_code=500, detail="Failed to process subscription update")
 
-    elif event_type == "invoice.paid":
+    elif event_type in ("invoice.paid", "invoice.payment_succeeded"):
         invoice = event.get("data", {}).get("object", {})
         customer_id = invoice.get("customer")
         if customer_id:
@@ -1677,6 +1687,22 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
             except Exception as e:
                 logger.error("billing_webhook_invoice_paid_error", error=str(e), customer_id=customer_id)
                 raise HTTPException(status_code=500, detail="Failed to process invoice payment")
+
+    elif event_type == "invoice.payment_failed":
+        invoice = event.get("data", {}).get("object", {})
+        customer_id = invoice.get("customer")
+        if customer_id:
+            try:
+                result = await db.execute(select(Tenant).where(Tenant.stripe_customer_id == customer_id))
+                tenant = result.scalar_one_or_none()
+                if tenant:
+                    tenant.is_active = False
+                    tenant.subscription_status = "past_due"
+                    await db.commit()
+                    logger.warning("billing_webhook_invoice_payment_failed", customer_id=customer_id, tenant_id=str(tenant.id))
+            except Exception as e:
+                logger.error("billing_webhook_invoice_payment_failed_error", error=str(e), customer_id=customer_id)
+                raise HTTPException(status_code=500, detail="Failed to process invoice payment failure")
 
     if idempotency_svc and event_id:
         # Mark processed now (upgrade temporary lock -> permanent tombstone)

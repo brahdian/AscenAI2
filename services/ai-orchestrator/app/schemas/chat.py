@@ -271,6 +271,7 @@ class AgentUpdate(BaseModel):
     is_active: Optional[bool] = None
     stripe_subscription_id: Optional[str] = None
     expires_at: Optional[str] = None
+    version: Optional[int] = Field(None, description="Current version of the agent for optimistic locking")
 
     @field_validator("agent_config", mode="before")
     @classmethod
@@ -321,6 +322,7 @@ class AgentResponse(BaseModel):
     is_available_as_tool: bool = True
     is_active: bool
     status: str
+    version: int = 1
     stripe_subscription_id: Optional[str] = None
     deleted_at: Optional[str] = None
     created_at: Optional[str]
@@ -514,6 +516,20 @@ class PlaybookResponse(BaseModel):
     is_active: bool
     created_at: str
     updated_at: str
+
+
+class PlaybookHistoryResponse(BaseModel):
+    id: str
+    playbook_id: str
+    tenant_id: str
+    agent_id: str
+    name: str
+    description: Optional[str]
+    intent_triggers: list[str]
+    config: dict = Field(default_factory=dict)
+    snapshot_reason: Optional[str]
+    created_at: str
+
 
 
 class FeedbackSummary(BaseModel):

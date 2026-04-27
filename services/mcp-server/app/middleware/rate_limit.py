@@ -47,13 +47,23 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         redis = getattr(request.app.state, "redis", None)
         if redis is None:
-            # Redis not available — allow request through (fail open)
-            logger.warning("rate_limit_redis_unavailable", tenant_id=tenant_id)
-            return await call_next(request)
+            # Redis not available — fail closed for Zero Trust
+            logger.error("rate_limit_redis_unavailable_fail_closed", tenant_id=tenant_id)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Service temporarily unavailable due to rate limiter dependency failure"},
+            )
 
-        allowed, remaining, reset_in = await self._check_rate_limit(
-            redis, tenant_id
-        )
+        try:
+            allowed, remaining, reset_in = await self._check_rate_limit(
+                redis, tenant_id
+            )
+        except Exception as exc:
+            logger.error("rate_limit_redis_error_fail_closed", tenant_id=tenant_id, error=str(exc))
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Service temporarily unavailable due to rate limiter dependency failure"},
+            )
 
         if not allowed:
             logger.warning(

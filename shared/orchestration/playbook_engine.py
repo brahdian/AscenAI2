@@ -91,7 +91,8 @@ def _substitute_vars(template: str, variables: dict[str, Any]) -> str:
             else:
                 value = getattr(value, part, "")
         # FIX-10: Apply XML structural isolation for safe UI/prompt rendering
-        return html.escape(str(value), quote=False) if value is not None else ""
+        escaped_value = html.escape(str(value), quote=False) if value is not None else ""
+        return f"<user_variable>{escaped_value}</user_variable>"
 
     # FIX-09: Apply PII scrubbing to the final substituted string for defense-in-depth
     return pii_service.redact(re.sub(r"\{\{([^}]+)\}\}", _resolve, template))

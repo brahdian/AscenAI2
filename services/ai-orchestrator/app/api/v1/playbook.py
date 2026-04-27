@@ -8,8 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models.agent import Agent, AgentPlaybook
-from app.schemas.chat import PlaybookResponse, PlaybookUpsert
+from app.models.agent import Agent, AgentPlaybook, AgentPlaybookHistory
+from app.schemas.chat import PlaybookResponse, PlaybookUpsert, PlaybookHistoryResponse
 from shared.orchestration.moderation_service import ModerationService
 import shared.pii as pii_service
 
@@ -261,6 +261,20 @@ async def update_playbook(
 
     old_config = copy.deepcopy(pb.config or {})
     new_config = await _harden_playbook_config(body.config or {}, request)
+    
+    # Snapshot current state before applying updates
+    history_entry = AgentPlaybookHistory(
+        playbook_id=pb.id,
+        tenant_id=pb.tenant_id,
+        agent_id=pb.agent_id,
+        name=pb.name,
+        description=pb.description,
+        intent_triggers=pb.intent_triggers,
+        config=old_config,
+        snapshot_reason="update_via_api"
+    )
+    db.add(history_entry)
+    
     pb.config = new_config
 
     await db.commit()
@@ -300,6 +314,25 @@ async def delete_playbook(
         logger.info("playbook_deleted", agent_id=agent_id, playbook_id=playbook_id)
 
 
+@router.get("/{agent_id}/playbooks/{playbook_id}/history", response_model=list[PlaybookHistoryResponse])
+async def list_playbook_history(
+    agent_id: str,
+    playbook_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """List historical configurations for a playbook."""
+    tenant_id = _tenant_id(request)
+    await _verify_agent(agent_id, tenant_id, request, db)
+
+    result = await db.execute(
+        select(AgentPlaybookHistory).where(
+            AgentPlaybookHistory.playbook_id == uuid.UUID(playbook_id),
+            AgentPlaybookHistory.agent_id == uuid.UUID(agent_id),
+        ).order_by(AgentPlaybookHistory.created_at.desc())
+    )
+    history = result.scalars().all()
+    return [h.to_dict() for h in history]
 
 
 @router.post("/validate-safety")

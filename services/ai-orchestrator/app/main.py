@@ -22,6 +22,8 @@ from app.core.database import init_db, close_db
 from app.core.leadership import RedisLeaderLease
 from app.core.redis_client import init_redis, close_redis, get_redis
 from app.core.security import get_current_tenant
+from arq import create_pool
+from arq.connections import RedisSettings
 
 # ---------------------------------------------------------------------------
 # Sentry
@@ -122,6 +124,11 @@ async def lifespan(app: FastAPI):
     redis_client = await init_redis()
     app.state.redis = redis_client
     logger.info("redis_ready")
+
+    # Initialize ARQ Pool
+    arq_settings = RedisSettings.from_dsn(settings.REDIS_URL)
+    app.state.arq_pool = await create_pool(arq_settings)
+    logger.info("arq_pool_ready")
 
     # Pre-warm Presidio NLP models — eliminates cold-start latency on first chat
     pii_service.configure(settings.SECRET_KEY)
@@ -234,6 +241,8 @@ async def lifespan(app: FastAPI):
         app.state.session_cleanup.stop()
     if hasattr(app.state, "document_indexer"):
         app.state.document_indexer.stop()
+    if hasattr(app.state, "arq_pool"):
+        await app.state.arq_pool.close()
     await _mcp_client.close()
     await close_redis()
     await close_db()
@@ -370,7 +379,14 @@ app.mount(
 )
 
 # Prometheus metrics
-Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+# Phase 3.3 Metric Cardinality Control:
+# - group_untemplated: collapses unknown/404 paths into a single bucket to prevent cardinality explosion
+# - group_status_codes: folds 200/201/204 → 2xx etc., preventing hundreds of unique label combos
+Instrumentator(
+    should_group_untemplated=True,
+    should_group_status_codes=True,
+    excluded_handlers=["/health", "/health/ready", "/health/live", "/health/startup", "/metrics"],
+).instrument(app).expose(app, endpoint="/metrics")
 
 
 # ── RequestValidationError handler ────────────────────────────────────────────

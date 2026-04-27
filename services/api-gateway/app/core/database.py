@@ -1,7 +1,8 @@
 from typing import AsyncGenerator
+import time
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import text, event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -13,6 +14,7 @@ from sqlalchemy.pool import NullPool
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
+_SLOW_QUERY_THRESHOLD_MS = 500
 
 
 class Base(DeclarativeBase):
@@ -23,8 +25,8 @@ class Base(DeclarativeBase):
 _pool_kwargs: dict = {}
 if "sqlite" not in settings.DATABASE_URL:
     _pool_kwargs = {
-        "pool_size": 10,
-        "max_overflow": 20,
+        "pool_size": 50,
+        "max_overflow": 100,
         "pool_pre_ping": True,
         # Recycle connections every 30 min to avoid stale connections after
         # PostgreSQL keepalive / firewall idle-connection timeouts.
@@ -47,6 +49,23 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
     autocommit=False,
 )
+
+
+# Phase 3.4: Slow Query Observability
+@event.listens_for(engine.sync_engine, "before_cursor_execute")
+def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    conn.info.setdefault("query_start_time", []).append(time.monotonic())
+
+
+@event.listens_for(engine.sync_engine, "after_cursor_execute")
+def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    elapsed_ms = (time.monotonic() - conn.info["query_start_time"].pop()) * 1000
+    if elapsed_ms >= _SLOW_QUERY_THRESHOLD_MS:
+        logger.warning(
+            "slow_query_detected",
+            elapsed_ms=round(elapsed_ms, 2),
+            statement=statement[:500],
+        )
 
 
 async def get_db(tenant_id: str | None = None, bypass_rls: bool = False) -> AsyncGenerator[AsyncSession, None]:

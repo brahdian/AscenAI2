@@ -1,13 +1,16 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
-from sqlalchemy import text
+from sqlalchemy import text, event
 from typing import AsyncGenerator, Optional
+import time
 import structlog
 
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
+
+_SLOW_QUERY_THRESHOLD_MS = 500  # log queries slower than 500ms
 
 
 class Base(DeclarativeBase):
@@ -20,8 +23,8 @@ engine = create_async_engine(
     echo=settings.DEBUG,
     poolclass=NullPool if _is_sqlite else None,
     pool_pre_ping=True,
-    pool_size=10 if not _is_sqlite else None,
-    max_overflow=20 if not _is_sqlite else None,
+    pool_size=50 if not _is_sqlite else None,
+    max_overflow=100 if not _is_sqlite else None,
     # Recycle connections every 30 min to avoid stale TCP connections after
     # PostgreSQL's tcp_keepalives_idle or firewall idle-connection timeouts.
     pool_recycle=1800 if not _is_sqlite else None,
@@ -35,6 +38,29 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
     autocommit=False,
 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.4: Slow Query Observability
+# We instrument the *sync* engine that backs the async engine. SQLAlchemy's
+# before/after_cursor_execute events fire on the underlying sync DBAPI layer,
+# which is the only place timing can be accurately captured.
+# ---------------------------------------------------------------------------
+@event.listens_for(engine.sync_engine, "before_cursor_execute")
+def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    conn.info.setdefault("query_start_time", []).append(time.monotonic())
+
+
+@event.listens_for(engine.sync_engine, "after_cursor_execute")
+def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    elapsed_ms = (time.monotonic() - conn.info["query_start_time"].pop()) * 1000
+    if elapsed_ms >= _SLOW_QUERY_THRESHOLD_MS:
+        # Truncate statement to prevent log bloat on long dynamic SQL
+        logger.warning(
+            "slow_query_detected",
+            elapsed_ms=round(elapsed_ms, 2),
+            statement=statement[:500],
+        )
 
 
 async def get_db(

@@ -73,7 +73,8 @@ def _get_metrics():
             "stt_lag": _h("voice_stt_lag_ms", "Time (ms) from speech_end to final STT transcript"),
             "llm_ttft": _h("voice_llm_ttft_ms", "Time (ms) to first LLM token (voice path)"),
             "tts_ttfa": _h("voice_tts_ttfa_ms", "Time (ms) to first TTS audio byte"),
-            "e2e": _h("voice_e2e_lag_ms", "End-to-end (ms): speech_end → first audio chunk sent"),
+            "e2e": _h("voice_e2e_lag_ms", "End-to-end (ms): speech_end to first audio chunk sent"),
+            "slo_breach": _h("voice_slo_breach_total", "Count of turns breaching the 1500ms E2E voice SLO"),
         }
     except ImportError:
         return {}
@@ -186,14 +187,24 @@ class LatencyTracker:
             "total_ms": self.total_ms,
         }
         logger.info("voice_latency_report", **summary)
+
+        # Phase 3.5: Voice SLO Enforcement
+        # SLO target: E2E latency < 1500ms for 95th percentile
+        _VOICE_E2E_SLO_MS = 1500
+        e2e = self.e2e_lag_ms
+        if e2e is not None and e2e > _VOICE_E2E_SLO_MS:
+            logger.warning(
+                "voice_slo_breach",
+                session_id=self._session_id,
+                turn=self._turn,
+                e2e_lag_ms=e2e,
+                slo_threshold_ms=_VOICE_E2E_SLO_MS,
+            )
+
         return summary
 
     def emit_metrics(self) -> None:
         """Push hop-by-hop measurements to Prometheus histograms."""
-        from app.core.config import settings
-        if not settings.LATENCY_TELEMETRY_ENABLED:
-            return
-
         m = _metrics()
         if not m:
             return
@@ -209,3 +220,9 @@ class LatencyTracker:
         _observe("llm_ttft", self.llm_ttft_ms)
         _observe("tts_ttfa", self.tts_ttfa_ms)
         _observe("e2e", self.e2e_lag_ms)
+
+        # SLO breach counter
+        _VOICE_E2E_SLO_MS = 1500
+        e2e = self.e2e_lag_ms
+        if e2e is not None and e2e > _VOICE_E2E_SLO_MS:
+            _observe("slo_breach", 1)

@@ -356,18 +356,20 @@ async def instantiate_template(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    return await process_template_instantiation(
-        t_uuid=t_uuid,
-        v_uuid=v_uuid,
-        agent=agent,
-        tenant=tenant,
-        db=db,
-        request=request,
-        background_tasks=background_tasks,
-        variable_values=body.variable_values,
-        tool_configs=body.tool_configs,
-        actor_info=actor_info,
+    # Zenith: Enqueue the heavy instantiation task to ARQ worker
+    # We pass strings instead of UUID objects because ARQ serialization (msgpack) might not support UUID natively depending on setup
+    await request.app.state.arq_pool.enqueue_job(
+        "process_template_instantiation_job",
+        str(t_uuid),
+        str(v_uuid),
+        str(agent.id),
+        tenant,
+        body.variable_values,
+        body.tool_configs,
+        actor_info,
     )
+    
+    return {"message": "Template instantiation queued successfully."}
 
 async def process_template_instantiation(
     t_uuid: uuid.UUID,
@@ -808,10 +810,18 @@ async def process_template_instantiation(
 
     # 4. Enqueue indexing jobs in the durable worker queue
     if _pending_indexing_jobs:
-        indexer = request.app.state.document_indexer
-        for job in _pending_indexing_jobs:
-            await indexer.enqueue(job)
-            logger.info("template_faq_queued", doc_id=job["document_id"], agent_id=str(agent.id))
+        if request and hasattr(request.app.state, "document_indexer"):
+            indexer = request.app.state.document_indexer
+            for job in _pending_indexing_jobs:
+                await indexer.enqueue(job)
+                logger.info("template_faq_queued", doc_id=job["document_id"], agent_id=str(agent.id))
+        else:
+            # Running in worker context
+            from app.core.redis_client import get_redis
+            redis = await get_redis()
+            for job in _pending_indexing_jobs:
+                await redis.lpush("doc_index_queue", json.dumps(job))
+                logger.info("template_faq_queued_via_redis", doc_id=job["document_id"], agent_id=str(agent.id))
 
     logger.info(
         "template_instantiated_successfully",

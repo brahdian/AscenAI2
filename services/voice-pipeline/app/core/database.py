@@ -15,9 +15,11 @@ from app.core.config import settings
 # Reuse the same DATABASE_URL the ai-orchestrator uses
 _engine = create_async_engine(
     settings.DATABASE_URL,
-    pool_size=5,
-    max_overflow=10,
+    pool_size=20,
+    max_overflow=40,
     pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_timeout=30,
     echo=False,
 )
 

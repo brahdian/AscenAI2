@@ -152,7 +152,9 @@ export default function AdminCrmPage() {
                       </span>
                       <span className="text-gray-400">/ {w.allowed_seats}</span>
                       {w.active_users > w.allowed_seats && (
-                        <AlertTriangle size={14} className="text-amber-500" title="Over seat limit" />
+                        <span title="Over seat limit">
+                          <AlertTriangle size={14} className="text-amber-500" />
+                        </span>
                       )}
                     </div>
                   </td>

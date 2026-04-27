@@ -218,7 +218,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # --- Prometheus metrics -----------------------------------------------------
-Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+# Phase 3.3 Metric Cardinality Control
+Instrumentator(
+    should_group_untemplated=True,
+    should_group_status_codes=True,
+    excluded_handlers=["/health", "/health/ready", "/health/live", "/health/startup", "/metrics"],
+).instrument(app).expose(app, endpoint="/metrics")
 
 # ---------------------------------------------------------------------------
 # Routers

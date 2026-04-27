@@ -2,21 +2,22 @@ from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import event, text
+import time
 import structlog
 
 from app.core.config import settings
 
 from pgvector.asyncpg import register_vector
-from sqlalchemy import event
 
 logger = structlog.get_logger(__name__)
+_SLOW_QUERY_THRESHOLD_MS = 500
 
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=50,
+    max_overflow=100,
     pool_timeout=30,
     pool_recycle=1800,
 )
@@ -32,6 +33,23 @@ SessionLocal = async_sessionmaker(
 @event.listens_for(engine.sync_engine, "connect")
 def register_pgvector(dbapi_connection, connection_record):
     dbapi_connection.run_async(register_vector)
+
+
+# Phase 3.4: Slow Query Observability
+@event.listens_for(engine.sync_engine, "before_cursor_execute")
+def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    conn.info.setdefault("query_start_time", []).append(time.monotonic())
+
+
+@event.listens_for(engine.sync_engine, "after_cursor_execute")
+def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    elapsed_ms = (time.monotonic() - conn.info["query_start_time"].pop()) * 1000
+    if elapsed_ms >= _SLOW_QUERY_THRESHOLD_MS:
+        logger.warning(
+            "slow_query_detected",
+            elapsed_ms=round(elapsed_ms, 2),
+            statement=statement[:500],
+        )
 
 
 class Base(DeclarativeBase):

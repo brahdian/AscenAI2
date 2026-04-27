@@ -165,7 +165,12 @@ def create_app() -> FastAPI:
 
     # ---- Prometheus metrics ----
     if settings.PROMETHEUS_ENABLED:
-        Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+        # Phase 3.3 Metric Cardinality Control
+        Instrumentator(
+            should_group_untemplated=True,
+            should_group_status_codes=True,
+            excluded_handlers=["/health", "/metrics"],
+        ).instrument(app).expose(app, endpoint="/metrics")
 
     # ---- Routers ----
     from app.api.v1.tools import router as tools_router

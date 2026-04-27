@@ -179,8 +179,12 @@ app.add_middleware(
 
 app.include_router(voice_router.router, prefix="/api/v1", tags=["voice"])
 
-# Prometheus metrics
-Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+# Phase 3.3 Metric Cardinality Control
+Instrumentator(
+    should_group_untemplated=True,
+    should_group_status_codes=True,
+    excluded_handlers=["/health", "/health/ready", "/health/live", "/health/startup", "/metrics"],
+).instrument(app).expose(app, endpoint="/metrics")
 
 
 @app.get("/health", tags=["health"])

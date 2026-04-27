@@ -16,7 +16,7 @@ import hmac
 import uuid
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -170,7 +170,7 @@ async def deliver_signal(
     """
     from app.core.redis_client import get_redis
     from app.models.workflow import WorkflowExecution, ExecutionStatus
-    from app.services.workflow_engine import WorkflowEngine, _SIGNAL_KEY_PREFIX
+    from shared.orchestration.workflow_engine import WorkflowEngine, _SIGNAL_KEY_PREFIX
 
     redis = await get_redis()
     redis_key = f"{_SIGNAL_KEY_PREFIX}{signal_name}:{body.correlation_id}"
@@ -280,3 +280,154 @@ async def deliver_signal(
         message=f"Signal delivered. Execution status: {result.status.value}",
     )
 
+
+# ---------------------------------------------------------------------------
+# Voice session → CRM auto-logging
+# ---------------------------------------------------------------------------
+
+
+class VoiceFinalizeRequest(BaseModel):
+    tenant_id: str
+    agent_id: str
+    session_id: str
+    caller_phone: Optional[str] = None
+    duration_seconds: Optional[int] = None
+
+
+class VoiceFinalizeResponse(BaseModel):
+    logged: bool
+    person_id: Optional[str] = None
+    note_id: Optional[str] = None
+    skipped_reason: Optional[str] = None
+
+
+def _build_call_summary(messages: list, duration_seconds: Optional[int]) -> str:
+    """Build a compact call summary from the message history.
+
+    Truncates long messages and caps the overall body so we don't push pages
+    of transcript into the CRM. The full transcript stays in our session DB.
+    """
+    if not messages:
+        return "Voice call ended with no recorded transcript."
+
+    lines: list[str] = []
+    if duration_seconds:
+        lines.append(f"Duration: {duration_seconds // 60}m {duration_seconds % 60}s")
+    lines.append(f"Turns: {len(messages)}")
+    lines.append("")
+
+    tail = messages[-12:]
+    for msg in tail:
+        role = (getattr(msg, "role", None) or "").lower()
+        speaker = "Caller" if role == "user" else "Agent" if role == "assistant" else role.capitalize()
+        text = (getattr(msg, "content", None) or "").strip().replace("\n", " ")
+        if len(text) > 240:
+            text = text[:237] + "..."
+        if text:
+            lines.append(f"{speaker}: {text}")
+
+    body = "\n".join(lines)
+    return body[:4000]
+
+
+@router.post("/voice/finalize", response_model=VoiceFinalizeResponse)
+async def finalize_voice_session(
+    body: VoiceFinalizeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(_require_internal_key),
+) -> VoiceFinalizeResponse:
+    """Auto-log a finished voice call into Twenty CRM as a Note.
+
+    All steps are best-effort. Any failure returns ``logged=false`` with a reason
+    rather than raising — voice-pipeline calls this fire-and-forget after hangup.
+    """
+    from app.models.agent import Agent
+
+    try:
+        tenant_uuid = uuid.UUID(body.tenant_id)
+        agent_uuid = uuid.UUID(body.agent_id)
+    except ValueError:
+        return VoiceFinalizeResponse(logged=False, skipped_reason="invalid_id_format")
+
+    agent_row = (
+        await db.execute(select(Agent).where(Agent.id == agent_uuid, Agent.tenant_id == tenant_uuid))
+    ).scalar_one_or_none()
+    if agent_row is None:
+        return VoiceFinalizeResponse(logged=False, skipped_reason="agent_not_found")
+
+    if not agent_row.crm_workspace_id:
+        return VoiceFinalizeResponse(logged=False, skipped_reason="no_crm_workspace")
+
+    if not (agent_row.agent_config or {}).get("auto_log_to_crm"):
+        return VoiceFinalizeResponse(logged=False, skipped_reason="auto_log_disabled")
+
+    msg_rows = (
+        await db.execute(
+            select(Message)
+            .where(Message.session_id == body.session_id, Message.tenant_id == tenant_uuid)
+            .order_by(Message.created_at)
+        )
+    ).scalars().all()
+
+    summary = _build_call_summary(list(msg_rows), body.duration_seconds)
+
+    mcp = getattr(request.app.state, "mcp_client", None)
+    if mcp is None:
+        return VoiceFinalizeResponse(logged=False, skipped_reason="mcp_unavailable")
+
+    crm_workspace_id = str(agent_row.crm_workspace_id)
+    person_id: Optional[str] = None
+
+    if body.caller_phone:
+        try:
+            lookup = await mcp.execute_tool(
+                tenant_id=body.tenant_id,
+                tool_name="crm_lookup",
+                parameters={"phone": body.caller_phone},
+                session_id=body.session_id,
+                crm_workspace_id=crm_workspace_id,
+            )
+            result = (lookup or {}).get("result") or {}
+            if result.get("found"):
+                person_id = (result.get("customer") or {}).get("id")
+            elif "error" not in result:
+                create = await mcp.execute_tool(
+                    tenant_id=body.tenant_id,
+                    tool_name="crm_create_person",
+                    parameters={"phone": body.caller_phone},
+                    session_id=body.session_id,
+                    crm_workspace_id=crm_workspace_id,
+                )
+                person_id = ((create or {}).get("result") or {}).get("id")
+        except Exception as exc:
+            logger.warning("voice_finalize_lookup_failed", session_id=body.session_id, error=str(exc))
+
+    note_params: dict = {
+        "title": f"Voice call · {body.session_id[:8]}",
+        "body": summary,
+    }
+    if person_id:
+        note_params["person_id"] = person_id
+
+    try:
+        note_resp = await mcp.execute_tool(
+            tenant_id=body.tenant_id,
+            tool_name="crm_create_note",
+            parameters=note_params,
+            session_id=body.session_id,
+            crm_workspace_id=crm_workspace_id,
+        )
+        note_result = (note_resp or {}).get("result") or {}
+        note_id = note_result.get("id")
+    except Exception as exc:
+        logger.warning("voice_finalize_note_failed", session_id=body.session_id, error=str(exc))
+        return VoiceFinalizeResponse(logged=False, person_id=person_id, skipped_reason="note_failed")
+
+    logger.info(
+        "voice_session_logged_to_crm",
+        session_id=body.session_id,
+        person_id=person_id,
+        note_id=note_id,
+    )
+    return VoiceFinalizeResponse(logged=bool(note_id), person_id=person_id, note_id=note_id)

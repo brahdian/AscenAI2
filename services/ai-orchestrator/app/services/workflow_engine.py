@@ -41,7 +41,7 @@ from typing import Any, Optional
 
 import httpx
 import structlog
-import app.services.pii_service as pii_service
+import shared.pii as pii_service
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1451,7 +1451,7 @@ class WorkflowEngine:
         elif isinstance(data, list):
             return [await self._scrub_pii_recursive(x, secret_keys) for x in data]
         elif isinstance(data, str):
-            from app.services import pii_service
+            import shared.pii as pii_service
             return pii_service.redact(data)
         return data
 

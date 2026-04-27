@@ -687,7 +687,7 @@ async def list_audit_logs(
             raise HTTPException(status_code=403, detail="Admin access required.")
         tenant_id = caller_tenant_id
 
-    from app.utils.dates import enforce_temporal_cap
+    from shared.dates import enforce_temporal_cap
     
     since_dt = datetime.fromisoformat(since) if since else None
     until_dt = datetime.fromisoformat(until) if until else datetime.now(timezone.utc)
@@ -733,7 +733,7 @@ async def export_audit_logs(
     from datetime import datetime, timedelta
 
     from app.services.audit_service import stream_audit_logs as _stream
-    from app.utils.dates import enforce_temporal_cap, sanitize_for_csv
+    from shared.dates import enforce_temporal_cap, sanitize_for_csv
 
     # Security: Exports of all tenant data are restricted to Super Admins
     _require_super_admin(request)

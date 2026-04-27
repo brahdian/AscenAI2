@@ -28,6 +28,15 @@ class Settings(BaseSettings):
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/ascenai"
+    TWENTY_DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/twenty"
+
+    # Domains & Ports
+    ROOT_DOMAIN: str = "lvh.me"
+    CRM_PORT: int = 3001
+    FRONTEND_PORT: int = 3000
+    TENANT_ADMIN_SUBDOMAIN: str = "admin"
+    AGENTS_SUBDOMAIN: str = "agents"
+    PLATFORM_ADMIN_SUBDOMAIN: str = "admin.agent"
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -99,10 +108,17 @@ class Settings(BaseSettings):
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
     
+    # Twenty CRM
+    TWENTY_APP_SECRET: str = ""
+    
     # Stripe Price IDs
     STRIPE_TEXT_GROWTH_PRICE_ID: str = ""
     STRIPE_VOICE_GROWTH_PRICE_ID: str = ""
     STRIPE_VOICE_BUSINESS_PRICE_ID: str = ""
+
+    # Pricing Defaults (Zenith Hardening)
+    CRM_SEAT_PRICE: float = 19.0
+    AGENT_SLOT_PRICE_FALLBACK: float = 99.0
 
     # WhatsApp (Meta Business API)
     WHATSAPP_VERIFY_TOKEN: str = ""     # Webhook verification challenge token
@@ -125,19 +141,33 @@ class Settings(BaseSettings):
 
     # CORS — override with comma-separated list via ALLOWED_ORIGINS env var in production
     # Example: ALLOWED_ORIGINS="https://app.yourdomain.com,https://admin.yourdomain.com"
-    FRONTEND_URL: str = "http://lvh.me:3000"
-    ALLOWED_ORIGINS: Any = [
-        "http://lvh.me:3000",
-        "http://admin.lvh.me:3000",
-        "http://app.lvh.me:3000",
-        "http://localhost:3000",
-    ]
+    @property
+    def FRONTEND_URL(self) -> str:
+        return f"http://{self.ROOT_DOMAIN}:{self.FRONTEND_PORT}"
+
+    @property
+    def DEFAULT_ALLOWED_ORIGINS(self) -> list[str]:
+        return [
+            f"http://{self.ROOT_DOMAIN}:{self.FRONTEND_PORT}",
+            f"http://{self.TENANT_ADMIN_SUBDOMAIN}.{self.ROOT_DOMAIN}:{self.FRONTEND_PORT}",
+            f"http://{self.AGENTS_SUBDOMAIN}.{self.ROOT_DOMAIN}:{self.FRONTEND_PORT}",
+            f"http://{self.PLATFORM_ADMIN_SUBDOMAIN}.{self.ROOT_DOMAIN}:{self.FRONTEND_PORT}",
+            "http://localhost:3000",
+        ]
+
+    ALLOWED_ORIGINS: Any = None
     COOKIE_DOMAIN: str | None = ".lvh.me"
     DYNAMIC_COOKIE_DOMAIN: bool = True  # Skips cookie domain for 'localhost'
 
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
-    def validate_allowed_origins(cls, v: Any) -> list[str]:
+    def validate_allowed_origins(cls, v: Any, info: Any) -> list[str]:
+        if not v:
+            # We can't access self here as it's a class method, 
+            # so we either need to re-generate or use a different approach.
+            # BaseSettings will populate this AFTER init if we use a default_factory,
+            # but let's just use the default list logic.
+            return [] 
         if isinstance(v, str):
             return [i.strip() for i in v.split(",")]
         return v

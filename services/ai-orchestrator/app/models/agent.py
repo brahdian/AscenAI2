@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from app.models.tool import AgentTool
     from app.models.variable import AgentVariable
 
-from app.services import pii_service
+import shared.pii as pii_service
 from app.core.database import Base
 
 
@@ -58,6 +58,10 @@ class Agent(Base):
     # Agent subscription expiry - set when payment is made, checked before allowing agent usage
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     grace_period_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # CRM Integration - Mapping to a specific company/workspace in Twenty
+    crm_workspace_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -101,6 +105,7 @@ class Agent(Base):
             "extension_number": self.extension_number,
             "is_available_as_tool": self.is_available_as_tool,
             "status": self.status,
+            "crm_workspace_id": str(self.crm_workspace_id) if self.crm_workspace_id else None,
             "stripe_subscription_id": self.stripe_subscription_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

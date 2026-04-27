@@ -17,8 +17,8 @@ from app.core.database import get_db
 from app.core.security import get_tenant_db, require_forwarded_role
 from app.core.zenith import ZenithContext, get_zenith_context
 from app.models.agent import Agent, AgentDocument, AgentDocumentChunk
-from app.services import pii_service
-from app.services.mcp_client import MCPClient
+import shared.pii as pii_service
+from shared.orchestration.mcp_client import MCPClient
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()

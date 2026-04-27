@@ -97,8 +97,8 @@ async def get_current_tenant(
     if credentials:
         try:
             # First, check if it's a signed internal service token (Phase 13)
-            from app.core.internal_auth import verify_internal_token
-            if verify_internal_token(credentials.credentials):
+            from shared.internal_auth import verify_internal_token
+            if verify_internal_token(credentials.credentials, settings.SECRET_KEY, settings.JWT_ALGORITHM):
                 # Trust the X-Tenant-ID header if it's an internal-service call
                 xtid = request.headers.get("X-Tenant-ID")
                 if xtid:
@@ -216,8 +216,8 @@ async def require_internal_key(
     """
     # 1. Prefer Signed JWT (Phase 13 Standard)
     if credentials:
-        from app.core.internal_auth import verify_internal_token
-        if verify_internal_token(credentials.credentials):
+        from shared.internal_auth import verify_internal_token
+        if verify_internal_token(credentials.credentials, settings.SECRET_KEY, settings.JWT_ALGORITHM):
             return True
 
     # 2. Legacy check (X-Internal-Key)

@@ -14,6 +14,9 @@ _WEAK_KEYS = frozenset({
 
 
 class Settings(BaseSettings):
+    # Unified Orchestration (In-process Brain)
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/ascenai"
+    
     # STT config
     # Deepgram Nova-2 is recommended for STT ($0.46/hr). Gemini is fallback.
     STT_PROVIDER: str = "deepgram"  # "cartesia" | "deepgram" | "gemini" | "openai"
@@ -48,6 +51,7 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://localhost:6379/0"
     SECRET_KEY: str = "change-this-secret-key-in-production"
+    INTERNAL_API_KEY: str = ""
 
     # JWT
     JWT_ALGORITHM: str = "HS256"
@@ -66,12 +70,36 @@ class Settings(BaseSettings):
 
     # Audio settings
     SAMPLE_RATE: int = 16000
-    CHUNK_SIZE_MS: int = 100
-    VAD_SILENCE_THRESHOLD_MS: int = 800  # Voice Activity Detection silence timeout
+    CHUNK_SIZE_MS: int = 32              # Silero VAD requires 32ms frames at 16kHz
+    VAD_SILENCE_THRESHOLD_MS: int = 300  # Neural VAD: 300ms (was 800ms energy-based)
     MAX_UTTERANCE_DURATION_S: int = 30
 
-    # VAD energy threshold (0.0 - 1.0, fraction of int16 max)
+    # Legacy energy-based VAD threshold (used as fallback if Silero fails to load)
     VAD_ENERGY_THRESHOLD: float = 0.01
+
+    # Phase 1: Silero VAD
+    # Download from: https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+    SILERO_VAD_ENABLED: bool = True
+    SILERO_VAD_THRESHOLD: float = 0.5        # Speech probability threshold (0.0-1.0)
+    SILERO_VAD_MIN_SPEECH_MS: int = 250      # Minimum voiced frame length to count as speech
+    SILERO_VAD_MIN_SILENCE_MS: int = 300     # Silence gap to signal end of utterance
+    SILERO_VAD_MODEL_PATH: str = "/tmp/silero_vad.onnx"  # Auto-downloaded on first run
+
+    # Phase 2: Streaming STT
+    STT_STREAMING_ENABLED: bool = True       # Open live STT WS, not batch upload
+    STT_INTERIM_CONFIDENCE_THRESHOLD: float = 0.0  # Accept all interim results for early LLM fire
+
+    # Phase 3: Voice-Mode LLM Routing
+    # When set, this model is used for voice turns (overrides ai-orchestrator default)
+    VOICE_LLM_MODEL: str = ""                # e.g. "gemini-2.0-flash" or Groq model
+    VOICE_LLM_MAX_TOKENS: int = 200          # Keep voice responses short
+
+    # Phase 4: Chunked TTS
+    TTS_WORD_CHUNK_SIZE: int = 10            # Synthesize after N words (don't wait for sentence end)
+    TTS_FORCE_CHUNK_CHARS: int = 80          # Also flush if buffer > N chars even without punctuation
+
+    # Phase 4: Latency Telemetry
+    LATENCY_TELEMETRY_ENABLED: bool = True   # Track hop-by-hop latency per session
 
     # Storage for audio files
     AUDIO_STORAGE_PATH: str = "/tmp/audio"

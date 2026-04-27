@@ -44,7 +44,7 @@ Before running AscenAI2, ensure the following are installed on your system:
 
 ```bash
 git clone <repository-url>
-cd AscenAI/ascenai2
+cd AscenAI
 ```
 
 ### 2.2 Configure Environment Variables

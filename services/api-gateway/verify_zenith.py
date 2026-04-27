@@ -5,7 +5,7 @@ import os
 sys.path.append("/Users/visvasis/Home/Jamvant/AscenAI/services/api-gateway")
 
 from app.utils.pii import mask_pii
-from app.utils.dates import sanitize_for_csv
+from shared.dates import sanitize_for_csv
 
 def test_pii_masking():
     data = {

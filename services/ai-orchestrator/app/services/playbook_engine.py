@@ -37,7 +37,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services import pii_service
+import shared.pii as pii_service
 from app.schemas.playbook import (
     AnyStep,
     ConditionStep,

@@ -18,7 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.leadership import RedisLeaderLease
-from app.services.mcp_client import MCPClient
+from shared.orchestration.mcp_client import MCPClient
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)

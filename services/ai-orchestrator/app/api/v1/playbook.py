@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.agent import Agent, AgentPlaybook
 from app.schemas.chat import PlaybookResponse, PlaybookUpsert
-from app.services.moderation_service import ModerationService
-from app.services import pii_service
+from shared.orchestration.moderation_service import ModerationService
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -309,7 +309,7 @@ async def validate_playbook_safety(
     db: AsyncSession = Depends(get_db),
 ):
     """Validate that playbook text content is safe (no blocked keywords or PII)."""
-    from app.services.moderation_service import ModerationService
+    from shared.orchestration.moderation_service import ModerationService
     
     text = body.get("text", "")
     if not text:

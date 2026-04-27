@@ -29,7 +29,7 @@ from app.models.template import (
     TemplateVariable,
     TemplateTool,
 )
-import app.services.pii_service as pii_service
+import shared.pii as pii_service
 from app.api.v1.agents import _validate_system_prompt
 from app.schemas.template import AgentTemplateSchema, TemplateInstantiationRequest, AgentTemplateInstanceSchema
 

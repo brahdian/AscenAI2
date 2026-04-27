@@ -156,6 +156,7 @@ function VariableFormPanel({
             <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
               Variable Name * (Must start with a letter)
             </label>
+            <input
               maxLength={100}
               required
               disabled={isReadOnly}

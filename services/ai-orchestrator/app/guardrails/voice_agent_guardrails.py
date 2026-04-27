@@ -30,8 +30,8 @@ from __future__ import annotations
 
 # Mapping of ISO 639-1 codes to their respective "please speak in [language]" phrases.
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.services import pii_service
-from app.services.settings_service import SettingsService
+import shared.pii as pii_service
+from shared.orchestration.settings_service import SettingsService
 
 
 async def generate_multilingual_greeting(
@@ -45,7 +45,7 @@ async def generate_multilingual_greeting(
     Generate the audible MANDATORY OPENING string based on selected languages and platform settings.
     Redacts PII from custom greetings for safety.
     """
-    import app.services.pii_service as pii_service
+    import shared.pii as pii_service
     # 1. Fetch config from Platform Settings (with cache in SettingsService)
     lang_config = await SettingsService.get_setting(db, "global_language_config", {})
     

@@ -19,6 +19,7 @@ import {
   ShieldAlert,
   ClipboardList,
   Activity,
+  Database,
 } from 'lucide-react'
 
 const ROOT_DOMAIN = process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'localhost:3000'
@@ -68,6 +69,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   ]
 
   const configItems = [
+    { label: 'CRM Management', href: '/admin/crm', icon: Database },
     { label: 'Guardrails', href: '/admin/guardrails', icon: ShieldAlert },
     { label: 'Audit Logs', href: '/admin/audit-logs', icon: ClipboardList },
     { label: 'Plans & Pricing', href: '/admin/settings/plans', icon: Zap },

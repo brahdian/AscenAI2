@@ -15,7 +15,7 @@ mock_structlog.get_logger = lambda x: types.SimpleNamespace(
 sys.modules["structlog"] = mock_structlog
 
 # Mock pii_service.warmup to avoid loading spacy
-import app.services.pii_service as pii_service
+import shared.pii as pii_service
 pii_service._analyzer = types.SimpleNamespace(
     analyze=lambda text, language: [
         types.SimpleNamespace(start=0, end=len(text), entity_type="TEST_PII")

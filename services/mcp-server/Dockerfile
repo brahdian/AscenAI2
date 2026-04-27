@@ -13,12 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system app && adduser --system --ingroup app app
 
-COPY requirements.txt .
+COPY services/mcp-server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m spacy download en_core_web_lg --quiet
 
-COPY --chown=app:app . .
+COPY shared /app/shared
+RUN pip install --no-cache-dir /app/shared
 
+COPY --chown=app:app services/mcp-server/ .
 USER app
 EXPOSE 8001
 

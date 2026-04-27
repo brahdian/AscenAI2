@@ -14,8 +14,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from shared.dates import utcnow
 
 class UserInvite(Base):
     __tablename__ = "user_invites"

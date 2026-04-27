@@ -486,7 +486,109 @@ INTEGRATION_CATALOG: list[dict[str, Any]] = [
                     "required": ["amount"]
                 }
             }
-        ]}
+        ]},
+    {
+        "id": "twenty_crm",
+        "name": "Twenty CRM",
+        "description": "Self-hosted CRM. Look up customers, log calls as notes, and track relationships.",
+        "category": "crm",
+        "requires_config": True,
+        "is_builtin": True,
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "twenty_api_key": {"type": "string", "description": "Twenty workspace API key"},
+                "twenty_api_url": {"type": "string", "description": "Optional override (e.g. https://crm.example.com/rest)"},
+            },
+            "required": ["twenty_api_key"],
+        },
+        "credentials": [
+            {"field": "twenty_api_key", "label": "API Key", "type": "password"},
+            {"field": "twenty_api_url", "label": "API URL Override (optional)", "type": "text"},
+        ],
+        "tools": [
+            {
+                "name": "crm_lookup",
+                "description": "Find a person in the CRM by phone, email, or id.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "phone": {"type": "string"},
+                        "email": {"type": "string"},
+                        "customer_id": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "crm_search",
+                "description": "Free-text search across CRM contacts.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 5},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "crm_update",
+                "description": "Update fields on an existing CRM contact.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "email": {"type": "string"},
+                        "phone": {"type": "string"},
+                        "notes": {"type": "string"},
+                    },
+                    "required": ["customer_id"],
+                },
+            },
+            {
+                "name": "crm_create_person",
+                "description": "Create a new contact in the CRM.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "email": {"type": "string"},
+                        "phone": {"type": "string"},
+                        "company_id": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "crm_create_company",
+                "description": "Create a new company in the CRM.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "domain": {"type": "string"},
+                        "employees": {"type": "integer"},
+                    },
+                    "required": ["name"],
+                },
+            },
+            {
+                "name": "crm_create_note",
+                "description": "Attach a note (call summary, follow-up, etc.) to a contact, company, or opportunity.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "person_id": {"type": "string"},
+                        "company_id": {"type": "string"},
+                        "opportunity_id": {"type": "string"},
+                    },
+                    "required": ["body"],
+                },
+            },
+        ],
+    },
 ]
 
 

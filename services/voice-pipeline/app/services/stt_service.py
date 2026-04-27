@@ -1,17 +1,17 @@
 """
-Speech-to-Text service supporting OpenAI Whisper and Deepgram.
-Provides both batch and streaming transcription with Voice Activity Detection.
+Speech-to-Text service powered by LiveKit Deepgram Plugin.
+Provides production-grade streaming transcription with official SDK logic.
 """
 import asyncio
 import io
-import struct
-import math
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
-import httpx
 import structlog
 from pydantic import BaseModel
+from livekit import rtc
+from livekit.plugins import deepgram
+from livekit.agents import stt
 
 from app.core.config import settings
 
@@ -33,13 +33,19 @@ class PartialTranscript(BaseModel):
 
 class STTService:
     """
-    Streaming and batch Speech-to-Text service.
-    Supports OpenAI Whisper and Deepgram.
+    STT service using the official LiveKit Deepgram plugin.
+    Supports both batch (via Whisper fallback) and streaming.
     """
 
     def __init__(self):
         self._openai_client = None
-        self._deepgram_client = None
+        # Initialize the official Deepgram plugin
+        self._dg_stt = deepgram.STT(
+            api_key=settings.DEEPGRAM_API_KEY,
+            model="nova-2",
+            language="en-US",
+            interim_results=True,
+        )
 
     def _get_openai_client(self):
         if self._openai_client is None:
@@ -54,28 +60,19 @@ class STTService:
         format: str = "webm",
     ) -> TranscriptResult:
         """
-        Batch transcription via OpenAI Whisper API.
-
-        Sends the entire audio buffer to Whisper and returns a complete
-        TranscriptResult with detected text, confidence, language, and duration.
+        Batch transcription via OpenAI Whisper API (retained for fallback).
         """
         if not audio_data:
-            return TranscriptResult(
-                text="", confidence=0.0, language=language, duration_ms=0
-            )
+            return TranscriptResult(text="", confidence=0.0, language=language, duration_ms=0)
 
         start_time = time.monotonic()
         client = self._get_openai_client()
 
-        # Build a file-like object with correct MIME type so Whisper accepts it
         mime_map = {
             "webm": "audio/webm",
             "mp3": "audio/mpeg",
             "mp4": "audio/mp4",
             "wav": "audio/wav",
-            "ogg": "audio/ogg",
-            "flac": "audio/flac",
-            "m4a": "audio/m4a",
         }
         content_type = mime_map.get(format.lower(), "audio/webm")
         filename = f"audio.{format.lower()}"
@@ -87,35 +84,15 @@ class STTService:
                 language=language if language != "auto" else None,
                 response_format="verbose_json",
             )
-
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-
-            # verbose_json returns duration in seconds; fall back to elapsed if absent
-            audio_duration_ms = int(getattr(response, "duration", 0) * 1000) or elapsed_ms
-
-            # Whisper doesn't expose per-segment confidence via the simple API,
-            # so we report 1.0 for a successful response.
-            confidence = 1.0
-            detected_language = getattr(response, "language", language) or language
-
-            logger.info(
-                "stt_transcribe_complete",
-                chars=len(response.text),
-                duration_ms=elapsed_ms,
-                language=detected_language,
-            )
-
             return TranscriptResult(
                 text=response.text.strip(),
-                confidence=confidence,
-                language=detected_language,
-                duration_ms=audio_duration_ms,
+                confidence=1.0,
+                language=getattr(response, "language", language),
+                duration_ms=int(getattr(response, "duration", 0) * 1000) or elapsed_ms,
             )
-
         except Exception as exc:
-            logger.error("stt_transcribe_error", error=type(exc).__name__)
-            # Return empty result instead of raising — the caller will treat
-            # this as silence and prompt the user to repeat themselves.
+            logger.error("stt_batch_error", error=str(exc))
             return TranscriptResult(text="", confidence=0.0, language=language, duration_ms=0)
 
     async def transcribe_stream(
@@ -124,246 +101,59 @@ class STTService:
         language: str = "en",
     ) -> AsyncGenerator[PartialTranscript, None]:
         """
-        Streaming transcription using the configured STT provider.
-
-        Opens a persistent WebSocket to the STT provider, forwards audio chunks as they
-        arrive, and yields PartialTranscript objects as the provider emits interim
-        and final transcript events. Falls back to OpenAI Whisper if no
-        configured provider key is available.
+        Official LiveKit Deepgram Streaming STT.
+        
+        This handles the complex WebSocket handshake, keep-alives, 
+        and interim result consolidation automatically.
         """
+        # Create an official STT stream
+        stt_stream = self._dg_stt.stream()
 
-        if settings.STT_PROVIDER == "cartesia" and getattr(settings, "CARTESIA_API_KEY", ""):
-            async for partial in self._cartesia_stream(audio_stream, language):
-                yield partial
-        elif settings.STT_PROVIDER == "deepgram" and settings.DEEPGRAM_API_KEY:
-            async for partial in self._deepgram_stream(audio_stream, language):
-                yield partial
-        else:
-            # Fallback: buffer all audio then do single Whisper call
-            logger.warning(
-                "stt_provider_key_missing_falling_back_to_whisper",
-            )
-            async for partial in self._whisper_buffered_stream(audio_stream, language):
-                yield partial
-
-    async def _cartesia_stream(
-        self,
-        audio_stream: AsyncGenerator[bytes, None],
-        language: str,
-    ) -> AsyncGenerator[PartialTranscript, None]:
-        """
-        Live streaming transcription via Cartesia Ink-Whisper WebSocket API.
-        """
-        import json
-        import websockets  # type: ignore
-
-        api_key = getattr(settings, "CARTESIA_API_KEY", "")
-        url = f"wss://api.cartesia.ai/stt?api_key={api_key}&cartesia_version=2025-04-16"
-
-        result_queue: asyncio.Queue[PartialTranscript | None] = asyncio.Queue()
-
-        async def _send_audio(ws):
-            try:
-                # 1. Send Configuration Handshake
-                config = {
-                    "model_id": "ink-whisper",
-                    "language": language,
-                    "encoding": "pcm_s16le",
-                    "sample_rate": settings.SAMPLE_RATE
-                }
-                await ws.send(json.dumps(config))
-
-                # 2. Stream Audio Chunks
-                async for chunk in audio_stream:
-                    await ws.send(chunk)
-                
-                # 3. Finalize Stream
-                await ws.send(json.dumps({"type": "finalize"}))
-            except Exception as exc:
-                logger.error("cartesia_send_error", error=str(exc))
-
-        async def _receive_transcripts(ws):
-            try:
-                async for message in ws:
-                    data = json.loads(message)
-                    msg_type = data.get("type", "")
-                    
-                    if msg_type == "transcript":
-                        transcript = data.get("transcript", "").strip()
-                        if transcript:
-                            # We treat it as an interim or final based on what event we get.
-                            # Ink-Whisper websocket payload usually sends continuous transcripts.
-                            await result_queue.put(
-                                PartialTranscript(
-                                    text=transcript,
-                                    is_final=True, # Ink typically emits final text segments
-                                    confidence=1.0,
-                                )
-                            )
-                    elif msg_type == "done":
-                        break
-            except Exception as exc:
-                logger.error("cartesia_receive_error", error=str(exc))
-            finally:
-                await result_queue.put(None)  # sentinel
-
-        try:
-            async with websockets.connect(url) as ws:
-                send_task = asyncio.create_task(_send_audio(ws))
-                recv_task = asyncio.create_task(_receive_transcripts(ws))
-
-                while True:
-                    item = await result_queue.get()
-                    if item is None:
-                        break
-                    yield item
-
-                await asyncio.gather(send_task, recv_task, return_exceptions=True)
-        except Exception as exc:
-            logger.error("cartesia_connection_error", error=str(exc))
-            raise
-
-    async def _deepgram_stream(
-        self,
-        audio_stream: AsyncGenerator[bytes, None],
-        language: str,
-    ) -> AsyncGenerator[PartialTranscript, None]:
-        """
-        Live streaming transcription via Deepgram WebSocket API.
-        https://developers.deepgram.com/reference/streaming
-        """
-        import json
-        import websockets  # type: ignore
-
-        # Use "multi" for automatic language detection when language is "auto"
-        lang_param = "multi" if language == "auto" else language
-        url = (
-            "wss://api.deepgram.com/v1/listen"
-            f"?language={lang_param}"
-            "&model=nova-2"
-            "&encoding=linear16"
-            f"&sample_rate={settings.SAMPLE_RATE}"
-            "&channels=1"
-            "&interim_results=true"
-            "&endpointing=500"
-        )
-        headers = {"Authorization": f"Token {settings.DEEPGRAM_API_KEY}"}
-
-        result_queue: asyncio.Queue[PartialTranscript | None] = asyncio.Queue()
-
-        async def _send_audio(ws):
+        async def _push_audio():
             try:
                 async for chunk in audio_stream:
-                    await ws.send(chunk)
-                # Signal end of stream
-                await ws.send(json.dumps({"type": "CloseStream"}))
-            except Exception as exc:
-                logger.error("deepgram_send_error", error=str(exc))
+                    # Wrap raw bytes in AudioFrame for the SDK
+                    frame = rtc.AudioFrame(
+                        data=chunk,
+                        sample_rate=settings.SAMPLE_RATE,
+                        num_channels=1,
+                        samples_per_channel=len(chunk) // 2
+                    )
+                    stt_stream.push_frame(frame)
+                stt_stream.end_input()
+            except Exception as e:
+                logger.error("stt_stream_push_error", error=str(e))
 
-        async def _receive_transcripts(ws):
-            try:
-                async for message in ws:
-                    data = json.loads(message)
-                    msg_type = data.get("type", "")
-                    if msg_type == "Results":
-                        channel = data.get("channel", {})
-                        alternatives = channel.get("alternatives", [{}])
-                        detected_language = data.get(" detected_language", "")
-                        if alternatives:
-                            alt = alternatives[0]
-                            transcript = alt.get("transcript", "").strip()
-                            is_final = data.get("is_final", False)
-                            confidence = alt.get("confidence", 0.0)
-                            if transcript:
-                                logger.debug(
-                                    "deepgram_result",
-                                    language=detected_language,
-                                    is_final=is_final,
-                                )
-                                await result_queue.put(
-                                    PartialTranscript(
-                                        text=transcript,
-                                        is_final=is_final,
-                                        confidence=confidence,
-                                    )
-                                )
-                    elif msg_type in ("SpeechStarted", "UtteranceEnd"):
-                        pass  # informational
-            except Exception as exc:
-                logger.error("deepgram_receive_error", error=str(exc))
-            finally:
-                await result_queue.put(None)  # sentinel
+        # Start pushing in background
+        push_task = asyncio.create_task(_push_audio())
 
         try:
-            async with websockets.connect(url, extra_headers=headers) as ws:
-                send_task = asyncio.create_task(_send_audio(ws))
-                recv_task = asyncio.create_task(_receive_transcripts(ws))
+            # Iterate over official STT events
+            async for event in stt_stream:
+                if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    yield PartialTranscript(
+                        text=event.alternatives[0].text,
+                        is_final=True,
+                        confidence=event.alternatives[0].confidence
+                    )
+                elif event.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
+                    yield PartialTranscript(
+                        text=event.alternatives[0].text,
+                        is_final=False,
+                        confidence=event.alternatives[0].confidence
+                    )
+        finally:
+            if not push_task.done():
+                push_task.cancel()
 
-                while True:
-                    item = await result_queue.get()
-                    if item is None:
-                        break
-                    yield item
-
-                await asyncio.gather(send_task, recv_task, return_exceptions=True)
-        except Exception as exc:
-            logger.error("deepgram_connection_error", error=str(exc))
-            raise
-
-    async def _whisper_buffered_stream(
-        self,
-        audio_stream: AsyncGenerator[bytes, None],
-        language: str,
-    ) -> AsyncGenerator[PartialTranscript, None]:
+    async def detect_voice_activity(self, audio_chunk: bytes) -> bool:
         """
-        Buffer all incoming audio, then transcribe once via Whisper.
-        Used as a fallback when Deepgram is unavailable.
-        Emits interim 'listening…' updates every second while buffering.
+        Legacy fallback VAD (RMS energy). 
+        The main pipeline now uses Silero VAD from silero_vad.py.
         """
-        buffer = bytearray()
-        last_interim = time.monotonic()
-
-        async for chunk in audio_stream:
-            buffer.extend(chunk)
-            now = time.monotonic()
-            if now - last_interim >= 1.0:
-                last_interim = now
-                yield PartialTranscript(text="...", is_final=False, confidence=0.0)
-
-        if buffer:
-            result = await self.transcribe_audio(bytes(buffer), language=language)
-            yield PartialTranscript(
-                text=result.text, is_final=True, confidence=result.confidence
-            )
-
-    async def detect_voice_activity(
-        self,
-        audio_chunk: bytes,
-        sample_rate: int = 16000,
-    ) -> bool:
-        """
-        Simple energy-based Voice Activity Detection (VAD).
-
-        Interprets ``audio_chunk`` as raw 16-bit little-endian PCM samples,
-        computes the root-mean-square (RMS) energy, and returns True if the
-        RMS exceeds the configured threshold fraction of the int16 maximum
-        amplitude (32768).
-
-        Returns False (silence) when the chunk is too small to analyse.
-        """
-        if len(audio_chunk) < 2:
-            return False
-
-        # Parse as 16-bit signed integers (little-endian)
+        import struct, math
+        if len(audio_chunk) < 2: return False
         num_samples = len(audio_chunk) // 2
         samples = struct.unpack_from(f"<{num_samples}h", audio_chunk, 0)
-
-        # RMS energy
-        mean_sq = sum(s * s for s in samples) / num_samples
-        rms = math.sqrt(mean_sq)
-
-        # Normalise to [0, 1] range relative to int16 max
-        normalised_rms = rms / 32768.0
-
-        is_voice = normalised_rms > settings.VAD_ENERGY_THRESHOLD
-        return is_voice
+        rms = math.sqrt(sum(s * s for s in samples) / num_samples)
+        return (rms / 32768.0) > settings.VAD_ENERGY_THRESHOLD

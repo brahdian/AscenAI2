@@ -1,6 +1,6 @@
 import asyncio
-from app.services import pii_service
-from app.services.pii_service import PIIContext
+import shared.pii as pii_service
+from shared.pii import PIIContext
 
 pii_service.init_presidio()
 ctx = PIIContext(tenant_id="test")

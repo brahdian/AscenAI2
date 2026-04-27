@@ -248,7 +248,7 @@ class WorkflowTriggerWorker:
                 await db.commit()
                 
                 # Record event
-                from app.services.workflow_engine import WorkflowEngine
+                from shared.orchestration.workflow_engine import WorkflowEngine
                 engine = WorkflowEngine(db=db)
                 await engine._record_event(
                     execution=execution,
@@ -340,7 +340,7 @@ class WorkflowTriggerWorker:
 
         async with AsyncSessionLocal() as db:
             try:
-                from app.services.workflow_engine import WorkflowEngine
+                from shared.orchestration.workflow_engine import WorkflowEngine
                 engine = WorkflowEngine(db=db)
                 result = await engine.advance(
                     execution_id=execution_id,
@@ -374,7 +374,7 @@ class WorkflowTriggerWorker:
 
         async with AsyncSessionLocal() as db:
             try:
-                from app.services.workflow_engine import WorkflowEngine
+                from shared.orchestration.workflow_engine import WorkflowEngine
                 from app.models.workflow import Workflow as _WF
 
                 wf = await db.scalar(select(_WF).where(_WF.id == workflow_id))

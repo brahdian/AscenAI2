@@ -15,6 +15,7 @@ class MCPToolCall(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=255, description="Current session identifier")
     trace_id: str = Field(default="", max_length=255, description="Distributed trace identifier")
     timeout_override: Optional[int] = Field(None, ge=1, le=300, description="Override default timeout in seconds")
+    crm_workspace_id: Optional[str] = Field(None, description="Twenty CRM Workspace ID for scoped tool execution")
 
 
 class MCPToolResult(BaseModel):

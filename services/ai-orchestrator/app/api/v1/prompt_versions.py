@@ -27,7 +27,7 @@ from app.core.database import get_db
 from app.core.security import get_tenant_db
 from app.models.agent import Agent
 from app.models.prompt import PromptABTest, PromptVersion
-from app.services.prompt_manager import PromptManager
+from shared.orchestration.prompt_manager import PromptManager
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()

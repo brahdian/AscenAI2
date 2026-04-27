@@ -17,7 +17,7 @@ from app.models.agent import Agent
 from app.models.variable import AgentVariable
 from app.core.zenith import ZenithContext, get_zenith_context
 from app.core.rate_limiter import RateLimiter
-from app.services import pii_service
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 

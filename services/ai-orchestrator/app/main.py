@@ -63,10 +63,10 @@ def _setup_opentelemetry(app: FastAPI) -> None:
 
 from app.core.tracing import TracingMiddleware
 from app.middleware.idempotency import IdempotencyMiddleware
-from app.services.llm_client import create_llm_client
-from app.services.mcp_client import MCPClient
-from app.services.memory_manager import MemoryManager
-from app.services.orchestrator import Orchestrator
+from shared.orchestration.llm_client import create_llm_client
+from shared.orchestration.mcp_client import MCPClient
+from shared.orchestration.memory_manager import MemoryManager
+from shared.orchestration.orchestrator import Orchestrator
 from app.api.v1 import chat as chat_router
 from app.api.v1 import agents as agents_router
 from app.api.v1 import sessions as sessions_router
@@ -85,7 +85,7 @@ from app.api.v1 import prompt_versions as prompt_versions_router
 from app.api.v1 import templates as templates_router
 from app.api.v1 import variables as variables_router
 from app.api.v1 import platform as platform_router
-from app.services import pii_service
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -106,14 +106,14 @@ async def lifespan(app: FastAPI):
     
     # Seed templates (idempotent, safe on every startup)
     try:
-        from app.services.seed_templates import seed_templates
+        from shared.orchestration.seed_templates import seed_templates
         await seed_templates()
     except Exception as exc:
         logger.error("seed_templates_error", error=str(exc))
 
     # Seed prebuilt workflow definitions (idempotent)
     try:
-        from app.services.seed_workflows import seed_prebuilt_workflows
+        from shared.orchestration.seed_workflows import seed_prebuilt_workflows
         await seed_prebuilt_workflows()
     except Exception as exc:
         logger.error("seed_workflows_error", error=str(exc))
@@ -124,6 +124,7 @@ async def lifespan(app: FastAPI):
     logger.info("redis_ready")
 
     # Pre-warm Presidio NLP models — eliminates cold-start latency on first chat
+    pii_service.configure(settings.SECRET_KEY)
     await pii_service.warmup()
     logger.info("pii_service_ready")
 
@@ -146,20 +147,20 @@ async def lifespan(app: FastAPI):
     logger.info("mcp_client_ready", url=settings.MCP_SERVER_URL)
 
     # Initialize moderation service
-    from app.services.moderation_service import ModerationService
+    from shared.orchestration.moderation_service import ModerationService
     openai_key = getattr(settings, "OPENAI_API_KEY", "") or ""
     app.state.moderation_service = ModerationService(openai_api_key=openai_key or None)
     logger.info("moderation_service_ready")
 
     # Initialize semantic cache
-    from app.services.semantic_cache import SemanticCache
-    from app.services.llm_client import get_embedding_fn
+    from shared.orchestration.semantic_cache import SemanticCache
+    from shared.orchestration.llm_client import get_embedding_fn
     embed_fn = get_embedding_fn()
     app.state.semantic_cache = SemanticCache(redis_client=redis_client, embed_fn=embed_fn)
     logger.info("semantic_cache_ready")
 
     # Initialize model router
-    from app.services.model_router import ModelRouter
+    from shared.orchestration.model_router import ModelRouter
     app.state.model_router = ModelRouter(
         provider=settings.LLM_PROVIDER,
         settings=settings,
@@ -300,12 +301,12 @@ class InternalAuthMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("Authorization", "")
         presented_key = request.headers.get("X-Internal-Key", "")
         
-        from app.core.internal_auth import verify_internal_token
+        from shared.internal_auth import verify_internal_token
         
         is_authenticated = False
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            if verify_internal_token(token):
+            if verify_internal_token(token, self._INTERNAL_KEY, settings.JWT_ALGORITHM):
                 is_authenticated = True
         
         if not is_authenticated and presented_key:

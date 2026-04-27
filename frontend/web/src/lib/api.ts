@@ -1016,6 +1016,18 @@ export const adminApi = {
   updateGuardrail: (guardrailId: string, enabled: boolean) =>
     api.patch(`/admin/guardrails/${guardrailId}`, { enabled }).then((r) => r.data),
 }
+
+// ---------------------------------------------------------------------------
+// Admin CRM API
+// ---------------------------------------------------------------------------
+
+export const adminCrmApi = {
+  getWorkspaces: () => api.get('/admin/crm/workspaces').then((r) => r.data),
+  getHealth: () => api.get('/admin/crm/health').then((r) => r.data),
+  repairWorkspace: (workspaceId: string) => 
+    api.post(`/admin/crm/workspaces/${workspaceId}/repair`).then((r) => r.data),
+}
+
 // ---------------------------------------------------------------------------
 // Platform Configuration
 // ---------------------------------------------------------------------------

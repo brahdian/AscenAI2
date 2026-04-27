@@ -297,7 +297,7 @@ export default function ConsolePage() {
           </button>
 
           <button
-            onClick={refresh}
+            onClick={() => refresh()}
             disabled={loading}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs bg-gray-800 border border-gray-700 text-gray-400 hover:text-gray-200 disabled:opacity-40 transition-colors"
           >

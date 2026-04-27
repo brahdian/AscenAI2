@@ -17,7 +17,7 @@ from app.models.tool import Tool, ToolExecution
 from app.schemas.mcp import MCPToolCall, MCPToolResult
 from app.services.tool_registry import ToolRegistry
 from app.services.auth_manager import AuthManager
-from app.services import pii_service
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -33,7 +33,14 @@ async def _get_builtin_handlers() -> dict:
         handle_appointment_list,
         handle_appointment_cancel,
     )
-    from app.tools.builtin.crm import handle_crm_lookup, handle_crm_update
+    from app.tools.builtin.crm import (
+        handle_crm_lookup,
+        handle_crm_search,
+        handle_crm_update,
+        handle_crm_create_person,
+        handle_crm_create_company,
+        handle_crm_create_note,
+    )
     from app.tools.builtin.sms import handle_send_sms
     from app.tools.integrations.google_calendar import (
         handle_google_calendar_check,
@@ -71,7 +78,11 @@ async def _get_builtin_handlers() -> dict:
         "appointment_list": handle_appointment_list,
         "appointment_cancel": handle_appointment_cancel,
         "crm_lookup": handle_crm_lookup,
+        "crm_search": handle_crm_search,
         "crm_update": handle_crm_update,
+        "crm_create_person": handle_crm_create_person,
+        "crm_create_company": handle_crm_create_company,
+        "crm_create_note": handle_crm_create_note,
         "send_sms": handle_send_sms,
         
         # Google Calendar
@@ -290,6 +301,7 @@ class ToolExecutor:
                     session_id=tool_call.session_id,
                     tenant_id=tenant_id,
                     execution_id=execution_id,
+                    crm_workspace_id=tool_call.crm_workspace_id, # New
                 ),
                 timeout=float(timeout),
             )
@@ -462,11 +474,13 @@ class ToolExecutor:
         session_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         execution_id: Optional[str] = None,
+        crm_workspace_id: Optional[str] = None, # New
     ) -> dict:
         """Route to built-in or HTTP executor based on tool type."""
         if tool.is_builtin:
             return await self._execute_builtin_tool(
-                tool, parameters, session_id=session_id, tenant_id=tenant_id, execution_id=execution_id
+                tool, parameters, session_id=session_id, tenant_id=tenant_id, 
+                execution_id=execution_id, crm_workspace_id=crm_workspace_id
             )
         if tool.endpoint_url:
             return await self._execute_http_tool(tool, parameters, execution_id=execution_id)
@@ -509,6 +523,7 @@ class ToolExecutor:
         session_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         execution_id: Optional[str] = None,
+        crm_workspace_id: Optional[str] = None, # New
     ) -> dict:
         """Execute a platform built-in tool handler.
 
@@ -541,7 +556,9 @@ class ToolExecutor:
             **self.tenant_config, 
             **decrypted_metadata,
             "execution_id": execution_id,
-            "idempotency_key": execution_id
+            "idempotency_key": execution_id,
+            "crm_workspace_id": crm_workspace_id,
+            "db": self.db, # Passed for workspace resolution
         }
 
         # ── Try new adapter registry first ─────────────────────────────

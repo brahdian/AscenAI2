@@ -89,7 +89,7 @@ def _set_auth_cookies(response: Response, tokens: TokenResponse, request: Reques
     # We use SameSite=Lax for same-registrable-domain (lvh.me) which is safer and works on subdomains.
     
     hostname = request.url.hostname or ""
-    is_local = "localhost" in hostname or "lvh.me" in hostname or "127.0.0.1" in hostname or "[::1]" in hostname or "::1" == hostname
+    is_local = "localhost" in hostname or settings.ROOT_DOMAIN in hostname or "127.0.0.1" in hostname or "[::1]" in hostname or "::1" == hostname
     
     # Default to production-grade security
     is_secure = True

@@ -29,9 +29,10 @@ from app.services.audit_service import audit_log
 from app.services.billing_service import BillingService
 from app.services.idempotency_service import IdempotencyService
 from app.services.tenant_service import get_plan_limits
-from app.utils.dates import enforce_temporal_cap
-from app.utils.dates import get_calendar_billing_period as _billing_period
+from shared.dates import enforce_temporal_cap
+from shared.dates import get_calendar_billing_period as _billing_period
 from app.utils.pii import mask_pii
+from app.services.crm_service import crm_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/billing")
@@ -132,6 +133,15 @@ DEFAULT_PLANS: dict[str, dict] = {
         "overage_per_voice_minute": 0.0,
         "voice_enabled": True,
         "model": "chat_equivalent",
+    },
+    "crm_user_slot": {
+        "display_name": "CRM User Slot",
+        "description": "Additional user seat for Twenty CRM workspace.",
+        "badge": "Power Up",
+        "color": "border-blue-500/30",
+        "highlight": False,
+        "price": 19.00,
+        "price_yearly": 190.00,
     },
 }
 
@@ -1505,6 +1515,28 @@ async def stripe_billing_webhook(request: Request, db: AsyncSession = Depends(ge
                     if not slot_accounted:
                         slot_delta = 1
                         slot_accounted = True
+
+                # FLOW 4: CRM Power-Up Provisioning
+                if metadata.get("action") == "add_crm_powerup":
+                    logger.info("provisioning_crm_powerup", tenant_id=tenant_id)
+                    # We need the user email and name. 
+                    # Metadata should include them, or we fetch the owner.
+                    user_email = metadata.get("email")
+                    business_name = metadata.get("business_name") or tenant.name
+                    user_name = metadata.get("user_name") or "Owner"
+                    
+                    if user_email and tenant:
+                        try:
+                            crm_data = await crm_service.provision_tenant_crm(
+                                tenant_id=tenant.id,
+                                business_name=business_name,
+                                owner_email=user_email,
+                                owner_full_name=user_name
+                            )
+                            logger.info("crm_provisioning_success", tenant_id=tenant_id, crm_url=crm_data.get("url"))
+                        except Exception as crm_err:
+                            logger.error("crm_provisioning_failed", tenant_id=tenant_id, error=str(crm_err))
+                            # Don't fail the whole webhook if CRM fails, but log it.
 
                 if tenant and slot_delta:
                     # Atomic update to avoid race conditions with concurrent webhooks

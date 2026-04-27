@@ -32,8 +32,7 @@ from app.tools.builtin.sms import handle_send_sms
 logger = structlog.get_logger(__name__)
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from shared.dates import utcnow as _utcnow
 
 
 class SMSWorkflowEngine:

@@ -5,70 +5,94 @@ export function middleware(request: NextRequest) {
   const url = request.nextUrl
   const hostname = request.headers.get('host') || ''
 
-  // Read domains from environment
-  const adminSubdomain =
-    process.env.ADMIN_SUBDOMAIN || process.env.NEXT_PUBLIC_ADMIN_SUBDOMAIN || 'admin.lvh.me:3000'
-  const appSubdomain =
-    process.env.APP_SUBDOMAIN || process.env.NEXT_PUBLIC_APP_SUBDOMAIN || 'app.lvh.me:3000'
-  const rootDomain =
-    process.env.ROOT_DOMAIN || process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'lvh.me:3000'
+  // ── Subdomain configuration ──────────────────────────────────────────────
+  const rootDomain = process.env.NEXT_PUBLIC_ROOT_DOMAIN || 'lvh.me:3000'
+  const tenantAdminSubdomain = process.env.NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN || `admin.${rootDomain}`
+  const agentsSubdomain = process.env.NEXT_PUBLIC_AGENTS_SUBDOMAIN || `agents.${rootDomain}`
+  const appSubdomain = process.env.NEXT_PUBLIC_APP_SUBDOMAIN || `app.${rootDomain}`
+  const adminSubdomain = process.env.NEXT_PUBLIC_ADMIN_SUBDOMAIN || `admin.agent.${rootDomain}`
 
-  const isAdminSubdomain = hostname === adminSubdomain
-  const isAppSubdomain = hostname === appSubdomain
+  const isTenantAdmin = hostname === tenantAdminSubdomain
+  const isAgents = hostname === agentsSubdomain
+  const isAppLegacy = hostname === appSubdomain  // legacy, treated as agents
+  const isPlatformAdmin = hostname === adminSubdomain
 
-  // Log for debugging
   if (process.env.NODE_ENV === 'development') {
-    console.log(`[Middleware] Host: ${hostname}, Admin: ${isAdminSubdomain}, App: ${isAppSubdomain}`)
+    console.log(`[Middleware] Host: ${hostname} → TenantAdmin:${isTenantAdmin} Agents:${isAgents} Legacy:${isAppLegacy} PlatformAdmin:${isPlatformAdmin}`)
   }
 
-  // 1. ADMIN SUBDOMAIN: admin.lvh.me:3000
-  if (isAdminSubdomain) {
+  // Common paths that always render normally regardless of subdomain
+  const commonPaths = [
+    '/login', '/register', '/onboarding', '/forgot-password',
+    '/reset-password', '/api/', '/pricing', '/docs',
+  ]
+  const isCommonPath = commonPaths.some(
+    (p) => url.pathname === p || url.pathname.startsWith(p + '/')
+  )
+
+  // ── 1. TENANT ADMIN PORTAL: admin.lvh.me ────────────────────────────────
+  if (isTenantAdmin) {
+    if (isCommonPath) return NextResponse.next()
+
+    // Root → hub
+    if (url.pathname === '/') {
+      return NextResponse.rewrite(new URL('/tenant-admin', request.url))
+    }
+    // Already scoped under /tenant-admin → pass through
+    if (url.pathname.startsWith('/tenant-admin')) {
+      return NextResponse.next()
+    }
+    // Transparent rewrite: /members → /tenant-admin/members
+    return NextResponse.rewrite(new URL(`/tenant-admin${url.pathname}`, request.url))
+  }
+
+  // ── 2. AGENTS DASHBOARD: agents.lvh.me (+ legacy app.lvh.me) ───────────
+  if (isAgents || isAppLegacy) {
+    if (isCommonPath) return NextResponse.next()
+    if (url.pathname.startsWith('/console')) return NextResponse.next()
+
+    const hasToken = request.cookies.has('access_token')
+    if (url.pathname === '/') {
+      return hasToken
+        ? NextResponse.rewrite(new URL('/dashboard', request.url))
+        : NextResponse.next()
+    }
+    if (!url.pathname.startsWith('/dashboard')) {
+      return NextResponse.rewrite(new URL(`/dashboard${url.pathname}`, request.url))
+    }
+    return NextResponse.next()
+  }
+
+  // ── 3. PLATFORM SUPER ADMIN: admin.agent.lvh.me ─────────────────────────
+  if (isPlatformAdmin) {
+    if (isCommonPath) return NextResponse.next()
     if (url.pathname === '/') {
       return NextResponse.rewrite(new URL('/admin/settings', request.url))
-    }
-    const commonPaths = ['/login', '/register', '/onboarding', '/forgot-password', '/reset-password', '/api/auth']
-    if (commonPaths.some(p => url.pathname === p || url.pathname.startsWith(p + '/'))) {
-      return NextResponse.next()
     }
     if (!url.pathname.startsWith('/admin')) {
       return NextResponse.rewrite(new URL(`/admin${url.pathname}`, request.url))
     }
+    return NextResponse.next()
   }
 
-  // 2. APP SUBDOMAIN: app.lvh.me:3000
-  if (isAppSubdomain) {
-    const hasToken = request.cookies.has('access_token')
-
-    // If root path on app subdomain:
-    // - Logged in → /dashboard
-    // - Guest → Landing page (/)
-    if (url.pathname === '/') {
-      if (hasToken) {
-        return NextResponse.rewrite(new URL('/dashboard', request.url))
-      }
-      return NextResponse.next()
-    }
-
-    // EXCLUDE common paths
-    const commonPaths = ['/', '/login', '/register', '/onboarding', '/forgot-password', '/reset-password', '/api/auth', '/console', '/pricing', '/docs']
-    if (commonPaths.some(p => url.pathname === p || url.pathname.startsWith(p + '/'))) {
-      return NextResponse.next()
-    }
-
-    // TRANSPARENT REWRITE: /agents -> /dashboard/agents
-    if (!url.pathname.startsWith('/dashboard')) {
-      return NextResponse.rewrite(new URL(`/dashboard${url.pathname}`, request.url))
-    }
+  // ── 4. SECURITY: Block cross-subdomain direct access ────────────────────
+  // Block /tenant-admin/* from non-admin subdomains
+  if (url.pathname.startsWith('/tenant-admin') && !isTenantAdmin) {
+    return NextResponse.redirect(
+      new URL(`http://${tenantAdminSubdomain}/`, request.url)
+    )
   }
-
-  // 3. SECURITY: Block cross-access
-  // Block direct /admin/* access from main domain or app subdomain
-  if (url.pathname.startsWith('/admin') && !isAdminSubdomain) {
-    return NextResponse.redirect(new URL(`http://${adminSubdomain}/admin/settings`))
+  // Block /admin/* (platform admin) from non-platform-admin subdomains
+  if (url.pathname.startsWith('/admin') && !isPlatformAdmin) {
+    return NextResponse.redirect(
+      new URL(`http://${adminSubdomain}/admin/settings`, request.url)
+    )
   }
-  // Block direct /dashboard/* access from main domain or admin subdomain
-  if (url.pathname.startsWith('/dashboard') && !isAppSubdomain) {
-    return NextResponse.redirect(new URL(`http://${appSubdomain}/`))
+  // Block /dashboard/* from non-agents subdomains
+  if (url.pathname.startsWith('/dashboard') && !isAgents && !isAppLegacy) {
+    return NextResponse.redirect(
+      new URL(`http://${agentsSubdomain}/`, request.url)
+    )
   }
 
   return NextResponse.next()
@@ -76,14 +100,6 @@ export function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    /*
-     * Match all request paths except for the ones starting with:
-     * - api (API routes — authenticated separately by the backend)
-     * - _next/static (static files)
-     * - _next/image (image optimization files)
-     * - favicon.ico (favicon file)
-     * - public assets (png, jpg, svg, etc.)
-     */
-    '/((?!api|_next/static|_next/image|favicon.ico|.*\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+    '/((?!api|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
   ],
 }

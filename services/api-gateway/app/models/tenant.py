@@ -18,8 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from shared.dates import utcnow
 
 
 class Tenant(Base):
@@ -202,3 +201,101 @@ class PendingAgentPurchase(Base):
 
     def __repr__(self) -> str:
         return f"<PendingAgentPurchase tenant={self.tenant_id} id={self.id}>"
+
+
+class TenantCRMWorkspace(Base):
+    """
+    Mapping between an AscenAI Tenant and their Twenty CRM Workspaces (Companies).
+    Allows one tenant to have multiple isolated CRM environments.
+    """
+    __tablename__ = "tenant_crm_workspaces"
+    __table_args__ = (
+        Index("ix_crm_workspaces_tenant_id", "tenant_id"),
+        Index("ix_crm_workspaces_workspace_id", "workspace_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # The actual ID of the workspace in Twenty's database
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    
+    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    subdomain: Mapped[str] = mapped_column(String(100), nullable=False)
+    
+    # Track allowed user slots for this specific company
+    user_slots: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    # Relationship
+    tenant: Mapped["Tenant"] = relationship("Tenant")
+
+
+class TenantMember(Base):
+    """
+    Cross-product RBAC membership record.
+    One row per person per tenant. Governs access to all AscenAI products.
+    CRM-only members (is_crm_only=True) have no AscenAI dashboard account.
+    """
+    __tablename__ = "tenant_members"
+    __table_args__ = (
+        Index("ix_tenant_members_tenant_id", "tenant_id"),
+        Index("ix_tenant_members_user_id", "user_id"),
+        Index("ix_tenant_members_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    # Null until the invite is accepted (for pending invites)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    # Product access toggles
+    can_access_agents: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    can_access_crm: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    can_access_billing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    can_access_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Role within each product
+    agents_role: Mapped[str] = mapped_column(String(50), nullable=False, default="viewer")  # viewer|editor|admin
+    crm_role: Mapped[str] = mapped_column(String(50), nullable=False, default="viewer")
+
+    # CRM-only = no AscenAI login, enters CRM via magic link only
+    is_crm_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Invite tracking
+    invite_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    invite_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invited_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|active|revoked
+
+    # CRM workspace assignment (for CRM-only users)
+    crm_workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=utcnow, nullable=False
+    )
+
+    # Relationships
+    tenant: Mapped["Tenant"] = relationship("Tenant")

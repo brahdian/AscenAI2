@@ -4,7 +4,7 @@ Usage
 -----
 From anywhere in ai-orchestrator:
 
-    from app.services.event_bus import publish_event
+    from shared.orchestration.event_bus import publish_event
     await publish_event(redis, "payment.completed", tenant_id=str(tenant_id), payload={...})
 
 WorkflowTriggerWorker subscribes to the channel and fires any workflows whose

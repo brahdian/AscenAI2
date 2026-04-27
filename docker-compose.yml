@@ -111,8 +111,8 @@ services:
   # ---------------------------------------------------------------------------
   api-gateway:
     build:
-      context: ./services/api-gateway
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -159,8 +159,8 @@ services:
 
   mcp-server:
     build:
-      context: ./services/mcp-server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/mcp-server/Dockerfile
     restart: unless-stopped
     # VULN-041 FIX: MCP Server should not be directly accessible from outside
     # ports:
@@ -197,8 +197,8 @@ services:
 
   ai-orchestrator:
     build:
-      context: ./services/ai-orchestrator
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/ai-orchestrator/Dockerfile
     restart: unless-stopped
     # VULN-041 FIX: Orchestrator should not be directly accessible from outside
     # ports:
@@ -240,8 +240,8 @@ services:
 
   voice-pipeline:
     build:
-      context: ./services/voice-pipeline
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/voice-pipeline/Dockerfile
     restart: unless-stopped
     # VULN-041 FIX: Voice Pipeline should not be directly accessible from outside
     # ports:
@@ -291,8 +291,11 @@ services:
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://api.lvh.me:8000}
         NEXT_PUBLIC_ROOT_DOMAIN: ${NEXT_PUBLIC_ROOT_DOMAIN:-lvh.me:3000}
         NEXT_PUBLIC_APP_SUBDOMAIN: ${NEXT_PUBLIC_APP_SUBDOMAIN:-app.lvh.me:3000}
-        NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+        NEXT_PUBLIC_AGENTS_SUBDOMAIN: ${NEXT_PUBLIC_AGENTS_SUBDOMAIN:-agents.lvh.me:3000}
+        NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+        NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.agent.lvh.me:3000}
         NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
+        NEXT_PUBLIC_CRM_SEAT_PRICE: ${NEXT_PUBLIC_CRM_SEAT_PRICE:-19}
     restart: unless-stopped
     ports:
       - "3000:3000"
@@ -301,9 +304,14 @@ services:
       NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://api.lvh.me:8000}
       NEXT_PUBLIC_ROOT_DOMAIN: ${NEXT_PUBLIC_ROOT_DOMAIN:-lvh.me:3000}
       NEXT_PUBLIC_APP_SUBDOMAIN: ${NEXT_PUBLIC_APP_SUBDOMAIN:-app.lvh.me:3000}
-      NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+      NEXT_PUBLIC_AGENTS_SUBDOMAIN: ${NEXT_PUBLIC_AGENTS_SUBDOMAIN:-agents.lvh.me:3000}
+      NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+      NEXT_PUBLIC_ADMIN_SUBDOMAIN: ${NEXT_PUBLIC_ADMIN_SUBDOMAIN:-admin.agent.lvh.me:3000}
       NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AscenAI}
-      ADMIN_SUBDOMAIN: ${ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
+      NEXT_PUBLIC_CRM_SEAT_PRICE: ${NEXT_PUBLIC_CRM_SEAT_PRICE:-19}
+      ADMIN_SUBDOMAIN: ${ADMIN_SUBDOMAIN:-admin.agent.lvh.me:3000}
+      AGENTS_SUBDOMAIN: ${AGENTS_SUBDOMAIN:-agents.lvh.me:3000}
+      TENANT_ADMIN_SUBDOMAIN: ${TENANT_ADMIN_SUBDOMAIN:-admin.lvh.me:3000}
       APP_SUBDOMAIN: ${APP_SUBDOMAIN:-app.lvh.me:3000}
       HOSTNAME: 0.0.0.0
       PORT: 3000
@@ -321,9 +329,69 @@ services:
           cpus: "0.25"
           memory: 128M
 
+  # ---------------------------------------------------------------------------
+  # Twenty CRM Integration
+  # ---------------------------------------------------------------------------
+  twenty-server:
+    image: twentycrm/twenty:latest
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    env_file:
+      - .env
+    environment:
+      - PORT=3000
+      - PG_DATABASE_URL=postgres://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/twenty
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - APP_SECRET=${TWENTY_APP_SECRET}
+      - SERVER_URL=${SERVER_URL:-http://localhost:3001}
+      - STORAGE_TYPE=local
+      - AI_ENABLED=false
+    volumes:
+      - twenty_local_data:/app/packages/twenty-server/.local-storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend-net
+      - data-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  twenty-worker:
+    image: twentycrm/twenty:latest
+    restart: unless-stopped
+    command: ["yarn", "worker:prod"]
+    env_file:
+      - .env
+    environment:
+      - PG_DATABASE_URL=postgres://${POSTGRES_USER:-ascenai}:${POSTGRES_PASSWORD}@postgres:5432/twenty
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - APP_SECRET=${TWENTY_APP_SECRET}
+      - STORAGE_TYPE=local
+      - AI_ENABLED=false
+    volumes:
+      - twenty_local_data:/app/packages/twenty-server/.local-storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      twenty-server:
+        condition: service_healthy
+    networks:
+      - backend-net
+      - data-net
+
 volumes:
   postgres_data:
   redis_data:
+  twenty_local_data:
 
 # VULN-041 FIX: Network segmentation by trust boundary
 # backend-net: API Gateway, AI Orchestrator, Voice Pipeline (trusted services)

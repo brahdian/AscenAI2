@@ -35,6 +35,27 @@ from app.core.security import validate_token_for_tenant
 from app.services.stt_service import STTService, TranscriptResult
 from app.services.tts_service import TTSService
 
+# Phase 1: Neural VAD & Audio Foundation (ported from livekit-plugins-silero)
+from app.services.silero_vad import SileroVAD, SileroVADStream, VADEventType, get_silero_vad
+from app.services.audio_processor import AudioProcessor
+
+# Phase 2: Transcription Scrubbing
+from app.services.transcription_scrubber import TranscriptBuffer
+
+# Phase 3: Interrupt State Machine
+from app.services.interrupt_state_machine import InterruptStateMachine, PipelineState
+
+# Phase 4: Latency Telemetry
+from app.services.latency_tracker import LatencyTracker
+
+# Unified Orchestration: In-process Brain (replaces HTTP SSE hop for voice)
+try:
+    from shared.orchestration.voice_bridge import VoiceOrchestrator
+    _VOICE_ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    VoiceOrchestrator = None  # type: ignore[assignment,misc]
+    _VOICE_ORCHESTRATOR_AVAILABLE = False
+
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -129,9 +150,6 @@ class SessionState:
     current_tts_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
     speech_detected: bool = False  # at least one voiced frame in current utterance
     # Per-session mutex: prevents concurrent utterance processing (TC-A02).
-    # Only one utterance may run the STT→orchestrator→TTS pipeline at a time.
-    # Barge-in cancels the TTS task, but the *next* utterance must wait for the
-    # lock to be released before starting a new pipeline pass.
     utterance_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # VULN-032 FIX: Rate limiting on utterance processing
     utterance_timestamps: list[float] = field(default_factory=list)
@@ -139,23 +157,39 @@ class SessionState:
     # Per-session agent configuration (persisted after first fetch)
     agent_config: Optional[dict] = None
 
-    # Backchannel state -------------------------------------------------------
-    # Monotonic time when the user started their current voiced segment.
+    # Backchannel state
     speech_started_at: float = 0.0
-    # Monotonic time of the last backchannel emission (prevents spamming).
     last_backchannel_at: float = 0.0
-    # True once a backchannel has been sent for the current utterance.
     backchannel_sent: bool = False
 
-    # Twilio Telephony Integration ---------------------------------------------
-    # Set to the StreamSid when a Twilio Media Stream connects.
+    # Twilio Telephony Integration
     twilio_stream_sid: Optional[str] = None
-    # Twilio CallSid — populated from the 'start' event customParameters or accountSid field.
     call_sid: Optional[str] = None
-    # Maps extension numbers (strings) to phone numbers or agent IDs for SIP REFER transfers.
+    caller_phone: Optional[str] = None
+    started_at: float = 0.0
     extension_map: dict = field(default_factory=dict)
 
-    # Derived timing helpers ---------------------------------------------------
+    # ------------------------------------------------------------------
+    # Phase 1: Neural VAD stream (per-session official Silero state)
+    # ------------------------------------------------------------------
+    vad_stream: Optional["VADStreamWrapper"] = None
+
+    # Phase 1: Stateful Resampler (LiveKit RTC)
+    audio_processor: Optional["AudioProcessor"] = None
+
+    # Phase 2: Transcription scrubbing buffer (per-session)
+    transcript_buffer: Optional["TranscriptBuffer"] = None
+
+    # Phase 3: Interrupt state machine (per-session)
+    fsm: Optional["InterruptStateMachine"] = None
+
+    # Unified Brain: in-process VoiceOrchestrator (eliminates HTTP SSE hop)
+    voice_orchestrator: Optional[object] = None
+
+    # Partial frame buffer — stores <512 samples that don't fill a Silero frame yet
+    _partial_frame: bytes = field(default_factory=bytes)
+
+    # Derived timing helpers
 
     @property
     def silence_ms(self) -> int:
@@ -170,6 +204,10 @@ class SessionState:
         self.interrupt_tts = False
         self.speech_started_at = 0.0
         self.backchannel_sent = False
+        self._partial_frame = b""
+        if self.transcript_buffer:
+            self.transcript_buffer.reset()
+
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +234,7 @@ class VoicePipeline:
         self.active_sessions: dict[str, SessionState] = {}
         self._http_client: Optional[httpx.AsyncClient] = None
 
+
     # ------------------------------------------------------------------
     # Public WebSocket entry point
     # ------------------------------------------------------------------
@@ -221,6 +260,38 @@ class VoicePipeline:
 
         await websocket.accept()
 
+        # Phase 1: Initialize AudioProcessor per-session (stateful)
+        # Twilio sends 8kHz, we want 16kHz
+        processor = AudioProcessor(input_rate=8000, output_rate=16000)
+
+        # Phase 1: Initialize Silero VAD
+        vad = None
+        if settings.SILERO_VAD_ENABLED:
+            vad = await get_silero_vad()
+
+        # Phase 2: Transcription scrubber per-session
+        transcript_buf = TranscriptBuffer(session_id=session_id)
+
+        # Phase 3: Interrupt state machine per-session
+        fsm = InterruptStateMachine(session_id=session_id)
+
+        # Unified Brain: initialize in-process VoiceOrchestrator if available
+        voice_orc = None
+        if _VOICE_ORCHESTRATOR_AVAILABLE:
+            try:
+                db = await self._get_db_session()
+                voice_orc = VoiceOrchestrator(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    db=db,
+                    redis_client=self.redis,
+                )
+                logger.info("voice_orchestrator_bridge_active", session_id=session_id)
+            except Exception as _oe:
+                logger.warning("voice_orchestrator_bridge_failed", error=str(_oe))
+                voice_orc = None
+
         state = SessionState(
             session_id=session_id,
             tenant_id=tenant_id,
@@ -229,7 +300,14 @@ class VoicePipeline:
             is_listening=True,
             audio_buffer=bytearray(),
             silence_frames=0,
+            vad_stream=vad.stream() if vad is not None else None,
+            transcript_buffer=transcript_buf,
+            fsm=fsm,
+            audio_processor=processor,
+            voice_orchestrator=voice_orc,
+            started_at=time.time(),
         )
+
         self.active_sessions[session_id] = state
 
         logger.info(
@@ -237,19 +315,15 @@ class VoicePipeline:
             session_id=session_id,
             tenant_id=tenant_id,
             agent_id=agent_id,
+            silero_vad=state.vad_stream is not None,
         )
 
         try:
-            # Play pre-recorded greeting (zero TTS cost per call) or TTS-synthesise
-            # the text greeting before entering the listening loop.
             await self._play_greeting(websocket, state)
 
-            # Phase 4: DTMF Phase Simulation
             menu = (state.agent_config or {}).get("ivr_dtmf_menu")
             has_menu = menu and isinstance(menu.get("entries"), list) and len(menu["entries"]) > 0
             if has_menu and not state.twilio_stream_sid:
-                # Only simulate DTMF over WS if this isn't a Twilio call. 
-                # (Twilio handles DTMF via <Gather> before bridging to WS).
                 proceed = await self._run_dtmf_phase(websocket, state, menu)
                 if not proceed:
                     return
@@ -260,11 +334,12 @@ class VoicePipeline:
         except Exception as exc:
             logger.error("voice_session_error", session_id=session_id, error=str(exc))
         finally:
-            # Cancel any in-flight TTS task
             if state.current_tts_task and not state.current_tts_task.done():
                 state.current_tts_task.cancel()
             self.active_sessions.pop(session_id, None)
             logger.info("voice_session_ended", session_id=session_id)
+            asyncio.create_task(self._finalize_voice_session(state))
+
 
     # ------------------------------------------------------------------
     # Main voice loop
@@ -426,6 +501,12 @@ class VoicePipeline:
                             or start_data.get("callSid")
                             or ctrl.get("callSid")
                         )
+                        custom = start_data.get("customParameters", {}) or {}
+                        state.caller_phone = (
+                            custom.get("From")
+                            or custom.get("from")
+                            or start_data.get("from")
+                        )
                         # Populate extension map from agent config if available
                         if state.agent_config:
                             state.extension_map = state.agent_config.get("escalation_extensions", {})
@@ -437,18 +518,14 @@ class VoicePipeline:
                         continue
 
                     elif event_type == "media" and "payload" in ctrl.get("media", {}):
-                        # Twilio sends 8000Hz mu-law audio encoded as base64
+                        # Twilio sends 8000Hz mu-law audio
                         import base64
-                        import audioop
                         payload = ctrl["media"]["payload"]
                         mulaw_bytes = base64.b64decode(payload)
-                        # Convert 8kHz mu-law to 16kHz PCM (our pipeline standard)
-                        pcm_bytes = audioop.ulaw2lin(mulaw_bytes, 2)
-                        resampled_bytes, _ = audioop.ratecv(pcm_bytes, 2, 1, 8000, 16000, None)
-                        
-                        # Pack it into the raw context so the existing pipeline processes it seamlessly
-                        raw = {"bytes": resampled_bytes}
-                        # DO NOT continue; fall through to the binary audio chunk handler below
+                        # Convert mu-law to PCM (still 8kHz)
+                        pcm8_bytes = AudioProcessor.convert_mulaw_to_pcm(mulaw_bytes)
+                        # The binary handler below will resample it to 16kHz via session.audio_processor
+                        raw = {"bytes": pcm8_bytes}
 
                     elif event_type == "stop":
                         # Twilio end of call
@@ -466,56 +543,80 @@ class VoicePipeline:
             if not audio_chunk:
                 continue
 
-            # Barge-in: if TTS is playing and user starts speaking, interrupt
-            has_voice = await self.stt.detect_voice_activity(audio_chunk)
-            if has_voice and state.is_speaking:
-                logger.info("barge_in_detected", session_id=state.session_id)
-                await self._handle_barge_in(state)
-                # For Twilio streams send a 'clear' event to stop queued audio playback
-                if state.twilio_stream_sid:
-                    await self._send_json(websocket, {
-                        "event": "clear",
-                        "streamSid": state.twilio_stream_sid,
-                    })
-                await self._send_json(websocket, {"type": "barge_in"})
+            # ------------------------------------------------------------------
+            # Phase 2: Silero VAD path (if initialized) or legacy energy VAD
+            # ------------------------------------------------------------------
+            if state.vad_stream is not None and state.audio_processor:
+                # 1. State-aware Resampling + Normalization (LiveKit RTC)
+                # This ensures click-free audio even if Twilio sends tiny packets
+                processed_chunk = state.audio_processor.resample_and_normalize(audio_chunk)
+                if not processed_chunk:
+                    continue
 
-            if state.is_listening:
-                state.audio_buffer.extend(audio_chunk)
+                # 2. Push to official VAD
+                state.vad_stream.push_frame(processed_chunk, sample_rate=16000)
 
-                if has_voice:
-                    if not state.speech_detected:
-                        # Record when voiced speech began for backchannel timing
+                # 3. Drain events
+                while not state.vad_stream._event_queue.empty():
+                    vad_event = state.vad_stream._event_queue.get_nowait()
+
+                    if vad_event.type == VADEventType.START_OF_SPEECH:
+                        if state.fsm and state.fsm.is_speaking:
+                            await self._handle_barge_in(state, websocket)
+                        state.speech_detected = True
                         state.speech_started_at = time.monotonic()
-                    state.speech_detected = True
-                    state.silence_frames = 0
+                        await self._maybe_emit_backchannel(websocket, state)
+                        if state.transcript_buffer:
+                            state.transcript_buffer.reset()
 
-                    # Backchannel: emit a filler word after the user has been
-                    # speaking long enough and we haven't sent one this turn.
-                    await self._maybe_emit_backchannel(websocket, state)
+                    elif vad_event.type == VADEventType.END_OF_SPEECH:
+                        if state.is_listening and state.speech_detected:
+                            # Combine frames from the official VAD event
+                            # (The SDK automatically includes the prefix padding)
+                            utterance_audio = b"".join([f.data for f in vad_event.frames])
+                            state.reset_utterance()
+                            state.is_listening = False
+                            await self._send_json(websocket, {"type": "processing"})
+                            asyncio.create_task(
+                                self._process_utterance(utterance_audio, websocket, state)
+                            )
 
-                elif state.speech_detected:
-                    # Accumulate silence only after real speech has been heard
-                    state.silence_frames += 1
+            else:
+                # ------------------------------------------------------------------
+                # Legacy energy-based VAD fallback (no Silero)
+                # ------------------------------------------------------------------
+                has_voice = await self.stt.detect_voice_activity(audio_chunk)
 
-                # Trigger transcription on end-of-utterance conditions
-                end_of_utterance = (
-                    state.speech_detected
-                    and state.silence_ms >= settings.VAD_SILENCE_THRESHOLD_MS
-                )
-                max_duration_reached = (
-                    len(state.audio_buffer) >= max_utterance_bytes
-                )
+                # Phase 3 FSM: barge-in via legacy VAD
+                if has_voice and state.is_speaking:
+                    await self._handle_barge_in(state, websocket)
 
-                if end_of_utterance or max_duration_reached:
-                    utterance_audio = bytes(state.audio_buffer)
-                    state.reset_utterance()
-                    state.is_listening = False  # pause intake during processing
+                if state.is_listening:
+                    state.audio_buffer.extend(audio_chunk)
 
-                    await self._send_json(websocket, {"type": "processing"})
+                    if has_voice:
+                        if not state.speech_detected:
+                            state.speech_started_at = time.monotonic()
+                        state.speech_detected = True
+                        state.silence_frames = 0
+                        await self._maybe_emit_backchannel(websocket, state)
+                    elif state.speech_detected:
+                        state.silence_frames += 1
 
-                    asyncio.create_task(
-                        self._process_utterance(utterance_audio, websocket, state)
+                    end_of_utterance = (
+                        state.speech_detected
+                        and state.silence_ms >= settings.VAD_SILENCE_THRESHOLD_MS
                     )
+                    max_duration_reached = len(state.audio_buffer) >= max_utterance_bytes
+
+                    if end_of_utterance or max_duration_reached:
+                        utterance_audio = bytes(state.audio_buffer)
+                        state.reset_utterance()
+                        state.is_listening = False
+                        await self._send_json(websocket, {"type": "processing"})
+                        asyncio.create_task(
+                            self._process_utterance(utterance_audio, websocket, state)
+                        )
 
     # ------------------------------------------------------------------
     # Utterance processing
@@ -565,8 +666,17 @@ class VoicePipeline:
         state: SessionState,
     ) -> None:
         """Internal: execute STT → orchestrator → TTS under the utterance lock."""
+        # Phase 4: per-turn latency tracker
+        turn = len(state.utterance_timestamps)
+        tracker = LatencyTracker(session_id=state.session_id, turn=turn)
+        tracker.on_speech_end()  # T=0: VAD fired
+
+        # Phase 3 FSM: transition to THINKING
+        if state.fsm and state.fsm.can_transition_to(PipelineState.THINKING):
+            state.fsm.transition_to(PipelineState.THINKING, reason="utterance_start")
+
         try:
-            # 1. Transcribe — use Gemini audio STT if configured (44× cheaper)
+            # 1. Transcribe
             if settings.STT_PROVIDER == "gemini" and settings.GEMINI_API_KEY:
                 raw_text, detected_lang = await self._transcribe_gemini(audio_data)
                 transcript = TranscriptResult(
@@ -577,39 +687,35 @@ class VoicePipeline:
                     audio_data, language="auto", format="webm"
                 )
 
-            if not transcript.text.strip():
+            tracker.on_stt_done()  # Phase 4: STT hop complete
+
+            # Phase 2: run transcript through scrubber to remove stutter/fillers
+            if state.transcript_buffer:
+                clean_text = state.transcript_buffer.finalize(transcript.text)
+            else:
+                clean_text = transcript.text
+
+            if not clean_text.strip():
                 logger.debug("empty_transcript_skipped", session_id=state.session_id)
+                if state.fsm and state.fsm.can_transition_to(PipelineState.LISTENING):
+                    state.fsm.transition_to(PipelineState.LISTENING, reason="empty_transcript")
                 state.is_listening = True
                 return
 
-            # TC-A01: Low-confidence transcript gate.
-            # If the STT provider returns confidence < 0.6, ask the user to
-            # repeat rather than processing a potentially mis-transcribed utterance.
+            # TC-A01: Low-confidence gate
             if transcript.confidence < 0.6:
                 logger.info(
                     "low_confidence_transcript",
                     session_id=state.session_id,
                     confidence=transcript.confidence,
-                    text=transcript.text[:60],
                 )
                 await self._send_json(
                     websocket,
-                    {
-                        "type": "transcript",
-                        "text": transcript.text,
-                        "is_final": False,
-                        "confidence": transcript.confidence,
-                    },
+                    {"type": "transcript", "text": clean_text, "is_final": False, "confidence": transcript.confidence},
                 )
                 state.is_listening = True
                 fallback_msg = (state.agent_config or {}).get("computed_fallback") or "Sorry, I didn't quite catch that. Could you say that again?"
-                tts_task = asyncio.create_task(
-                    self._tts_and_send(
-                        fallback_msg,
-                        websocket,
-                        state,
-                    )
-                )
+                tts_task = asyncio.create_task(self._tts_and_send(fallback_msg, websocket, state))
                 state.current_tts_task = tts_task
                 await tts_task
                 return
@@ -617,28 +723,31 @@ class VoicePipeline:
             logger.info(
                 "utterance_transcribed",
                 session_id=state.session_id,
-                text=_redact_pii(transcript.text)[:80],
+                text=_redact_pii(clean_text)[:80],
             )
             await self._send_json(
                 websocket,
-                {
-                    "type": "transcript",
-                    "text": transcript.text,
-                    "is_final": True,
-                    "confidence": transcript.confidence,
-                },
+                {"type": "transcript", "text": clean_text, "is_final": True, "confidence": transcript.confidence},
             )
 
-            # 2. Stream text from orchestrator and synthesise TTS
+            # Phase 13 (existing): Scrub PII before sending to orchestrator
+            redacted_user_text = _redact_pii(clean_text)
+
+            # Phase 3 FSM: transition to SPEAKING when TTS begins
+            # (actual transition happens inside _stream_response on first audio)
             state.is_speaking = True
             state.interrupt_tts = False
 
-            # Phase 13: Scrub transcript before sending to Orchestrator for inter-service privacy
-            redacted_user_text = _redact_pii(transcript.text)
-
             tts_task = asyncio.create_task(
-                self._stream_response(redacted_user_text, websocket, state, detected_language=transcript.language)
+                self._stream_response(
+                    redacted_user_text, websocket, state,
+                    detected_language=transcript.language,
+                    tracker=tracker,
+                )
             )
+            # Phase 3 FSM: register task so FSM can cancel it on barge-in
+            if state.fsm:
+                state.fsm.register_tts_task(tts_task)
             state.current_tts_task = tts_task
 
             await tts_task
@@ -655,16 +764,24 @@ class VoicePipeline:
             logger.error(
                 "utterance_processing_error",
                 session_id=state.session_id,
-                error=type(exc).__name__,  # no stack details to client
+                error=type(exc).__name__,
             )
-            # Graceful fallback — keep the call alive and let the user retry
             await self._tts_and_send(
                 "Sorry, something went wrong on my end. Could you repeat that?",
                 websocket, state,
             )
         finally:
             state.is_speaking = False
-            state.is_listening = True  # resume listening
+            state.is_listening = True
+            # Phase 3 FSM: reset after clean response
+            if state.fsm:
+                state.fsm.reset_after_response()
+            # Phase 4: emit final latency report
+            tracker.on_response_complete()
+            report = tracker.report()
+            tracker.emit_metrics()
+            logger.info("turn_latency", **{k: v for k, v in report.items() if v is not None})
+
 
     async def _stream_response(
         self,
@@ -672,105 +789,132 @@ class VoicePipeline:
         websocket: WebSocket,
         state: SessionState,
         detected_language: str = "en",
+        tracker: Optional["LatencyTracker"] = None,
     ) -> None:
         """
-        Query the AI orchestrator via SSE, buffer text into sentences, and
-        synthesise+send each sentence concurrently using a producer/consumer
-        asyncio.Queue.
+        Phase 4 Upgrade: LLM SSE → word-chunked TTS → WebSocket.
 
-        Architecture
-        ------------
-        Producer (LLM)  →  sentence_queue  →  Consumer (TTS)
-
-        While TTS is playing sentence N the LLM continues streaming sentence
-        N+1 into the queue — eliminating the serialisation gap that previously
-        existed between each TTS call.
-
-        Barge-in: a shared asyncio.Event (cancel_event) signals both tasks to
-        abort immediately; the queue is emptied so no stale sentences play.
+        Improvements over original:
+        - Producer flushes to TTS after TTS_WORD_CHUNK_SIZE words (default 10)
+          OR TTS_FORCE_CHUNK_CHARS characters — whichever comes first.
+          This reduces Time-to-First-Audio from ~1 full sentence to ~10 words.
+        - LatencyTracker instruments LLM TTFT and TTS TTFA per turn.
+        - FSM transitions to SPEAKING on the first audio chunk sent.
         """
-        # Bounded queue — back-pressures the LLM producer if TTS falls behind.
-        sentence_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=6)
+        sentence_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=8)
         cancel_event = asyncio.Event()
 
-        # ── Producer: LLM SSE → sentence_queue ──────────────────────────────
+        first_token_recorded = False
+        first_audio_recorded = False
+
+        # ── Producer: LLM SSE → word-chunked sentence_queue ─────────────────
         async def _producer() -> None:
-            sentence_buffer = ""
+            nonlocal first_token_recorded
+            text_buffer = ""
             try:
-                async for text_chunk in self._send_text_to_orchestrator(user_text, state, detected_language=detected_language):
+                async for text_chunk in self._send_text_to_orchestrator(
+                    user_text, state, detected_language=detected_language
+                ):
                     if cancel_event.is_set() or state.interrupt_tts:
                         break
 
-                    sentence_buffer += text_chunk
+                    # Phase 4: track first LLM token
+                    if tracker and not first_token_recorded:
+                        tracker.on_llm_first_token()
+                        first_token_recorded = True
+
+                    text_buffer += text_chunk
                     await self._send_json(
                         websocket, {"type": "ai_text_chunk", "text": text_chunk}
                     )
 
-                    # Flush complete sentences into the queue immediately
+                    # Phase 4: Flush on sentence boundary OR word/char threshold
                     while True:
-                        sentence, remainder = _split_sentence(sentence_buffer)
-                        if sentence is None:
-                            break
-                        sentence_buffer = remainder
-                        if sentence.strip():
-                            logger.debug(
-                                "llm_producer_queued_sentence",
-                                session_id=state.session_id,
-                                chars=len(sentence),
-                            )
-                            await sentence_queue.put(sentence)
-                        if cancel_event.is_set() or state.interrupt_tts:
-                            return
+                        # 1. Try sentence split first (cleanest boundary)
+                        sentence, remainder = _split_sentence(text_buffer)
+                        if sentence is not None:
+                            text_buffer = remainder
+                            if sentence.strip():
+                                await sentence_queue.put(sentence.strip())
+                            if cancel_event.is_set() or state.interrupt_tts:
+                                return
+                            continue
 
-                # Flush any trailing fragment
-                if sentence_buffer.strip() and not (cancel_event.is_set() or state.interrupt_tts):
-                    await sentence_queue.put(sentence_buffer)
+                        # 2. If no sentence boundary yet, check word/char threshold
+                        word_count = len(text_buffer.split())
+                        if (
+                            word_count >= settings.TTS_WORD_CHUNK_SIZE
+                            or len(text_buffer) >= settings.TTS_FORCE_CHUNK_CHARS
+                        ):
+                            # Flush at last whitespace to avoid cutting mid-word
+                            last_space = text_buffer.rfind(" ")
+                            if last_space > 0:
+                                chunk = text_buffer[:last_space].strip()
+                                text_buffer = text_buffer[last_space + 1:]
+                            else:
+                                chunk = text_buffer.strip()
+                                text_buffer = ""
+                            if chunk:
+                                await sentence_queue.put(chunk)
+                            if cancel_event.is_set() or state.interrupt_tts:
+                                return
+                        break
+
+                # Flush trailing text
+                if text_buffer.strip() and not (cancel_event.is_set() or state.interrupt_tts):
+                    await sentence_queue.put(text_buffer.strip())
             except asyncio.CancelledError:
                 pass
             finally:
-                # Sentinel: tells consumer there are no more sentences
                 await sentence_queue.put(None)
 
         # ── Consumer: sentence_queue → TTS → WebSocket ───────────────────────
         async def _consumer() -> None:
+            nonlocal first_audio_recorded
             while True:
                 try:
-                    sentence = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
+                    chunk = await asyncio.wait_for(sentence_queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     logger.warning("tts_consumer_timeout", session_id=state.session_id)
                     break
 
-                if sentence is None:  # producer sent the sentinel
+                if chunk is None:
                     break
                 if cancel_event.is_set() or state.interrupt_tts:
-                    # Drain remaining queue without synthesising
                     while not sentence_queue.empty():
                         sentence_queue.get_nowait()
                     break
 
+                # Phase 3 FSM: transition to SPEAKING on first TTS chunk
+                if state.fsm and state.fsm.can_transition_to(PipelineState.SPEAKING):
+                    state.fsm.transition_to(PipelineState.SPEAKING, reason="first_tts_chunk")
+
                 t_start = time.monotonic()
-                await self._tts_and_send(sentence, websocket, state)
+                await self._tts_and_send(chunk, websocket, state)
                 elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+                # Phase 4: track first audio sent to client
+                if tracker and not first_audio_recorded:
+                    tracker.on_tts_first_audio()
+                    first_audio_recorded = True
+
                 logger.debug(
-                    "tts_consumer_sent_audio",
+                    "tts_chunk_sent",
                     session_id=state.session_id,
-                    chars=len(sentence),
+                    chars=len(chunk),
                     elapsed_ms=elapsed_ms,
                 )
 
-        # Watch barge-in: if state.interrupt_tts flips, signal cancel_event so
-        # both coroutines exit cleanly without waiting for the full LLM stream.
+        # ── Barge-in watcher ─────────────────────────────────────────────────
         async def _barge_in_watcher() -> None:
             while not cancel_event.is_set():
                 if state.interrupt_tts:
                     cancel_event.set()
-                    # Drain the queue so the consumer exits immediately
                     while not sentence_queue.empty():
                         try:
                             sentence_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
-                    # Push a sentinel so the consumer unblocks from get()
                     try:
                         sentence_queue.put_nowait(None)
                     except asyncio.QueueFull:
@@ -786,10 +930,11 @@ class VoicePipeline:
                 return_exceptions=True,
             )
         finally:
-            cancel_event.set()  # clean up watcher
+            cancel_event.set()
 
         if not state.interrupt_tts:
             await self._send_json(websocket, {"type": "response_complete"})
+
 
     # ------------------------------------------------------------------
     # Backchannel: filler words during user speech
@@ -994,63 +1139,20 @@ class VoicePipeline:
             return
 
         # TC-A03: Strip markdown/formatting that TTS engines read literally
-        # (e.g. "**bold**" → "asterisk asterisk bold asterisk asterisk").
         spoken_text = _strip_markdown_for_tts(text)
         if not spoken_text.strip():
             return
 
         try:
-            provider = settings.TTS_PROVIDER.lower()
-            
-            # Request explicit mu-law 8kHz format if communicating over Twilio
-            # so we don't need to transcode inside the Python process.
-            fmt_kwargs = {}
-            if state.twilio_stream_sid:
-                if provider == "cartesia":
-                    fmt_kwargs["output_format"] = {
-                        "container": "raw",
-                        "encoding": "pcm_mulaw",
-                        "sample_rate": 8000
-                    }
-                elif provider == "deepgram":
-                    fmt_kwargs["encoding"] = "mulaw"
-                    fmt_kwargs["sample_rate"] = 8000
-
-            if provider == "deepgram":
-                audio_iter = self.tts.synthesize_deepgram_stream(
-                    spoken_text,
-                    voice_id="aura-asteria-en",
-                    **fmt_kwargs
-                )
-            elif provider == "cartesia":
-                audio_iter = self.tts.synthesize_cartesia_stream(
-                    spoken_text,
-                    voice_id=settings.CARTESIA_VOICE_ID,
-                    **fmt_kwargs
-                )
-            elif provider == "google":
-                audio_bytes = await self._tts_google_cloud(spoken_text)
-                async def _google_iter():
-                    if audio_bytes:
-                        yield audio_bytes
-                audio_iter = _google_iter()
-            elif provider == "elevenlabs":
-                audio_iter = self.tts.synthesize_elevenlabs(
-                    spoken_text,
-                    voice_id="21m00Tcm4TlvDq8ikWAM",
-                    model_id="eleven_turbo_v2_5",
-                )
-            else:
-                # Default: OpenAI TTS
-                audio_iter = self.tts.synthesize_stream(spoken_text, voice_id="alloy")
+            # Phase 4: Use refactored Cartesia TTS stream (Sonic engine)
+            audio_iter = self.tts.synthesize_stream(spoken_text)
 
             async for audio_chunk in audio_iter:
                 if state.interrupt_tts:
                     return
                 await self._emit_audio(websocket, audio_chunk, state)
 
-            # After all audio chunks are sent, emit a Twilio mark event so the
-            # caller knows exactly when playback of this response ended.
+            # After all audio chunks are sent, emit a Twilio mark event
             if state.twilio_stream_sid and not state.interrupt_tts:
                 await self._send_json(websocket, {
                     "event": "mark",
@@ -1061,29 +1163,23 @@ class VoicePipeline:
             logger.error("tts_send_error", session_id=state.session_id, error=str(exc))
 
     async def _emit_audio(self, websocket: WebSocket, audio_chunk: bytes, state: SessionState) -> None:
-        """Helper to send audio correctly depending on the channel type (Browser PCM/MP3 vs Twilio base64 mu-law)."""
+        """Helper to send audio correctly depending on the channel type."""
+        from starlette.websockets import WebSocketState
         if websocket.client_state != WebSocketState.CONNECTED:
             return
 
         if state.twilio_stream_sid:
+            # Twilio requires 8kHz mu-law. Cartesia plugin yields 16kHz PCM (s16le).
             import audioop
-            # When the TTS provider returns raw PCM16 at 16kHz (e.g. openai pcm),
-            # we must downsample to 8kHz and encode as mu-law for Twilio.
-            # Providers configured with fmt_kwargs already return 8kHz mulaw raw bytes;
-            # for all others we perform the conversion here.
-            provider = settings.TTS_PROVIDER.lower()
-            if provider in ("cartesia", "deepgram"):
-                # These providers are configured to return raw mulaw 8kHz — use as-is.
+            import base64
+            try:
+                # 1. Downsample 16kHz -> 8kHz
+                pcm8, _ = audioop.ratecv(audio_chunk, 2, 1, 16000, 8000, None)
+                # 2. Encode to mu-law
+                mulaw_bytes = audioop.lin2ulaw(pcm8, 2)
+            except Exception:
                 mulaw_bytes = audio_chunk
-            else:
-                # Generic PCM16 at 16kHz → 8kHz → mu-law conversion
-                try:
-                    resampled, _ = audioop.ratecv(audio_chunk, 2, 1, 16000, 8000, None)
-                    mulaw_bytes = audioop.lin2ulaw(resampled, 2)
-                except Exception:
-                    mulaw_bytes = audio_chunk  # best-effort fallback
 
-            # Twilio Media Streams require base64 encoded audio wrapped in JSON.
             payload = {
                 "event": "media",
                 "streamSid": state.twilio_stream_sid,
@@ -1093,6 +1189,7 @@ class VoicePipeline:
             }
             await self._send_json(websocket, payload)
         else:
+            # Browser: Send raw PCM chunks (frontend handles playback)
             await websocket.send_bytes(audio_chunk)
 
     # ------------------------------------------------------------------
@@ -1205,14 +1302,35 @@ class VoicePipeline:
         self, text: str, state: SessionState, detected_language: str = "en"
     ) -> AsyncGenerator[str, None]:
         """
-        Send the transcribed text to the AI orchestrator's SSE stream endpoint
-        and yield text delta chunks as they arrive.
+        Forward the transcript to the AI Brain and yield streaming text deltas.
 
-        Expected orchestrator endpoint:
-          POST /api/v1/chat/stream
-          Body: {"tenant_id": ..., "agent_id": ..., "session_id": ..., "message": ...}
-          Response: text/event-stream  data: {"delta": "...", "done": false}
+        PRIMARY PATH (in-process): if a VoiceOrchestrator is attached to the session,
+        call it directly — zero network hops, zero serialization cost.
+
+        FALLBACK PATH (HTTP SSE): if no in-process orchestrator is available
+        (e.g. model failed to load, or running in standalone mode), fall back
+        to the existing HTTP SSE call to the ai-orchestrator service.
         """
+        # --- PRIMARY: In-process brain ---
+        if state.voice_orchestrator is not None:
+            try:
+                async for delta in state.voice_orchestrator.stream_response(
+                    user_message=text,
+                    request_id=state.session_id,
+                ):
+                    yield delta
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "voice_orchestrator_bridge_error_falling_back",
+                    error=str(exc),
+                    session_id=state.session_id,
+                )
+                # Fall through to HTTP path below
+
+        # --- FALLBACK: HTTP SSE to ai-orchestrator service ---
         url = f"{self.orchestrator_url}/api/v1/chat/stream"
         payload = {
             "tenant_id": state.tenant_id,
@@ -1222,8 +1340,8 @@ class VoicePipeline:
             "detected_language": detected_language,
         }
 
-        from app.core.internal_auth import generate_internal_token
-        token = generate_internal_token()
+        from shared.internal_auth import generate_internal_token
+        token = generate_internal_token(settings.SECRET_KEY, getattr(settings, "JWT_ALGORITHM", "HS256"))
 
         client = await self._get_http_client()
         try:
@@ -1253,7 +1371,6 @@ class VoicePipeline:
                         if delta:
                             yield delta
                     except json.JSONDecodeError:
-                        # Plain-text delta (non-JSON SSE)
                         yield raw
 
         except httpx.HTTPStatusError as exc:
@@ -1271,19 +1388,43 @@ class VoicePipeline:
     # Barge-in
     # ------------------------------------------------------------------
 
-    async def _handle_barge_in(self, state: SessionState) -> None:
-        """Stop current TTS playback immediately when the user starts speaking."""
-        state.interrupt_tts = True
-        state.is_speaking = False
-        if state.current_tts_task and not state.current_tts_task.done():
-            state.current_tts_task.cancel()
-            try:
-                await state.current_tts_task
-            except asyncio.CancelledError:
-                pass
-        state.current_tts_task = None
-        state.reset_utterance()
-        state.is_listening = True
+    async def _handle_barge_in(self, state: SessionState, websocket: Optional[WebSocket] = None) -> None:
+        """
+        Phase 3: Stop TTS playback via the InterruptStateMachine when the user
+        speaks over the agent.  Falls back to direct task cancellation if FSM
+        is unavailable (e.g. session created without Silero).
+        """
+        if state.fsm:
+            # FSM path: validates state, cancels TTS task, transitions to LISTENING
+            await state.fsm.cancel_speaking(reason="barge_in")
+            state.interrupt_tts = True
+            state.is_speaking = False
+            state.current_tts_task = None
+            state.reset_utterance()
+            state.is_listening = True
+        else:
+            # Legacy path
+            state.interrupt_tts = True
+            state.is_speaking = False
+            if state.current_tts_task and not state.current_tts_task.done():
+                state.current_tts_task.cancel()
+                try:
+                    await state.current_tts_task
+                except asyncio.CancelledError:
+                    pass
+            state.current_tts_task = None
+            state.reset_utterance()
+            state.is_listening = True
+
+        # Notify Twilio to discard queued audio
+        if websocket and state.twilio_stream_sid:
+            await self._send_json(websocket, {
+                "event": "clear",
+                "streamSid": state.twilio_stream_sid,
+            })
+        if websocket:
+            await self._send_json(websocket, {"type": "barge_in"})
+
 
     # ------------------------------------------------------------------
     # SIP REFER / Extension escalation
@@ -1428,6 +1569,45 @@ class VoicePipeline:
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=60.0)
         return self._http_client
+
+    async def _finalize_voice_session(self, state: SessionState) -> None:
+        """Fire-and-forget call to ai-orchestrator's voice/finalize endpoint.
+
+        The orchestrator decides whether the agent has CRM auto-logging enabled,
+        looks up / creates the contact, and writes a Note. All errors are swallowed
+        — voice teardown must never raise.
+        """
+        try:
+            duration = int(time.time() - state.started_at) if state.started_at else None
+            payload = {
+                "tenant_id": state.tenant_id,
+                "agent_id": state.agent_id,
+                "session_id": state.session_id,
+                "caller_phone": state.caller_phone,
+                "duration_seconds": duration,
+            }
+            client = await self._get_http_client()
+            headers = {"X-Internal-Key": settings.INTERNAL_API_KEY} if getattr(settings, "INTERNAL_API_KEY", "") else {}
+            await client.post(
+                f"{self.orchestrator_url}/api/v1/internal/voice/finalize",
+                json=payload,
+                headers=headers,
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.warning("voice_finalize_post_failed", session_id=state.session_id, error=str(exc))
+
+    async def _get_db_session(self):
+        """
+        Returns an AsyncSession from the voice-pipeline's DB pool.
+        Used to supply a DB connection to the in-process VoiceOrchestrator.
+        """
+        try:
+            from app.core.database import AsyncSessionLocal
+            return AsyncSessionLocal()
+        except ImportError:
+            # DB not configured in voice-pipeline (fallback to HTTP SSE path)
+            return None
 
     async def close(self) -> None:
         """Shut down shared resources."""

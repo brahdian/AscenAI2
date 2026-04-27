@@ -9,9 +9,9 @@ from sqlalchemy import select, func
 
 from app.models.agent import Agent, AgentPlaybook, Session as AgentSession, Message, PlaybookExecution
 from app.schemas.chat import ChatResponse
-from app.services.llm_client import LLMClient
-from app.services.session_state_machine import SessionStateMachine
-from app.services import pii_service
+from shared.orchestration.llm_client import LLMClient
+from shared.orchestration.session_state_machine import SessionStateMachine
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 

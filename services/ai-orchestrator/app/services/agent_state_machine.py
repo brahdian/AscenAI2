@@ -15,7 +15,7 @@ Every transition is persisted to `agent_state_transitions` for a full audit
 trail. The DB write is a fire-and-forget `db.add()` — the caller must commit.
 
 Usage:
-    from app.services.agent_state_machine import AgentStateMachine
+    from shared.orchestration.agent_state_machine import AgentStateMachine
 
     ok = await AgentStateMachine.transition(
         agent, "ACTIVE", db=db,

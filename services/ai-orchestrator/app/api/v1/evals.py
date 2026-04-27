@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.agent import Agent
 from app.models.eval import EvalCase, EvalRun, EvalScore
-from app.services.eval_service import EvalService
+from shared.orchestration.eval_service import EvalService
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()

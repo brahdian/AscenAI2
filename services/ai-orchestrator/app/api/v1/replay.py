@@ -19,7 +19,7 @@ from app.core.database import get_db
 from app.core.security import get_tenant_db
 from app.models.agent import Session as AgentSession
 from app.models.trace import ConversationTrace
-from app.services import pii_service
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()

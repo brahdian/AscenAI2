@@ -32,6 +32,7 @@ import {
   Menu,
   X,
   User,
+  ExternalLink,
 } from 'lucide-react'
 import { agentsApi } from '@/lib/api'
 
@@ -224,6 +225,20 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
         {/* User */}
         <div className="p-4 border-t border-gray-100 dark:border-gray-800">
+          {/* Admin Portal shortcut — owner only */}
+          {(user?.role === 'owner' || user?.role === 'admin') && (
+            <a
+              href={typeof window !== 'undefined'
+                ? `${window.location.protocol}//${process.env.NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN || window.location.host.replace(/^agents\./, 'admin.')}`
+                : `http://${process.env.NEXT_PUBLIC_TENANT_ADMIN_SUBDOMAIN || 'admin.lvh.me:3000'}`}
+              className="flex items-center gap-2 px-3 py-2 mb-2 rounded-lg text-xs font-medium text-violet-600 dark:text-violet-400 hover:bg-violet-50 dark:hover:bg-violet-900/20 transition-colors"
+              title="Admin Portal"
+            >
+              <ShieldCheck size={14} />
+              Admin Portal
+              <ExternalLink size={11} className="ml-auto opacity-60" />
+            </a>
+          )}
           <div className="flex items-center gap-2">
             <Link
               href="/dashboard/profile"
@@ -240,7 +255,6 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                 <p className="text-xs text-gray-500 truncate">{user?.email}</p>
               </div>
             </Link>
-            {/* Console link — discreet, not in main nav */}
             <Link
               href="/console"
               className="p-1.5 text-gray-300 hover:text-gray-600 dark:text-gray-600 dark:hover:text-gray-300 transition-colors"

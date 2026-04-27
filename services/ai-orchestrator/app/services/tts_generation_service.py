@@ -155,7 +155,7 @@ class TTSGenerationService:
         Falls back to the original text on any error so synthesis always proceeds.
         """
         try:
-            from app.services.llm_client import LLMClient  # lazy import — avoid circular deps
+            from shared.orchestration.llm_client import LLMClient  # lazy import — avoid circular deps
 
             llm = LLMClient(
                 provider=settings.LLM_PROVIDER,

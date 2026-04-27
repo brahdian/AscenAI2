@@ -65,8 +65,8 @@ docker compose version
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/brahdian/ascenai2.git
-cd ascenai2
+git clone https://github.com/brahdian/AscenAI.git
+cd AscenAI
 ```
 
 ---

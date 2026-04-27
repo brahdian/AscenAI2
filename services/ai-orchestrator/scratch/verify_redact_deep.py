@@ -6,7 +6,7 @@ from typing import Any
 # Add current dir to path
 sys.path.append(os.getcwd())
 
-from app.services import pii_service
+import shared.pii as pii_service
 
 async def test_redact_deep():
     print("Pre-warming PII service...")

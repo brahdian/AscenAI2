@@ -19,7 +19,7 @@ from app.core.database import close_db, init_db, SessionLocal
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.tenant import TenantMiddleware
 from app.schemas.mcp import HealthResponse, StreamMessage, WebSocketMessage
-from app.services import pii_service
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 
@@ -111,6 +111,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 4. Warm up PII service (Presidio)
     try:
+        pii_service.configure(settings.SECRET_KEY)
         await pii_service.warmup()
         logger.info("pii_service_initialized")
     except Exception as exc:

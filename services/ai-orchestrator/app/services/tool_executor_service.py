@@ -5,8 +5,8 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.services.mcp_client import MCPClient
-from app.services.llm_client import ToolCall
+from shared.orchestration.mcp_client import MCPClient
+from shared.orchestration.llm_client import ToolCall
 from app.models.agent import Session as AgentSession, PlaybookExecution
 from app.models.variable import AgentVariable
 
@@ -101,6 +101,7 @@ class ToolExecutionService:
         tool_calls: list[ToolCall],
         tenant_id: str,
         session_id: str,
+        crm_workspace_id: str | None = None,
     ) -> list[dict]:
         """
         Execute all tool calls in parallel via the MCP client.
@@ -134,6 +135,7 @@ class ToolExecutionService:
                         parameters=tc.arguments,
                         session_id=session_id,
                         trace_id=f"{trace_id}-{i}",
+                        crm_workspace_id=crm_workspace_id,
                     ))
             
             results = await asyncio.gather(*tasks, return_exceptions=True)

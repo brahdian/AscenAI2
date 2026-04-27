@@ -10,23 +10,23 @@ from sqlalchemy import select, func
 from app.core.config import settings
 from app.models.agent import Agent, Session, Message, GuardrailEvent
 from app.schemas.chat import ChatResponse, SourceCitation, StreamChatEvent
-from app.services import pii_service
-from app.services.llm_client import LLMClient, LLMResponse
-from app.services.mcp_client import MCPClient
-from app.services.memory_manager import MemoryManager
-from app.services.intent_detector import IntentDetector
+import shared.pii as pii_service
+from shared.orchestration.llm_client import LLMClient, LLMResponse
+from shared.orchestration.mcp_client import MCPClient
+from shared.orchestration.memory_manager import MemoryManager
+from shared.orchestration.intent_detector import IntentDetector
 
-from app.services.guardrail_service import GuardrailService
-from app.services.tool_executor_service import ToolExecutionService
-from app.services.context_builder_service import ContextBuilderService
-from app.services.playbook_handler import PlaybookHandler
-from app.services.session_billing_service import SessionBillingService
-from app.services.moderation_service import ModerationService, OutputBlockedError
-from app.services.grounding_service import GroundingService
-from app.services.settings_service import SettingsService
+from shared.orchestration.guardrail_service import GuardrailService
+from shared.orchestration.tool_executor_service import ToolExecutionService
+from shared.orchestration.context_builder_service import ContextBuilderService
+from shared.orchestration.playbook_handler import PlaybookHandler
+from shared.orchestration.session_billing_service import SessionBillingService
+from shared.orchestration.moderation_service import ModerationService, OutputBlockedError
+from shared.orchestration.grounding_service import GroundingService
+from shared.orchestration.settings_service import SettingsService
 from app.core.metrics import CONTEXT_RETRIEVALS
-from app.services.session_state_machine import SessionStateMachine
-from app.services.trace_logger import TraceLogger
+from shared.orchestration.session_state_machine import SessionStateMachine
+from shared.orchestration.trace_logger import TraceLogger
 from app.prompts.system_prompts import resolve_response_placeholders
 
 logger = structlog.get_logger(__name__)
@@ -144,7 +144,7 @@ class Orchestrator:
             )
         except asyncio.TimeoutError:
             logger.error("llm_timeout", timeout_s=LLM_TIMEOUT_SECONDS, model=getattr(self.llm, "model", "unknown"))
-            from app.services.llm_client import LLMResponse, TokenUsage
+            from shared.orchestration.llm_client import LLMResponse, TokenUsage
             return LLMResponse(
                 content="I'm sorry, I'm taking longer than expected to respond. Please try again in a moment.",
                 tool_calls=None,
@@ -436,7 +436,12 @@ class Orchestrator:
                             tc.arguments = pii_service.restore_dict(tc.arguments, pii_ctx, session_id)
 
                 tracer.start_timer("tools")
-                tool_results = await self.tool_executor.execute_tool_calls(tool_calls=allowed_calls, tenant_id=tenant_id, session_id=session_id)
+                tool_results = await self.tool_executor.execute_tool_calls(
+                    tool_calls=allowed_calls, 
+                    tenant_id=tenant_id, 
+                    session_id=session_id,
+                    crm_workspace_id=str(agent.crm_workspace_id) if getattr(agent, "crm_workspace_id", None) else None
+                )
                 tracer.stop_timer("tools")
                 
                 tool_results = [{k: self.guardrail_service.scrub_credentials(str(v)) if isinstance(v, str) else v for k, v in r.items()} if isinstance(r, dict) else r for r in tool_results]
@@ -906,7 +911,12 @@ class Orchestrator:
                         tc.arguments = pii_service.restore_dict(tc.arguments, stream_pii_ctx, session_id)
 
             tracer.start_timer("tools")
-            tool_results = await self.tool_executor.execute_tool_calls(tool_calls=allowed_calls, tenant_id=tenant_id, session_id=session_id)
+            tool_results = await self.tool_executor.execute_tool_calls(
+                tool_calls=allowed_calls, 
+                tenant_id=tenant_id, 
+                session_id=session_id,
+                crm_workspace_id=str(agent.crm_workspace_id) if getattr(agent, "crm_workspace_id", None) else None
+            )
             tracer.stop_timer("tools")
             tool_results = [{k: self.guardrail_service.scrub_credentials(str(v)) if isinstance(v, str) else v for k, v in r.items()} if isinstance(r, dict) else r for r in tool_results]
 

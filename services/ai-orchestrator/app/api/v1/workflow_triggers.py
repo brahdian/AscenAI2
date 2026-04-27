@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.workflows import _get_db_session, _get_workflow_or_404
 from app.models.workflow import Workflow, WorkflowExecution
 from app.schemas.workflow import WorkflowAdvanceResult, WorkflowExecutionResponse
-from app.services.workflow_engine import WorkflowEngine
+from shared.orchestration.workflow_engine import WorkflowEngine
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()

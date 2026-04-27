@@ -177,9 +177,9 @@ class DocumentIndexer:
         storage_path = job["storage_path"]
         file_type = job.get("file_type", "txt")
 
-        from app.services.llm_client import create_llm_client
+        from shared.orchestration.llm_client import create_llm_client
         from app.models.agent import AgentDocumentChunk
-        from app.services.moderation_service import ModerationService
+        from shared.orchestration.moderation_service import ModerationService
         from app.core.config import settings
         from sqlalchemy import delete
 
@@ -236,7 +236,7 @@ class DocumentIndexer:
 
         # 2. Compliance: PII Redaction
         # Scrub sensitive data before vectorization to ensure privacy/HIPAA.
-        from app.services import pii_service
+        import shared.pii as pii_service
         try:
             # Check if agent has guardrails enabled for PII
             async with self._db_factory() as db:

@@ -9,8 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY services/api-gateway/requirements.txt .
+COPY shared /app/shared
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install /app/shared
 
 # ---------------------------------------------------------------------------
 # Runtime image
@@ -31,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && addgroup --system app && adduser --system --ingroup app app
 
 COPY --from=builder /install /usr/local
-COPY --chown=app:app . .
+COPY --chown=app:app services/api-gateway/ .
 
 USER app
 EXPOSE 8000

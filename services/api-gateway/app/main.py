@@ -15,11 +15,13 @@ from sentry_sdk.integrations.redis import RedisIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
 from app.api.v1 import admin as admin_router
+from app.api.v1 import admin_crm as admin_crm_router
 from app.api.v1 import api_keys, auth, billing, compliance, proxy, team, tenants, webhooks
 from app.api.v1 import channels as channels_router
 from app.api.v1 import compliance_audit as compliance_audit_router
 from app.api.v1 import console as console_router
 from app.api.v1 import playbooks as playbooks_router
+from app.api.v1 import tenant_admin as tenant_admin_router
 from app.core.config import settings
 from app.core.database import close_db, init_db
 from app.core.scheduler import BACKGROUND_TASKS
@@ -171,7 +173,7 @@ app.add_middleware(RequestLoggingMiddleware)
 # 4. CORS (Must be outer so it catches 401s from Auth and 429s from RateLimit)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=settings.ALLOWED_ORIGINS if settings.ALLOWED_ORIGINS else settings.DEFAULT_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -232,9 +234,12 @@ app.include_router(compliance.router, prefix="/api/v1", tags=["compliance"])
 app.include_router(proxy.router, prefix="/api/v1", tags=["proxy"])
 app.include_router(channels_router.router, prefix="/api/v1/channels", tags=["channels"])
 app.include_router(admin_router.router, prefix="/api/v1", tags=["admin"])
+app.include_router(admin_crm_router.router, prefix="/api/v1/admin/crm", tags=["admin", "crm"])
 app.include_router(compliance_audit_router.router, prefix="/api/v1", tags=["compliance-audit"])
 app.include_router(playbooks_router.router, prefix="/api/v1", tags=["playbooks"])
 app.include_router(console_router.router, prefix="/api/v1", tags=["console"])
+app.include_router(tenant_admin_router.router, prefix="/api/v1", tags=["tenant-admin"])
+
 
 # ── Static assets — widget.js served at /widget/widget.js ─────────────────
 

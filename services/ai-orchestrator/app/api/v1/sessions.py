@@ -23,7 +23,7 @@ router = APIRouter()
 # message was persisted before the orchestrator-level pseudonymization was
 # fully in place.
 # ---------------------------------------------------------------------------
-from app.services import pii_service
+import shared.pii as pii_service
 
 
 def _tenant_id(request: Request) -> str:

@@ -15,7 +15,7 @@ from app.schemas.chat import (
     LearningInsights, LearningGap, UnreviewedNegative,
     GuardrailTrigger, SuggestedTrainingPair,
 )
-from app.services import pii_service
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()

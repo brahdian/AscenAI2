@@ -37,8 +37,8 @@ from app.schemas.workflow import (
     WorkflowResponse,
     WorkflowUpdate,
 )
-from app.services.workflow_engine import WorkflowEngine, ExecutionNotFoundError, WorkflowNotFoundError
-from app.services.workflow_registry import WorkflowRegistry
+from shared.orchestration.workflow_engine import WorkflowEngine, ExecutionNotFoundError, WorkflowNotFoundError
+from shared.orchestration.workflow_registry import WorkflowRegistry
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["workflows"])

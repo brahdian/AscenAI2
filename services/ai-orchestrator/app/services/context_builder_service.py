@@ -9,9 +9,9 @@ from app.models.agent import Agent, AgentPlaybook, AgentGuardrails
 from app.models.agent_custom_guardrail import AgentCustomGuardrail
 from app.models.variable import AgentVariable
 from app.prompts.system_prompts import build_system_prompt
-from app.services.mcp_client import MCPClient
-from app.services.settings_service import SettingsService
-import app.services.pii_service as pii_service
+from shared.orchestration.mcp_client import MCPClient
+from shared.orchestration.settings_service import SettingsService
+import shared.pii as pii_service
 
 logger = structlog.get_logger(__name__)
 

@@ -11,7 +11,7 @@ from sqlalchemy import select, func
 from app.core.config import settings
 
 if TYPE_CHECKING:
-    from app.services.llm_client import LLMClient
+    from shared.orchestration.llm_client import LLMClient
 
 logger = structlog.get_logger(__name__)
 

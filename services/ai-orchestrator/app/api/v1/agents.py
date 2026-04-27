@@ -20,8 +20,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.core.redis_client import get_redis as _get_redis
 
 
-from app.services.pii_service import redact
-from app.services import pii_service
+from shared.pii import redact
+import shared.pii as pii_service
 
 def _has_variables(text: str | None) -> bool:
     if not text:
@@ -54,7 +54,7 @@ from app.schemas.chat import (
     ChatResponse,
     ConnectorTestResult,
 )
-from app.services.agent_state_machine import AgentStateMachine
+from shared.orchestration.agent_state_machine import AgentStateMachine
 from app.guardrails.voice_agent_guardrails import (
     get_dynamic_voice_protocol,
     generate_multilingual_greeting,
@@ -62,10 +62,10 @@ from app.guardrails.voice_agent_guardrails import (
     get_or_compute_voice_strings,
     generate_ivr_language_prompt,
 )
-from app.services.tts_generation_service import TTSGenerationService
+from shared.orchestration.tts_generation_service import TTSGenerationService
 from app.utils.expansion import resolve_agent_variables
 from app.models.variable import AgentVariable
-from app.services.mcp_client import MCPClient
+from shared.orchestration.mcp_client import MCPClient
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
@@ -93,7 +93,7 @@ _MAX_SYSTEM_PROMPT_LEN = 8_000
 
 async def _background_purge_agent_knowledge(agent_id: str, tenant_id: str):
     """Purge all RAG chunks from MCP for a specific agent when archived or deleted."""
-    from app.services.mcp_client import MCPClient
+    from shared.orchestration.mcp_client import MCPClient
     from app.core.config import settings
     mcp = MCPClient(base_url=settings.MCP_SERVER_URL, ws_url=settings.MCP_WS_URL)
     try:
@@ -192,7 +192,7 @@ async def get_platform_global_guardrails(
     db: AsyncSession = Depends(get_db),
 ):
     """Get global guardrails from DB/Redis cache."""
-    from app.services.settings_service import SettingsService
+    from shared.orchestration.settings_service import SettingsService
     guardrails_setting = await SettingsService.get_setting(db, "platform_guardrails", default={})
     # Handle both wrapped {rules: [...]} and direct list/dict formats
     if isinstance(guardrails_setting, dict) and "rules" in guardrails_setting:
@@ -285,7 +285,7 @@ async def update_platform_global_guardrails(
     db: AsyncSession = Depends(get_db),
 ):
     """Update global guardrails (admin only). Writes to DB and updates Redis cache."""
-    from app.services.settings_service import SettingsService
+    from shared.orchestration.settings_service import SettingsService
     guardrails = body.get("guardrails", [])
 
     await db.execute(
@@ -338,7 +338,7 @@ async def create_agent(
     
     # If the agent is inactive, it requires payment. Transition its lifecycle state.
     if not agent.is_active:
-        from app.services.agent_state_machine import AgentStateMachine as _AgentStateMachine
+        from shared.orchestration.agent_state_machine import AgentStateMachine as _AgentStateMachine
         await _AgentStateMachine.pending_payment(
             agent, db=db, actor="user", reason="created_without_slot"
         )
@@ -1487,7 +1487,7 @@ async def delete_agent(
     tenant_id: str = Depends(get_current_tenant),
 ):
     """Deactivate an agent (transition to ARCHIVED state) and purge knowledge."""
-    from app.services.agent_lifecycle import transition_agent, AgentLifecycleError
+    from shared.orchestration.agent_lifecycle import transition_agent, AgentLifecycleError
 
     result = await db.execute(
         select(Agent).where(
@@ -1536,7 +1536,7 @@ async def restore_agent(
     - If the subscription is invalid or missing, the agent is restored as INACTIVE
       (is_active=False) so the user must complete payment.
     """
-    from app.services.agent_lifecycle import transition_agent, AgentLifecycleError
+    from shared.orchestration.agent_lifecycle import transition_agent, AgentLifecycleError
 
     result = await db.execute(
         select(Agent).where(

@@ -11,7 +11,7 @@ from app.schemas.chat import ChatResponse
 from app.core.config import settings
 from app.utils.expansion import resolve_agent_variables
 from app.models.variable import AgentVariable
-from app.services.pii_service import redact_pii, PIIContext
+from shared.pii import redact_pii, PIIContext
 
 logger = structlog.get_logger(__name__)
 

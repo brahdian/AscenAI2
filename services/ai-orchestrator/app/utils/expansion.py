@@ -2,7 +2,7 @@ import re
 import html
 from typing import TYPE_CHECKING, Optional
 import structlog
-import app.services.pii_service as pii_service
+import shared.pii as pii_service
 
 if TYPE_CHECKING:
     from app.models.agent import Agent

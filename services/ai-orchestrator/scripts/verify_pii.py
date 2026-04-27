@@ -5,8 +5,8 @@ import os
 # Add the app directory to sys.path to allow imports
 sys.path.append(os.path.join(os.getcwd(), "app"))
 
-from app.services import pii_service
-from app.services.pii_service import PIIContext
+import shared.pii as pii_service
+from shared.pii import PIIContext
 
 async def test_pii():
     print("--- PII Service Verification ---")

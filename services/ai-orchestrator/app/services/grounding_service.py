@@ -1,6 +1,6 @@
 import structlog
 from typing import List, Tuple
-from app.services.llm_client import LLMClient
+from shared.orchestration.llm_client import LLMClient
 from app.schemas.chat import SourceCitation
 
 logger = structlog.get_logger(__name__)

@@ -22,8 +22,8 @@ from app.schemas.chat import (
     SessionInitRequest, 
     SessionInitResponse
 )
-from app.services.memory_manager import MemoryManager
-from app.services.orchestrator import Orchestrator
+from shared.orchestration.memory_manager import MemoryManager
+from shared.orchestration.orchestrator import Orchestrator
 from app.guardrails.voice_agent_guardrails import get_or_compute_voice_strings
 
 logger = structlog.get_logger(__name__)

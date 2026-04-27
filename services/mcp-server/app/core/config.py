@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     AI_ORCHESTRATOR_URL: str = "http://ai-orchestrator:8000"
     INTERNAL_API_KEY: str = ""
 
+    # Twenty CRM
+    TWENTY_INTERNAL_API_URL: Optional[str] = None
+    TWENTY_PUBLIC_DOMAIN: str = "lvh.me:3001"
+    TWENTY_USE_SUBDOMAIN_ROUTING: bool = False
+
     @field_validator("INTERNAL_API_KEY")
     @classmethod
     def validate_internal_api_key(cls, v: str) -> str:

@@ -13,7 +13,7 @@ Legal state graph:
   ended  --> (terminal — no further transitions)
 
 Usage:
-    from app.services.session_state_machine import SessionStateMachine
+    from shared.orchestration.session_state_machine import SessionStateMachine
 
     SessionStateMachine.transition(session, "escalated", reason="frustration_threshold")
 """

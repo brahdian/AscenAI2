@@ -286,7 +286,7 @@ export function FeedbackModal({
           />
           <div className="mt-2 flex items-start gap-2 px-1">
             <div className="mt-0.5 text-amber-500 dark:text-amber-400">
-               <svg size={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
             </div>
             <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-tight">
               <span className="font-semibold text-amber-600 dark:text-amber-400">Compliance Check:</span> Please ensure corrections do not contain raw PII (names, phone numbers, or emails). Use generic labels like [PERSON] or [PHONE] instead.

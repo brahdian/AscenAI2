@@ -7,8 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from shared.dates import utcnow
 
 class PlatformSetting(Base):
     __tablename__ = "platform_settings"

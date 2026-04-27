@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from app.core.database import get_db
-from app.services.settings_service import SettingsService
+from shared.orchestration.settings_service import SettingsService
 import json
 import uuid
 
